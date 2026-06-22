@@ -16,8 +16,10 @@
 --  - usage_rollups はテナント×UTC日×component 粒度の事前集計。finalize と同一 tx 内で increment UPSERT
 --    する（s4）。peak_memory は SUM ではなく MAX セマンティクス（列名 _max で明示）。
 --    DELETE は付与しない＝集計の改竄/消去を不可にする（請求の権威, §3.2 と同じ追記思想）。
---  - sweeper(reaper) で終端化された stuck execution は usage_rollups に反映しない（バッチかつ計量を持たない）。
---    invocation_count の合計が executions の終端行数と稀に一致しないことがある＝既知の許容差（運用ドキュメント記載）。
+--  - sweeper(reaper) で終端化された stuck execution も usage_rollups に計上する（§15 M5「欠落しない」完了条件）。
+--    各 swept 行を `failed`・リソース指標 0（計測不能）で increment UPSERT する＝DLQ 経路と同一の「半端行」
+--    セマンティクス（reaper.rs (1b)）。sweep は CAS（既終端は WHERE で除外）なので再走で同じ行は返らず
+--    二重計上しない。invocation_count / 各 count は sweeper 経路ぶんも漏れなく集計に乗る（リソース指標は 0 加算）。
 
 -- 1. executions: per-execution 計量列（全て nullable → additive・backfill 不要, §15 M5）。
 --    executions は 0004_rls.sql の FORCE RLS + tenant_isolation 下にあり、列追加はその対象テーブルへの
