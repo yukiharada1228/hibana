@@ -747,25 +747,48 @@ pub async fn count_inflight_executions(
 /// `created_at < now() - deadline` の非終端行を failed に倒し、呼び出し側が各行を DECR して回収する。
 ///
 /// executions は FORCE RLS 下のため、呼び出し側は事前に同一 tx で `set_tenant_guc(tenant)` 済みのこと。
-/// 返す id 群が「この pass で実際に pending/running → failed へ遷移させた行」（CAS で 1 度きり）。
+/// 返す行群が「この pass で実際に pending/running → failed へ遷移させた行」（CAS で 1 度きり）。
+///
+/// M5 (§15「欠落しない」): 各行は `id` に加え `component_id` と `period_start`（この UPDATE が打った
+/// `finished_at` 由来の UTC 日）を返す。呼び出し側（reaper）はこれを使い、sweeper で終端化した実行も
+/// `usage_rollups` に `failed` として計上する（invocation +1 / failed +1 / リソース指標 0）。これにより
+/// 「worker 落下で sweeper が終端化した実行が集計に乗らない」欠落を塞ぐ。sweep は CAS（既終端は WHERE で
+/// 除外）なので再走しても同じ行は返らず、rollup も二重計上にならない。
 pub async fn finalize_stuck_executions(
     executor: impl sqlx::PgExecutor<'_>,
     tenant_id: &str,
     deadline_secs: i64,
-) -> Result<Vec<String>, sqlx::Error> {
+) -> Result<Vec<SweptExecution>, sqlx::Error> {
     let rows = sqlx::query(STUCK_EXECUTION_SWEEP_SQL)
         .bind(tenant_id)
         .bind(deadline_secs)
         .fetch_all(executor)
         .await?;
     rows.into_iter()
-        .map(|r| r.try_get::<String, _>("id"))
+        .map(|r| {
+            Ok(SweptExecution {
+                id: r.try_get::<String, _>("id")?,
+                component_id: r.try_get::<String, _>("component_id")?,
+                period_start: r.try_get::<NaiveDate, _>("period_start")?,
+            })
+        })
         .collect()
 }
 
+/// `finalize_stuck_executions` が CAS で `failed` 化した 1 行。sweeper 経路の rollup 計上に必要な
+/// 最小情報（集計キー）を持つ (M5, §15)。
+#[derive(Debug, Clone)]
+pub struct SweptExecution {
+    pub id: String,
+    pub component_id: String,
+    /// この UPDATE が打った `finished_at`（DB の `now()`）由来の UTC 日。`usage_rollups.period_start`。
+    pub period_start: NaiveDate,
+}
+
 /// `finalize_stuck_executions` の SQL。`created_at < now() - deadline` の非終端（pending/running）
-/// 行のみを `failed` に遷移させ（CAS: 既終端は WHERE で除外）、遷移した行の id を返す。
+/// 行のみを `failed` に遷移させ（CAS: 既終端は WHERE で除外）、遷移した行の集計キーを返す。
 /// `$2` は INTERVAL の秒数。`error` には sweeper 由来であることを記録する（監査・調査用）。
+/// M5: rollup 計上のため `component_id` と `period_start`（finished_at 由来 UTC 日, 単一時計源）も返す。
 const STUCK_EXECUTION_SWEEP_SQL: &str = "UPDATE executions \
      SET status = 'failed', \
          error = '\"execution exceeded delivery deadline without a terminal result (stuck-execution sweeper)\"'::jsonb, \
@@ -773,7 +796,7 @@ const STUCK_EXECUTION_SWEEP_SQL: &str = "UPDATE executions \
      WHERE tenant_id = $1 \
        AND status IN ('pending', 'running') \
        AND created_at < now() - make_interval(secs => $2::double precision) \
-     RETURNING id";
+     RETURNING id, component_id, (finished_at AT TIME ZONE 'UTC')::date AS period_start";
 
 /// 結果メッセージを CAS 的に反映する (§ result subscriber)。
 ///

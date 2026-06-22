@@ -596,6 +596,17 @@ CHAOS_ALWAYS_TRAP=always-trap CHAOS_SLOW=slow \
 | `POST /invoke` | invoke | active version を解決し JobMessage を publish（202）。大入力時は予約済み `execution_id` + `input_ref`（完全一致検証, §3.4） |
 | `POST /uploads` | invoke | 大入力アップロード用 single-key presigned PUT URL を発行（`execution_id` 予約。行 INSERT/INCR なし, §5.2/§6.4） |
 | `GET /executions/{id}` | read | 実行状態の参照（`input_ref`/`output_ref` を含む, §6.4） |
+| `GET /usage` | read | **M5**: テナント利用量参照。`from`/`to`（`YYYY-MM-DD`・UTC・既定は直近30日）で期間集計を返す。`principal.tenant_id` を権威化（cross-tenant パスなし）, §15 |
+
+> **`GET /usage` の集計セマンティクス（課金解釈の明示, M5）**: `invocation_count` と
+> `succeeded_count`/`failed_count`/`timeout_count` は **全終端実行**で +1 される（worker 落下を
+> sweeper が `failed` 終端化したぶんも含む）。一方リソース指標（`cpu_fuel_used`/`wall_time_ms`/
+> `output_bytes` は SUM、`peak_memory_bytes_max` は MAX）は **計測値を持つ succeeded 実行のみ**が
+> 寄与する。DLQ・timeout・sweeper 経路は count を立てつつリソース指標は 0 加算となる（「半端行」）。
+> したがって `SUM(cpu_fuel_used)` 等を「全終端実行の総コスト」と解釈してはならない —
+> あくまで「計測済み実行のリソース合計」である。権威 `resource_limits` が解決できなかった result は
+> 信頼境界外の値を課金しないため、invocation は計上しつつリソース指標は記録しない（fail-closed）。
+> 0007 マイグレーション適用前の実行は計量を持たず集計に現れない（additive・backfill なし）。
 
 ---
 

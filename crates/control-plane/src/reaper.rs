@@ -131,6 +131,22 @@ async fn reconcile_tenant(
         Vec::new()
     };
 
+    // (1b) M5 (§15「欠落しない」): sweeper で終端化した実行も usage_rollups に計上する。各 swept 行を
+    //      `failed`・リソース指標 0（計測不能なため）で増分する＝DLQ 経路と同一の「半端行」セマンティクス。
+    //      finalize と同一 tx 内・commit 前に発行する。sweep は CAS なので再走で同じ行は返らず、rollup も
+    //      二重計上にならない（invocation/各 count は sweeper 経路ぶんも漏れなく集計に乗る）。
+    for row in &swept {
+        crate::db::upsert_usage_rollup(
+            &mut *tx,
+            tenant,
+            &row.component_id,
+            row.period_start,
+            faas_shared::ExecutionStatus::Failed,
+            &faas_shared::UsageMetrics::default(),
+        )
+        .await?;
+    }
+
     // (2) DB COUNT（真実）を引く。sweep 済み行は除外されているので、孤立スロットは COUNT から消える。
     let count = crate::db::count_inflight_executions(&mut *tx, tenant).await?;
     tx.commit().await?;
@@ -153,6 +169,7 @@ async fn reconcile_tenant(
         tracing::warn!(
             tenant = %tenant,
             swept = swept.len(),
+            swept_ids = ?swept.iter().map(|s| s.id.as_str()).collect::<Vec<_>>(),
             deadline_secs = stuck_deadline_secs,
             "stuck-execution sweeper finalized orphaned pending/running rows to 'failed' (reclaiming in-flight slots)"
         );

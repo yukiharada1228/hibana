@@ -322,12 +322,24 @@ async fn handle_message(state: &AppState, tenant: &str, payload: &[u8]) -> anyho
     // (6) M5 (§15): worker 自己申告の計量を sanity clamp する。worker は信頼境界外 (§3.3) なので、
     //     version の resource_limits（worker の get_limits と同じ権威値）を引いて上限で切り詰めてから
     //     永続化する（水増し/桁あふれ防止）。usage None（旧 worker / デコード不能 poison）は None のまま渡す。
+    //     fail-closed: 権威 limit が引けない（version 行欠落 / resource_limits 破損）ときは、信用できない
+    //     worker 値を ResourceLimits::default() で素通しさせず（default は max_fuel=None で fuel が実質
+    //     無制限になり水増しを通す fail-open）、リソース指標を記録しない（usage=None）。invocation は
+    //     後段の rollup で計上されるため欠落しないが、検証不能なコスト指標で課金しない。
     let clamped_usage = match result.usage {
         Some(raw) => {
-            let limits = crate::db::find_version_resource_limits(&mut *tx, tenant, &row_version_id)
-                .await?
-                .unwrap_or_default();
-            Some(clamp_usage(&raw, &limits))
+            match crate::db::find_version_resource_limits(&mut *tx, tenant, &row_version_id).await? {
+                Some(limits) => Some(clamp_usage(&raw, &limits)),
+                None => {
+                    tracing::warn!(
+                        execution_id = %result.execution_id,
+                        version_id = %row_version_id,
+                        "could not resolve authoritative resource_limits; dropping untrusted usage \
+                         metrics (fail-closed: invocation still counted, resource cost not billed)"
+                    );
+                    None
+                }
+            }
         }
         None => None,
     };
