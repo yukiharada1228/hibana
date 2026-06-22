@@ -962,15 +962,18 @@ pub async fn get_usage_rollups(
     component_id: Option<&str>,
 ) -> Result<Vec<UsageRollupRow>, sqlx::Error> {
     let rows = sqlx::query(
+        // SUM(bigint) は Postgres では NUMERIC を返すため、各集計を ::bigint へ明示キャストして
+        // Rust 側の i64 デコード（UsageRollupRow）と型を一致させる（MAX は元の bigint を保つ）。
+        // 行数 × 各列とも実運用域では i64 に収まる（saturating_i64 で書込時に頭打ち済み）。
         "SELECT component_id, \
-                SUM(invocation_count) AS invocation_count, \
-                SUM(cpu_fuel_used) AS cpu_fuel_used, \
-                SUM(wall_time_ms) AS wall_time_ms, \
+                SUM(invocation_count)::bigint AS invocation_count, \
+                SUM(cpu_fuel_used)::bigint AS cpu_fuel_used, \
+                SUM(wall_time_ms)::bigint AS wall_time_ms, \
                 MAX(peak_memory_bytes_max) AS peak_memory_bytes_max, \
-                SUM(output_bytes) AS output_bytes, \
-                SUM(succeeded_count) AS succeeded_count, \
-                SUM(failed_count) AS failed_count, \
-                SUM(timeout_count) AS timeout_count \
+                SUM(output_bytes)::bigint AS output_bytes, \
+                SUM(succeeded_count)::bigint AS succeeded_count, \
+                SUM(failed_count)::bigint AS failed_count, \
+                SUM(timeout_count)::bigint AS timeout_count \
          FROM usage_rollups \
          WHERE tenant_id = $1 AND period_start >= $2 AND period_start <= $3 \
            AND ($4::text IS NULL OR component_id = $4) \
