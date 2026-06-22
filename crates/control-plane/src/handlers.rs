@@ -1043,7 +1043,9 @@ fn resolve_usage_range(
     };
 
     if from > to {
-        return Err(FaasError::InvalidRequest("from must not be after to".into()));
+        return Err(FaasError::InvalidRequest(
+            "from must not be after to".into(),
+        ));
     }
     Ok((from, to))
 }

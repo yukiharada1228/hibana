@@ -1481,15 +1481,18 @@ mod tests {
             "peak_memory_bytes_max = GREATEST(usage_rollups.peak_memory_bytes_max, EXCLUDED.peak_memory_bytes_max)"
         ));
         // 終端カウンタも加算する。
-        assert!(UPSERT_USAGE_ROLLUP_SQL
-            .contains("succeeded_count = usage_rollups.succeeded_count + EXCLUDED.succeeded_count"));
+        assert!(UPSERT_USAGE_ROLLUP_SQL.contains(
+            "succeeded_count = usage_rollups.succeeded_count + EXCLUDED.succeeded_count"
+        ));
         assert!(UPSERT_USAGE_ROLLUP_SQL
             .contains("failed_count = usage_rollups.failed_count + EXCLUDED.failed_count"));
         assert!(UPSERT_USAGE_ROLLUP_SQL
             .contains("timeout_count = usage_rollups.timeout_count + EXCLUDED.timeout_count"));
         // テナント境界はバインドパラメータ（$1）。DELETE は伴わない。
         assert!(UPSERT_USAGE_ROLLUP_SQL.contains("tenant_id"));
-        assert!(!UPSERT_USAGE_ROLLUP_SQL.to_ascii_uppercase().contains("DELETE"));
+        assert!(!UPSERT_USAGE_ROLLUP_SQL
+            .to_ascii_uppercase()
+            .contains("DELETE"));
     }
 
     /// `saturating_i64` は `i64::MAX` で頭打ちにし、負値混入や格納失敗を防ぐ（二重防御）。

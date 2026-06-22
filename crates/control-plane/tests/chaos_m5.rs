@@ -52,14 +52,22 @@ fn echo_component() -> String {
 ///
 /// `succeeded` 実行をまたいだ delta 比較に使う。範囲既定は「今日」を含むため、テスト中に作る
 /// 実行は必ずこの窓に入る（UTC 日境界をまたぐ瞬間の稀ケースは finalize 側の単一時計源で吸収される）。
-async fn fetch_usage_totals(client: &reqwest::Client, base: &str, token: &str) -> serde_json::Value {
+async fn fetch_usage_totals(
+    client: &reqwest::Client,
+    base: &str,
+    token: &str,
+) -> serde_json::Value {
     let resp = client
         .get(format!("{base}/usage"))
         .bearer_auth(token)
         .send()
         .await
         .expect("GET /usage send");
-    assert_eq!(resp.status(), 200, "GET /usage must return 200 (read scope)");
+    assert_eq!(
+        resp.status(),
+        200,
+        "GET /usage must return 200 (read scope)"
+    );
     let body: serde_json::Value = resp.json().await.expect("GET /usage json");
     body["totals"].clone()
 }

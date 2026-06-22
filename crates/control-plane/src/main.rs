@@ -601,7 +601,8 @@ mod migration_tests {
     fn usage_rollups_does_not_grant_delete_to_faas_app() {
         // GRANT 句は SELECT/INSERT/UPDATE のみ（DELETE を含まない）。
         assert!(
-            USAGE_METERING_SQL.contains("GRANT  SELECT, INSERT, UPDATE ON usage_rollups TO   faas_app;")
+            USAGE_METERING_SQL
+                .contains("GRANT  SELECT, INSERT, UPDATE ON usage_rollups TO   faas_app;")
                 || USAGE_METERING_SQL
                     .contains("GRANT SELECT, INSERT, UPDATE ON usage_rollups TO faas_app;"),
             "faas_app must be granted only SELECT/INSERT/UPDATE on usage_rollups"

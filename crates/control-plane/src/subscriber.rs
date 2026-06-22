@@ -328,7 +328,8 @@ async fn handle_message(state: &AppState, tenant: &str, payload: &[u8]) -> anyho
     //     後段の rollup で計上されるため欠落しないが、検証不能なコスト指標で課金しない。
     let clamped_usage = match result.usage {
         Some(raw) => {
-            match crate::db::find_version_resource_limits(&mut *tx, tenant, &row_version_id).await? {
+            match crate::db::find_version_resource_limits(&mut *tx, tenant, &row_version_id).await?
+            {
                 Some(limits) => Some(clamp_usage(&raw, &limits)),
                 None => {
                     tracing::warn!(
@@ -949,10 +950,10 @@ mod tests {
     fn clamp_usage_clamps_each_field_to_limit() {
         let limits = test_limits();
         let raw = UsageMetrics {
-            cpu_fuel_used: 5_000,        // > max_fuel 1_000
-            wall_time_ms: 9_999,         // > max_execution_time_ms 500
+            cpu_fuel_used: 5_000,         // > max_fuel 1_000
+            wall_time_ms: 9_999,          // > max_execution_time_ms 500
             peak_memory_bytes: 1_000_000, // > max_memory_bytes 1024
-            output_bytes: 1_000_000,     // > max_memory_bytes 1024
+            output_bytes: 1_000_000,      // > max_memory_bytes 1024
         };
         let c = clamp_usage(&raw, &limits);
         assert_eq!(c.cpu_fuel_used, 1_000);
