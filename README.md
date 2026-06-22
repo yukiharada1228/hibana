@@ -657,9 +657,13 @@ components/slow/           # M4 chaos_d 用: handle が tight loop（epoch inter
 
 M4 完了済み（本リポジトリの現状）。次は M5 以降の将来⬜:
 
-- **M5 以降（§10 / §14）**: 分散トレーシング（OpenTelemetry）→ 同期 Invoke（reply subject） →
-  外部イベントトリガー → Result Ingestor 分離 → Workflow Engine / Cron → Secrets Manager →
-  AI 統合 → Multi Region。スケール要求が顕在化した時点で順次。
+- **M5 以降（商用マルチテナント SaaS 化, §15）**: 商用クラウド SaaS として成立させる段階実装。
+  基本線は **M5 課金・メータリング → M6 Invoke 拡充（同期 Invoke + 外部イベント/Cron トリガー）
+  → M7 デプロイ運用（canary / rollback / Secrets）→ M8 弾力スケール + テナント間アイソレーション
+  → M9 サンドボックス強化・サプライチェーン**。分散トレーシング（OpenTelemetry）は高レバレッジで
+  前倒し推奨。Workflow Engine / Result Ingestor 分離 / Multi Region は固定順序を持たない**需要発火型**。
+  AI/LLM はプラットフォーム機能ではなく Capability 経由の外部呼び出し（§4.4 / §13）で充足するため、
+  ロードマップ項目から除外。
 - **M4 follow-ups**（M4 範囲内で残る配線。`crates/control-plane/src/metrics.rs` 等の
   メトリクス登録は完了しているが record 配線が未到達）:
   - HTTP middleware で `faas_http_requests_total` / `_duration_seconds` の observe 配線
