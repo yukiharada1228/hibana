@@ -38,7 +38,7 @@ use serde_json::json;
 
 use faas_shared::{
     failed_subject_wildcard, result_subject_wildcard, tenant_from_subject, ExecutionStatus,
-    FailedMessage, JobClaims, ResultMessage,
+    FailedMessage, JobClaims, ResourceLimits, ResultMessage, UsageMetrics,
 };
 
 use crate::state::AppState;
@@ -262,7 +262,7 @@ async fn handle_message(state: &AppState, tenant: &str, payload: &[u8]) -> anyho
     // (4c) 行 SELECT で execution の存在 + version_id / status を取り、claim と照合する。
     let provenance =
         crate::db::find_execution_provenance(&mut *tx, tenant, &result.execution_id).await?;
-    let (row_version_id, row_status) = match provenance {
+    let (row_component_id, row_version_id, row_status) = match provenance {
         Some(p) => p,
         None => {
             // 行が無い（subject テナント下に当該 execution が存在しない）→ drop+audit。
@@ -319,16 +319,32 @@ async fn handle_message(state: &AppState, tenant: &str, payload: &[u8]) -> anyho
         return Ok(());
     }
 
-    // (6) CAS finalize（status NOT IN terminal のときだけ遷移する）。共通ロジックは
+    // (6) M5 (§15): worker 自己申告の計量を sanity clamp する。worker は信頼境界外 (§3.3) なので、
+    //     version の resource_limits（worker の get_limits と同じ権威値）を引いて上限で切り詰めてから
+    //     永続化する（水増し/桁あふれ防止）。usage None（旧 worker / デコード不能 poison）は None のまま渡す。
+    let clamped_usage = match result.usage {
+        Some(raw) => {
+            let limits = crate::db::find_version_resource_limits(&mut *tx, tenant, &row_version_id)
+                .await?
+                .unwrap_or_default();
+            Some(clamp_usage(&raw, &limits))
+        }
+        None => None,
+    };
+
+    // (7) CAS finalize（status NOT IN terminal のときだけ遷移する）。共通ロジックは
     //     `commit_finalize_and_release` に集約する（DLQ 経路と同一の DECR + audit 規則を共有）。
+    //     計量永続化 + rollup 増分は finalize と同一 tx 内・commit 前に行われる（冪等アンカー）。
     commit_finalize_and_release(
         state,
         tx,
         tenant,
         &result.execution_id,
+        &row_component_id,
         result.status,
         result.output.as_ref(),
         error_json.as_ref(),
+        clamped_usage,
         FinalizeOrigin::Result,
     )
     .await
@@ -484,7 +500,7 @@ async fn handle_failed_message(
     crate::db::set_tenant_guc(&mut tx, tenant).await?;
     let provenance =
         crate::db::find_execution_provenance(&mut *tx, tenant, &failed.execution_id).await?;
-    let (row_version_id, row_status) = match provenance {
+    let (row_component_id, row_version_id, row_status) = match provenance {
         Some(p) => p,
         None => {
             tx.rollback().await?;
@@ -558,41 +574,85 @@ async fn handle_failed_message(
     //     error には worker が記録した reason を `{"message": reason}` で保存し、運用者が DLQ
     //     由来の失敗理由を execution 行から読めるようにする。
     let error_json = json!({ "message": failed.reason });
+    // M5 (§15): DLQ 経路は計量を持たない（FailedMessage に usage 無し, s2）。executions の計量列は
+    //     NULL のまま（usage=None）書くが、呼び出し回数の欠落を防ぐため rollup には failed_count を +1 する
+    //     （commit_finalize_and_release が usage None を default() に倒して rollup を打つ）。リソース指標
+    //     （cpu/wall/peak/output）は 0 加算となる（半端行; 解釈は API ドキュメントで明示）。
     commit_finalize_and_release(
         state,
         tx,
         tenant,
         &failed.execution_id,
+        &row_component_id,
         ExecutionStatus::Failed,
         None,
         Some(&error_json),
+        None,
         FinalizeOrigin::Dlq,
     )
     .await
 }
 
-/// CAS finalize + audit + in-flight DECR の共通コア（result / DLQ 両経路で共有）。
+/// CAS finalize + 計量永続化 + rollup 増分 + audit + in-flight DECR の共通コア（result / DLQ 両経路で共有）。
 ///
-/// `tx` は呼び出し側で `set_tenant_guc(tenant)` 済み・claim 照合通過後に渡される。本関数で commit し、
-/// `updated > 0` のときだけメトリクス inc + `release_inflight` を行う（重複配送では二重 DECR しない）。
-/// `release_inflight` の失敗はログのみ（reaper の DB COUNT 再同期が補正する）。
+/// `tx` は呼び出し側で `set_tenant_guc(tenant)` 済み・claim 照合通過後に渡される。
+///
+/// M5 (§15) 冪等アンカー: (1) `finalize_execution` が CAS UPDATE と同一ステートメントで executions の
+/// 計量列を書き、`RETURNING (finished_at AT TIME ZONE 'UTC')::date` で遷移有無と集計用 UTC 日を同時に返す
+/// （`usage` は呼び出し側で clamp 済み・DLQ は None）。(2) CAS が実際に遷移させた（`Some(period_start)`）
+/// ときだけ、**同一 tx 内・commit 前**に `upsert_usage_rollup` を打つ（usage None は `UsageMetrics::default()`
+/// に倒して呼び出し回数だけ計上する）。これにより再配送（`None`）では rollup を触らず二重計上しない。
+/// rollup の `period_start` は CP の `Utc::now()` ではなく finalize の `finished_at` 由来なので、
+/// per-execution と集計の日付帰属が日境界をまたいでもズレない。(3) `tx.commit()` は rollup の後に発行する
+/// ため、finalize と rollup は all-or-nothing（乖離しない）。commit 後に遷移したときだけメトリクス inc +
+/// `release_inflight` を行う（重複配送では二重 DECR しない）。`release_inflight` の失敗はログのみ（reaper が補正する）。
 #[allow(clippy::too_many_arguments)]
 async fn commit_finalize_and_release(
     state: &AppState,
     mut tx: sqlx::Transaction<'_, sqlx::Postgres>,
     tenant: &str,
     execution_id: &str,
+    component_id: &str,
     status: ExecutionStatus,
     output: Option<&serde_json::Value>,
     error: Option<&serde_json::Value>,
+    usage: Option<UsageMetrics>,
     origin: FinalizeOrigin,
 ) -> anyhow::Result<()> {
-    let updated =
-        crate::db::finalize_execution(&mut *tx, tenant, execution_id, status, output, error)
-            .await?;
+    // 戻り値は CAS が遷移させたときだけ `Some(period_start)`（DB の finished_at::date = 単一時計源）。
+    let finalized = crate::db::finalize_execution(
+        &mut *tx,
+        tenant,
+        execution_id,
+        status,
+        output,
+        error,
+        usage.as_ref(),
+    )
+    .await?;
+
+    // M5 (§15): CAS が実際に遷移させた（finalized.is_some()）ときだけ、同一 tx 内・commit 前に rollup を
+    //     増分する。これが冪等の要: 再配送 / 既終端 / sweeper 先着（None）では rollup を一切触らない
+    //     （二重計上しない）。usage None（DLQ / 旧 worker）は default()（全 0）に倒し、invocation_count と
+    //     succeeded/failed/timeout_count のみが status から計上される（リソース指標は 0 加算）。
+    //     period_start は finalize_execution が RETURNING した `finished_at` 由来の UTC 日であり、
+    //     per-execution の finished_at と同一時計源なので日境界をまたいでも乖離しない（CP の Utc::now() は使わない）。
+    if let Some(period_start) = finalized {
+        let usage_for_rollup = usage.unwrap_or_default();
+        crate::db::upsert_usage_rollup(
+            &mut *tx,
+            tenant,
+            component_id,
+            period_start,
+            status,
+            &usage_for_rollup,
+        )
+        .await?;
+    }
+
     tx.commit().await?;
 
-    if updated == 0 {
+    if finalized.is_none() {
         // 既終端で no-op。result/DLQ で再配送と CP 双方を回しても二重 DECR しない（CAS が冪等性の境界）。
         match origin {
             FinalizeOrigin::Result => {
@@ -661,6 +721,26 @@ async fn commit_finalize_and_release(
         );
     }
     Ok(())
+}
+
+/// worker 自己申告の計量を `ResourceLimits` 上限で sanity clamp する (M5, §15)。
+///
+/// worker は署名鍵を持たない**非特権・信頼境界外**ランタイム (§3.3) なので、申告値は無検証だと
+/// 課金水増しや桁あふれで rollup の SUM を破壊しうる。各指標を version の resource_limits（worker の
+/// `get_limits` と同じ権威値）の上限で頭打ちにしてから永続化する:
+/// - `wall_time_ms`  → `max_execution_time_ms`（実行に許される総壁時計上限）
+/// - `cpu_fuel_used` → `max_fuel`（fuel 無効化時は上限なし＝`u64::MAX`。worker 側でも 0 化済み）
+/// - `peak_memory_bytes` → `max_memory_bytes`（StoreLimits が強制する上限）
+/// - `output_bytes`  → `max_memory_bytes`（出力はメモリ上限を超え得ないため同上限で頭打ち）
+///
+/// 純関数（DB 不要）で clamp ロジックをテスト可能にする。`UsageMetrics` は `Copy`。
+fn clamp_usage(raw: &UsageMetrics, limits: &ResourceLimits) -> UsageMetrics {
+    UsageMetrics {
+        cpu_fuel_used: raw.cpu_fuel_used.min(limits.max_fuel.unwrap_or(u64::MAX)),
+        wall_time_ms: raw.wall_time_ms.min(limits.max_execution_time_ms),
+        peak_memory_bytes: raw.peak_memory_bytes.min(limits.max_memory_bytes),
+        output_bytes: raw.output_bytes.min(limits.max_memory_bytes),
+    }
 }
 
 /// finalize 経路の出所（観測 + audit 区別のため）。
@@ -835,5 +915,74 @@ mod tests {
             failed, 1,
             "executions_total must move only on real finalize"
         );
+    }
+
+    // ---- M5 (§15): clamp_usage の信頼境界 clamp 検査（DB-free 純関数）----------
+
+    use super::clamp_usage;
+    use faas_shared::{ResourceLimits, UsageMetrics};
+
+    /// テスト用の固定上限。`max_fuel` は Some（fuel 有効）。
+    fn test_limits() -> ResourceLimits {
+        ResourceLimits {
+            max_memory_bytes: 1024,
+            max_wall_time_ms: 0,
+            max_execution_time_ms: 500,
+            max_fuel: Some(1_000),
+        }
+    }
+
+    /// 上限超過の自己申告値は各上限に頭打ちされる（課金水増し防止）。
+    #[test]
+    fn clamp_usage_clamps_each_field_to_limit() {
+        let limits = test_limits();
+        let raw = UsageMetrics {
+            cpu_fuel_used: 5_000,        // > max_fuel 1_000
+            wall_time_ms: 9_999,         // > max_execution_time_ms 500
+            peak_memory_bytes: 1_000_000, // > max_memory_bytes 1024
+            output_bytes: 1_000_000,     // > max_memory_bytes 1024
+        };
+        let c = clamp_usage(&raw, &limits);
+        assert_eq!(c.cpu_fuel_used, 1_000);
+        assert_eq!(c.wall_time_ms, 500);
+        assert_eq!(c.peak_memory_bytes, 1024);
+        assert_eq!(c.output_bytes, 1024);
+    }
+
+    /// 上限以下の値はそのまま通す（正規の計測値を歪めない）。
+    #[test]
+    fn clamp_usage_passes_through_in_range_values() {
+        let limits = test_limits();
+        let raw = UsageMetrics {
+            cpu_fuel_used: 800,
+            wall_time_ms: 250,
+            peak_memory_bytes: 512,
+            output_bytes: 128,
+        };
+        assert_eq!(clamp_usage(&raw, &limits), raw);
+    }
+
+    /// 0 は 0 のまま（計測して 0 を歪めない）。
+    #[test]
+    fn clamp_usage_zero_stays_zero() {
+        let c = clamp_usage(&UsageMetrics::default(), &test_limits());
+        assert_eq!(c, UsageMetrics::default());
+    }
+
+    /// fuel 無効化（max_fuel=None）時は cpu_fuel_used に上限が無い（u64::MAX で clamp = 素通し）。
+    /// worker 側で既に 0 化済みだが、clamp は申告値をそのまま通す（二次防御として桁あふれは
+    /// db 層の saturating_i64 が担保）。
+    #[test]
+    fn clamp_usage_fuel_disabled_has_no_cpu_clamp() {
+        let limits = ResourceLimits {
+            max_fuel: None,
+            ..test_limits()
+        };
+        let raw = UsageMetrics {
+            cpu_fuel_used: 123_456_789,
+            ..Default::default()
+        };
+        let c = clamp_usage(&raw, &limits);
+        assert_eq!(c.cpu_fuel_used, 123_456_789);
     }
 }

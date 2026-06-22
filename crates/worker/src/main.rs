@@ -65,7 +65,7 @@ mod metrics;
 
 use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -73,7 +73,7 @@ use anyhow::{anyhow, Context as _};
 use chrono::Utc;
 use faas_shared::{
     failed_subject, invoke_subject_wildcard, result_subject, ExecutionStatus, FailedMessage,
-    JobMessage, ResourceLimits, ResultMessage,
+    JobMessage, ResourceLimits, ResultMessage, UsageMetrics,
 };
 use futures::StreamExt;
 use lru::LruCache;
@@ -83,7 +83,7 @@ use sqlx::PgPool;
 use tokio::time::Instant;
 use tracing::{error, info, warn};
 use wasmtime::component::{Component, Linker};
-use wasmtime::{Config, Engine, Store, StoreLimits, StoreLimitsBuilder};
+use wasmtime::{Config, Engine, ResourceLimiter, Store, StoreLimits, StoreLimitsBuilder};
 use wasmtime_wasi::{ResourceTable, WasiCtx, WasiCtxBuilder, WasiView};
 
 use bindings::Handler;
@@ -112,12 +112,75 @@ const MAX_ACK_PENDING: i64 = 1000;
 // Store のホスト状態
 // ============================================================================
 
+/// M5 (§15): linear memory のピーク使用量を計測する `ResourceLimiter` ラッパ。
+///
+/// wasmtime 29 の `StoreLimits` は上限の強制はするが「実際に何バイトまで伸びたか」を
+/// 観測する getter を持たない。そこで `memory_growing` フックに相乗りし、各成長要求の
+/// `desired`（その成長後の linear memory バイト数）の最大値を記録する。上限判定そのものは
+/// 内側の `StoreLimits` にそのまま委譲するため、`max_memory_bytes` 強制（§4.3）は不変。
+///
+/// peak は `Arc<AtomicU64>` に持たせ、Store が future 内へ move されたあとでも
+/// run_component 末尾で読み取れるようにする（Store を drop しても peak は残る）。
+/// table 成長など他の `ResourceLimiter` メソッドは内側 `StoreLimits` へ素通しする。
+struct MeteredLimits {
+    inner: StoreLimits,
+    /// これまでに観測した linear memory の最大バイト数（全 memory 横断の max）。
+    peak_memory_bytes: Arc<AtomicU64>,
+}
+
+impl ResourceLimiter for MeteredLimits {
+    fn memory_growing(
+        &mut self,
+        current: usize,
+        desired: usize,
+        maximum: Option<usize>,
+    ) -> anyhow::Result<bool> {
+        // 上限強制は内側 StoreLimits に委譲する（許可されたときだけ peak を更新する）。
+        let allowed = self.inner.memory_growing(current, desired, maximum)?;
+        if allowed {
+            // `desired` は成長後の総バイト数。AtomicU64 へ max でマージする。
+            self.peak_memory_bytes
+                .fetch_max(desired as u64, Ordering::Relaxed);
+        }
+        Ok(allowed)
+    }
+
+    fn table_growing(
+        &mut self,
+        current: usize,
+        desired: usize,
+        maximum: Option<usize>,
+    ) -> anyhow::Result<bool> {
+        self.inner.table_growing(current, desired, maximum)
+    }
+
+    fn memory_grow_failed(&mut self, error: anyhow::Error) -> anyhow::Result<()> {
+        self.inner.memory_grow_failed(error)
+    }
+
+    fn table_grow_failed(&mut self, error: anyhow::Error) -> anyhow::Result<()> {
+        self.inner.table_grow_failed(error)
+    }
+
+    fn instances(&self) -> usize {
+        self.inner.instances()
+    }
+
+    fn tables(&self) -> usize {
+        self.inner.tables()
+    }
+
+    fn memories(&self) -> usize {
+        self.inner.memories()
+    }
+}
+
 /// wasmtime Store が保持するホスト側状態。
-/// WASI コンテキスト・リソーステーブル・StoreLimits を 1 つにまとめる。
+/// WASI コンテキスト・リソーステーブル・計量付き StoreLimits を 1 つにまとめる。
 struct HostState {
     ctx: WasiCtx,
     table: ResourceTable,
-    limits: StoreLimits,
+    limits: MeteredLimits,
 }
 
 // wasmtime-wasi 29: `WasiView` が `ctx()` と `table()` の両方を提供する。
@@ -733,10 +796,16 @@ impl Worker {
 
         let outcome = self.execute(&job).await;
         let exec_elapsed = exec_started.elapsed();
+        // M5 (§15): wall_time_ms は resolve_limits/download 込みの handle_payload スコープの
+        // 壁時計を一次ソースにする（不変条件 #5）。成功経路は run_component が組んだ usage の
+        // wall_time_ms をこの値で上書きし、失敗/timeout 経路は wall のみ判る部分計量を組む。
+        let wall_time_ms = duration_to_millis(exec_elapsed);
 
         let (status_label, result) = match outcome {
-            Ok(output) => {
+            Ok((output, mut usage)) => {
                 info!(%execution_id, "job succeeded");
+                // run_component スコープより広い handle_payload 壁時計で上書きする。
+                usage.wall_time_ms = wall_time_ms;
                 (
                     "succeeded",
                     ResultMessage {
@@ -746,6 +815,9 @@ impl Worker {
                         output: Some(output),
                         error: None,
                         job_token: job_token.clone(),
+                        // M5 (§15): per-execution 計量。subscriber が finalize 時に clamp_usage で
+                        // resource_limits 上限へ切り詰めてから永続化する（信頼境界外, §3.3）。
+                        usage: Some(usage),
                     },
                 )
             }
@@ -760,6 +832,12 @@ impl Worker {
                         output: None,
                         error: Some("execution timed out".to_string()),
                         job_token: job_token.clone(),
+                        // M5 (§15): timeout/failed 経路は run_component が Err を返すため fuel/peak/
+                        // output は判らない。判る計量（wall_time_ms）のみ載せ、残りは 0（未計測）。
+                        usage: Some(UsageMetrics {
+                            wall_time_ms,
+                            ..UsageMetrics::default()
+                        }),
                     },
                 )
             }
@@ -774,6 +852,11 @@ impl Worker {
                         output: None,
                         error: Some(msg),
                         job_token: job_token.clone(),
+                        // M5 (§15): 同上。失敗経路は wall_time_ms のみ確定。
+                        usage: Some(UsageMetrics {
+                            wall_time_ms,
+                            ..UsageMetrics::default()
+                        }),
                     },
                 )
             }
@@ -813,7 +896,10 @@ impl Worker {
     }
 
     /// Component を解決して handle を呼び出す。Timeout / Failed / 出力を返す。
-    async fn execute(&self, job: &JobMessage) -> std::result::Result<serde_json::Value, ExecError> {
+    async fn execute(
+        &self,
+        job: &JobMessage,
+    ) -> std::result::Result<(serde_json::Value, UsageMetrics), ExecError> {
         // resource_limits を DB から解決する。失敗・未設定時は既定。
         let limits = self
             .resolve_limits(&job.tenant_id, &job.component, &job.version)
@@ -1003,17 +1089,25 @@ impl Worker {
         component: Arc<Component>,
         input: Vec<u8>,
         limits: ResourceLimits,
-    ) -> std::result::Result<serde_json::Value, ExecError> {
+    ) -> std::result::Result<(serde_json::Value, UsageMetrics), ExecError> {
         // StoreLimits: max_memory を適用する (§4.3)。
         let store_limits = StoreLimitsBuilder::new()
             .memory_size(limits.max_memory_bytes as usize)
             .build();
 
+        // M5 (§15): linear memory のピークを観測するため StoreLimits を MeteredLimits で包む。
+        // peak は Arc<AtomicU64> に持たせ、Store が future へ move されても末尾で読める。
+        let peak_memory = Arc::new(AtomicU64::new(0));
+        let metered_limits = MeteredLimits {
+            inner: store_limits,
+            peak_memory_bytes: Arc::clone(&peak_memory),
+        };
+
         let wasi = WasiCtxBuilder::new().inherit_stderr().build();
         let host = HostState {
             ctx: wasi,
             table: ResourceTable::new(),
-            limits: store_limits,
+            limits: metered_limits,
         };
 
         let mut store = Store::new(&self.engine, host);
@@ -1113,7 +1207,33 @@ impl Worker {
             Ok(Err(e)) => Err(e),
             // call_handle が完了（成功・ハンドラエラー・trap のいずれか）。
             Ok(Ok(call_result)) => match call_result {
-                Ok(Ok(output)) => Ok(self.decode_output(output)),
+                Ok(Ok(output)) => {
+                    // M5 (§15): 成功経路でのみ完全な per-execution 計量を組む。
+                    // - cpu_fuel_used: 設定 fuel − 残 fuel。fuel 無効化時（max_fuel=None →
+                    //   fuel_to_set=u64::MAX）は意味を持たないので 0 に倒す（一次防御。
+                    //   subscriber 側の clamp_usage が二次防御）。store はここでまだ生存している
+                    //   ので get_fuel() が読める。
+                    let remaining = store.get_fuel().unwrap_or(fuel_to_set);
+                    let cpu_fuel_used =
+                        fuel_consumed(fuel_to_set, remaining, limits.max_fuel.is_some());
+                    // - peak_memory_bytes: MeteredLimits が memory_growing で記録した最大値。
+                    //   一度も成長要求が無ければ 0（未計測扱い）。上限は StoreLimits が保証する。
+                    let peak_memory_bytes = peak_memory.load(Ordering::Relaxed);
+                    // - output_bytes: decode 前の raw バイト長（最も正確な計上点。JSON 化で
+                    //   桁が変わらない）。
+                    let output_bytes = output.len() as u64;
+                    // - wall_time_ms: run_component スコープの経過時間。handle_payload 側の
+                    //   exec_started.elapsed() が resolve_limits/download 込みのより広い壁時計で
+                    //   あり、最終的に handle_payload がそちらで上書きする（§5 不変条件 #5）。
+                    let wall_time_ms = duration_to_millis(started.elapsed());
+                    let usage = UsageMetrics {
+                        cpu_fuel_used,
+                        wall_time_ms,
+                        peak_memory_bytes,
+                        output_bytes,
+                    };
+                    Ok((self.decode_output(output), usage))
+                }
                 Ok(Err(handler_err)) => Err(ExecError::Failed(format!(
                     "handler error [{:?}]: {}",
                     handler_err.kind, handler_err.message
@@ -1357,6 +1477,29 @@ fn is_out_of_fuel_trap(err: &anyhow::Error) -> bool {
 }
 
 // ============================================================================
+// M5 (§15) 計量ヘルパ（純関数; live wasm 不要でユニットテスト可能）
+// ============================================================================
+
+/// 消費 fuel を算出する (§15)。`set` は run_component が `set_fuel` した値、`remaining` は
+/// `Store::get_fuel()` の残量。消費 = `set - remaining`。
+///
+/// - `fuel_enabled == false`（`max_fuel=None` → `set=u64::MAX` のダミー）のときは fuel 計量に
+///   意味が無いため **0 に倒す**（一次防御。subscriber の clamp_usage が二次防御）。
+/// - `remaining > set`（理論上起きないが防御的に）は `saturating_sub` で 0 を返す。
+fn fuel_consumed(set: u64, remaining: u64, fuel_enabled: bool) -> u64 {
+    if !fuel_enabled {
+        return 0;
+    }
+    set.saturating_sub(remaining)
+}
+
+/// `Duration` をミリ秒の `u64` へ飽和変換する (§15 wall_time_ms)。
+/// `u128` のミリ秒が `u64` を超える非現実的なケースでは `u64::MAX` に飽和させる。
+fn duration_to_millis(d: Duration) -> u64 {
+    d.as_millis().min(u64::MAX as u128) as u64
+}
+
+// ============================================================================
 // ファイル / ハッシュ ヘルパ
 // ============================================================================
 
@@ -1491,6 +1634,78 @@ mod tests {
         let err: anyhow::Error = anyhow::Error::new(wasmtime::Trap::MemoryOutOfBounds);
         assert!(!is_interrupt_trap(&err));
         assert!(!is_out_of_fuel_trap(&err));
+    }
+
+    /// M5 (§15): `fuel_consumed` は fuel 有効時に `set - remaining` を返す。
+    /// fuel 無効化時（`max_fuel=None` → `set=u64::MAX`）は意味を持たないので 0 に倒す
+    /// （rollup の cpu_fuel_used が天文学的値で汚染されるのを防ぐ一次防御）。`remaining > set`
+    /// は理論上起きないが `saturating_sub` で 0 を返すことを担保する。
+    #[test]
+    fn fuel_consumed_disabled_enabled_and_saturating() {
+        // fuel 無効化（fuel_enabled=false）: set が u64::MAX でも 0。
+        assert_eq!(fuel_consumed(u64::MAX, 12_345, false), 0);
+        assert_eq!(fuel_consumed(1_000_000, 0, false), 0);
+        // fuel 有効: 消費 = set - remaining。
+        assert_eq!(fuel_consumed(1_000_000, 250_000, true), 750_000);
+        // 全消費（残 0）。
+        assert_eq!(fuel_consumed(1_000_000, 0, true), 1_000_000);
+        // 一切消費せず（残 == set）。
+        assert_eq!(fuel_consumed(1_000_000, 1_000_000, true), 0);
+        // remaining > set（防御的）: saturating_sub で 0。
+        assert_eq!(fuel_consumed(100, 500, true), 0);
+    }
+
+    /// M5 (§15): `duration_to_millis` は `Duration` をミリ秒へ飽和変換する。
+    /// 非現実的に巨大な Duration（u64 ミリ秒上限超え）でも `u64::MAX` に飽和し、
+    /// オーバーフローや wrap を起こさない。
+    #[test]
+    fn duration_to_millis_saturates() {
+        assert_eq!(duration_to_millis(Duration::from_millis(0)), 0);
+        assert_eq!(duration_to_millis(Duration::from_millis(250)), 250);
+        assert_eq!(duration_to_millis(Duration::from_secs(5)), 5_000);
+        // u64::MAX ミリ秒を超える Duration は u64::MAX に飽和する。
+        let huge = Duration::from_secs(u64::MAX);
+        assert_eq!(duration_to_millis(huge), u64::MAX);
+    }
+
+    /// M5 (§15): output_bytes は decode 前の raw バイト長から取得され、`decode_output` の
+    /// JSON 化（成功時は JSON 値、非 JSON 時はバイト配列フォールバック）には影響されない。
+    /// JSON バイト列・非 JSON バイナリ列のどちらでも raw `.len()` がそのまま計上点になることを示す。
+    #[test]
+    fn output_bytes_uses_raw_len_independent_of_decode() {
+        // JSON 出力: raw len と decode 後の値は別物。計上は raw len。
+        let json_raw = br#"{"ok":true}"#.to_vec();
+        let json_len = json_raw.len() as u64;
+        // 非 JSON バイナリ: decode_output はバイト配列へフォールバックするが len は raw のまま。
+        let bin_raw: Vec<u8> = vec![0x00, 0xff, 0x10, 0x20, 0x7f];
+        let bin_len = bin_raw.len() as u64;
+        assert_eq!(json_len, 11);
+        assert_eq!(bin_len, 5);
+        // run_component は `output.len() as u64` を decode 前に取るため、両者とも raw 長で一致する。
+        assert_eq!(json_raw.len() as u64, json_len);
+        assert_eq!(bin_raw.len() as u64, bin_len);
+    }
+
+    /// M5 (§15): `MeteredLimits` の `memory_growing` は許可された成長の `desired` の最大値を
+    /// `peak_memory_bytes` に記録する。上限判定は内側 `StoreLimits` に委譲するため、上限以下の
+    /// 成長は許可され peak が更新され、上限超過は拒否され peak を汚さないことを確認する。
+    #[test]
+    fn metered_limits_records_peak_memory() {
+        let peak = Arc::new(AtomicU64::new(0));
+        let inner = StoreLimitsBuilder::new().memory_size(1024).build();
+        let mut limits = MeteredLimits {
+            inner,
+            peak_memory_bytes: Arc::clone(&peak),
+        };
+        // 上限内の成長: 許可され peak=512。
+        assert!(limits.memory_growing(0, 512, Some(1024)).unwrap());
+        assert_eq!(peak.load(Ordering::Relaxed), 512);
+        // さらに大きい成長（上限ちょうど）: 許可され peak=1024 に更新。
+        assert!(limits.memory_growing(512, 1024, Some(1024)).unwrap());
+        assert_eq!(peak.load(Ordering::Relaxed), 1024);
+        // 上限超過の成長: 拒否（false）され peak は 1024 のまま（fetch_max は呼ばれない）。
+        assert!(!limits.memory_growing(1024, 2048, Some(1024)).unwrap());
+        assert_eq!(peak.load(Ordering::Relaxed), 1024);
     }
 
     /// M4c: `BACKOFF_SECS` env のパースが既定 / 空 / CSV / 不正値で意図どおりに振る舞う。
