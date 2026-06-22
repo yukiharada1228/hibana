@@ -1,0 +1,121 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/control-plane",
+    "crates/worker",
+    "crates/shared",
+    "components/echo",
+    "components/always-trap",
+    "components/slow",
+]
+
+# control-plane / worker / components/echo は後続エージェントが各ディレクトリを作成する。
+# このルート Cargo.toml は members に先に列挙しておくのみ（M1 足場）。
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+
+[workspace.dependencies]
+# --- 共有 ---
+faas-shared = { path = "crates/shared" }
+
+# --- Web / 非同期 ---
+axum = "0.8"
+tokio = { version = "1", features = ["full"] }
+tower = "0.5"
+tower-http = { version = "0.6", features = ["trace", "cors"] }
+
+# --- DB（query! マクロは使わずランタイム API のみ） ---
+sqlx = { version = "0.8", features = [
+    "runtime-tokio",
+    "tls-rustls",
+    "postgres",
+    "uuid",
+    "chrono",
+    "json",
+    "migrate",
+] }
+
+# --- 認証ハッシュ（M3a, §3.3） ---
+# password_hash は argon2id（pure-Rust、当環境は cc/aws-lc 不可）。
+# api_tokens.token_hash は既存の sha2 を再利用する（ここには追加しない）。
+argon2 = "0.5"
+# opaque トークン secret と argon2 salt の生成。
+rand = "0.8"
+# LoginThrottle trait の async メソッド用（M3a は no-op スタブ、実装は M3d）。
+async-trait = "0.1"
+
+# --- メッセージング ---
+async-nats = "0.38"
+
+# --- 共有ストア (M3d, §8): 全 Axum インスタンスで共有する低レイテンシカウンタ。
+# レート制限（token-bucket）/ 同時実行 in-flight / login 失敗ロックアウトを集計する。
+# pure-Rust 構成のみを使う（当環境は cc/aws-lc 不可）。`tokio-comp` は pure-Rust の
+# tokio ベースコネクションを、`connection-manager` は自動再接続プールを有効化する。
+# `script` で Lua アトミック操作（INCR-cmp-condDECR / token-bucket）を使う。
+# 既定機能に C 依存（native TLS の openssl-sys 等）が紛れ込まないよう
+# default-features = false で必要分だけ取り込む（TLS は本スライスでは使わない）。
+# redis 0.27 にピン留め（pure-Rust であることを cargo tree で検証する）。
+redis = { version = "0.27", default-features = false, features = [
+    "tokio-comp",
+    "connection-manager",
+    "script",
+    "keep-alive",
+] }
+
+# --- Object Storage (S3 互換 / MinIO。§3.4) ---
+#
+# TLS バックエンドは ring を明示選択する（既定の rustls-aws-lc は aws-lc-sys を
+# 介して C コンパイラ(cc)を要求し、当環境では未導入のためビルド不能）。
+# そのため AWS SDK の `default-features` を切り、`default-https-client`
+# (= rustls-aws-lc を強制) を取り込まないようにし、HTTP クライアントは
+# `aws-smithy-http-client` の rustls-ring 版をコードで明示注入する（storage.rs）。
+aws-config = { version = "1", default-features = false, features = ["behavior-version-latest"] }
+aws-sdk-s3 = { version = "1", default-features = false, features = [
+    "behavior-version-latest",
+    "sigv4a",
+    "http-1x",
+    "rt-tokio",
+] }
+aws-credential-types = { version = "1", features = ["hardcoded-credentials"] }
+# rustls-ring バックエンドの SharedHttpClient を構築するための smithy HTTP クライアント。
+aws-smithy-http-client = { version = "1", default-features = false, features = ["rustls-ring"] }
+
+# --- Wasm 検証 (§6.2)。wasm-tools 系と整合する版 ---
+wasmparser = "0.221"
+
+# --- ハッシュ ---
+sha2 = "0.10"
+
+# --- ジョブ署名トークン (M3c, §3.3)。pure-Rust（当環境は cc/aws-lc 不可）。
+# control-plane だけが署名鍵を持つ。shared / worker には入れない。
+ed25519-dalek = "2"
+
+# --- Wasm ランタイム ---
+wasmtime = { version = "29", features = ["component-model", "async", "cranelift"] }
+wasmtime-wasi = "29"
+
+# --- シリアライズ / ID / 時刻 ---
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+uuid = { version = "1", features = ["v4", "serde"] }
+chrono = { version = "0.4", features = ["serde"] }
+
+# --- エラー / ログ ---
+thiserror = "2"
+anyhow = "1"
+tracing = "0.1"
+# M4a (§3.8): LOG_FORMAT=json トグルで構造化ログを有効化する。json feature を追加して
+# tracing_subscriber::fmt().json() を使えるようにする。既定（text）出力は従来どおり。
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+
+# --- 観測（M4a, §3.8） ---
+# Prometheus メトリクスは pure-Rust の `prometheus` crate を使う（当環境は cc/aws-lc 不可、
+# protobuf feature は使わず TextEncoder だけで /metrics を返す）。default-features = false で
+# protobuf 依存を含めない（cc 経由のビルドを回避するため明示）。
+prometheus = { version = "0.13", default-features = false }
+
+# --- Component (guest) ---
+wit-bindgen = "0.36"

@@ -1,0 +1,130 @@
+# M2 のローカル依存サービス。
+# 仕様書 §15 M2: PostgreSQL（メタデータ）+ NATS JetStream（invoke/result）+ MinIO（本体 Object Storage, §3.4）。
+#
+# 露出ガード(§15 MUST NOT): M1 は固定トークン・RLS 無効・単一テナント構成のため、
+# 本 compose は信頼境界外（共有ネットワーク / インターネット到達可能環境）へ展開してはならない。
+# ポートは既定で 127.0.0.1 にのみバインドする。
+#
+# 起動: `docker compose up -d`（または `make up`）
+
+services:
+  # --- PostgreSQL: components / component_versions / executions（§3.2 を M1 に縮約） ---
+  postgres:
+    image: postgres:16
+    container_name: faas-postgres
+    environment:
+      # POSTGRES_USER=faas は SUPERUSER かつテーブル所有者。**マイグレーション専用**
+      # （MIGRATION_DATABASE_URL）。0004_rls.sql がこの所有者で CREATE ROLE faas_app /
+      # FORCE RLS / SECURITY DEFINER 関数を作る。M3b(§3.2): ランタイム（control-plane /
+      # worker の DATABASE_URL）は migration 0004 が作る非特権 faas_app で接続する。
+      # superuser/owner で接続すると FORCE RLS が無条件にバイパスされ RLS が無効化されるため、
+      # アプリは起動時に current_user の rolsuper/rolbypassrls を検証して fail-fast する。
+      POSTGRES_USER: faas
+      POSTGRES_PASSWORD: faas
+      POSTGRES_DB: faas
+    ports:
+      # .env.example の DATABASE_URL=postgres://faas:faas@localhost:5432/faas と一致。
+      - "127.0.0.1:5432:5432"
+    volumes:
+      - faas-postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      # pg_isready で接続受付可能になるまで待つ。make migrate はこれを前提にする。
+      test: ["CMD-SHELL", "pg_isready -U faas -d faas"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
+    restart: unless-stopped
+
+  # --- NATS JetStream: invoke ストリーム + 共有 Pull Consumer、result 購読（§3.3 / §6） ---
+  nats:
+    # alpine 版を使う。素の nats:2 は FROM scratch（nats-server バイナリのみ）で
+    # wget も shell も無く、healthcheck コマンドを実行できないため unhealthy になる。
+    # alpine 版は busybox（wget / sh）を含むので /healthz を叩ける。
+    image: nats:2-alpine
+    container_name: faas-nats
+    # JetStream を有効化（仕様書 §15 M1）。-m 8222 は HTTP 監視/healthcheck 用。
+    command: ["--jetstream", "--store_dir=/data", "-m", "8222"]
+    ports:
+      # .env.example の NATS_URL=nats://localhost:4222 と一致。
+      - "127.0.0.1:4222:4222"   # client
+      - "127.0.0.1:8222:8222"   # monitoring (healthz)
+    volumes:
+      - faas-nats-data:/data
+    healthcheck:
+      # NATS 監視エンドポイント /healthz で JetStream 含む健全性を確認。
+      # busybox wget 互換のため --spider ではなく -q -O /dev/null を使う。
+      test: ["CMD-SHELL", "wget -q -O /dev/null http://127.0.0.1:8222/healthz || exit 1"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 5s
+    restart: unless-stopped
+
+  # --- Redis: 共有 admission ストア（M3d, §8）。レート制限 / in-flight 同時実行 / login 失敗
+  #     ロックアウトを全 Axum インスタンスで共有して集計する（インスタンスローカルだと上限が
+  #     実効 N 倍に緩む）。pure-Rust の redis crate（tokio-comp）でアクセスし、Lua アトミックで
+  #     TOCTOU を避ける。本番は HA（Sentinel/Cluster）構成にすること（§9。単一障害点にしない）。 ---
+  redis:
+    image: redis:7-alpine
+    container_name: faas-redis
+    # appendonly でカウンタの耐久性を上げる（再起動時は reaper が DB COUNT へ再同期するため
+    # 厳密永続は必須でないが、短時間の再起動でカウンタを保つ）。
+    command: ["redis-server", "--appendonly", "yes"]
+    ports:
+      # .env.example の REDIS_URL=redis://localhost:6379 と一致。
+      - "127.0.0.1:6379:6379"
+    volumes:
+      - faas-redis-data:/data
+    healthcheck:
+      # PING に PONG が返れば healthy。
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 5s
+    restart: unless-stopped
+
+  # --- MinIO: Component 本体の Object Storage（S3 互換, §3.4）。presigned GET URL を発行する ---
+  minio:
+    image: minio/minio
+    container_name: faas-minio
+    command: ["server", "/data", "--console-address", ":9001"]
+    environment:
+      MINIO_ROOT_USER: minioadmin
+      MINIO_ROOT_PASSWORD: minioadmin
+    ports:
+      # .env.example の S3_ENDPOINT=http://localhost:9000 と一致。9001 は Web コンソール。
+      - "127.0.0.1:9000:9000"   # S3 API
+      - "127.0.0.1:9001:9001"   # console
+    volumes:
+      - faas-minio-data:/data
+    healthcheck:
+      # MinIO 健全性エンドポイント。バケット作成 (minio-setup) はこれを前提にする。
+      test: ["CMD", "mc", "ready", "local"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
+    restart: unless-stopped
+
+  # --- ワンショット: バケット faas-components を冪等に作成する（§6.2 アップロード先） ---
+  minio-setup:
+    image: minio/mc
+    container_name: faas-minio-setup
+    depends_on:
+      minio:
+        condition: service_healthy
+    # alias 設定 → バケット作成（既存なら no-op）。完了後に終了する。
+    entrypoint: >
+      /bin/sh -c "
+      mc alias set local http://minio:9000 minioadmin minioadmin &&
+      mc mb --ignore-existing local/faas-components
+      "
+    restart: "no"
+
+volumes:
+  faas-postgres-data:
+  faas-nats-data:
+  faas-redis-data:
+  faas-minio-data:

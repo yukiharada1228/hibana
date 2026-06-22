@@ -1,0 +1,17 @@
+/target
+.env
+
+# Windows/WSL のメタデータ
+*:Zone.Identifier
+
+# build artifacts / caches
+**/*.rs.bk
+*.wasm
+*.cwasm
+
+# ローカル開発のランタイム生成物
+/components-dist
+/worker-cache
+
+# サンドボックス専用のツールチェイン補正（絶対パスを含むためコミットしない）
+/.cargo

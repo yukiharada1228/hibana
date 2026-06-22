@@ -1,0 +1,75 @@
+name: CI
+
+on:
+  push:
+    branches: [develop, main]
+  pull_request:
+    branches: [develop, main]
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # ネイティブ crate（control-plane / worker / shared）のビルド・テスト。
+  # echo は wasm32-wasip2 専用のため除外し、component ジョブでビルドする。
+  # sqlx は query! マクロを使わないため DB なしでビルドできる（M1）。
+  native:
+    name: build & test (native)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # M3b (§3.2): テナント分離の静的ガード。toolchain 不要で安価なため最初に走らせる。
+      # SET app.tenant_id ハザード（LOCAL 欠落・文字列結合）と、tenant-scoped db:: 呼び出しを
+      # 生 pool に渡している箇所（GUC 未設定→FORCE RLS で fail-closed する）を検出して落とす。
+      - name: rls-lint
+        run: ./scripts/rls-lint.sh
+
+      # rust-toolchain.toml（stable + wasm32-wasip2）が channel を固定する。
+      # clippy / rustfmt コンポーネントを固定 toolchain に追加する。
+      - name: Install toolchain components
+        run: rustup component add clippy rustfmt
+
+      - uses: Swatinem/rust-cache@v2
+
+      # まず「コンパイルが通るか」を確認する（最重要シグナル）。
+      - name: build
+        run: cargo build --workspace --exclude echo
+
+      - name: test
+        run: cargo test --workspace --exclude echo
+
+      # 品質ゲート（コンパイル後に評価。最初の skeleton では赤になりうる）。
+      - name: clippy
+        run: cargo clippy --workspace --exclude echo --all-targets -- -D warnings
+
+      - name: rustfmt
+        run: cargo fmt --all -- --check
+
+  # echo Component を WebAssembly Component（wasm32-wasip2）としてビルドし、
+  # wasm-tools で「妥当な Component か」を検査する（M2 検証パイプラインの先取り）。
+  component:
+    name: build & validate (wasm component)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Add wasm target
+        run: rustup target add wasm32-wasip2
+
+      - uses: Swatinem/rust-cache@v2
+
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: wasm-tools
+
+      - name: build echo component
+        run: cargo build -p echo --target wasm32-wasip2 --release
+
+      - name: validate component
+        run: |
+          WASM=target/wasm32-wasip2/release/echo.wasm
+          test -f "$WASM" || { echo "echo.wasm が見つかりません"; exit 1; }
+          wasm-tools validate "$WASM"
+          # WASI Component Model のコンポーネントであること（WIT world を持つ）を確認。
+          wasm-tools component wit "$WASM"

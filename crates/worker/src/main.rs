@@ -1,0 +1,1524 @@
+//! faas-worker — Component を invoke して結果を返す実行ワーカ。
+//!
+//! 仕様書 §3.4 / §3.6 / §6.3 / §6.5 / §15 M2。
+//!
+//! 流れ (§6.3 / §6.5):
+//!   1. NATS JetStream の `invoke_subject_wildcard()`（`tenant.*.component.invoke`,
+//!      §3.3）を共有 Pull Consumer (durable "workers") で購読する。水平スケール時は
+//!      同一 durable を共有し JetStream がメッセージを分配する。新規テナント追加時も
+//!      stream/consumer の再構成は不要（`*` は 1 トークン=テナント ID に一致）。
+//!   2. `JobMessage` を受信 → executions を `running` へ更新 (M2 は worker が
+//!      直接 DB 更新)。
+//!   3. `job.wasm_sha256` をキーに Component を解決して wasmtime で実行する
+//!      (§3.6 のキャッシュ階層。詳細は `Worker::resolve_component`)。
+//!      - Engine: epoch_interruption + consume_fuel + async + cranelift。precompile /
+//!        deserialize / 実行は同一 Config の Engine を共有する (deserialize は同一設定が必須)。
+//!      - Store: StoreLimits(max_memory) を適用。
+//!      - 別 OS スレッドの epoch ticker が max_wall_time 経過後に
+//!        `engine.increment_epoch()` を周期的に呼び出し、実行を停止させる (Timeout)。
+//!        OS スレッドにするのは tokio LIFO-slot 起因のスタベーション回避のため
+//!        (`run_component` の設計メモ参照)。
+//!      - M4b (§4.3): tokio::time::timeout(max_execution_time) で host+guest 総時間も覆う。
+//!        任意 max_fuel が設定されていれば Store::set_fuel(n) を適用し、OutOfFuel 超過は
+//!        `failed` に分類する。
+//!      - world `handler` の `handle(input: list<u8>)` を呼び出す。
+//!        入力は `serde_json::to_vec(&job.input)`。
+//!   4. 結果 (succeeded | failed | timeout) を `ResultMessage` として
+//!      `result_subject(job.tenant_id)`（具体テナント subject）へ publish する。
+//!      CP の subscriber が `tenant.*.component.result` で受け、echo した署名トークンを
+//!      検証してから executions を終端状態へ CAS 更新する。worker は終端状態を **直接
+//!      DB に書かない**（鍵なし。唯一の終端 writer は検証付きの CP subscriber, §3.3）。
+//!
+//! Component キャッシュ (§3.6): `job.wasm_url`（短命 presigned GET URL）から本体を
+//! 取得し、`job.wasm_sha256` をキーに in-memory LRU → ローカル cwasm →
+//! ダウンロード+事前コンパイル の順で解決する。hit 経路で coldstart を短縮する。
+//!
+//! M3b (§3.2): DB アクセスは faas_app（NOBYPASSRLS）で接続し、各 tx 冒頭で
+//! job 由来の tenant を `app.tenant_id` GUC に設定してから executions /
+//! component_versions / components に触れる（FORCE RLS。未設定だと fail-closed）。
+//!
+//! M3c (§3.3): テナントの権威は **CP が署名した claim** であり、それは CP 内の
+//! subscriber がトークン検証時に行 (execution_id/tenant_id/version_id) と突き合わせる。
+//! worker は鍵を持たず、JobMessage.job_token を全 result に verbatim に echo するだけで
+//! ある（DONE: 署名トークンの echo 経路）。job.tenant_id は CP が mint した claim と
+//! 一致するので、worker は引き続き job.tenant_id で SET LOCAL し RLS 書き込みを tenant tx
+//! の下で行う（GUC/tx は撤去しない）。consumer の ack_wait/max_deliver は CP の token exp と
+//! 同一定数から導出する（TTL 結合, §3.3）。
+//!
+//! M4c (§6.6 MUST): JetStream pull consumer に `backoff` 配列を載せ、`delivered == max_deliver`
+//! の最終配送試行で result publish に失敗したら、worker が自前で `.failed` (DLQ) を core NATS で
+//! publish して CP の DLQ subscriber に即時 finalize+DECR させる経路を加えた。`.failed` の publish 自体
+//! にも失敗した場合は最終手段として CP 側 reaper の stuck-execution sweeper が deadline で回収する
+//! （二段救済）。また durable consumer の config drift（ack_wait/max_deliver/backoff）が検出されたら
+//! 起動時に自動で delete+recreate して TTL 結合を保つ。
+//!
+//! スコープ外 (TODO):
+//!   - result / failed の durable JetStream stream 化（M4c では core NATS のままで耐ブラスト半径を維持）
+//!   - InstancePre 事前インスタンス化・Pooling アロケータ (§3.6 / 将来最適化)
+//!
+//! M4b (§4.3) 完了: tokio::time::timeout で max_execution_time（ホスト関数込み総時間）を、
+//! Store::set_fuel で任意 max_fuel を、それぞれ epoch + StoreLimits に加えて適用する。
+//! トラップ分類: epoch 中断 / 時間超過 → `timeout`、fuel 超過 → `failed`（§4.3）。
+
+mod bindings;
+mod metrics;
+
+use std::num::NonZeroUsize;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
+
+use anyhow::{anyhow, Context as _};
+use chrono::Utc;
+use faas_shared::{
+    failed_subject, invoke_subject_wildcard, result_subject, ExecutionStatus, FailedMessage,
+    JobMessage, ResourceLimits, ResultMessage,
+};
+use futures::StreamExt;
+use lru::LruCache;
+use sha2::{Digest, Sha256};
+use sqlx::postgres::PgPoolOptions;
+use sqlx::PgPool;
+use tokio::time::Instant;
+use tracing::{error, info, warn};
+use wasmtime::component::{Component, Linker};
+use wasmtime::{Config, Engine, Store, StoreLimits, StoreLimitsBuilder};
+use wasmtime_wasi::{ResourceTable, WasiCtx, WasiCtxBuilder, WasiView};
+
+use bindings::Handler;
+
+/// JetStream の共有 Pull Consumer の durable 名。全 worker が共有する (§6.3)。
+const DURABLE_NAME: &str = "workers";
+
+/// JetStream stream 名。invoke subject を束ねる。
+const STREAM_NAME: &str = "FAAS_INVOKE";
+
+/// 1 度の Pull で取りに行く最大メッセージ数。
+const PULL_BATCH: usize = 16;
+
+/// in-memory Component LRU キャッシュの最大エントリ数 (§3.6)。
+/// hit 経路が coldstart 短縮の主経路。容量超過時は最古を退避する。
+const COMPONENT_CACHE_CAP: usize = 64;
+
+/// JetStream consumer の MaxAckPending（M4d, §8 表 line 742）。
+///
+/// 「配送済み未 ack」の全テナント合算上限。CP 側 admission（per-tenant `max_concurrent_executions`）
+/// とは数える量が異なる（合算 vs テナント別）。値は仕様 §8 表に直接対応する固定値 1000。
+/// 運用目安: `Σ(アクティブテナント数 × max_concurrent_executions) ≲ MaxAckPending`（§8 line 750）。
+const MAX_ACK_PENDING: i64 = 1000;
+
+// ============================================================================
+// Store のホスト状態
+// ============================================================================
+
+/// wasmtime Store が保持するホスト側状態。
+/// WASI コンテキスト・リソーステーブル・StoreLimits を 1 つにまとめる。
+struct HostState {
+    ctx: WasiCtx,
+    table: ResourceTable,
+    limits: StoreLimits,
+}
+
+// wasmtime-wasi 29: `WasiView` が `ctx()` と `table()` の両方を提供する。
+impl WasiView for HostState {
+    fn ctx(&mut self) -> &mut WasiCtx {
+        &mut self.ctx
+    }
+
+    fn table(&mut self) -> &mut ResourceTable {
+        &mut self.table
+    }
+}
+
+// ============================================================================
+// 設定
+// ============================================================================
+
+struct Settings {
+    database_url: String,
+    nats_url: String,
+    /// 取得した wasm 本体の事前コンパイル成果物 (cwasm) を置くローカルキャッシュ先 (§3.6)。
+    /// 起動時に mkdir する。M2 で `COMPONENTS_DIR` 依存は撤去した。
+    wasm_cache_dir: PathBuf,
+    /// M3c (§3.3 TTL 結合): JetStream consumer の ack 待ち秒数。CP のトークン exp 計算と
+    /// **同一の定数** から導出する（既定は faas_shared::ACK_WAIT_SECS）。env で上書き可能。
+    ack_wait_secs: u64,
+    /// M3c: JetStream consumer の最大再配送回数。CP の token exp と同一定数
+    /// （既定は faas_shared::MAX_DELIVER）。env で上書き可能。worker は鍵を持たない。
+    max_deliver: u64,
+    /// M4c (§6.6 / §3.3): JetStream pull consumer の `backoff` 配列（秒）。CSV で渡す。
+    /// 既定 `[5, 15, 60]` 秒。空文字 / 空配列で「backoff 無効 = 固定 ack_wait 構成」となり、
+    /// 既存挙動と完全互換。CP の token exp 計算（§3.3）は固定 ack_wait/max_deliver から導出する
+    /// 既定式なので、backoff の合計が `ack_wait*max_deliver` を**下回る**範囲で使うこと
+    /// （上回ると正規の遅延結果がトークン失効後に届き、subscriber が drop して実行喪失する恐れ）。
+    backoff_secs: Vec<u64>,
+    /// M4a (§3.8): /metrics + /readyz を返す最小 axum サーバの bind 先。既定 `0.0.0.0:9090`。
+    /// 内部ネット越しのみで露出させる前提。ノード LB の readinessProbe ターゲットでもある。
+    metrics_bind_addr: String,
+}
+
+/// `WASM_CACHE_DIR` 未設定時の既定キャッシュ先。
+const DEFAULT_WASM_CACHE_DIR: &str = "./worker-cache";
+/// `METRICS_BIND_ADDR` 未設定時の既定。
+const DEFAULT_METRICS_BIND_ADDR: &str = "0.0.0.0:9090";
+
+impl Settings {
+    fn from_env() -> anyhow::Result<Self> {
+        let database_url = std::env::var("DATABASE_URL").context("DATABASE_URL must be set")?;
+        let nats_url = std::env::var("NATS_URL").context("NATS_URL must be set")?;
+        // 未設定時は既定 (`./worker-cache`) を採用する。
+        let wasm_cache_dir = std::env::var("WASM_CACHE_DIR")
+            .unwrap_or_else(|_| DEFAULT_WASM_CACHE_DIR.to_string())
+            .into();
+        // M3c TTL 結合: 既定は faas_shared の定数。CP と値を揃えること（README 参照）。
+        let ack_wait_secs = env_u64("ACK_WAIT_SECS", faas_shared::ACK_WAIT_SECS)?;
+        let max_deliver = env_u64("MAX_DELIVER", faas_shared::MAX_DELIVER)?;
+        // M4c: BACKOFF_SECS は CSV（例 "5,15,60"）。空 / 未設定で既定 [5, 15, 60]、"" で無効化。
+        let backoff_secs = parse_backoff_secs("BACKOFF_SECS")?;
+        let metrics_bind_addr = std::env::var("METRICS_BIND_ADDR")
+            .map(|v| v.trim().to_string())
+            .unwrap_or_else(|_| DEFAULT_METRICS_BIND_ADDR.to_string());
+        Ok(Self {
+            database_url,
+            nats_url,
+            wasm_cache_dir,
+            ack_wait_secs,
+            max_deliver,
+            backoff_secs,
+            metrics_bind_addr,
+        })
+    }
+}
+
+/// `BACKOFF_SECS` 環境変数（CSV）を `Vec<u64>` に変換する (M4c)。
+///
+/// 受理形式:
+/// - 未設定 → `[5, 15, 60]`（既定）
+/// - 空文字（"" や " "）→ `[]`（backoff 無効・固定 ack_wait 構成）
+/// - "5,15,60" / "5, 15, 60" → `[5, 15, 60]`
+///
+/// 不正値（負数・非数値）はエラー（fail-fast）。CP の token exp 計算と齟齬しないよう
+/// 合計値は呼び出し側の運用判断（README 注釈）。
+fn parse_backoff_secs(key: &str) -> anyhow::Result<Vec<u64>> {
+    const DEFAULT_BACKOFF_SECS: &[u64] = &[5, 15, 60];
+    match std::env::var(key) {
+        Err(_) => Ok(DEFAULT_BACKOFF_SECS.to_vec()),
+        Ok(raw) => {
+            let trimmed = raw.trim();
+            if trimmed.is_empty() {
+                return Ok(Vec::new());
+            }
+            trimmed
+                .split(',')
+                .map(|s| {
+                    s.trim()
+                        .parse::<u64>()
+                        .with_context(|| format!("env var {key} contains a non-integer entry"))
+                })
+                .collect()
+        }
+    }
+}
+
+/// u64 の任意 env。欠損は default、不正値はエラー。値は trim する。
+fn env_u64(key: &str, default: u64) -> anyhow::Result<u64> {
+    match std::env::var(key) {
+        Ok(v) => v
+            .trim()
+            .parse::<u64>()
+            .with_context(|| format!("env var {key} must be a non-negative integer")),
+        Err(_) => Ok(default),
+    }
+}
+
+/// `tracing` を初期化する。control-plane と同じ規約: `LOG_FORMAT=json` で構造化 JSON。
+fn init_tracing(log_format: &str) {
+    use tracing_subscriber::{fmt, EnvFilter};
+    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
+    if log_format.eq_ignore_ascii_case("json") {
+        fmt()
+            .with_env_filter(filter)
+            .json()
+            .flatten_event(true)
+            .with_current_span(true)
+            .with_span_list(false)
+            .init();
+    } else {
+        fmt().with_env_filter(filter).init();
+    }
+}
+
+/// `/metrics` + `/readyz` + `/healthz` を返す最小 axum サーバを別 tokio task で起動する
+/// （M4a, §3.8）。
+///
+/// JetStream pull ループから独立しているため、ジョブ消費が詰まっても liveness 応答は出る。
+/// バインドエラーは fatal（プロセスを巻き込まずに warn して諦める）。bind が成功した後の
+/// `axum::serve` の Err はループ内 backoff で再 listen するほどでもないので、終了時にログのみ。
+///
+/// readiness 判定:
+/// - 本スライスでは「プロセスが立ち上がっている + 起動初期化が済んだ」をもって Ready とする。
+///   NATS pull consumer の生死は pull ループ側のリトライで吸収するため readiness とは結合しない
+///   （詰まり時の cascading restart 防止; §3.8 の liveness/readiness 分離方針）。
+///   将来、NATS 接続性や DB pool 健全性を probe する場合はここで `state` を握って判定する。
+fn spawn_metrics_server(metrics: Arc<metrics::Metrics>, bind_addr: String) {
+    tokio::spawn(async move {
+        use axum::{extract::State as AxState, routing::get, Router};
+
+        async fn healthz() -> axum::http::StatusCode {
+            axum::http::StatusCode::OK
+        }
+        async fn readyz() -> axum::http::StatusCode {
+            // 本スライスでは依存疎通を probe しない（上記コメント参照）。
+            axum::http::StatusCode::OK
+        }
+        async fn metrics_handler(
+            AxState(m): AxState<Arc<metrics::Metrics>>,
+        ) -> impl axum::response::IntoResponse {
+            let (headers, body) = m.render();
+            (axum::http::StatusCode::OK, headers, body)
+        }
+
+        let app = Router::new()
+            .route("/healthz", get(healthz))
+            .route("/readyz", get(readyz))
+            .route("/metrics", get(metrics_handler))
+            .with_state(metrics);
+
+        let listener = match tokio::net::TcpListener::bind(&bind_addr).await {
+            Ok(l) => l,
+            Err(e) => {
+                warn!(addr = %bind_addr, error = %e, "worker metrics server: failed to bind; metrics unavailable");
+                return;
+            }
+        };
+        info!(addr = %bind_addr, "worker metrics server listening");
+        if let Err(e) = axum::serve(listener, app).await {
+            warn!(error = %e, "worker metrics server: serve exited with error");
+        }
+    });
+}
+
+/// ランタイム接続ロールが RLS をバイパスしないことを起動時に検証する（M3b §3.2）。
+///
+/// FORCE RLS は SUPERUSER / BYPASSRLS ロールに対し無条件にバイパスされる。worker が
+/// 特権ロールで接続していると、`SET LOCAL app.tenant_id` 越しの cross-tenant 書き込みガードが
+/// 無効化される。`current_user` の `rolsuper`/`rolbypassrls` を確認し、特権なら fail-fast する。
+async fn assert_non_privileged_runtime_role(pool: &PgPool) -> anyhow::Result<()> {
+    let (rolname, rolsuper, rolbypassrls): (String, bool, bool) = sqlx::query_as(
+        "SELECT rolname, rolsuper, rolbypassrls FROM pg_roles WHERE rolname = current_user",
+    )
+    .fetch_one(pool)
+    .await
+    .context("probing runtime DB role privileges")?;
+
+    if rolsuper || rolbypassrls {
+        anyhow::bail!(
+            "worker DATABASE_URL connects as privileged role '{rolname}' \
+             (rolsuper={rolsuper}, rolbypassrls={rolbypassrls}); RLS would be bypassed. \
+             Point DATABASE_URL at the non-privileged 'faas_app' role."
+        );
+    }
+    info!(role = %rolname, "runtime DB role is non-privileged (RLS enforced)");
+    Ok(())
+}
+
+// ============================================================================
+// エントリポイント
+// ============================================================================
+
+#[tokio::main]
+async fn main() -> anyhow::Result<()> {
+    // M4a (§3.8): LOG_FORMAT=json で構造化 JSON ログに切り替える。span のフィールド
+    // （execution_id 等）をイベントへ flatten する。既定の text は従来挙動と完全互換。
+    let log_format = std::env::var("LOG_FORMAT")
+        .map(|v| v.trim().to_string())
+        .unwrap_or_else(|_| "text".to_string());
+    init_tracing(&log_format);
+
+    let settings = Settings::from_env()?;
+
+    info!(nats = %settings.nats_url, "connecting to NATS");
+    let nats = async_nats::connect(&settings.nats_url)
+        .await
+        .context("failed to connect to NATS")?;
+    let jetstream = async_nats::jetstream::new(nats.clone());
+
+    info!("connecting to Postgres");
+    let pool = PgPoolOptions::new()
+        .max_connections(8)
+        .connect(&settings.database_url)
+        .await
+        .context("failed to connect to Postgres")?;
+    // M3b §3.2: ランタイムは必ず非特権 faas_app（NOBYPASSRLS・非 SUPERUSER）で接続する。
+    // superuser/owner だと FORCE RLS が無条件にバイパスされ、set_tenant_guc の fail-closed も
+    // 働かず、worker の cross-tenant 書き込みガードが無効化される。起動時に検証して fail-fast。
+    assert_non_privileged_runtime_role(&pool)
+        .await
+        .context("runtime DB role check failed")?;
+
+    // 共有 Engine。precompile / deserialize / 実行で同一 Config を共有する。
+    // (deserialize は同一 Engine 設定でないと拒否されるため §3.6 / §4)。
+    let engine = build_engine().context("failed to build wasmtime engine")?;
+
+    // cwasm キャッシュ先を起動時に用意する (§3.6)。
+    std::fs::create_dir_all(&settings.wasm_cache_dir).with_context(|| {
+        format!(
+            "failed to create WASM_CACHE_DIR {}",
+            settings.wasm_cache_dir.display()
+        )
+    })?;
+
+    // presigned GET URL から本体を取得する HTTP クライアント (§3.4)。
+    let http = reqwest::Client::builder()
+        .build()
+        .context("failed to build reqwest client")?;
+
+    // in-memory Component LRU (§3.6)。sha256 -> Arc<Component>。
+    let cache = Mutex::new(LruCache::new(
+        NonZeroUsize::new(COMPONENT_CACHE_CAP).expect("cache cap must be non-zero"),
+    ));
+
+    // M4a (§3.8): メトリクスは pull ループから独立した tokio task で公開する。pull ループが
+    // 詰まっても /metrics と /readyz が応答できるように分離する。
+    let worker_metrics = metrics::Metrics::init();
+    spawn_metrics_server(worker_metrics.clone(), settings.metrics_bind_addr.clone());
+
+    // JetStream stream / consumer を冪等に用意する。
+    // M3c: ack_wait / max_deliver は CP のトークン exp と同一定数から導出する（TTL 結合, §3.3）。
+    // M4c: backoff を pull consumer config に流し、最終配送試行のシグナルを `delivered` で取れるようにする。
+    let consumer = ensure_consumer(
+        &jetstream,
+        settings.ack_wait_secs,
+        settings.max_deliver,
+        &settings.backoff_secs,
+    )
+    .await?;
+    // M4c: `.failed` (DLQ) 用の core NATS 経路は stream を貼らず、CP の subscriber が core
+    // で購読する（result と同じトランスポート規約）。stream を作らない理由は、(a) DLQ メッセージ
+    // は最終配送失敗時に worker が 1 度 publish するだけで JetStream の durable 保証が無くても
+    // reaper の stuck-execution sweeper が二重安全網になっていること、(b) stream を増やすと
+    // 観測・運用面の複雑度が増し M4c のブラスト半径が広がること、による。`.failed` の durable
+    // stream 化は後続スライス（M4 完了後）で再評価する。
+
+    info!(
+        durable = DURABLE_NAME,
+        stream = STREAM_NAME,
+        cache_dir = %settings.wasm_cache_dir.display(),
+        "worker started; pulling jobs"
+    );
+
+    let worker = Arc::new(Worker {
+        engine,
+        pool,
+        nats,
+        http,
+        wasm_cache_dir: settings.wasm_cache_dir,
+        cache,
+        metrics: worker_metrics,
+    });
+
+    let max_deliver = settings.max_deliver as i64;
+
+    // 共有 Pull Consumer のメッセージループ。
+    loop {
+        let mut batch = match consumer
+            .batch()
+            .max_messages(PULL_BATCH)
+            .expires(Duration::from_secs(30))
+            .messages()
+            .await
+        {
+            Ok(b) => b,
+            Err(e) => {
+                error!(error = %e, "failed to pull batch; backing off");
+                tokio::time::sleep(Duration::from_secs(1)).await;
+                continue;
+            }
+        };
+
+        while let Some(item) = batch.next().await {
+            let msg = match item {
+                Ok(m) => m,
+                Err(e) => {
+                    warn!(error = %e, "error reading pulled message");
+                    continue;
+                }
+            };
+
+            // M4c (§6.6): JetStream のメッセージメタデータから今回が何回目の配送かを取り出す。
+            // `delivered` は 1 始まりで、今回の試行を含むカウント。`delivered >= max_deliver`
+            // のときは「これが最後の試行」であり、ここで publish に失敗すると JetStream は
+            // 二度と再配送しないため、worker は自前で `.failed` (DLQ) を publish しなければ
+            // ならない（無音失踪を作らない）。info() が取れない（旧サーバ・形式不一致）場合は
+            // 安全側で 1（=「最終ではない」扱い）とし、reaper の stuck sweeper に救済を委ねる。
+            let delivered = msg.info().map(|i| i.delivered).unwrap_or(1);
+            let is_final_attempt = max_deliver > 0 && delivered >= max_deliver;
+
+            // M3d (§8 / §6.6): ack は **結果 publish の成功後** に返す（ack-after-publish）。
+            // 以前は処理前に ack していたため、spawn 後のパニック／プロセスクラッシュ／
+            // publish_result 失敗で ResultMessage が一度も出ず、subscriber が finalize できず、
+            // pending/running 行が孤立して in-flight スロットが恒久リークした（reaper は DB COUNT
+            // を真実とするため孤立行を「真実」として数え、回収できない）。AckExplicit + ack_wait +
+            // max_deliver は設定済みなので、publish できなかったメッセージは ack せず JetStream に
+            // 再配送させ、最終的に finalize+DECR へ収束させる。
+            // M4c: ただし `delivered == max_deliver` の最終試行で publish に失敗したら、もう再配送が
+            // 来ない（JetStream は終了済み扱い）。そのまま un-ack で放置すると CP の reaper の
+            // stuck deadline (既定 900s) まで pending/running が残り続けるため、worker は `.failed`
+            // (DLQ) を publish して CP の subscriber に即時 finalize+DECR を促す。`.failed` の
+            // publish にも失敗したら最終手段として reaper に委ねる（保険）。
+            let worker = Arc::clone(&worker);
+            let payload = msg.payload.clone();
+            tokio::spawn(async move {
+                let published = worker.handle_payload(&payload).await;
+                if published {
+                    if let Err(e) = msg.ack().await {
+                        warn!(error = %e, "failed to ack message after publishing result");
+                    }
+                } else if is_final_attempt {
+                    // 最終配送で publish できなかった: `.failed` を出してから ack する。`.failed`
+                    // が出れば CP の DLQ subscriber が即 finalize+DECR する（reaper を待たない）。
+                    // 出せなくても ack はしない（保険として再配送可能性を残す。max_deliver 到達後は
+                    // 実際には再配送されないため reaper が deadline で拾う）。
+                    let dlq_ok = worker
+                        .publish_failed_for_payload(&payload, "max_deliver exhausted")
+                        .await;
+                    if dlq_ok {
+                        if let Err(e) = msg.ack().await {
+                            warn!(error = %e, "failed to ack message after publishing DLQ");
+                        }
+                    } else {
+                        warn!(
+                            "final delivery attempt could not publish result or DLQ; \
+                             leaving un-acked (reaper will reclaim via stuck-execution sweep)"
+                        );
+                    }
+                } else {
+                    // 通常の再配送経路。ack せず JetStream に再配送させる（backoff 待ち）。
+                    warn!(
+                        delivered,
+                        "did not publish a result; leaving message un-acked for redelivery"
+                    );
+                }
+            });
+        }
+    }
+}
+
+// ============================================================================
+// wasmtime Engine 構築
+// ============================================================================
+
+/// epoch interruption + async + component-model + fuel を有効にした Engine を作る。
+///
+/// M4b (§4.3): fuel と epoch は **暴走中断の代替関係** にあり、spec は「両機構を常時同時適用は
+/// しない」と明記する。しかし Wasmtime の `Config` は Engine 構築時に **immutable** で、cwasm
+/// (precompile) も同一 Config の Engine で deserialize されることが必須（§3.6）。よって
+/// per-job で epoch-only / fuel+epoch を切り替えるには Engine を 2 つ持ち cwasm キャッシュも
+/// 分割する必要があり、複雑度が大きく増す（§3.6 LRU + cwasm パスのキー空間 + LRU を Engine
+/// 種別で 2 系統化）。
+///
+/// 本スライス（M4b）は「単一 Engine で `consume_fuel(true)` を常時有効化し、per-Store では
+/// `set_fuel` を **`max_fuel.is_some()` のときだけ** 呼ぶ」方針を取る。`set_fuel` を呼ばない
+/// Store は fuel カウンタが 0 のままだが、`consume_fuel(true)` 自体は実行に影響しない（fuel が
+/// 設定されていない Store は OutOfFuel に至らない、というのが Wasmtime の意味論ではないため、
+/// 実際は **`set_fuel` を呼ばずに fuel mode の component を実行するとすぐ trap する**）。
+/// したがって本スライスでは「fuel が `None` の Store では `set_fuel(u64::MAX)` 相当を入れ、
+/// 実質無効化扱いにする」運用とし、コードレベルで明示する。
+///
+/// 計装オーバーヘッド（§4.3 注意点）: fuel 計装は Cranelift がコード生成時に挿入するため、
+/// `consume_fuel(true)` を Engine レベルで有効化すると **全 component が計装される**。fuel を
+/// 使わない component に対する非ゼロのオーバーヘッドが発生するが、Engine 分割の運用複雑度
+/// より優先する（follow-up: M4c 以降で Engine 分割 + cwasm キャッシュ分離を再評価）。
+fn build_engine() -> anyhow::Result<Engine> {
+    let mut config = Config::new();
+    config.wasm_component_model(true);
+    config.async_support(true);
+    // 別 task の ticker が増分する epoch で実行を中断できるようにする（§4.3 主機構）。
+    config.epoch_interruption(true);
+    // M4b (§4.3): fuel を Engine レベルで有効化する。実 set_fuel は per-Store で行う。
+    // 詳細はこの関数の doc コメント参照。
+    config.consume_fuel(true);
+    Engine::new(&config).map_err(|e| anyhow!("Engine::new failed: {e}"))
+}
+
+// ============================================================================
+// JetStream consumer 用意
+// ============================================================================
+
+/// invoke subject を束ねる stream と、共有 Pull Consumer (durable) を冪等に作る。
+///
+/// M3c (§3.3 TTL 結合): `ack_wait_secs` / `max_deliver` は CP のトークン exp
+/// （`exp = iat + ack_wait*max_deliver + 実行上限 + 余裕`）と **同一の定数** から渡される。
+/// これにより通常の再配送がトークン失効より先に届き、正規の遅延結果を取りこぼさない。
+///
+/// M4c (§3.3 / §6.6): `backoff_secs` を pull consumer の `backoff` 配列にセットする。空配列なら
+/// 従来の「固定 ack_wait」構成（既存挙動）と同一。最悪滞留時間 `Σ backoff[i]` は CP の token exp と
+/// 整合させること（README 注釈）。DLQ subject は別接続（core NATS の `tenant.*.component.failed`）に
+/// 流す方針のため pull consumer 自体には dead-letter 設定を持たせない。代わりに worker が
+/// `delivered >= max_deliver` の最終試行で publish 失敗を検知したとき、自前で `.failed` を publish
+/// してから un-ack に倒す（[`Worker::publish_failed`] / [`Worker::handle_payload`] 参照）。
+///
+/// 注意（drift）: `get_or_create_consumer` は **既存の durable consumer の config を必ずしも
+/// 更新しない**。既存 "workers" consumer が古い設定（ack_wait/max_deliver/backoff 未設定）で残って
+/// いると、ここで渡す値が黙って無視され TTL 結合が崩れる。本実装では、起動時に `consumer.info()`
+/// で現状値を取得し、欲しい設定とドリフトしていれば `delete_consumer` → 再 create でドリフトを
+/// 解消する。durable の場合でも stream 側に再配送状態が残っているため、消費中ジョブは取りこぼさない。
+async fn ensure_consumer(
+    jetstream: &async_nats::jetstream::Context,
+    ack_wait_secs: u64,
+    max_deliver: u64,
+    backoff_secs: &[u64],
+) -> anyhow::Result<
+    async_nats::jetstream::consumer::Consumer<async_nats::jetstream::consumer::pull::Config>,
+> {
+    use async_nats::jetstream::consumer::pull::Config as PullConfig;
+    use async_nats::jetstream::consumer::{AckPolicy, DeliverPolicy};
+    use async_nats::jetstream::stream::Config as StreamConfig;
+
+    // §3.3: テナントワイルドカード `tenant.*.component.invoke` で束ねる。
+    // 新規テナント追加時に stream/consumer の再構成が不要（`*` は 1 トークン=テナント ID に一致）。
+    // 注意: 既存の単一テナント subject で作られた FAAS_INVOKE stream があると、subjects 変更で
+    // get_or_create が競合しうる（README / risks 参照: 必要なら stream 更新 or 新名）。
+    let subject = invoke_subject_wildcard().to_string();
+
+    let stream = jetstream
+        .get_or_create_stream(StreamConfig {
+            name: STREAM_NAME.to_string(),
+            subjects: vec![subject.clone()],
+            ..Default::default()
+        })
+        .await
+        .map_err(|e| anyhow!("get_or_create_stream failed: {e}"))?;
+
+    let backoff: Vec<Duration> = backoff_secs
+        .iter()
+        .copied()
+        .map(Duration::from_secs)
+        .collect();
+    let desired = PullConfig {
+        durable_name: Some(DURABLE_NAME.to_string()),
+        ack_policy: AckPolicy::Explicit,
+        deliver_policy: DeliverPolicy::All,
+        filter_subject: subject.clone(),
+        // M3c: トークン exp と同一定数から導出した ack_wait / max_deliver (§3.3)。
+        ack_wait: Duration::from_secs(ack_wait_secs),
+        max_deliver: max_deliver as i64,
+        // M4c: 再配送 backoff（§6.6）。空配列なら固定 ack_wait 構成。
+        backoff: backoff.clone(),
+        // M4d (§8 表 line 742): JetStream consumer の「配送済み未 ack」上限。
+        // 全テナント合算の後段歯止め。CP 側 admission の max_concurrent_executions は
+        // **テナント別**の上限であり MaxAckPending とは数える量が異なる（§8 line 750 解説）。
+        // 運用目安: Σ(アクティブテナント数 × max_concurrent_executions) ≲ MaxAckPending。
+        // 既定 1000 は仕様 §8 表に直接対応する固定値（env 化は M4 では行わない）。
+        max_ack_pending: MAX_ACK_PENDING,
+        ..Default::default()
+    };
+
+    // durable + AckExplicit + DeliverAll で、複数 worker が共有して
+    // メッセージを分配する Pull Consumer を構成する (§6.3)。
+    let consumer = stream
+        .get_or_create_consumer(DURABLE_NAME, desired.clone())
+        .await
+        .map_err(|e| anyhow!("get_or_create_consumer failed: {e}"))?;
+
+    // M4c (drift 解消): `get_or_create_consumer` は既存 durable の config を更新しないため、
+    // info() の現状値を比較し、ドリフトしていれば delete + recreate する。durable 状態
+    // （stream-side の再配送進捗）は stream に残るため、消費中メッセージは取りこぼさない。
+    // 比較は ack_wait / max_deliver / backoff の 3 軸のみ（filter_subject 等は subject 体系で固定）。
+    let mut consumer = consumer;
+    let info = consumer
+        .info()
+        .await
+        .map_err(|e| anyhow!("consumer.info() failed: {e}"))?
+        .clone();
+    let drift = info.config.ack_wait != desired.ack_wait
+        || info.config.max_deliver != desired.max_deliver
+        || info.config.backoff != backoff
+        // M4d: 既存 durable が古い max_ack_pending（既定値）で残っていると §8 の
+        // backpressure 上限が黙って無効化されるため、ドリフト軸に含めて recreate する。
+        || info.config.max_ack_pending != desired.max_ack_pending;
+    if drift {
+        warn!(
+            durable = DURABLE_NAME,
+            stream = STREAM_NAME,
+            "consumer config drift detected; recreating to apply ack_wait/max_deliver/backoff/max_ack_pending"
+        );
+        stream
+            .delete_consumer(DURABLE_NAME)
+            .await
+            .map_err(|e| anyhow!("delete_consumer failed: {e}"))?;
+        consumer = stream
+            .get_or_create_consumer(DURABLE_NAME, desired)
+            .await
+            .map_err(|e| anyhow!("get_or_create_consumer (recreate) failed: {e}"))?;
+    }
+
+    Ok(consumer)
+}
+
+// ============================================================================
+// Worker 本体
+// ============================================================================
+
+struct Worker {
+    engine: Engine,
+    pool: PgPool,
+    /// result は core NATS で publish する (CP は core subscribe; subscriber.rs)。
+    nats: async_nats::Client,
+    /// presigned GET URL から本体を取得する HTTP クライアント (§3.4)。
+    http: reqwest::Client,
+    /// cwasm 事前コンパイル成果物のローカルキャッシュ先 (§3.6)。
+    wasm_cache_dir: PathBuf,
+    /// in-memory Component キャッシュ。`wasm_sha256` -> 解決済み `Component` (§3.6)。
+    /// hit なら即実行でき、coldstart を短縮できる主経路。
+    cache: Mutex<LruCache<String, Arc<Component>>>,
+    /// 観測メトリクス（M4a, §3.8）。LRU / cwasm のキャッシュヒット率、execute 時間、終端化件数。
+    metrics: Arc<metrics::Metrics>,
+}
+
+impl Worker {
+    /// 1 メッセージ分のペイロードを処理する。失敗してもパニックさせず、
+    /// 可能な限り failed の ResultMessage を返す。
+    ///
+    /// 戻り値（M3d, §8）: 終端 ResultMessage を **publish できたか**。`true` のとき呼び出し側は
+    /// メッセージを ack する。`false`（decode 不能 / publish 失敗）のときは ack せず、JetStream の
+    /// 再配送（ack_wait + max_deliver）に委ねる —— これにより worker 側の取りこぼしでも最終的に
+    /// 結果が出て subscriber の finalize+DECR が走り、in-flight スロットがリークしない。
+    ///
+    /// M4a (§3.8): `worker.handle_payload` span で包む。JobMessage を decode 後に execution_id /
+    /// tenant_id / component を span へ記録し、以降のすべてのログを相関させる。
+    #[tracing::instrument(
+        name = "worker.handle_payload",
+        skip_all,
+        fields(
+            execution_id = tracing::field::Empty,
+            tenant_id = tracing::field::Empty,
+            component = tracing::field::Empty,
+        )
+    )]
+    async fn handle_payload(&self, payload: &[u8]) -> bool {
+        let job: JobMessage = match serde_json::from_slice(payload) {
+            Ok(j) => j,
+            Err(e) => {
+                // execution_id が取れないため DB / result publish は不能。デコード不能な毒メッセージは
+                // 再配送しても無駄なので、結果は出ないが ack させて DLQ 化を避ける（true を返す）。
+                error!(error = %e, "failed to decode JobMessage; dropping (acking poison message)");
+                return true;
+            }
+        };
+
+        let execution_id = job.execution_id.clone();
+        let tenant_id = job.tenant_id.clone();
+        // M4a: span に相関 ID を詰める（JSON ログでは各イベントのトップレベルに展開される）。
+        let span = tracing::Span::current();
+        span.record("execution_id", execution_id.as_str());
+        span.record("tenant_id", tenant_id.as_str());
+        span.record("component", job.component.as_str());
+        // M3c: CP が署名した不透明トークン。worker は中身を解釈せず、全 result に verbatim に echo する
+        // （鍵を持たない。検証は CP の subscriber が kid で行う, §3.3）。
+        let job_token = job.job_token.clone();
+        info!(%execution_id, component = %job.component, "received job");
+
+        // M4a (§3.8): execute の wall-clock を計測する。outcome ラベルに応じて histogram + counter を
+        // 動かす（subscriber 側の finalize と二重計上にはなるが、worker 視点の「実行完了率」を取りたい
+        // のと、CP がダウンしていても worker で計測できるので両方で残す）。
+        let exec_started = std::time::Instant::now();
+
+        // running へ遷移 (M1: worker が直接 DB 更新)。
+        if let Err(e) = self.mark_running(&tenant_id, &execution_id).await {
+            warn!(%execution_id, error = %e, "failed to mark running");
+            // 続行する: 実行結果側で最終状態を書く。
+        }
+
+        let outcome = self.execute(&job).await;
+        let exec_elapsed = exec_started.elapsed();
+
+        let (status_label, result) = match outcome {
+            Ok(output) => {
+                info!(%execution_id, "job succeeded");
+                (
+                    "succeeded",
+                    ResultMessage {
+                        execution_id: execution_id.clone(),
+                        tenant_id: tenant_id.clone(),
+                        status: ExecutionStatus::Succeeded,
+                        output: Some(output),
+                        error: None,
+                        job_token: job_token.clone(),
+                    },
+                )
+            }
+            Err(ExecError::Timeout) => {
+                warn!(%execution_id, "job timed out");
+                (
+                    "timeout",
+                    ResultMessage {
+                        execution_id: execution_id.clone(),
+                        tenant_id: tenant_id.clone(),
+                        status: ExecutionStatus::Timeout,
+                        output: None,
+                        error: Some("execution timed out".to_string()),
+                        job_token: job_token.clone(),
+                    },
+                )
+            }
+            Err(ExecError::Failed(msg)) => {
+                warn!(%execution_id, error = %msg, "job failed");
+                (
+                    "failed",
+                    ResultMessage {
+                        execution_id: execution_id.clone(),
+                        tenant_id: tenant_id.clone(),
+                        status: ExecutionStatus::Failed,
+                        output: None,
+                        error: Some(msg),
+                        job_token: job_token.clone(),
+                    },
+                )
+            }
+        };
+
+        // M4a (§3.8): outcome 別に duration histogram + executions_total を更新する。
+        self.metrics
+            .wasmtime_execution_duration_seconds
+            .with_label_values(&[status_label])
+            .observe(exec_elapsed.as_secs_f64());
+        self.metrics
+            .executions_total
+            .with_label_values(&[status_label])
+            .inc();
+
+        // TODO(§3.4 / §6.4 大出力退避): 出力がインライン上限（256 KiB）を超える場合は、
+        // CP が同梱する **出力キー限定の write 資格**（io_output_key, §3.4）で Object Storage へ
+        // 書き出し、ResultMessage に output_ref を載せて subscriber が executions.output_ref を
+        // 確定する経路を加える。本スライスは DB 列（executions.output_ref）+ GET 応答 + キー
+        // レイアウト（faas_shared::io_output_key）までを敷設し、worker 側の write と
+        // ResultMessage.output_ref フィールドは後続（最小実装で広げない方針）に残す。
+        //
+        // M3c (§3.3「結果の出所認証」): worker は終端状態を **直接 DB に書かない**。
+        // 終端状態の唯一の writer は CP の subscriber であり、echo された署名トークンを
+        // 検証（kid 署名 + execution_id/tenant_id/version_id を行と突き合わせ + exp/CAS）
+        // してから finalize する。worker は鍵を持たない（keyless by design）ので、ここで
+        // 直接 UPDATE すると検証を一切経ずに任意 execution を終端化でき、§3.3 が防ぐべき
+        // forgery を許してしまう。よって worker は result を publish するだけにする。
+        if let Err(e) = self.publish_result(&tenant_id, &result).await {
+            // publish 失敗 → 呼び出し側に ack させない（false）。再配送で再試行され、最終的に
+            // subscriber が finalize+DECR する。ここで ack してしまうと結果が永久に出ず、
+            // pending/running 行と in-flight スロットがリークする（§8）。
+            warn!(%execution_id, error = %e, "failed to publish ResultMessage; will NOT ack (redeliver)");
+            return false;
+        }
+        true
+    }
+
+    /// Component を解決して handle を呼び出す。Timeout / Failed / 出力を返す。
+    async fn execute(&self, job: &JobMessage) -> std::result::Result<serde_json::Value, ExecError> {
+        // resource_limits を DB から解決する。失敗・未設定時は既定。
+        let limits = self
+            .resolve_limits(&job.tenant_id, &job.component, &job.version)
+            .await
+            .unwrap_or_default();
+
+        // §3.6 のキャッシュ階層で Component を解決する。
+        let component = self.resolve_component(job).await?;
+
+        // 入力を取得する (§3.4 / §5.2)。大入力時は CP が同梱した **そのキー限定** の短命
+        // presigned GET URL（input_url）から取得する。worker はこの URL 以外のオブジェクトを
+        // 読まない（CP が input_ref を当該 execution の入力キーへ完全一致検証済み, §3.4 MUST NOT）。
+        // インライン invoke では input_url=None で、JobMessage.input をそのまま使う。
+        let input_bytes = match job.input_url.as_deref() {
+            Some(url) => self.download_input(url).await?,
+            None => serde_json::to_vec(&job.input)
+                .map_err(|e| ExecError::Failed(format!("failed to encode input: {e}")))?,
+        };
+
+        self.run_component(component, input_bytes, limits).await
+    }
+
+    /// 大入力を presigned GET URL（input_url）から取得する (§3.4)。
+    ///
+    /// CP が `input_ref` を当該 execution の入力キーへ完全一致検証してから presign した URL であり、
+    /// worker はそのキー以外を読まない。退避入力は **生バイト列** をそのままハンドラへ渡す
+    /// （インライン入力が `serde_json::to_vec(input)` であるのと対称: クライアントが PUT した
+    /// バイト列がハンドラの `list<u8>` 入力になる）。
+    async fn download_input(&self, url: &str) -> std::result::Result<Vec<u8>, ExecError> {
+        let resp = self
+            .http
+            .get(url)
+            .send()
+            .await
+            .map_err(|e| ExecError::Failed(format!("failed to GET input: {e}")))?;
+        let resp = resp
+            .error_for_status()
+            .map_err(|e| ExecError::Failed(format!("input GET returned error status: {e}")))?;
+        let bytes = resp
+            .bytes()
+            .await
+            .map_err(|e| ExecError::Failed(format!("failed to read input body: {e}")))?;
+        Ok(bytes.to_vec())
+    }
+
+    /// `job.wasm_sha256` をキーに Component を解決する (§3.6)。
+    ///
+    /// キャッシュ階層:
+    ///   a. in-memory LRU が hit すれば即返す (coldstart 短縮の主経路)。
+    ///   b. miss 時、ローカル cwasm `{WASM_CACHE_DIR}/{sha256}.cwasm` が在れば、
+    ///      自プラットフォームが生成した信頼できる成果物として deserialize する。
+    ///      バージョン不一致等で失敗したら c へフォールバックする。
+    ///   c. cwasm が無い/壊れている場合、`job.wasm_url` から本体を取得し sha256 を
+    ///      照合 → `precompile_component` で cwasm を生成 → アトミックに書き込み →
+    ///      deserialize する。
+    ///   d. 解決した Component を in-memory LRU に格納する。
+    async fn resolve_component(
+        &self,
+        job: &JobMessage,
+    ) -> std::result::Result<Arc<Component>, ExecError> {
+        let sha = &job.wasm_sha256;
+
+        // a. in-memory LRU hit。
+        if let Some(component) = self.cache_get(sha) {
+            // M4a (§3.8): LRU hit を計上。
+            self.metrics
+                .wasmtime_component_cache_hits_total
+                .with_label_values(&["lru"])
+                .inc();
+            return Ok(component);
+        }
+
+        // b. ローカル cwasm を試す。
+        let cwasm_path = self.wasm_cache_dir.join(format!("{sha}.cwasm"));
+        if cwasm_path.exists() {
+            // SAFETY: deserialize_file は信頼できない入力に対して未定義動作になりうる。
+            // ここで読むのは「自分が precompile_component で生成した cwasm」のみであり、
+            // 他テナント由来の cwasm は決して読み込まない (§3.6 MUST NOT)。
+            // キーは sha256 で、cwasm 自体も自プラットフォーム生成物に限定している。
+            match unsafe { Component::deserialize_file(&self.engine, &cwasm_path) } {
+                Ok(component) => {
+                    let component = Arc::new(component);
+                    self.cache_put(sha.clone(), Arc::clone(&component));
+                    // M4a (§3.8): cwasm hit を計上。
+                    self.metrics
+                        .wasmtime_component_cache_hits_total
+                        .with_label_values(&["cwasm"])
+                        .inc();
+                    info!(%sha, "component cache: cwasm hit");
+                    return Ok(component);
+                }
+                Err(e) => {
+                    // バージョン不一致・破損など。c へフォールバックする。
+                    warn!(%sha, error = %e, "cwasm deserialize failed; recompiling");
+                }
+            }
+        }
+
+        // c. ダウンロード → sha256 照合 → precompile → cwasm 書き込み → deserialize。
+        // M4a (§3.8): miss を計上（download + precompile に進む経路）。
+        self.metrics.wasmtime_component_cache_misses_total.inc();
+        info!(%sha, "component cache: miss; downloading and precompiling");
+        let bytes = self.download_wasm(&job.wasm_url).await?;
+        self.verify_sha256(&bytes, sha)?;
+
+        let cwasm = self
+            .engine
+            .precompile_component(&bytes)
+            .map_err(|e| ExecError::Failed(format!("precompile_component failed: {e}")))?;
+
+        // アトミックに書き込む (tmp -> rename)。失敗しても実行自体は続行する。
+        if let Err(e) = write_atomic(&cwasm_path, &cwasm) {
+            warn!(%sha, error = %e, "failed to persist cwasm cache (continuing)");
+        }
+
+        // SAFETY: 直前に同一 Engine で生成した cwasm を読み込む。信頼できる自前生成物。
+        let component = unsafe { Component::deserialize(&self.engine, &cwasm) }
+            .map_err(|e| ExecError::Failed(format!("Component::deserialize failed: {e}")))?;
+        let component = Arc::new(component);
+
+        // d. in-memory LRU に格納する。
+        self.cache_put(sha.clone(), Arc::clone(&component));
+        Ok(component)
+    }
+
+    /// in-memory LRU から取得する (hit で参照順を更新)。
+    fn cache_get(&self, sha: &str) -> Option<Arc<Component>> {
+        let mut cache = self.cache.lock().expect("component cache mutex poisoned");
+        cache.get(sha).map(Arc::clone)
+    }
+
+    /// in-memory LRU へ格納する。
+    fn cache_put(&self, sha: String, component: Arc<Component>) {
+        let mut cache = self.cache.lock().expect("component cache mutex poisoned");
+        cache.put(sha, component);
+    }
+
+    /// presigned GET URL から wasm 本体を取得する (§3.4)。
+    async fn download_wasm(&self, url: &str) -> std::result::Result<Vec<u8>, ExecError> {
+        let resp = self
+            .http
+            .get(url)
+            .send()
+            .await
+            .map_err(|e| ExecError::Failed(format!("failed to GET wasm: {e}")))?;
+        let resp = resp
+            .error_for_status()
+            .map_err(|e| ExecError::Failed(format!("wasm GET returned error status: {e}")))?;
+        let bytes = resp
+            .bytes()
+            .await
+            .map_err(|e| ExecError::Failed(format!("failed to read wasm body: {e}")))?;
+        Ok(bytes.to_vec())
+    }
+
+    /// ダウンロード本体の sha256 (16進) を期待値と照合する。不一致は Failed (§3.6)。
+    fn verify_sha256(&self, bytes: &[u8], expected: &str) -> std::result::Result<(), ExecError> {
+        let mut hasher = Sha256::new();
+        hasher.update(bytes);
+        let actual = hex_encode(&hasher.finalize());
+        if actual.eq_ignore_ascii_case(expected) {
+            Ok(())
+        } else {
+            Err(ExecError::Failed(format!(
+                "wasm sha256 mismatch: expected {expected}, got {actual}"
+            )))
+        }
+    }
+
+    /// 解決済み Component を 1 回実行する。
+    ///
+    /// 時間・暴走制御 (§4.3):
+    /// - **epoch ticker (max_wall_time)**: ゲスト計算の壁時計上限。別 task で `sleep(wall)` →
+    ///   `engine.increment_epoch()` を 1 回呼び、ゲスト内ループを `Trap::Interrupt` で停止させる。
+    /// - **tokio::time::timeout (max_execution_time)**: ホスト関数（WASI のブロッキング呼び出し
+    ///   など）込みの総経過時間上限。epoch はゲスト内コードのみを中断するため、ホスト関数中で
+    ///   詰まると epoch では止まらない。よって `instantiate_async + call_handle` 全体を tokio
+    ///   タイムアウトで包む。タイムアウトはどちらの原因でも `ExecError::Timeout` に収束する
+    ///   （subscriber は `status=timeout` で finalize する）。
+    /// - **max_fuel (M4b, 任意)**: `Some(n)` のとき `Store::set_fuel(n)` で fuel を設定する。
+    ///   fuel 超過は `Trap::OutOfFuel` として現れ、§4.3 の規定どおり `failed` 分類にする
+    ///   （wall-time / execution_time 超過の `timeout` とは別物。決定性が要件の component に
+    ///   限り fuel を有効化し、暴走中の fuel 切れは「リソース超過」として失敗扱い）。
+    ///   `None` のときは fuel を **無効化** する（後述のため `u64::MAX` 相当を流し込むダミー）。
+    async fn run_component(
+        &self,
+        component: Arc<Component>,
+        input: Vec<u8>,
+        limits: ResourceLimits,
+    ) -> std::result::Result<serde_json::Value, ExecError> {
+        // StoreLimits: max_memory を適用する (§4.3)。
+        let store_limits = StoreLimitsBuilder::new()
+            .memory_size(limits.max_memory_bytes as usize)
+            .build();
+
+        let wasi = WasiCtxBuilder::new().inherit_stderr().build();
+        let host = HostState {
+            ctx: wasi,
+            table: ResourceTable::new(),
+            limits: store_limits,
+        };
+
+        let mut store = Store::new(&self.engine, host);
+        store.limiter(|state| &mut state.limits);
+
+        // epoch deadline を 1 に設定し、ticker が 1 増分すると中断される。
+        store.set_epoch_deadline(1);
+        // 既定の epoch deadline 動作は Trap (Trap::Interrupt) で、ticker が `increment_epoch` を
+        // 呼んだ直後の guest 内 epoch check で発火する。Cranelift がループ back-edge と関数入口に
+        // 自動挿入する。
+        //
+        // 設計メモ (chaos_d 対策, LIFO-slot 起因): epoch ticker は tokio::spawn では動かさず、
+        // 必ず OS スレッドで回す（後段の std::thread::spawn ブロック参照）。tokio 1.x は task 内から
+        // spawn された新規 task をその worker の LIFO slot に積み、LIFO slot は他 worker から steal
+        // できない。standard handler world は host import を持たず、tight loop の guest が
+        // `Future::poll` 内で同期的に走り続けるため、spawning worker は次の scheduling iteration に
+        // 戻れず ticker future が永久にスロットに留まる（chaos_d 再現で確認: ticker tokio::spawn 版は
+        // increment_epoch が一度も呼ばれず 5s exec_timeout 全域で hang）。
+        // OS スレッドに分離することで wasm-busy な tokio worker から独立して必ず ticker が発火し、
+        // 50ms 周期で epoch を継続的に bump するため Cranelift の epoch-check 挿入密度や
+        // wasmtime 側の yield 経路に依存せず Trap::Interrupt が surface する。
+
+        // M4b (§4.3): fuel の per-Store 設定。
+        // - `Some(n)`: 上限 n を設定。超過時は `Trap::OutOfFuel`（後段で `failed` 分類）。
+        // - `None`:    Engine レベルで `consume_fuel(true)` を常時有効にしているため
+        //              **何も set しないと即 OutOfFuel になりうる**。fuel を使わない component
+        //              でも実行を阻害しないよう、`u64::MAX` を流し込んで実質無効化する。
+        //              これにより既定 component（fuel なし）の挙動は M4a 以前と同一になる。
+        // 注意: set_fuel は consume_fuel(false) の Engine では Err を返すが、ここは Engine で
+        // 常時 true にしているため Ok を期待する。失敗は `Failed` として上に伝える（決定的に
+        // 検知できるよう ExecError 化）。
+        let fuel_to_set = limits.max_fuel.unwrap_or(u64::MAX);
+        store
+            .set_fuel(fuel_to_set)
+            .map_err(|e| ExecError::Failed(format!("failed to set fuel: {e}")))?;
+
+        // Linker: WASI を非同期で配線する。
+        let mut linker: Linker<HostState> = Linker::new(&self.engine);
+        wasmtime_wasi::add_to_linker_async(&mut linker)
+            .map_err(|e| ExecError::Failed(format!("failed to link wasi: {e}")))?;
+
+        // 別 OS スレッドで epoch ticker を起動する。max_wall_time 経過で epoch を継続増分する。
+        // ticker は execution 全体（instantiate + call_handle）に対して張る。
+        // tokio::spawn ではなく std::thread::spawn を使う理由は上述の LIFO-slot 設計メモ参照。
+        // 50ms 周期で経過時間を確認し、wall を超えたら毎周期 increment_epoch を呼ぶ。
+        // - 単発ではなく繰り返しにすることで、wasmtime 側の epoch-check 挿入密度に左右されず
+        //   ゲスト/ホストが次の check に到達した瞬間に確実に deadline を超過させる。
+        // - cleanup path で stop フラグを立てることでスレッドは自然に終了する（最大 1 tick 遅延）。
+        let engine = self.engine.clone();
+        let wall = limits.max_wall_time();
+        let started = Instant::now();
+        let stop = Arc::new(AtomicBool::new(false));
+        let stop_t = Arc::clone(&stop);
+        let engine_t = engine.clone();
+        std::thread::spawn(move || {
+            let tick = Duration::from_millis(50);
+            let thread_started = std::time::Instant::now();
+            while !stop_t.load(Ordering::Relaxed) {
+                std::thread::sleep(tick);
+                if thread_started.elapsed() >= wall {
+                    // wall 経過後は毎 tick 増分し続ける。host blocked / LIFO race / async yield
+                    // upgrade などで一発では届かないケースでも次の epoch check で必ず Trap させる。
+                    engine_t.increment_epoch();
+                }
+            }
+        });
+
+        // M4b (§4.3): instantiate + call_handle 全体を tokio タイムアウトで包む。
+        // epoch だけではホスト関数（WASI）内の sleep / blocking I/O を中断できないため、
+        // ホスト経過時間込みの総時間で wall-clock 上限をかぶせる二重防御。タイムアウト時は
+        // future が drop され、worker task は次の job へ進む（Wasmtime ランタイムは Store と
+        // ともに drop される）。
+        let exec_timeout = limits.max_execution_time();
+        let exec_future = async {
+            // TODO(§3.6): 将来最適化として、ここを `InstancePre` による事前
+            // インスタンス化（リンク済み Component を再利用）や Pooling アロケータへ
+            // 引き上げ、coldstart をさらに短縮する。今回は Component キャッシュ +
+            // 事前コンパイル (cwasm) までを実装範囲とする。
+            let instance = Handler::instantiate_async(&mut store, &component, &linker)
+                .await
+                .map_err(|e| ExecError::Failed(format!("failed to instantiate handler: {e}")))?;
+            // handle 呼び出し (async)。epoch 中断時は Err(trap) になる。
+            Ok::<_, ExecError>(instance.call_handle(&mut store, &input).await)
+        };
+
+        let timed = tokio::time::timeout(exec_timeout, exec_future).await;
+
+        // ticker を停止する (正常終了でも timeout でも不要)。
+        // OS スレッドは次の 50ms tick で stop を観測して終了する（detached, join しない）。
+        stop.store(true, Ordering::Relaxed);
+
+        match timed {
+            // tokio タイムアウト（max_execution_time 超過）。host+guest 総時間上限を超えた。
+            // §4.3: 時間超過は `timeout` 分類。subscriber は ExecutionStatus::Timeout で finalize する。
+            Err(_elapsed) => Err(ExecError::Timeout),
+            // 内側で instantiate に失敗した（Failed）。
+            Ok(Err(e)) => Err(e),
+            // call_handle が完了（成功・ハンドラエラー・trap のいずれか）。
+            Ok(Ok(call_result)) => match call_result {
+                Ok(Ok(output)) => Ok(self.decode_output(output)),
+                Ok(Err(handler_err)) => Err(ExecError::Failed(format!(
+                    "handler error [{:?}]: {}",
+                    handler_err.kind, handler_err.message
+                ))),
+                Err(trap) => {
+                    // §4.3: fuel 切れは `failed`（リソース超過）。epoch 中断 / wall-time 経過は
+                    // `timeout`。trap 種別を優先的に見て分類し、種別不明（プレーンな trap）の
+                    // ときに限り `started.elapsed()` で wall 越えを補助判定する（ticker race
+                    // 対策: epoch を増分した直後にゲストが別 trap を出すコーナーを timeout に倒す）。
+                    if is_out_of_fuel_trap(&trap) {
+                        Err(ExecError::Failed(format!("fuel exhausted: {trap}")))
+                    } else if is_interrupt_trap(&trap) || started.elapsed() >= wall {
+                        Err(ExecError::Timeout)
+                    } else {
+                        Err(ExecError::Failed(format!("wasm trap: {trap}")))
+                    }
+                }
+            },
+        }
+    }
+
+    /// 出力バイト列を JSON として解釈する。JSON でなければ生バイト配列にフォールバック。
+    fn decode_output(&self, bytes: Vec<u8>) -> serde_json::Value {
+        match serde_json::from_slice::<serde_json::Value>(&bytes) {
+            Ok(v) => v,
+            Err(_) => {
+                serde_json::Value::Array(bytes.into_iter().map(serde_json::Value::from).collect())
+            }
+        }
+    }
+
+    // ------------------------------------------------------------------------
+    // DB アクセス (sqlx ランタイム API; query! マクロ不使用)
+    // ------------------------------------------------------------------------
+    //
+    // M3b (§3.2): executions / components / component_versions は FORCE RLS 下にある
+    // （migrations/0004_rls.sql）。worker は faas_app（NOBYPASSRLS）で接続するため、
+    // これらのクエリは事前に `app.tenant_id` GUC が設定された tx 内でしか成立しない
+    // （未設定だと RLS ポリシーが ERROR で fail-closed する）。
+    // 各 DB アクセスを tx で包み、冒頭で job 由来の tenant を GUC に設定する。
+    // WHERE tenant_id=$1 等の述語は belt-and-suspenders として残す。
+
+    /// tx にテナントコンテキストを設定する (§3.2)。control-plane の `db::set_tenant_guc`
+    /// と同型: パラメータバインドのみ・`set_config(...,true)`（SET LOCAL 相当）。
+    /// SET ステートメント文字列結合は禁止（injection 防止）。
+    async fn set_tenant_guc(
+        tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+        tenant_id: &str,
+    ) -> Result<(), sqlx::Error> {
+        sqlx::query("SELECT set_config('app.tenant_id', $1, true)")
+            .bind(tenant_id)
+            .execute(&mut **tx)
+            .await?;
+        Ok(())
+    }
+
+    async fn mark_running(&self, tenant_id: &str, execution_id: &str) -> anyhow::Result<()> {
+        // M3c: tenant の権威は CP-signed claim（subscriber が検証時に行と突き合わせる）。
+        //   job.tenant_id はその claim と一致する。worker は鍵なしのまま、引き続き
+        //   job.tenant_id で SET LOCAL し RLS 書き込みを tenant tx の下で行う。
+        let mut tx = self.pool.begin().await?;
+        Self::set_tenant_guc(&mut tx, tenant_id).await?;
+        // pending -> running のみ遷移させる (CAS 的)。
+        sqlx::query(
+            "UPDATE executions \
+             SET status = $1, started_at = $2 \
+             WHERE id = $3 AND status = $4",
+        )
+        .bind(ExecutionStatus::Running.as_str())
+        .bind(Utc::now())
+        .bind(execution_id)
+        .bind(ExecutionStatus::Pending.as_str())
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
+    /// component_versions.resource_limits を解決する。見つからなければ None。
+    async fn resolve_limits(
+        &self,
+        tenant_id: &str,
+        component: &str,
+        version: &str,
+    ) -> anyhow::Result<ResourceLimits> {
+        use sqlx::Row as _;
+
+        // M3c: tenant の権威は CP-signed claim。job.tenant_id はその claim と一致する。
+        //   RLS 読み取りは tenant tx の下で行う（GUC/tx は撤去しない）。
+        let mut tx = self.pool.begin().await?;
+        Self::set_tenant_guc(&mut tx, tenant_id).await?;
+        let row = sqlx::query(
+            "SELECT cv.resource_limits AS resource_limits \
+             FROM component_versions cv \
+             JOIN components c ON c.id = cv.component_id \
+             WHERE c.tenant_id = $1 AND c.name = $2 AND cv.version = $3 \
+             LIMIT 1",
+        )
+        .bind(tenant_id)
+        .bind(component)
+        .bind(version)
+        .fetch_optional(&mut *tx)
+        .await?;
+        tx.commit().await?;
+
+        match row {
+            Some(r) => {
+                let value: serde_json::Value = r.try_get("resource_limits")?;
+                let limits: ResourceLimits = serde_json::from_value(value).unwrap_or_default();
+                Ok(limits)
+            }
+            None => Ok(ResourceLimits::default()),
+        }
+    }
+
+    // ------------------------------------------------------------------------
+    // NATS publish
+    // ------------------------------------------------------------------------
+
+    async fn publish_result(&self, tenant_id: &str, result: &ResultMessage) -> anyhow::Result<()> {
+        let subject = result_subject(tenant_id);
+        let payload = serde_json::to_vec(result)?;
+        // M1: result は core NATS で publish する (CP は core subscribe; subscriber.rs)。
+        // JetStream stream は invoke 用のみ存在するため、result は素の publish で配送する。
+        self.nats
+            .publish(subject, payload.into())
+            .await
+            .map_err(|e| anyhow!("nats publish failed: {e}"))?;
+        // 配送の確実性を高めるため flush する。
+        self.nats
+            .flush()
+            .await
+            .map_err(|e| anyhow!("nats flush failed: {e}"))?;
+        Ok(())
+    }
+
+    /// `.failed` (DLQ) subject へ最終配送失敗通知を publish する (M4c, §6.6 MUST)。
+    ///
+    /// 呼び出し条件: pull consumer のメタデータで「今回が `delivered == max_deliver` の最終試行」と
+    /// 判定でき、かつ `.result` の publish が失敗した場合のみ。これより前の試行は backoff 再配送で
+    /// 拾うべきなので呼ばない（早すぎる DLQ 化を防ぐ）。
+    ///
+    /// 経路: core NATS で `tenant.{tenant_id}.component.failed` に publish する（result と同じ
+    /// トランスポート規約）。CP の subscriber::run_failed が purchase 検証してから `failed` 終端化する。
+    /// `job_token` は CP がジョブ時に mint した不透明トークンを verbatim に echo する（DLQ 経路の
+    /// 出所認証も result と同じ kid + claim 突き合わせを通る、§3.3）。
+    async fn publish_failed(&self, tenant_id: &str, failed: &FailedMessage) -> anyhow::Result<()> {
+        let subject = failed_subject(tenant_id);
+        let payload = serde_json::to_vec(failed)?;
+        self.nats
+            .publish(subject, payload.into())
+            .await
+            .map_err(|e| anyhow!("nats publish (failed) failed: {e}"))?;
+        self.nats
+            .flush()
+            .await
+            .map_err(|e| anyhow!("nats flush (failed) failed: {e}"))?;
+        Ok(())
+    }
+
+    /// 失敗 envelope を payload から組み立てて DLQ に publish するベストエフォート (M4c)。
+    ///
+    /// payload が JobMessage として decode できないとき（毒メッセージ）は execution_id が取れず
+    /// 救済不能なので何もせず false を返す（呼び出し側は無音 ack で DLQ ループを断ち切る）。
+    /// decode できれば `FailedMessage { execution_id, tenant_id, reason, job_token }` を作って
+    /// publish する。publish 自体の失敗も false を返し、最終的な救済は reaper の stuck deadline
+    /// に委ねる（DLQ は冗長な高速救済経路で、reaper が真の安全網）。
+    async fn publish_failed_for_payload(&self, payload: &[u8], reason: &str) -> bool {
+        let job: JobMessage = match serde_json::from_slice(payload) {
+            Ok(j) => j,
+            Err(e) => {
+                warn!(error = %e, "DLQ publish skipped: payload is not a JobMessage");
+                return false;
+            }
+        };
+        let failed = FailedMessage {
+            execution_id: job.execution_id.clone(),
+            tenant_id: job.tenant_id.clone(),
+            reason: reason.to_string(),
+            job_token: job.job_token.clone(),
+        };
+        match self.publish_failed(&job.tenant_id, &failed).await {
+            Ok(()) => {
+                warn!(
+                    execution_id = %job.execution_id,
+                    tenant_id = %job.tenant_id,
+                    reason,
+                    "published DLQ (.failed) envelope after final delivery attempt"
+                );
+                self.metrics
+                    .dlq_published_total
+                    .with_label_values(&["published"])
+                    .inc();
+                true
+            }
+            Err(e) => {
+                warn!(
+                    execution_id = %job.execution_id,
+                    tenant_id = %job.tenant_id,
+                    error = %e,
+                    "failed to publish DLQ; reaper stuck-execution sweeper will reclaim slot"
+                );
+                self.metrics
+                    .dlq_published_total
+                    .with_label_values(&["publish_failed"])
+                    .inc();
+                false
+            }
+        }
+    }
+}
+
+// ============================================================================
+// 実行結果の内部表現
+// ============================================================================
+
+enum ExecError {
+    /// wall-time 超過 (epoch 中断)。
+    Timeout,
+    /// その他の実行失敗。
+    Failed(String),
+}
+
+/// trap が epoch 中断由来か判定する。wasmtime 29 では `Trap::Interrupt`。
+fn is_interrupt_trap(err: &anyhow::Error) -> bool {
+    matches!(
+        err.downcast_ref::<wasmtime::Trap>(),
+        Some(wasmtime::Trap::Interrupt)
+    )
+}
+
+/// M4b (§4.3): trap が fuel 切れ由来か判定する。wasmtime 29 では `Trap::OutOfFuel`。
+///
+/// 仕様: 時間超過は `timeout`、メモリ/fuel 超過は `failed` として記録する（§4.3 末尾）。
+/// よって OutOfFuel は `ExecError::Failed` に分類し、subscriber は `status=failed` で finalize する。
+fn is_out_of_fuel_trap(err: &anyhow::Error) -> bool {
+    matches!(
+        err.downcast_ref::<wasmtime::Trap>(),
+        Some(wasmtime::Trap::OutOfFuel)
+    )
+}
+
+// ============================================================================
+// ファイル / ハッシュ ヘルパ
+// ============================================================================
+
+/// バイト列を小文字 16進文字列へエンコードする (sha256 照合用)。
+fn hex_encode(bytes: &[u8]) -> String {
+    use std::fmt::Write as _;
+    let mut s = String::with_capacity(bytes.len() * 2);
+    for b in bytes {
+        let _ = write!(s, "{b:02x}");
+    }
+    s
+}
+
+/// `path` へアトミックに書き込む (同一ディレクトリの tmp に書いてから rename)。
+///
+/// 複数 worker / 同一 worker の並行ダウンロードが同じ cwasm を書いても、
+/// 最終的な可視ファイルが部分書き込みにならないようにする (§3.6)。
+fn write_atomic(path: &Path, data: &[u8]) -> std::io::Result<()> {
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    // tmp 名は衝突を避けるため pid + nanos を含める。
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let tmp = parent.join(format!(
+        ".{}.{}.{}.tmp",
+        path.file_name().and_then(|n| n.to_str()).unwrap_or("cwasm"),
+        std::process::id(),
+        nanos
+    ));
+    std::fs::write(&tmp, data)?;
+    // rename は同一ファイルシステム内でアトミック。既存があっても置き換える。
+    match std::fs::rename(&tmp, path) {
+        Ok(()) => Ok(()),
+        Err(e) => {
+            // 失敗時は tmp を掃除しておく。
+            let _ = std::fs::remove_file(&tmp);
+            Err(e)
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// M4b (§4.3): `ResourceLimits::max_execution_time()` は `max_execution_time_ms` を
+    /// `Duration` として返し、worker が `tokio::time::timeout(...)` でホスト+ゲスト総時間を
+    /// 覆うときの境界を決める。既定（5000ms）と任意値の両方で正しいことを担保する。
+    #[test]
+    fn resource_limits_max_execution_time_matches_ms() {
+        // 既定は ResourceLimits の DEFAULT_MAX_EXECUTION_TIME_MS（5000ms）由来。
+        let d = ResourceLimits::default();
+        assert_eq!(d.max_execution_time(), Duration::from_millis(5000));
+        // 任意値も同じ単位で。
+        let custom = ResourceLimits {
+            max_execution_time_ms: 250,
+            ..ResourceLimits::default()
+        };
+        assert_eq!(custom.max_execution_time(), Duration::from_millis(250));
+    }
+
+    /// M4b (§4.3): tokio::time::timeout(max_execution_time) で「ホスト関数中で詰まる」
+    /// パスをモデル化する。WASI のブロッキングホスト関数を呼んだまま帰ってこない future を
+    /// `tokio::time::sleep` で代用し、worker の `run_component` が `Err(_elapsed)` 経路を
+    /// 辿って `ExecError::Timeout` を返すことを future の合成で再現する。
+    ///
+    /// 実 wasm を要さずに timeout 分岐を行使できるのが要点（M4b の e2e は live worker +
+    /// 永久ブロックする component が必要なため #[ignore] で別途用意する）。
+    #[tokio::test(start_paused = true)]
+    async fn tokio_timeout_short_circuits_host_blocking_future() {
+        let limits = ResourceLimits {
+            max_wall_time_ms: 10,
+            max_execution_time_ms: 50,
+            ..ResourceLimits::default()
+        };
+        // host 側 blocking の代理: 100ms スリープする future（exec_timeout=50ms を超える）。
+        let blocking = async {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            Ok::<_, ExecError>(serde_json::Value::Null)
+        };
+        let timed = tokio::time::timeout(limits.max_execution_time(), blocking).await;
+        // 超過は `Err(_elapsed)`。run_component はこれを `ExecError::Timeout` へ写像する。
+        assert!(
+            timed.is_err(),
+            "tokio::time::timeout must trip on a host-blocking future longer than max_execution_time"
+        );
+    }
+
+    /// M4b (§4.3): 実時間より短い処理は当然 timeout 内に収まる（false-positive 回帰ガード）。
+    #[tokio::test(start_paused = true)]
+    async fn tokio_timeout_passes_fast_future() {
+        let limits = ResourceLimits {
+            max_wall_time_ms: 10,
+            max_execution_time_ms: 100,
+            ..ResourceLimits::default()
+        };
+        let fast = async {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+            Ok::<serde_json::Value, ExecError>(serde_json::json!({"ok": true}))
+        };
+        let timed = tokio::time::timeout(limits.max_execution_time(), fast).await;
+        assert!(timed.is_ok(), "fast future must not trip the timeout");
+        match timed.unwrap() {
+            Ok(v) => assert_eq!(v, serde_json::json!({"ok": true})),
+            Err(_) => panic!("inner future must succeed"),
+        }
+    }
+
+    /// M4b (§4.3) trap 分類: epoch 中断は `Trap::Interrupt` で `Timeout` に倒れる。
+    #[test]
+    fn interrupt_trap_is_recognized() {
+        let err: anyhow::Error = anyhow::Error::new(wasmtime::Trap::Interrupt);
+        assert!(is_interrupt_trap(&err));
+        assert!(!is_out_of_fuel_trap(&err));
+    }
+
+    /// M4b (§4.3) trap 分類: fuel 超過は `Trap::OutOfFuel` で `Failed` に倒れる
+    /// （timeout ではない。決定性 fuel 切れは「リソース超過」分類）。
+    #[test]
+    fn out_of_fuel_trap_is_recognized() {
+        let err: anyhow::Error = anyhow::Error::new(wasmtime::Trap::OutOfFuel);
+        assert!(is_out_of_fuel_trap(&err));
+        assert!(!is_interrupt_trap(&err));
+    }
+
+    /// M4b: 関係のない trap（メモリ越境等）はどちらの分類にも該当しない。
+    /// `run_component` はこのケースで「elapsed >= wall なら timeout / それ以外は failed」と
+    /// 補助判定する（ticker race 対策）。
+    #[test]
+    fn unrelated_trap_is_not_interrupt_or_fuel() {
+        let err: anyhow::Error = anyhow::Error::new(wasmtime::Trap::MemoryOutOfBounds);
+        assert!(!is_interrupt_trap(&err));
+        assert!(!is_out_of_fuel_trap(&err));
+    }
+
+    /// M4c: `BACKOFF_SECS` env のパースが既定 / 空 / CSV / 不正値で意図どおりに振る舞う。
+    /// 環境変数の状態はテスト間でグローバルなので、各ケースで先に `remove_var` して固定する。
+    #[test]
+    fn parse_backoff_secs_default_empty_and_csv() {
+        const KEY: &str = "TEST_BACKOFF_SECS_VAR";
+
+        // 未設定なら既定 `[5, 15, 60]`。
+        std::env::remove_var(KEY);
+        assert_eq!(parse_backoff_secs(KEY).unwrap(), vec![5, 15, 60]);
+
+        // 空文字（trim 後）は「backoff 無効」を意味する空 Vec。
+        std::env::set_var(KEY, "");
+        assert_eq!(parse_backoff_secs(KEY).unwrap(), Vec::<u64>::new());
+        std::env::set_var(KEY, "   ");
+        assert_eq!(parse_backoff_secs(KEY).unwrap(), Vec::<u64>::new());
+
+        // CSV（前後空白も許容）。
+        std::env::set_var(KEY, "5,15,60");
+        assert_eq!(parse_backoff_secs(KEY).unwrap(), vec![5, 15, 60]);
+        std::env::set_var(KEY, " 1, 2 ,3 ");
+        assert_eq!(parse_backoff_secs(KEY).unwrap(), vec![1, 2, 3]);
+
+        // 不正値は fail-fast（後続スライスで CP の token exp と齟齬を起こさせない）。
+        std::env::set_var(KEY, "5,abc,60");
+        assert!(parse_backoff_secs(KEY).is_err());
+
+        std::env::remove_var(KEY);
+    }
+}

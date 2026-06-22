@@ -1,0 +1,43 @@
+[package]
+name = "faas-worker"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "faas-worker"
+path = "src/main.rs"
+
+[dependencies]
+faas-shared = { workspace = true }
+
+tokio = { workspace = true }
+
+sqlx = { workspace = true }
+
+async-nats = { workspace = true }
+futures = "0.3"
+
+# --- Object Storage 本体取得 (§3.4): presigned GET URL の HTTP GET 用。
+#     rustls-tls のみ（OpenSSL 非依存）。
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
+# --- ダウンロード本体の sha256 検証 (§3.6)。
+sha2 = { workspace = true }
+# --- in-memory Component キャッシュ (§3.6)。
+lru = "0.12"
+
+wasmtime = { workspace = true }
+wasmtime-wasi = { workspace = true }
+
+serde = { workspace = true }
+serde_json = { workspace = true }
+chrono = { workspace = true }
+
+anyhow = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+
+# 観測（M4a, §3.8）。worker は /metrics + /readyz を返す最小 axum サーバを spawn する。
+# ルータ層のみ使うため tower-http は worker では不要（最小依存）。
+axum = { workspace = true }
+prometheus = { workspace = true }
