@@ -1,16 +1,16 @@
-# WASM FaaS Platform — M4 (運用成熟度)
+# WASM FaaS Platform — M5 (課金・メータリング基盤)
 
 [![CI](https://github.com/yukiharada1228/wasm-fass/actions/workflows/ci.yml/badge.svg?branch=develop)](https://github.com/yukiharada1228/wasm-fass/actions/workflows/ci.yml)
 
 WebAssembly Component をアップロードして invoke すると、Wasmtime Worker が実行して
-結果を返す FaaS プラットフォームです。本リポジトリの現状は **仕様書.md §15 の M4
-（運用成熟度）範囲**であり、M1 の invoke 経路・M2 のアップロード/検証/デプロイ・M3 の
+結果を返す FaaS プラットフォームです。本リポジトリの現状は **仕様書.md §15 の M5
+（課金・メータリング基盤）範囲**であり、M1 の invoke 経路・M2 のアップロード/検証/デプロイ・M3 の
 マルチテナント / 認証 / RLS / 結果出所認証 / Capability 強制 / 共有 admission ストア /
-大容量 I/O 退避の上に、Prometheus メトリクス + `/readyz`、`execution_id` を相関 ID とする
-構造化ログ、`.failed` (DLQ) subscriber と OS スレッドベースの epoch ticker による完全な
-リトライ/タイムアウト処理、`max_fuel` / `max_execution_time` を含む全リソース制限、
-テナント別クォータ上書き（`tenants.quotas` JSONB）と `Retry-After` 付き 429 バックプレッシャを
-追加します。
+大容量 I/O 退避・M4 の Prometheus メトリクス + `/readyz`・構造化ログ・`.failed` (DLQ) subscriber と
+OS スレッドベースの epoch ticker による完全なリトライ/タイムアウト処理・全リソース制限・
+テナント別クォータの上に、**per-execution の利用量計量（CPU fuel / wall time / peak memory /
+出力バイト）を終端 CAS と同一 tx で冪等に永続化し、テナント別期間集計（`usage_rollups`）と
+利用量参照 API（`GET /usage`）で課金可能にする**メータリング基盤を追加します。
 
 ```
                         ┌─ POST /components/{id}/versions (multipart) ─┐
@@ -55,6 +55,38 @@ Client ──HTTP──▶ control-plane ──put──▶ MinIO (Object Storag
   （§3.3 MUST NOT）。
 - `components/echo`: 入力をそのまま返す最小の Component（`wasm32-wasip2`）。アップロード対象の
   ローカル成果物。
+
+---
+
+## M5 スコープ（と非スコープ）
+
+仕様書.md §15 M5 に準拠。テナント別の利用量を冪等に計測・集計し課金可能にする。
+
+含む（per-execution 計量）:
+- `executions` に計量5列（`cpu_fuel_used` / `wall_time_ms` / `peak_memory_bytes` / `output_bytes` /
+  `invocation_count`。全 nullable で NULL=未計測）を additive 追加（`migrations/0007`）
+- worker が `MeteredLimits`(ResourceLimiter) で peak memory、`get_fuel` で fuel 消費、wall time、
+  出力バイトを計測し、`ResultMessage.usage`（`faas_shared::UsageMetrics`, serde default で後方互換）で運ぶ
+
+含む（冪等な集計・参照）:
+- 終端 writer（subscriber）の **CAS finalize の SET 句に計量列を同梱**し、CAS が遷移させたとき
+  だけ同一 tx 内で `usage_rollups`（テナント×UTC日×component 粒度）を UPSERT。再配送 / DLQ後着 /
+  sweeper先着は CAS が no-op になり rollup を触らない＝**二重計上が構造的に不可能**（冪等アンカー）
+- worker 計測値は信頼境界外としてバージョン上限に clamp。権威 limit を解決できない result は
+  invocation のみ計上しリソース指標は記録しない（fail-closed）
+- sweeper（reaper）で終端化した実行も rollup に計上（§15「欠落しない」）
+- `usage_rollups` は `FORCE ROW LEVEL SECURITY` + fail-closed tenant_isolation、`faas_app` は DELETE 不可（集計改竄防止）
+- 利用量参照 API `GET /usage`（read スコープ、`from`/`to` 期間集計、`principal.tenant_id` 権威化で IDOR 面なし）
+
+含まない（M6 以降の follow-up）:
+- 同期 Invoke / 外部イベントトリガー / Cron（M6, §15）
+- クォータ超過の課金的扱い（請求連携）・利用量の per-execution 明細 API
+
+> **完了条件（仕様書 §15 M5）**: 「障害注入（再配送・worker 落下・タイムアウト）下でも計量が
+> 二重計上/欠落せず、テナント別に時間窓集計が一致する」。`crates/control-plane/tests/chaos_m5.rs`
+> の E1（同一 Idempotency-Key の重複 invoke は +1 のみ）/ E2（distinct N 件はちょうど +N）で
+> end-to-end 検証済み（docker compose スタックに対し live 実走で 2/2 pass）。リソース指標は計測済み
+> succeeded 実行のみ寄与し、invocation/各 count は全終端で計上される（`GET /usage` のセマンティクス節参照）。
 
 ---
 
@@ -596,6 +628,17 @@ CHAOS_ALWAYS_TRAP=always-trap CHAOS_SLOW=slow \
 | `POST /invoke` | invoke | active version を解決し JobMessage を publish（202）。大入力時は予約済み `execution_id` + `input_ref`（完全一致検証, §3.4） |
 | `POST /uploads` | invoke | 大入力アップロード用 single-key presigned PUT URL を発行（`execution_id` 予約。行 INSERT/INCR なし, §5.2/§6.4） |
 | `GET /executions/{id}` | read | 実行状態の参照（`input_ref`/`output_ref` を含む, §6.4） |
+| `GET /usage` | read | **M5**: テナント利用量参照。`from`/`to`（`YYYY-MM-DD`・UTC・既定は直近30日）で期間集計を返す。`principal.tenant_id` を権威化（cross-tenant パスなし）, §15 |
+
+> **`GET /usage` の集計セマンティクス（課金解釈の明示, M5）**: `invocation_count` と
+> `succeeded_count`/`failed_count`/`timeout_count` は **全終端実行**で +1 される（worker 落下を
+> sweeper が `failed` 終端化したぶんも含む）。一方リソース指標（`cpu_fuel_used`/`wall_time_ms`/
+> `output_bytes` は SUM、`peak_memory_bytes_max` は MAX）は **計測値を持つ succeeded 実行のみ**が
+> 寄与する。DLQ・timeout・sweeper 経路は count を立てつつリソース指標は 0 加算となる（「半端行」）。
+> したがって `SUM(cpu_fuel_used)` 等を「全終端実行の総コスト」と解釈してはならない —
+> あくまで「計測済み実行のリソース合計」である。権威 `resource_limits` が解決できなかった result は
+> 信頼境界外の値を課金しないため、invocation は計上しつつリソース指標は記録しない（fail-closed）。
+> 0007 マイグレーション適用前の実行は計量を持たず集計に現れない（additive・backfill なし）。
 
 ---
 
@@ -635,12 +678,14 @@ migrations/0003_auth.sql   # M3a: users / api_tokens、faas_app ロール、認�
 migrations/0004_rls.sql    # M3b: 全テナント表に ENABLE / FORCE ROW LEVEL SECURITY とポリシー
 migrations/0005_provenance.sql  # M3c: 署名鍵 kid / idempotency_key UNIQUE / audit_logs (append-only)
 migrations/0006_large_io.sql    # M3d: input_ref / output_ref 列、tenants.quotas、大容量 I/O 用
+migrations/0007_usage_metering.sql  # M5: executions 計量5列 + usage_rollups（FORCE RLS / DELETE 不可）
 crates/shared/             # faas-shared: 型・NATS subject・メッセージ・エラー（共有契約の唯一の真実）
                            #   FailedMessage / failed_subject 等の M4c DLQ 型を含む
 crates/control-plane/      # faas-control-plane (bin): axum + storage(MinIO) + validation(wasmparser)
                            #   admission(Redis) / signing(Ed25519) / authz / RLS / subscriber
                            #   reaper + DLQ subscriber + metrics (M4a/c)
 crates/control-plane/tests/chaos_m4.rs  # M4 障害注入の end-to-end テスト（#[ignore]）
+crates/control-plane/tests/chaos_m5.rs  # M5 冪等会計の end-to-end テスト（E1: 重複は+1 / E2: N件は+N, #[ignore]）
 crates/control-plane/src/metrics.rs     # M4a: Prometheus Registry とメトリクス定義
 crates/worker/             # faas-worker (bin): wasmtime + async-nats + reqwest + cwasm キャッシュ
                            #   epoch ticker は OS スレッド (chaos_d 対策。M4b 設計メモ参照)
@@ -648,7 +693,7 @@ crates/worker/src/metrics.rs            # M4a: worker 側 Prometheus 公開（�
 components/echo/           # サンプル Component（cdylib, wasm32-wasip2）
 components/always-trap/    # M4 chaos_c 用: handle 入口で panic（trap → DLQ 経路）
 components/slow/           # M4 chaos_d 用: handle が tight loop（epoch interrupt → timeout 経路）
-仕様書.md                  # 全体仕様（M4 範囲は §15 M4 / §3.8 / §4.3 / §6.6 / §8）
+仕様書.md                  # 全体仕様（M4 範囲は §15 M4 / §3.8 / §4.3 / §6.6 / §8、M5 範囲は §15 M5 / §14 メータリング行）
 ```
 
 ---
@@ -657,9 +702,13 @@ components/slow/           # M4 chaos_d 用: handle が tight loop（epoch inter
 
 M4 完了済み（本リポジトリの現状）。次は M5 以降の将来⬜:
 
-- **M5 以降（§10 / §14）**: 分散トレーシング（OpenTelemetry）→ 同期 Invoke（reply subject） →
-  外部イベントトリガー → Result Ingestor 分離 → Workflow Engine / Cron → Secrets Manager →
-  AI 統合 → Multi Region。スケール要求が顕在化した時点で順次。
+- **M5 以降（商用マルチテナント SaaS 化, §15）**: 商用クラウド SaaS として成立させる段階実装。
+  基本線は **M5 課金・メータリング → M6 Invoke 拡充（同期 Invoke + 外部イベント/Cron トリガー）
+  → M7 デプロイ運用（canary / rollback / Secrets）→ M8 弾力スケール + テナント間アイソレーション
+  → M9 サンドボックス強化・サプライチェーン**。分散トレーシング（OpenTelemetry）は高レバレッジで
+  前倒し推奨。Workflow Engine / Result Ingestor 分離 / Multi Region は固定順序を持たない**需要発火型**。
+  AI/LLM はプラットフォーム機能ではなく Capability 経由の外部呼び出し（§4.4 / §13）で充足するため、
+  ロードマップ項目から除外。
 - **M4 follow-ups**（M4 範囲内で残る配線。`crates/control-plane/src/metrics.rs` 等の
   メトリクス登録は完了しているが record 配線が未到達）:
   - HTTP middleware で `faas_http_requests_total` / `_duration_seconds` の observe 配線

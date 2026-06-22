@@ -327,6 +327,34 @@ pub struct JobMessage {
     pub job_token: String,
 }
 
+/// worker が 1 実行ごとに計測したリソース利用量 (M5, §15)。
+///
+/// **信頼境界外**: worker は署名鍵を持たない非特権ランタイム (§3.3, keyless by design)
+/// であり、ここの値は worker が自己申告した計測値にすぎない。control-plane の subscriber は
+/// finalize 時にこれを `ResourceLimits` 由来の上限で sanity clamp してから永続化する
+/// （過大値による課金水増し/桁あふれ防止）。clamp 方針は subscriber 側の唯一の真実とする。
+///
+/// `invocation_count` は常に 1 であり wire には載せない（CP 側で固定。改竄面を減らす）。
+/// 全フィールド `#[serde(default)]` で前方/後方互換: 旧 worker が一部欠損 JSON を出しても
+/// 欠けたフィールドは 0 に補完される。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UsageMetrics {
+    /// 消費 fuel（= 設定 fuel − 残 fuel）。CPU 時間の代理量 (§15)。
+    /// fuel 無効化時（`max_fuel` 未設定）は意味を持たないため worker 側で 0 に倒す。
+    #[serde(default)]
+    pub cpu_fuel_used: u64,
+    /// 実行壁時計時間（ミリ秒）。`exec_started.elapsed()` 相当。
+    #[serde(default)]
+    pub wall_time_ms: u64,
+    /// ピークメモリ（バイト）。`StoreLimits`/`ResourceLimiter` 経由で取得。
+    /// 取得できない wasmtime バージョンでは 0（未計測）にフォールバックする。
+    #[serde(default)]
+    pub peak_memory_bytes: u64,
+    /// 出力バイト数（出力エンコード後）。egress 計量の元。
+    #[serde(default)]
+    pub output_bytes: u64,
+}
+
 /// result subject に流れる実行結果 (§6.5)。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ResultMessage {
@@ -345,6 +373,13 @@ pub struct ResultMessage {
     /// 旧 worker のメッセージとの互換のため serde default（空 -> drop+audit）。
     #[serde(default)]
     pub job_token: String,
+    /// M5 (§15): worker が自己申告する per-execution 計量。**信頼境界外**であり、
+    /// worker は鍵を持たない非特権ランタイム (§3.3)。subscriber は finalize 時に
+    /// sanity clamp してから永続化する（過大値による課金水増し/桁あふれ防止）。
+    /// `Option` にするのは、失敗/timeout の result で計量が部分的に欠ける場合を
+    /// `None` で表現でき、かつ旧 worker（`usage` キー欠損）と互換だからである。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub usage: Option<UsageMetrics>,
 }
 
 /// `tenant.*.component.failed` (DLQ) に流れる失敗通知 (M4c, §3.3 / §6.6)。
@@ -1018,11 +1053,89 @@ mod tests {
             output: Some(serde_json::json!({"ok": true})),
             error: None,
             job_token: "hdr.sig".into(),
+            usage: None,
         };
         let json = serde_json::to_string(&res).unwrap();
         let back: ResultMessage = serde_json::from_str(&json).unwrap();
         assert_eq!(back.job_token, "hdr.sig");
         assert_eq!(back.status, ExecutionStatus::Succeeded);
+    }
+
+    /// M5 (§15): 旧 worker の result（`usage` キー欠損）は serde(default) で `usage == None`
+    /// として復号でき、後方互換が壊れない（worker→CP の唯一契約・不変条件 #4）。
+    #[test]
+    fn result_message_decodes_without_usage_field() {
+        let res_json = r#"{"execution_id":"exec_1","tenant_id":"default","status":"succeeded","output":null,"error":null,"job_token":"hdr.sig"}"#;
+        let res: ResultMessage = serde_json::from_str(res_json).unwrap();
+        assert_eq!(res.usage, None);
+    }
+
+    /// M5 (§15): 全フィールド有りの `UsageMetrics` を載せた result を to_string→from_str すると
+    /// 計量が一致する（worker 計測値が wire を往復しても欠損しない）。
+    #[test]
+    fn result_message_roundtrip_includes_usage() {
+        let res = ResultMessage {
+            execution_id: "exec_1".into(),
+            tenant_id: "ten_a".into(),
+            status: ExecutionStatus::Succeeded,
+            output: Some(serde_json::json!({"ok": true})),
+            error: None,
+            job_token: "hdr.sig".into(),
+            usage: Some(UsageMetrics {
+                cpu_fuel_used: 123_456,
+                wall_time_ms: 42,
+                peak_memory_bytes: 1_048_576,
+                output_bytes: 17,
+            }),
+        };
+        let json = serde_json::to_string(&res).unwrap();
+        let back: ResultMessage = serde_json::from_str(&json).unwrap();
+        assert_eq!(
+            back.usage,
+            Some(UsageMetrics {
+                cpu_fuel_used: 123_456,
+                wall_time_ms: 42,
+                peak_memory_bytes: 1_048_576,
+                output_bytes: 17,
+            })
+        );
+    }
+
+    /// M5 (§15): `usage == None` の result をシリアライズすると `usage` キーが現れない
+    /// （`skip_serializing_if`）。旧 CP/worker が読んでも未知キーで困らない。
+    #[test]
+    fn result_message_none_usage_is_omitted_from_wire() {
+        let res = ResultMessage {
+            execution_id: "exec_1".into(),
+            tenant_id: "ten_a".into(),
+            status: ExecutionStatus::Failed,
+            output: None,
+            error: Some("boom".into()),
+            job_token: "hdr.sig".into(),
+            usage: None,
+        };
+        let json = serde_json::to_string(&res).unwrap();
+        assert!(
+            !json.contains("usage"),
+            "None usage must be omitted from wire, got: {json}"
+        );
+    }
+
+    /// M5 (§15): `usage` の一部フィールド欠損（`cpu_fuel_used` のみ）でも
+    /// `#[serde(default)]` で他フィールドが 0 に補完される（前方/後方互換）。
+    #[test]
+    fn usage_metrics_partial_json_defaults_missing_to_zero() {
+        let res_json = r#"{"execution_id":"exec_1","tenant_id":"default","status":"succeeded","output":null,"error":null,"job_token":"hdr.sig","usage":{"cpu_fuel_used":999}}"#;
+        let res: ResultMessage = serde_json::from_str(res_json).unwrap();
+        assert_eq!(
+            res.usage,
+            Some(UsageMetrics {
+                cpu_fuel_used: 999,
+                wall_time_ms: 0,
+                peak_memory_bytes: 0,
+                output_bytes: 0,
+            })
+        );
     }
 
     fn sample_claims() -> JobClaims {

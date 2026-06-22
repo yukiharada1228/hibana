@@ -252,6 +252,9 @@ fn build_router(state: AppState) -> Router {
             get(handlers::list_versions),
         )
         .route("/executions/{id}", get(handlers::get_execution))
+        // GET /usage: テナント利用量参照 (M5, §15 / §6.0)。principal.tenant_id を権威化し
+        // cross-tenant path を持たない（/tenants/{id}/usage の IDOR 面を作らない）。
+        .route("/usage", get(handlers::get_usage))
         .route_layer(axum::middleware::from_fn(require_scope(Scope::Read)));
 
     // --- Invoke スコープ ---
@@ -536,5 +539,80 @@ fn init_tracing(log_format: &str) {
             .init();
     } else {
         fmt().with_env_filter(filter).init();
+    }
+}
+
+#[cfg(test)]
+mod migration_tests {
+    use super::MIGRATOR;
+
+    // 0007_usage_metering.sql のソースを**コンパイル時**に埋め込む（DB-free 検査用）。
+    // MIGRATOR と同じ migrations/ ディレクトリを参照する（main.rs から見た相対パス）。
+    const USAGE_METERING_SQL: &str = include_str!("../../../migrations/0007_usage_metering.sql");
+
+    // MIGRATOR が 0007 を**コンパイル時収集**していること（sqlx::migrate! の埋め込み検証）。
+    // live DB を要さない（iter() は埋め込み済みメタデータを走査するだけ）。
+    #[test]
+    fn migrator_includes_version_7() {
+        let v7 = MIGRATOR
+            .iter()
+            .find(|m| m.version == 7)
+            .expect("migration version 7 (0007_usage_metering) must be collected by MIGRATOR");
+        // ファイル名由来の description（usage_metering）が拾えていること。
+        assert!(
+            v7.description.contains("usage") || v7.description.contains("metering"),
+            "unexpected 0007 description: {}",
+            v7.description
+        );
+    }
+
+    // 0007 を BASELINE_VERSIONS に入れていないこと（= MIGRATOR.run が通常適用する。
+    // baseline は手動適用済み 0001/0002 のみに限定し続ける）。
+    #[test]
+    fn version_7_is_not_baselined() {
+        assert!(
+            !super::BASELINE_VERSIONS.iter().any(|(v, _)| *v == 7),
+            "0007 must not be baselined; MIGRATOR.run applies it normally"
+        );
+    }
+
+    // usage_rollups の DDL 不変条件（DB-free 文字列検査）: FORCE RLS + fail-closed tenant_isolation。
+    #[test]
+    fn usage_rollups_is_force_rls_and_fail_closed() {
+        assert!(
+            USAGE_METERING_SQL.contains("usage_rollups FORCE  ROW LEVEL SECURITY")
+                || USAGE_METERING_SQL.contains("usage_rollups FORCE ROW LEVEL SECURITY"),
+            "usage_rollups must FORCE ROW LEVEL SECURITY"
+        );
+        assert!(
+            USAGE_METERING_SQL.contains("current_setting('app.tenant_id')"),
+            "tenant_isolation must gate on current_setting('app.tenant_id')"
+        );
+        // fail-closed: 第 2 引数フォールバック（', true)' / ', TRUE)'）を持たないこと（未設定 GUC は ERROR）。
+        assert!(
+            !USAGE_METERING_SQL.contains("current_setting('app.tenant_id', true)")
+                && !USAGE_METERING_SQL.contains("current_setting('app.tenant_id', TRUE)"),
+            "tenant_isolation must NOT use the second-arg fallback (must fail closed)"
+        );
+    }
+
+    // faas_app に DELETE を付与しないこと（集計の改竄/消去を不可にする）。
+    #[test]
+    fn usage_rollups_does_not_grant_delete_to_faas_app() {
+        // GRANT 句は SELECT/INSERT/UPDATE のみ（DELETE を含まない）。
+        assert!(
+            USAGE_METERING_SQL
+                .contains("GRANT  SELECT, INSERT, UPDATE ON usage_rollups TO   faas_app;")
+                || USAGE_METERING_SQL
+                    .contains("GRANT SELECT, INSERT, UPDATE ON usage_rollups TO faas_app;"),
+            "faas_app must be granted only SELECT/INSERT/UPDATE on usage_rollups"
+        );
+        // DELETE は防御的に REVOKE され、GRANT ... DELETE ... は存在しないこと。
+        assert!(
+            USAGE_METERING_SQL.contains("REVOKE DELETE")
+                && !USAGE_METERING_SQL.contains("GRANT  SELECT, INSERT, UPDATE, DELETE")
+                && !USAGE_METERING_SQL.contains("GRANT SELECT, INSERT, UPDATE, DELETE"),
+            "DELETE must not be granted to faas_app on usage_rollups"
+        );
     }
 }

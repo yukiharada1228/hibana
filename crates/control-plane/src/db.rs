@@ -3,12 +3,12 @@
 //! 列構成は migrations/0001_init.sql に厳密対応。M1 は単一テナント 'default'。
 //! 将来 (M3) のテナント分離に備え、関数は常に `tenant_id` を受け取る。
 
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, NaiveDate, Utc};
 use serde_json::Value;
 use sqlx::postgres::PgRow;
 use sqlx::Row;
 
-use faas_shared::{ExecutionStatus, Role, Scope};
+use faas_shared::{ExecutionStatus, Role, Scope, UsageMetrics};
 
 use crate::auth::Principal;
 
@@ -378,15 +378,19 @@ pub async fn find_execution_by_idempotency_key(
 /// subscriber のトークン claim 突き合わせ用に、実行行の最小情報を引く（M3c）。
 ///
 /// 署名 claim（execution_id / tenant_id / version_id）を行の権威値と照合するため、
-/// `(version_id, status)` のみ返す（行不在は `None` → 「未知の execution」として drop+audit）。
-/// tenant_id は呼び出し側が GUC（subject 由来テナント）で既に拘束しているため返さない。
+/// `(component_id, version_id, status)` を返す（行不在は `None` → 「未知の execution」として
+/// drop+audit）。tenant_id は呼び出し側が GUC（subject 由来テナント）で既に拘束しているため返さない。
+///
+/// M5 (§15): `component_id` は finalize と同一 tx で打つ `usage_rollups` の集計キー
+/// （テナント×UTC日×component）に必要なため同一行から追加で引く（同じ行参照なので追加コスト最小・
+/// RLS 下でも副作用なし）。
 pub async fn find_execution_provenance(
     executor: impl sqlx::PgExecutor<'_>,
     tenant_id: &str,
     execution_id: &str,
-) -> Result<Option<(String, String)>, sqlx::Error> {
+) -> Result<Option<(String, String, String)>, sqlx::Error> {
     let row = sqlx::query(
-        "SELECT version_id, status FROM executions \
+        "SELECT component_id, version_id, status FROM executions \
          WHERE tenant_id = $1 AND id = $2",
     )
     .bind(tenant_id)
@@ -396,9 +400,37 @@ pub async fn find_execution_provenance(
 
     row.map(|r| {
         Ok((
+            r.try_get::<String, _>("component_id")?,
             r.try_get::<String, _>("version_id")?,
             r.try_get::<String, _>("status")?,
         ))
+    })
+    .transpose()
+}
+
+/// version_id から `ResourceLimits`（JSONB）を解決する (M5, §15)。
+///
+/// finalize 経路で worker 自己申告の計量を sanity clamp する上限を引くために使う（worker の
+/// `get_limits` と同じ `component_versions.resource_limits` を参照する＝同一権威値で clamp する）。
+/// 行不在は `None`、JSONB のパース失敗時は `ResourceLimits::default()` にフォールバックする
+/// （壁時計上限の解決と同じ `unwrap_or_default` 規約）。
+pub async fn find_version_resource_limits(
+    executor: impl sqlx::PgExecutor<'_>,
+    tenant_id: &str,
+    version_id: &str,
+) -> Result<Option<faas_shared::ResourceLimits>, sqlx::Error> {
+    let row = sqlx::query(
+        "SELECT resource_limits FROM component_versions \
+         WHERE tenant_id = $1 AND id = $2",
+    )
+    .bind(tenant_id)
+    .bind(version_id)
+    .fetch_optional(executor)
+    .await?;
+
+    row.map(|r| {
+        let limits_json: Value = r.try_get("resource_limits")?;
+        Ok(serde_json::from_value::<faas_shared::ResourceLimits>(limits_json).unwrap_or_default())
     })
     .transpose()
 }
@@ -715,25 +747,48 @@ pub async fn count_inflight_executions(
 /// `created_at < now() - deadline` の非終端行を failed に倒し、呼び出し側が各行を DECR して回収する。
 ///
 /// executions は FORCE RLS 下のため、呼び出し側は事前に同一 tx で `set_tenant_guc(tenant)` 済みのこと。
-/// 返す id 群が「この pass で実際に pending/running → failed へ遷移させた行」（CAS で 1 度きり）。
+/// 返す行群が「この pass で実際に pending/running → failed へ遷移させた行」（CAS で 1 度きり）。
+///
+/// M5 (§15「欠落しない」): 各行は `id` に加え `component_id` と `period_start`（この UPDATE が打った
+/// `finished_at` 由来の UTC 日）を返す。呼び出し側（reaper）はこれを使い、sweeper で終端化した実行も
+/// `usage_rollups` に `failed` として計上する（invocation +1 / failed +1 / リソース指標 0）。これにより
+/// 「worker 落下で sweeper が終端化した実行が集計に乗らない」欠落を塞ぐ。sweep は CAS（既終端は WHERE で
+/// 除外）なので再走しても同じ行は返らず、rollup も二重計上にならない。
 pub async fn finalize_stuck_executions(
     executor: impl sqlx::PgExecutor<'_>,
     tenant_id: &str,
     deadline_secs: i64,
-) -> Result<Vec<String>, sqlx::Error> {
+) -> Result<Vec<SweptExecution>, sqlx::Error> {
     let rows = sqlx::query(STUCK_EXECUTION_SWEEP_SQL)
         .bind(tenant_id)
         .bind(deadline_secs)
         .fetch_all(executor)
         .await?;
     rows.into_iter()
-        .map(|r| r.try_get::<String, _>("id"))
+        .map(|r| {
+            Ok(SweptExecution {
+                id: r.try_get::<String, _>("id")?,
+                component_id: r.try_get::<String, _>("component_id")?,
+                period_start: r.try_get::<NaiveDate, _>("period_start")?,
+            })
+        })
         .collect()
 }
 
+/// `finalize_stuck_executions` が CAS で `failed` 化した 1 行。sweeper 経路の rollup 計上に必要な
+/// 最小情報（集計キー）を持つ (M5, §15)。
+#[derive(Debug, Clone)]
+pub struct SweptExecution {
+    pub id: String,
+    pub component_id: String,
+    /// この UPDATE が打った `finished_at`（DB の `now()`）由来の UTC 日。`usage_rollups.period_start`。
+    pub period_start: NaiveDate,
+}
+
 /// `finalize_stuck_executions` の SQL。`created_at < now() - deadline` の非終端（pending/running）
-/// 行のみを `failed` に遷移させ（CAS: 既終端は WHERE で除外）、遷移した行の id を返す。
+/// 行のみを `failed` に遷移させ（CAS: 既終端は WHERE で除外）、遷移した行の集計キーを返す。
 /// `$2` は INTERVAL の秒数。`error` には sweeper 由来であることを記録する（監査・調査用）。
+/// M5: rollup 計上のため `component_id` と `period_start`（finished_at 由来 UTC 日, 単一時計源）も返す。
 const STUCK_EXECUTION_SWEEP_SQL: &str = "UPDATE executions \
      SET status = 'failed', \
          error = '\"execution exceeded delivery deadline without a terminal result (stuck-execution sweeper)\"'::jsonb, \
@@ -741,12 +796,27 @@ const STUCK_EXECUTION_SWEEP_SQL: &str = "UPDATE executions \
      WHERE tenant_id = $1 \
        AND status IN ('pending', 'running') \
        AND created_at < now() - make_interval(secs => $2::double precision) \
-     RETURNING id";
+     RETURNING id, component_id, (finished_at AT TIME ZONE 'UTC')::date AS period_start";
 
 /// 結果メッセージを CAS 的に反映する (§ result subscriber)。
 ///
 /// 終端状態 (succeeded/failed/timeout) へは「まだ終端でないときだけ」遷移させる。
 /// これにより重複配送 / 競合更新が冪等になる。更新された行数を返す。
+///
+/// M5 (§15): per-execution 計量列（cpu_fuel_used / wall_time_ms / peak_memory_bytes /
+/// output_bytes / invocation_count）を **同一 CAS UPDATE の SET 句**に同梱する。これが計量の
+/// 冪等アンカー: status と計量が同一行・同一述語（`status NOT IN terminal`）で原子更新されるため、
+/// 再配送・worker 多重実行・DLQ 後着は既終端行に当たって rows_affected==0 となり、status だけ no-op で
+/// 計量だけ書かれる窓が存在しない（二重計上が構造的に不可能）。`usage` が `None`（旧 worker / DLQ /
+/// 未計測）なら計量列は NULL のまま書く（0=計測して 0 と NULL=未計測 を区別）。`invocation_count` は
+/// wire に載らないため CP 側で固定（`usage` 有りで 1, 無しで NULL）。`usage` は呼び出し側で
+/// `ResourceLimits` 上限に clamp 済み（信頼境界外対策）であることを前提とする。
+///
+/// 戻り値: CAS が実際に pending/running→終端へ遷移させたとき `Some(period_start)`、既終端 / 行なしで
+/// no-op だったとき `None`。`period_start` は `RETURNING (finished_at AT TIME ZONE 'UTC')::date` で
+/// この UPDATE が打った `finished_at`（= DB の `now()`）から導出した **UTC 日**であり、`usage_rollups`
+/// の `period_start` に使う。CP 側の `Utc::now()` ではなく **同一 finalize の単一時計源**にすることで、
+/// per-execution の `finished_at` と集計の日付帰属が UTC 日境界をまたぐ瞬間にもズレない（§15 M5）。
 pub async fn finalize_execution(
     executor: impl sqlx::PgExecutor<'_>,
     tenant_id: &str,
@@ -754,29 +824,201 @@ pub async fn finalize_execution(
     status: ExecutionStatus,
     output: Option<&Value>,
     error: Option<&Value>,
-) -> Result<u64, sqlx::Error> {
+    usage: Option<&UsageMetrics>,
+) -> Result<Option<NaiveDate>, sqlx::Error> {
     debug_assert!(status.is_terminal());
 
-    let result = sqlx::query(FINALIZE_EXECUTION_SQL)
+    // 計量列は nullable（BIGINT/INTEGER）。usage None のときは全て NULL バインドする。
+    // u64 → i64 の格納は clamp 済み前提だが、念のため飽和でオーバーフローを避ける。
+    let cpu_fuel_used = usage.map(|u| saturating_i64(u.cpu_fuel_used));
+    let wall_time_ms = usage.map(|u| saturating_i64(u.wall_time_ms));
+    let peak_memory_bytes = usage.map(|u| saturating_i64(u.peak_memory_bytes));
+    let output_bytes = usage.map(|u| saturating_i64(u.output_bytes));
+    let invocation_count: Option<i32> = usage.map(|_| 1);
+
+    // RETURNING を `fetch_optional` で受ける: CAS が当たれば 1 行（period_start: UTC 日）、
+    // 既終端で当たらなければ 0 行（None）。rows_affected を数える代わりに、遷移有無と
+    // 集計用日付を **1 ステートメント**で同時に得る（二重計上の冪等アンカーは不変）。
+    let period_start: Option<NaiveDate> = sqlx::query_scalar(FINALIZE_EXECUTION_SQL)
         .bind(tenant_id)
         .bind(execution_id)
         .bind(status.as_str())
         .bind(output)
         .bind(error)
+        .bind(cpu_fuel_used)
+        .bind(wall_time_ms)
+        .bind(peak_memory_bytes)
+        .bind(output_bytes)
+        .bind(invocation_count)
+        .fetch_optional(executor)
+        .await?;
+
+    Ok(period_start)
+}
+
+/// `u64` を `i64`（Postgres BIGINT）へ飽和変換する。計量は呼び出し側で `ResourceLimits` 上限に
+/// clamp 済み（信頼境界外対策）だが、二重防御として `i64::MAX` で頭打ちにし、桁あふれによる
+/// 負値混入や格納失敗を防ぐ（純関数・DB 非依存でテスト可能）。
+fn saturating_i64(v: u64) -> i64 {
+    v.min(i64::MAX as u64) as i64
+}
+
+/// finalize と同一 tx で打つ `usage_rollups` の増分 UPSERT (M5, §15)。
+///
+/// 集計粒度はテナント×UTC日（`period_start`）×component。`ON CONFLICT (tenant_id, period_start,
+/// component_id)` の複合 PK を競合ターゲットにして、SUM 列（invocation_count / cpu_fuel_used /
+/// wall_time_ms / output_bytes / 各 count）は加算、`peak_memory_bytes_max` は `GREATEST` で MAX 更新する。
+///
+/// **冪等の要**: 呼び出し側（`commit_finalize_and_release`）は `finalize_execution` が実際に
+/// pending/running→終端へ遷移させた（rows_affected==1）ときだけ本関数を呼ぶ。再配送 / 既終端 /
+/// sweeper 先着（updated==0）では一切呼ばない＝二重計上しない。さらに finalize の UPDATE と同一 tx 内・
+/// commit 前に発行されるため、『executions は終端化したが rollup は未反映』『rollup は加算したが finalize は
+/// ロールバック』という乖離は起きない（all-or-nothing）。
+///
+/// `invocation_count` は全終端で +1 し、`status` から `succeeded_count`/`failed_count`/`timeout_count`
+/// のどれか 1 つを +1 する。`usage` のリソース指標（cpu/wall/peak/output）は計測済みなら加算、DLQ/timeout の
+/// `UsageMetrics::default()`（= 全 0）なら 0 加算となる（invocation は全終端で計上、リソースは計測済みのみ
+/// という半端行になりうる; 解釈は API ドキュメントで明示する, §15 設計）。
+pub async fn upsert_usage_rollup(
+    executor: impl sqlx::PgExecutor<'_>,
+    tenant_id: &str,
+    component_id: &str,
+    period_start: NaiveDate,
+    status: ExecutionStatus,
+    usage: &UsageMetrics,
+) -> Result<(), sqlx::Error> {
+    debug_assert!(status.is_terminal());
+
+    // status から終端カウンタの 0/1 を導出する（DLQ は常に Failed に倒される）。
+    let succeeded_count: i64 = (status == ExecutionStatus::Succeeded) as i64;
+    let failed_count: i64 = (status == ExecutionStatus::Failed) as i64;
+    let timeout_count: i64 = (status == ExecutionStatus::Timeout) as i64;
+
+    sqlx::query(UPSERT_USAGE_ROLLUP_SQL)
+        .bind(tenant_id)
+        .bind(period_start)
+        .bind(component_id)
+        .bind(saturating_i64(usage.cpu_fuel_used))
+        .bind(saturating_i64(usage.wall_time_ms))
+        .bind(saturating_i64(usage.peak_memory_bytes))
+        .bind(saturating_i64(usage.output_bytes))
+        .bind(succeeded_count)
+        .bind(failed_count)
+        .bind(timeout_count)
         .execute(executor)
         .await?;
 
-    Ok(result.rows_affected())
+    Ok(())
+}
+
+/// `upsert_usage_rollup` が発行する増分 UPSERT SQL。複合 PK を競合ターゲットに、SUM 列は加算、
+/// `peak_memory_bytes_max` は `GREATEST`（MAX セマンティクス）で更新する。定数に切り出して
+/// DB 非依存のユニットテストで集計セマンティクスを静的検査できるようにする。
+const UPSERT_USAGE_ROLLUP_SQL: &str = "INSERT INTO usage_rollups \
+     (tenant_id, period_start, component_id, invocation_count, cpu_fuel_used, wall_time_ms, \
+      peak_memory_bytes_max, output_bytes, succeeded_count, failed_count, timeout_count) \
+     VALUES ($1, $2, $3, 1, $4, $5, $6, $7, $8, $9, $10) \
+     ON CONFLICT (tenant_id, period_start, component_id) DO UPDATE SET \
+       invocation_count = usage_rollups.invocation_count + 1, \
+       cpu_fuel_used = usage_rollups.cpu_fuel_used + EXCLUDED.cpu_fuel_used, \
+       wall_time_ms = usage_rollups.wall_time_ms + EXCLUDED.wall_time_ms, \
+       peak_memory_bytes_max = GREATEST(usage_rollups.peak_memory_bytes_max, EXCLUDED.peak_memory_bytes_max), \
+       output_bytes = usage_rollups.output_bytes + EXCLUDED.output_bytes, \
+       succeeded_count = usage_rollups.succeeded_count + EXCLUDED.succeeded_count, \
+       failed_count = usage_rollups.failed_count + EXCLUDED.failed_count, \
+       timeout_count = usage_rollups.timeout_count + EXCLUDED.timeout_count, \
+       updated_at = now()";
+
+/// `GET /usage` の応答用 component 別集計 1 行 (M5, §15 / §6.0)。
+///
+/// `usage_rollups`（テナント×UTC日×component 粒度）を期間で `GROUP BY component_id` した結果。
+/// SUM 列は和、`peak_memory_bytes_max` は期間内の最大（行レベルの MAX セマンティクスをさらに集約）。
+/// `invocation_count` は全終端で +1 されているため、計測済みリソース指標を持たない DLQ/timeout も
+/// 含む（解釈は API ドキュメント参照: invocation は全終端、リソース指標は計測済みのみ）。
+#[derive(Debug, Clone)]
+pub struct UsageRollupRow {
+    pub component_id: String,
+    pub invocation_count: i64,
+    pub cpu_fuel_used: i64,
+    pub wall_time_ms: i64,
+    pub peak_memory_bytes_max: i64,
+    pub output_bytes: i64,
+    pub succeeded_count: i64,
+    pub failed_count: i64,
+    pub timeout_count: i64,
+}
+
+/// `GET /usage` 用に `usage_rollups` を期間集計する (M5, §15 / §6.0, read スコープ)。
+///
+/// `period_start`（UTC 日境界）が `[from, to]`（両端含む）にある行を component 別に集約する。
+/// `tenant_id` は RLS の GUC（`set_tenant_guc`）と二重防御で WHERE にもバインドする（既存 db
+/// クエリ規約。文字列結合はしない: injection 防止）。`component_id` が `Some` なら単一 component に
+/// 絞り込む（`$4::text IS NULL OR ...` で NULL なら全件）。totals はハンドラ側で本行を畳んで算出する。
+pub async fn get_usage_rollups(
+    executor: impl sqlx::PgExecutor<'_>,
+    tenant_id: &str,
+    from: NaiveDate,
+    to: NaiveDate,
+    component_id: Option<&str>,
+) -> Result<Vec<UsageRollupRow>, sqlx::Error> {
+    let rows = sqlx::query(
+        // SUM(bigint) は Postgres では NUMERIC を返すため、各集計を ::bigint へ明示キャストして
+        // Rust 側の i64 デコード（UsageRollupRow）と型を一致させる（MAX は元の bigint を保つ）。
+        // 行数 × 各列とも実運用域では i64 に収まる（saturating_i64 で書込時に頭打ち済み）。
+        "SELECT component_id, \
+                SUM(invocation_count)::bigint AS invocation_count, \
+                SUM(cpu_fuel_used)::bigint AS cpu_fuel_used, \
+                SUM(wall_time_ms)::bigint AS wall_time_ms, \
+                MAX(peak_memory_bytes_max) AS peak_memory_bytes_max, \
+                SUM(output_bytes)::bigint AS output_bytes, \
+                SUM(succeeded_count)::bigint AS succeeded_count, \
+                SUM(failed_count)::bigint AS failed_count, \
+                SUM(timeout_count)::bigint AS timeout_count \
+         FROM usage_rollups \
+         WHERE tenant_id = $1 AND period_start >= $2 AND period_start <= $3 \
+           AND ($4::text IS NULL OR component_id = $4) \
+         GROUP BY component_id \
+         ORDER BY component_id",
+    )
+    .bind(tenant_id)
+    .bind(from)
+    .bind(to)
+    .bind(component_id)
+    .fetch_all(executor)
+    .await?;
+
+    rows.into_iter()
+        .map(|r| {
+            Ok(UsageRollupRow {
+                component_id: r.try_get("component_id")?,
+                invocation_count: r.try_get("invocation_count")?,
+                cpu_fuel_used: r.try_get("cpu_fuel_used")?,
+                wall_time_ms: r.try_get("wall_time_ms")?,
+                peak_memory_bytes_max: r.try_get("peak_memory_bytes_max")?,
+                output_bytes: r.try_get("output_bytes")?,
+                succeeded_count: r.try_get("succeeded_count")?,
+                failed_count: r.try_get("failed_count")?,
+                timeout_count: r.try_get("timeout_count")?,
+            })
+        })
+        .collect()
 }
 
 /// `finalize_execution` が発行する SQL。終端遷移は **CAS**（compare-and-set）で行う:
 /// `WHERE ... AND status NOT IN (terminal)` により、既に終端の行には 0 行しか当たらない
 /// （= 重複 result の再配送や worker 多重実行があっても終端状態を上書きしない, §6.6）。
 /// 定数に切り出して DB 非依存のユニットテストで CAS ガードの存在を検査できるようにする。
+/// M5 (§15): per-execution 計量列（$6..$10）を同一 SET 句に同梱する。CAS ガード
+/// （`WHERE ... AND status NOT IN (terminal)`）は不変。これにより重複 result は 0 行更新となり、
+/// 計量列も同時に no-op になる（status と計量が同一行・同一述語で原子更新されるため、status だけ no-op で
+/// 計量だけ書かれる窓が存在しない＝二重計上が構造的に不可能）。
 const FINALIZE_EXECUTION_SQL: &str = "UPDATE executions \
-     SET status = $3, output = $4, error = $5, finished_at = now() \
+     SET status = $3, output = $4, error = $5, finished_at = now(), \
+         cpu_fuel_used = $6, wall_time_ms = $7, peak_memory_bytes = $8, \
+         output_bytes = $9, invocation_count = $10 \
      WHERE tenant_id = $1 AND id = $2 \
-       AND status NOT IN ('succeeded', 'failed', 'timeout')";
+       AND status NOT IN ('succeeded', 'failed', 'timeout') \
+     RETURNING (finished_at AT TIME ZONE 'UTC')::date AS period_start";
 
 // ---------------------------------------------------------------------------
 // 認証・認可: users / api_tokens (§3.3 / §6.0)
@@ -1131,7 +1373,8 @@ pub async fn insert_audit_log(
 #[cfg(test)]
 mod tests {
     use super::{
-        TenantQuotaOverrides, FINALIZE_EXECUTION_SQL, SET_TENANT_GUC_SQL, STUCK_EXECUTION_SWEEP_SQL,
+        saturating_i64, TenantQuotaOverrides, FINALIZE_EXECUTION_SQL, SET_TENANT_GUC_SQL,
+        STUCK_EXECUTION_SWEEP_SQL, UPSERT_USAGE_ROLLUP_SQL,
     };
 
     // ---- M4d クォータ上書き JSONB のパース不変条件（DB 非依存）-----------------
@@ -1197,10 +1440,68 @@ mod tests {
         // tenant_id / id はバインドパラメータ（テナント境界 + injection 防止）。
         assert!(FINALIZE_EXECUTION_SQL.contains("tenant_id = $1"));
         assert!(FINALIZE_EXECUTION_SQL.contains("id = $2"));
-        // 単一 UPDATE（DELETE/INSERT を伴わない）。
+        // 単一 UPDATE（DELETE を伴わない）。
         let upper = FINALIZE_EXECUTION_SQL.to_ascii_uppercase();
         assert!(upper.starts_with("UPDATE EXECUTIONS"));
         assert!(!upper.contains("DELETE"));
+        // M5 (§15): 計量列を同一 SET 句に同梱する（status と計量が同一行・同一述語で原子更新される）。
+        for col in [
+            "cpu_fuel_used = $6",
+            "wall_time_ms = $7",
+            "peak_memory_bytes = $8",
+            "output_bytes = $9",
+            "invocation_count = $10",
+        ] {
+            assert!(
+                FINALIZE_EXECUTION_SQL.contains(col),
+                "finalize must carry metering column {col} in the same CAS UPDATE"
+            );
+        }
+    }
+
+    /// M5 (§15): rollup の増分 UPSERT は (1) 複合 PK を競合ターゲットにし、(2) SUM 列を加算、
+    /// (3) `peak_memory_bytes_max` は `GREATEST`（MAX セマンティクス）で更新する。DB 非依存で
+    /// SQL テキストの集計セマンティクスを静的検査する（退行ガード）。
+    #[test]
+    fn upsert_usage_rollup_sql_has_sum_and_max_semantics() {
+        // 複合 PK を競合ターゲットにする。
+        assert!(UPSERT_USAGE_ROLLUP_SQL
+            .contains("ON CONFLICT (tenant_id, period_start, component_id) DO UPDATE"));
+        // SUM 列は既存値に加算する。
+        assert!(UPSERT_USAGE_ROLLUP_SQL
+            .contains("invocation_count = usage_rollups.invocation_count + 1"));
+        assert!(UPSERT_USAGE_ROLLUP_SQL
+            .contains("cpu_fuel_used = usage_rollups.cpu_fuel_used + EXCLUDED.cpu_fuel_used"));
+        assert!(UPSERT_USAGE_ROLLUP_SQL
+            .contains("wall_time_ms = usage_rollups.wall_time_ms + EXCLUDED.wall_time_ms"));
+        assert!(UPSERT_USAGE_ROLLUP_SQL
+            .contains("output_bytes = usage_rollups.output_bytes + EXCLUDED.output_bytes"));
+        // peak は MAX（GREATEST）で更新する（SUM ではない）。
+        assert!(UPSERT_USAGE_ROLLUP_SQL.contains(
+            "peak_memory_bytes_max = GREATEST(usage_rollups.peak_memory_bytes_max, EXCLUDED.peak_memory_bytes_max)"
+        ));
+        // 終端カウンタも加算する。
+        assert!(UPSERT_USAGE_ROLLUP_SQL.contains(
+            "succeeded_count = usage_rollups.succeeded_count + EXCLUDED.succeeded_count"
+        ));
+        assert!(UPSERT_USAGE_ROLLUP_SQL
+            .contains("failed_count = usage_rollups.failed_count + EXCLUDED.failed_count"));
+        assert!(UPSERT_USAGE_ROLLUP_SQL
+            .contains("timeout_count = usage_rollups.timeout_count + EXCLUDED.timeout_count"));
+        // テナント境界はバインドパラメータ（$1）。DELETE は伴わない。
+        assert!(UPSERT_USAGE_ROLLUP_SQL.contains("tenant_id"));
+        assert!(!UPSERT_USAGE_ROLLUP_SQL
+            .to_ascii_uppercase()
+            .contains("DELETE"));
+    }
+
+    /// `saturating_i64` は `i64::MAX` で頭打ちにし、負値混入や格納失敗を防ぐ（二重防御）。
+    #[test]
+    fn saturating_i64_clamps_at_i64_max() {
+        assert_eq!(saturating_i64(0), 0);
+        assert_eq!(saturating_i64(123), 123);
+        assert_eq!(saturating_i64(i64::MAX as u64), i64::MAX);
+        assert_eq!(saturating_i64(u64::MAX), i64::MAX);
     }
 
     /// stuck-execution sweeper の SQL は (1) 非終端行のみを (2) deadline 超過のものに限り
