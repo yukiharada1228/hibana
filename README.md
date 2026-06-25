@@ -12,22 +12,67 @@ OS スレッドベースの epoch ticker による完全なリトライ/タイ�
 出力バイト）を終端 CAS と同一 tx で冪等に永続化し、テナント別期間集計（`usage_rollups`）と
 利用量参照 API（`GET /usage`）で課金可能にする**メータリング基盤を追加します。
 
+```mermaid
+flowchart TD
+  client["Client"]
+
+  subgraph cpbox["control-plane (axum)"]
+    rest["REST API<br>認証・認可 / RLS / invoke / uploads / usage"]
+    valid["検証 (wasmparser + import 厳密照合)"]
+    sign["署名 (Ed25519) job_token 発行"]
+    subr["result subscriber<br>署名検証 → CAS 終端 + rollup"]
+    dlq["DLQ subscriber (.failed 終端 + DECR)"]
+    reaper["reaper (stuck sweeper / in-flight 再同期)"]
+  end
+
+  worker["worker<br>Wasmtime + cwasm キャッシュ<br>+ 計量 (fuel / wall / mem / bytes)"]
+  comp["Component (echo)"]
+
+  pg[("PostgreSQL<br>tenants / users / api_tokens<br>components / versions / executions<br>audit_logs / usage_rollups<br>FORCE ROW LEVEL SECURITY")]
+  minio[("MinIO (S3 互換)<br>wasm 本体 / 大容量 I/O")]
+  redis[("Redis<br>共有 admission ストア<br>rate / in-flight / lockout")]
+
+  subgraph natsbox["NATS"]
+    js["invoke stream (JetStream)<br>tenant.*.component.invoke"]
+    ressub["result subject (core)<br>tenant.*.component.result"]
+    failsub["failed / DLQ (core)<br>tenant.*.component.failed"]
+  end
+
+  client -->|"HTTP/REST + Bearer"| rest
+  rest -->|"POST /versions (multipart)"| valid
+  valid -->|"通過した本体を put"| minio
+  rest -->|"presigned PUT/GET URL"| minio
+  rest -->|"admission (Lua 原子)"| redis
+  rest -->|"状態遷移 / SET LOCAL app.tenant_id"| pg
+  rest --> sign
+  sign -->|"JobMessage<br>(presigned GET + job_token)"| js
+  js -->|"Pull consumer (durable workers)"| worker
+  worker -->|"HTTP GET 本体 (sha256 で cwasm キャッシュ)"| minio
+  worker --> comp
+  worker -->|"ResultMessage<br>(job_token echo + usage)"| ressub
+  worker -.->|"最終配送失敗時 FailedMessage"| failsub
+  ressub --> subr
+  failsub --> dlq
+  subr -->|"CAS finalize + usage_rollups UPSERT (同一 tx)"| pg
+  dlq --> pg
+  reaper --> pg
+  reaper --> redis
+
+  classDef svc fill:#cfe8ff,stroke:#1f6feb,color:#0b2942;
+  classDef store fill:#d6f5dd,stroke:#1a7f37,color:#06281a;
+  classDef broker fill:#e7d9fb,stroke:#7b46c9,color:#23104a;
+  classDef guest fill:#fff3c4,stroke:#b08800,color:#3d2f00;
+  classDef ext fill:#eaeaea,stroke:#777,color:#222,stroke-dasharray:4 3;
+
+  class rest,valid,sign,subr,dlq,reaper,worker svc;
+  class pg,minio,redis store;
+  class js,ressub,failsub broker;
+  class comp guest;
+  class client ext;
 ```
-                        ┌─ POST /components/{id}/versions (multipart) ─┐
-                        │   検証(wasmparser + import 許可リスト)        │
-Client ──HTTP──▶ control-plane ──put──▶ MinIO (Object Storage, S3 互換)
-                      │  ▲                       │
-                      │  │ presigned GET URL     │ presigned GET URL
-                      │  │ (短命 read-only)       ▼
-                      │  └─ NATS(result) ◀── worker ──▶ HTTP GET 本体取得
-                      │                           │       │
-                      └─ NATS(invoke) ───────────▶│       ▼
-                                                  │   wasm_sha256 をキーに
-                      PostgreSQL                  │   Component キャッシュ +
-                  (components / versions /        │   事前コンパイル(cwasm)
-                   executions の状態遷移)          ▼   → coldstart 短縮 (§3.6)
-                                              Wasmtime ──▶ Component(echo)
-```
+
+> 上図は 50% 粒度（M5 時点）。100% のコンポーネント / データフロー図・invoke シーケンス図・
+> 25% コンテキスト図は [`docs/architecture/overview.md`](docs/architecture/overview.md) を参照。
 
 - `control-plane` (axum): REST API。認証・認可、Component / version のライフサイクル管理、invoke。
   - 認証 / 認可: `POST /auth/login`（`tenant_slug` + email + password、argon2id）で API トークンを
