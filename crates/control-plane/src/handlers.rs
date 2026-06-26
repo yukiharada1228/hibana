@@ -673,6 +673,17 @@ pub async fn invoke(
         .as_deref()
         .map(|corr| faas_shared::reply_subject(state.instance_id(), corr));
 
+    // M6a (§15): waiter は **publish より前**に登録する（register-before-publish）。echo のような
+    // 高速 component では worker の reply が publish 直後・ハンドラが待機に到達する前に届き得るため、
+    // publish 後に登録すると reply を取りこぼし常に 202 へ縮退してしまう。correlation 採番時点で
+    // oneshot を作って registry に載せておき、reply の取りこぼしを構造的に無くす。Enqueued 以外
+    // （冪等ヒット / publish 失敗 / DB 失敗）の分岐では登録した waiter を除去する（leak 防止）。
+    let sync_rx = correlation_id.as_deref().map(|corr| {
+        let (tx, rx) = tokio::sync::oneshot::channel::<faas_shared::ResultMessage>();
+        state.waiters().insert(corr.to_string(), tx);
+        rx
+    });
+
     // --- pending INSERT(provenance+冪等列) → commit → job_token 署名 → JobMessage publish ---
     // tx は set_tenant_guc 済み。ヘルパが savepoint で 23505 を捕捉し、再 SELECT して
     // IdempotentHit を返す（HTTP 側で「同一 body→既存返却 / 異 body→409」を最終判定する）。
@@ -707,19 +718,23 @@ pub async fn invoke(
         // 真実として数える）ため、ここで release はしない——subscriber の finalize で DECR され、
         // 取りこぼしは reaper の DB COUNT 再同期が補正する。
         Ok(enqueue::EnqueueOutcome::Enqueued { execution_id }) => {
-            // M6a (§15): 同期モードなら reply を上限レイテンシまで待つ。非同期は従来どおり 202。
-            if let Some(corr) = correlation_id {
-                Ok(wait_for_sync_reply(&state, corr, execution_id).await)
-            } else {
-                // 非同期 invoke は 202 Accepted のまま不変（後方互換）。
-                Ok((
-                    StatusCode::ACCEPTED,
-                    Json(InvokeResponse {
-                        execution_id,
-                        status: ExecutionStatus::Pending,
-                    }),
-                )
-                    .into_response())
+            // M6a (§15): 同期モードなら（publish 前に登録済みの）waiter を上限レイテンシまで待つ。
+            // 非同期は従来どおり 202。
+            match (correlation_id, sync_rx) {
+                (Some(corr), Some(rx)) => {
+                    Ok(wait_for_sync_reply(&state, corr, rx, execution_id).await)
+                }
+                _ => {
+                    // 非同期 invoke は 202 Accepted のまま不変（後方互換）。
+                    Ok((
+                        StatusCode::ACCEPTED,
+                        Json(InvokeResponse {
+                            execution_id,
+                            status: ExecutionStatus::Pending,
+                        }),
+                    )
+                        .into_response())
+                }
             }
         }
         // 冪等ヒット（23505 race）: この invoke は **新規 pending 行を作っていない**。予約した
@@ -730,6 +745,10 @@ pub async fn invoke(
             status,
             stored_request_hash,
         }) => {
+            // 新規 publish しなかった = この correlation には reply が来ない。登録済み waiter を除去する。
+            if let Some(corr) = &correlation_id {
+                state.waiters().remove(corr);
+            }
             release_if_reserved!();
             finish_idempotent_hit_after_enqueue(
                 &state,
@@ -746,6 +765,10 @@ pub async fn invoke(
         // 既に commit 済み（孤児だが reaper の stuck-execution sweeper が deadline で failed に倒す）。
         // スロットは pending 行に紐づくため release しない。
         Err(enqueue::EnqueueError::PublishBackpressure) => {
+            // publish 失敗 = reply は来ない。登録済み waiter を除去する（leak 防止）。
+            if let Some(corr) = &correlation_id {
+                state.waiters().remove(corr);
+            }
             state
                 .metrics()
                 .admission_rejections_total
@@ -755,6 +778,9 @@ pub async fn invoke(
         }
         // DB 層など他失敗。INSERT が失敗していれば pending 行は無いので予約スロットを release する。
         Err(enqueue::EnqueueError::Other(e)) => {
+            if let Some(corr) = &correlation_id {
+                state.waiters().remove(corr);
+            }
             release_if_reserved!();
             Err(e)
         }
@@ -919,31 +945,24 @@ async fn finish_idempotent_hit_after_enqueue(
 
 /// M6a (§15): 同期 invoke の publish 後、上限レイテンシまで reply を待って応答を確定する。
 ///
-/// 手順（§5.1 / §4 不変条件）:
-/// 1. `(correlation_id, oneshot::Sender)` を per-instance waiter registry に登録する。
-/// 2. `tokio::time::timeout(sync_reply_timeout, rx)` で待つ。
-///    - reply 到達 → 受信 `ResultMessage` を **`state.verifier().verify()` で署名検証してから**
-///      200 + 結果を返す（provenance 保全, §3.3。reply は別 transport だが検証規約は同一）。
-///      verify 失敗 / claim 不整合（execution_id 不一致）は **偽の reply** として握り、202 へ縮退する
-///      （正規の終端化・計量は依然 result/DLQ subscriber の単一 finalize パスが担う）。
-///    - timeout → waiter を除去（leak 防止）して 202 + execution_id へフォールバックする。worker は
-///      バックグラウンドで実行を続け、result/DLQ/sweeper が finalize する。
+/// 手順（§5.1 / §4 不変条件）: waiter は呼び出し側が **publish 前に** 登録済みで、本関数はその
+/// 受信端 `rx` を受け取って待つ（register-before-publish で高速 reply を取りこぼさない）。
+/// - reply 到達 → 受信 `ResultMessage` を **`state.verifier().verify()` で署名検証してから**
+///   200 + 結果を返す（provenance 保全, §3.3。reply は別 transport だが検証規約は同一）。
+///   verify 失敗 / claim 不整合（execution_id 不一致）は **偽の reply** として握り、202 へ縮退する
+///   （正規の終端化・計量は依然 result/DLQ subscriber の単一 finalize パスが担う）。
+/// - timeout → waiter を除去（leak 防止）して 202 + execution_id へフォールバックする。worker は
+///   バックグラウンドで実行を続け、result/DLQ/sweeper が finalize する。
 ///
 /// 所有インスタンス障害時は reply 購読タスクごと失われ waiter は解決されないため、この timeout が
 /// 確実に発火して 202 へ縮退する（ステートレス×N の fail-safe, §4 不変条件）。
 async fn wait_for_sync_reply(
     state: &AppState,
     correlation_id: String,
+    rx: tokio::sync::oneshot::Receiver<faas_shared::ResultMessage>,
     execution_id: String,
 ) -> Response {
-    use tokio::sync::oneshot;
-
-    let (tx, rx) = oneshot::channel::<faas_shared::ResultMessage>();
-    // 1) waiter を登録（publish は既に済んでいるが、reply は purpose 上 publish 後にしか来ないため
-    //    register-after-publish で取りこぼさない: reply は最速でも worker の実行完了後に届く）。
-    state.waiters().insert(correlation_id.clone(), tx);
-
-    // 2) 上限レイテンシまで待つ。
+    // 上限レイテンシまで待つ（waiter は呼び出し側が publish 前に登録済み）。
     let waited = tokio::time::timeout(state.sync_reply_timeout(), rx).await;
 
     // 202 フォールバック応答（timeout / 偽 reply）を組む共通クロージャ。waiter は除去済みにする。
