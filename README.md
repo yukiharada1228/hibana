@@ -97,6 +97,9 @@ Client ──HTTP──▶ control-plane ──put──▶ MinIO (Object Storag
 - Component チェーンは subscriber の **終端成功フックが CAS 遷移時のみ発火**し、上流 execution_id を
   `event_dedup_id` にした配送台帳で downstream を 1 度だけ起動。イベントペイロード → Component input は
   `input_mapping`（未指定なら event payload 素通し）で変換
+- **チェーン暴走の有界化**: chain 下流は毎回新しい execution_id を持つため配送台帳の冪等だけでは
+  A→B→A の循環を止められない。各 execution に `chain_depth`（migration 0008、root=0・chain 下流のみ +1）を
+  持たせ、上流深さ+1 が `MAX_CHAIN_DEPTH`（既定 8）を超える起動を拒否する（循環チェーンを深さで有界化）
 
 含まない（M7 以降の follow-up）:
 - 同期 Invoke の `.result` JetStream 化（現状 reply は Core NATS、CP 再起動で in-flight reply ドロップ）
@@ -668,11 +671,19 @@ CHAOS_ALWAYS_TRAP=always-trap CHAOS_SLOW=slow \
 end-to-end 検証します。chaos_m4/m5 と同じ作法で、全シナリオが `#[ignore]`・docker stack +
 `CHAOS_TOKEN` + echo デプロイ済みを前提とします（公開 API だけを使うブラックボックステスト）。
 
+> **前提（M4/M5 と違い M6 は worker 稼働が必須）**: S1〜S3 は実行が **succeeded まで進む**ことを
+> 前提にする（S1 は worker の reply で 200、S2/S3 は計量まで確認）。よって CP に加えて
+> **worker を 1 つだけ**起動しておくこと。worker が止まっていると S1 は reply が来ず常に 202 へ縮退して
+> 落ちる。逆に **古い worker が複数残っている**と JetStream の共有 Pull Consumer がジョブを分け合い、
+> reply 非対応の旧 worker が引いた回だけ 202 になって S1 がフレーク化する（`pgrep -fl faas-worker` で
+> 1 個だけか確認する）。
+
 ```bash
-# 共通: docker stack を起動して bootstrap + token + echo を用意
+# 共通: docker stack を起動して bootstrap + token + echo + worker を用意
 make up && make migrate && make bootstrap
 export CHAOS_TOKEN=$(make -s login | tail -1)
 make build-component && make deploy
+make run-worker > /tmp/worker.log 2>&1 &   # ← worker を 1 つだけ起動（M6 では必須）
 
 # S1 — 同期 Invoke: ?wait=1 が上限レイテンシ内に 200 + output、?wait 無しは 202 不変
 cargo test -p faas-control-plane --test chaos_m6 \
@@ -683,7 +694,11 @@ cargo test -p faas-control-plane --test chaos_m6 \
   -- --ignored chaos_s2_cron_fires_once_per_slot --nocapture
 
 # S3 — トリガー: object-storage イベント再送は enqueued=0（冪等）/ chain は上流成功で 1 度だけ起動
-cargo test -p faas-control-plane --test chaos_m6 \
+# object キーのテナントは principal と一致が必須（anti-spoof）。既定キーは placeholder のため、
+# 実テナント ID を CHAOS_OBJECT_KEY で渡す（未指定だと 403 で落ちる）。
+TA=$(docker compose exec -T postgres psql -U faas -d faas -tA -c "SELECT id FROM tenants WHERE slug='smoke';")
+CHAOS_OBJECT_KEY="tenants/$TA/in/chaos-s3.txt" CHAOS_BUCKET=uploads \
+  cargo test -p faas-control-plane --test chaos_m6 \
   -- --ignored chaos_s3_trigger_idempotent_and_chain_fires_once --nocapture
 ```
 
@@ -735,12 +750,12 @@ curl -s -X POST http://localhost:8080/triggers \
 | `GET /executions/{id}` | read | 実行状態の参照（`input_ref`/`output_ref` を含む, §6.4） |
 | `GET /usage` | read | **M5**: テナント利用量参照。`from`/`to`（`YYYY-MM-DD`・UTC・既定は直近30日）で期間集計を返す。`principal.tenant_id` を権威化（cross-tenant パスなし）, §15 |
 | `POST /invoke?wait=1` | invoke | **M6a**: 同期 Invoke。reply subject + correlation で結果を待ち、上限レイテンシ（`SYNC_REPLY_TIMEOUT_MS`）内に 200 + output。縮退時は 202 へ（§6.3） |
-| `POST /cron-jobs` | invoke | **M6b**: Cron トリガー登録（`schedule` = `* * * * *`、component、input）。201 + `next_fire_at`（§11） |
+| `POST /cron-jobs` | deploy | **M6b**: Cron トリガー登録（`schedule` = `* * * * *`、component、input）。201 + `next_fire_at`。component ライフサイクル相当の **deploy** スコープ（§11） |
 | `GET /cron-jobs` | read | **M6b**: 自テナントの Cron 登録一覧（`next_fire_at` 含む, §11） |
-| `DELETE /cron-jobs/{id}` | invoke | **M6b**: Cron 登録の削除（自テナント限定。他テナントは 404, §11） |
-| `POST /triggers` | invoke | **M6c**: 外部イベントトリガー登録（`trigger_type` = `object_storage` / `chain`、`match_config`、任意 `input_mapping`）。201 + `trigger_id`（§11） |
+| `DELETE /cron-jobs/{id}` | admin | **M6b**: Cron 登録の削除（自テナント限定。他テナントは 404）。他 DELETE と整合の **admin** スコープ（§11） |
+| `POST /triggers` | deploy | **M6c**: 外部イベントトリガー登録（`trigger_type` = `object_storage` / `chain`、`match_config`、任意 `input_mapping`）。201 + `trigger_id`。component ライフサイクル相当の **deploy** スコープ（§11） |
 | `GET /triggers` | read | **M6c**: 自テナントのトリガー登録一覧（§11） |
-| `DELETE /triggers/{id}` | invoke | **M6c**: トリガー登録の削除（自テナント限定。他テナントは 404, §11） |
+| `DELETE /triggers/{id}` | admin | **M6c**: トリガー登録の削除（自テナント限定。他テナントは 404）。他 DELETE と整合の **admin** スコープ（§11） |
 | `POST /events/object-storage` | invoke | **M6c**: Object Storage イベント受領。テナントは object キーの `tenants/{tenant}/...` から導出し principal と一致を要求（anti-spoof）。同一 `{bucket}/{key}/{etag}` 再送は `enqueued=0`（冪等, §6.6 / §11） |
 
 > **`GET /usage` の集計セマンティクス（課金解釈の明示, M5）**: `invocation_count` と
