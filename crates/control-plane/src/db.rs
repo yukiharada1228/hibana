@@ -295,6 +295,7 @@ pub async fn insert_pending_execution(
         None,
         None,
         None,
+        0,
     )
     .await
 }
@@ -324,12 +325,13 @@ pub async fn insert_pending_execution_with_provenance(
     idempotency_request_hash: Option<&str>,
     job_token_kid: Option<&str>,
     input_ref: Option<&str>,
+    chain_depth: i32,
 ) -> Result<(), sqlx::Error> {
     sqlx::query(
         "INSERT INTO executions \
          (id, tenant_id, component_id, version_id, status, input, \
-          idempotency_key, idempotency_request_hash, job_token_kid, input_ref) \
-         VALUES ($1, $2, $3, $4, 'pending', $5, $6, $7, $8, $9)",
+          idempotency_key, idempotency_request_hash, job_token_kid, input_ref, chain_depth) \
+         VALUES ($1, $2, $3, $4, 'pending', $5, $6, $7, $8, $9, $10)",
     )
     .bind(execution_id)
     .bind(tenant_id)
@@ -340,9 +342,27 @@ pub async fn insert_pending_execution_with_provenance(
     .bind(idempotency_request_hash)
     .bind(job_token_kid)
     .bind(input_ref)
+    .bind(chain_depth)
     .execute(executor)
     .await?;
     Ok(())
+}
+
+/// 実行行の `chain_depth`（Component チェーンのホップ深さ, §15 M6c）を引く。
+///
+/// chain トリガーの終端成功フックが「上流の深さ+1 が `MAX_CHAIN_DEPTH` を超えるか」を判定するために
+/// 使う。行不在（既に GC 済み等）は `None`。RLS 下で呼ぶ（GUC 済み tx）。
+pub async fn execution_chain_depth(
+    executor: impl sqlx::PgExecutor<'_>,
+    tenant_id: &str,
+    execution_id: &str,
+) -> Result<Option<i32>, sqlx::Error> {
+    let row = sqlx::query("SELECT chain_depth FROM executions WHERE tenant_id = $1 AND id = $2")
+        .bind(tenant_id)
+        .bind(execution_id)
+        .fetch_optional(executor)
+        .await?;
+    row.map(|r| r.try_get::<i32, _>("chain_depth")).transpose()
 }
 
 /// 冪等キーで既存実行を引く（§6.6 layer 1 fast path / 23505 後の再解決）。
@@ -1368,6 +1388,340 @@ pub async fn insert_audit_log(
     .execute(executor)
     .await?;
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Cron ジョブ (M6b, §11 / §15)
+// ---------------------------------------------------------------------------
+
+/// `cron_jobs` の 1 行（CRUD API 応答 + スケジューラの fire に必要な範囲）。
+#[derive(Debug, Clone)]
+pub struct CronJobRow {
+    pub id: String,
+    pub component_id: String,
+    pub schedule: String,
+    pub input: Value,
+    pub enabled: bool,
+    pub next_fire_at: DateTime<Utc>,
+    pub created_at: DateTime<Utc>,
+}
+
+impl CronJobRow {
+    fn from_row(row: &PgRow) -> Result<Self, sqlx::Error> {
+        Ok(Self {
+            id: row.try_get("id")?,
+            component_id: row.try_get("component_id")?,
+            schedule: row.try_get("schedule")?,
+            input: row.try_get("input")?,
+            enabled: row.try_get("enabled")?,
+            next_fire_at: row.try_get("next_fire_at")?,
+            created_at: row.try_get("created_at")?,
+        })
+    }
+}
+
+/// Cron ジョブを 1 件 INSERT する (M6b, `POST /cron-jobs`)。
+///
+/// FORCE RLS + tenant_isolation 下で動くため、**呼び出し側は同一 tx 上で先に**
+/// `set_tenant_guc(&mut *tx, tenant_id)` を呼ぶこと（WITH CHECK が GUC と一致しないと失敗する）。
+/// `component_id` は呼び出し側が存在検証済み（FK でも担保）、`schedule` は cron 式パース済み、
+/// `next_fire_at` は初回発火時刻（`cron::first_fire_after`）を渡す。`input` は fire 時に Component へ
+/// 渡す入力（未指定は `null`）。
+#[allow(clippy::too_many_arguments)]
+pub async fn insert_cron_job(
+    executor: impl sqlx::PgExecutor<'_>,
+    id: &str,
+    tenant_id: &str,
+    component_id: &str,
+    schedule: &str,
+    input: &Value,
+    next_fire_at: DateTime<Utc>,
+) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        "INSERT INTO cron_jobs \
+         (id, tenant_id, component_id, schedule, input, next_fire_at) \
+         VALUES ($1, $2, $3, $4, $5, $6)",
+    )
+    .bind(id)
+    .bind(tenant_id)
+    .bind(component_id)
+    .bind(schedule)
+    .bind(input)
+    .bind(next_fire_at)
+    .execute(executor)
+    .await?;
+    Ok(())
+}
+
+/// テナントの Cron ジョブ一覧 (M6b, `GET /cron-jobs`)。新しい順。
+///
+/// FORCE RLS 下のため呼び出し側は同一 tx で `set_tenant_guc(tenant)` 済みのこと。
+pub async fn list_cron_jobs(
+    executor: impl sqlx::PgExecutor<'_>,
+    tenant_id: &str,
+) -> Result<Vec<CronJobRow>, sqlx::Error> {
+    let rows = sqlx::query(
+        "SELECT id, component_id, schedule, input, enabled, next_fire_at, created_at \
+         FROM cron_jobs WHERE tenant_id = $1 ORDER BY created_at DESC",
+    )
+    .bind(tenant_id)
+    .fetch_all(executor)
+    .await?;
+    rows.iter().map(CronJobRow::from_row).collect()
+}
+
+/// Cron ジョブを 1 件物理削除する (M6b, `DELETE /cron-jobs/{id}`)。更新行数を返す。
+///
+/// FORCE RLS 下のため呼び出し側は同一 tx で `set_tenant_guc(tenant)` 済みのこと（GUC=テナントに
+/// 一致する行しか消せない＝cross-tenant 削除は構造的に不可）。soft-delete は持たない
+/// （登録の取り消しは単純に行を消す。実行済み execution は executions 側に独立して残る）。
+pub async fn delete_cron_job(
+    executor: impl sqlx::PgExecutor<'_>,
+    tenant_id: &str,
+    id: &str,
+) -> Result<u64, sqlx::Error> {
+    let result = sqlx::query("DELETE FROM cron_jobs WHERE tenant_id = $1 AND id = $2")
+        .bind(tenant_id)
+        .bind(id)
+        .execute(executor)
+        .await?;
+    Ok(result.rows_affected())
+}
+
+/// 全テナント横断で「いま due な Cron ジョブ」の (tenant_id, job_id) を引く (M6b スケジューラ)。
+///
+/// `cron_due_tenant_jobs()`（SECURITY DEFINER, migrations/0008_m6.sql）を呼ぶ。所有者権限で
+/// 実行されるため faas_app の FORCE RLS の対象外で、**GUC 未設定のまま**全テナントの due 行を
+/// 引ける（reaper の `list_active_tenant_ids` と同型の認証前/巡回参照）。返るのは (tenant, job_id)
+/// だけで、fire 本処理は呼び出し側が各テナントごとに `set_tenant_guc` した tx で RLS 下で行う。
+pub async fn cron_due_tenant_jobs(
+    executor: impl sqlx::PgExecutor<'_>,
+) -> Result<Vec<(String, String)>, sqlx::Error> {
+    let rows = sqlx::query("SELECT tenant_id, job_id FROM cron_due_tenant_jobs()")
+        .fetch_all(executor)
+        .await?;
+    rows.into_iter()
+        .map(|r| {
+            Ok((
+                r.try_get::<String, _>("tenant_id")?,
+                r.try_get::<String, _>("job_id")?,
+            ))
+        })
+        .collect()
+}
+
+/// due な Cron ジョブ 1 行を **`FOR UPDATE SKIP LOCKED`** で掴む (M6b single-flight)。
+///
+/// `cron_due_tenant_jobs()` で対象を引いたあと、各テナントの tx（`set_tenant_guc` 済み）で当該
+/// job_id の行を行ロックする。**最初にロックを掴んだ CP だけ**が `Some(row)` を得て fire し、他 CP は
+/// `SKIP LOCKED` で `None`（= 先取りされたので skip）になる。`enabled AND next_fire_at <= now()` を
+/// 再判定するのは、ロック獲得までの間に他 CP が next_fire_at を前進させて due を消した競合に対応する
+/// ため（掴んだ瞬間に「まだ due か」を権威的に確認する）。FORCE RLS 下のため呼び出し側は同一 tx で
+/// `set_tenant_guc(tenant)` 済みのこと。
+pub async fn lock_due_cron_job(
+    executor: impl sqlx::PgExecutor<'_>,
+    tenant_id: &str,
+    job_id: &str,
+) -> Result<Option<CronJobRow>, sqlx::Error> {
+    let row = sqlx::query(
+        "SELECT id, component_id, schedule, input, enabled, next_fire_at, created_at \
+         FROM cron_jobs \
+         WHERE tenant_id = $1 AND id = $2 AND enabled AND next_fire_at <= now() \
+         FOR UPDATE SKIP LOCKED",
+    )
+    .bind(tenant_id)
+    .bind(job_id)
+    .fetch_optional(executor)
+    .await?;
+    row.as_ref().map(CronJobRow::from_row).transpose()
+}
+
+/// 掴んだ Cron ジョブの `next_fire_at` を次回 occurrence へ前進させる (M6b)。
+///
+/// `lock_due_cron_job` で行ロックを保持している同一 tx 内で呼ぶ。`last_fired_slot` も今回 fire の
+/// scheduled_slot で更新する（冪等補助・観測用）。next_fire_at を前進させてから enqueue・commit する
+/// ことで、ロックを保持している間に同一行の重複 due を消し、次の poll では due に当たらなくする。
+pub async fn advance_cron_next_fire(
+    executor: impl sqlx::PgExecutor<'_>,
+    tenant_id: &str,
+    id: &str,
+    next_fire_at: DateTime<Utc>,
+    fired_slot: i64,
+) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        "UPDATE cron_jobs \
+         SET next_fire_at = $3, last_fired_slot = $4, updated_at = now() \
+         WHERE tenant_id = $1 AND id = $2",
+    )
+    .bind(tenant_id)
+    .bind(id)
+    .bind(next_fire_at)
+    .bind(fired_slot)
+    .execute(executor)
+    .await?;
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// トリガー (M6c, §11 / §15)
+// ---------------------------------------------------------------------------
+
+/// `triggers` の 1 行（CRUD API 応答 + chain 解決 / event ルーティングに必要な範囲）。
+#[derive(Debug, Clone)]
+pub struct TriggerRow {
+    pub id: String,
+    pub component_id: String,
+    pub trigger_type: String,
+    pub match_config: Value,
+    pub input_mapping: Option<Value>,
+    pub enabled: bool,
+    pub created_at: DateTime<Utc>,
+}
+
+impl TriggerRow {
+    fn from_row(row: &PgRow) -> Result<Self, sqlx::Error> {
+        Ok(Self {
+            id: row.try_get("id")?,
+            component_id: row.try_get("component_id")?,
+            trigger_type: row.try_get("trigger_type")?,
+            match_config: row.try_get("match_config")?,
+            input_mapping: row.try_get("input_mapping")?,
+            enabled: row.try_get("enabled")?,
+            created_at: row.try_get("created_at")?,
+        })
+    }
+}
+
+/// トリガーを 1 件 INSERT する (M6c, `POST /triggers`)。
+///
+/// FORCE RLS + tenant_isolation 下で動くため、呼び出し側は同一 tx 上で先に
+/// `set_tenant_guc(&mut *tx, tenant_id)` を呼ぶこと（WITH CHECK が GUC と一致しないと失敗する）。
+/// `component_id`（downstream 起動対象）は呼び出し側が存在検証済み（FK でも担保）、`trigger_type` /
+/// `match_config` / `input_mapping` は登録時に検証済み（不正は 422）。
+#[allow(clippy::too_many_arguments)]
+pub async fn insert_trigger(
+    executor: impl sqlx::PgExecutor<'_>,
+    id: &str,
+    tenant_id: &str,
+    component_id: &str,
+    trigger_type: &str,
+    match_config: &Value,
+    input_mapping: Option<&Value>,
+) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        "INSERT INTO triggers \
+         (id, tenant_id, component_id, trigger_type, match_config, input_mapping) \
+         VALUES ($1, $2, $3, $4, $5, $6)",
+    )
+    .bind(id)
+    .bind(tenant_id)
+    .bind(component_id)
+    .bind(trigger_type)
+    .bind(match_config)
+    .bind(input_mapping)
+    .execute(executor)
+    .await?;
+    Ok(())
+}
+
+/// テナントのトリガー一覧 (M6c, `GET /triggers`)。新しい順。
+///
+/// FORCE RLS 下のため呼び出し側は同一 tx で `set_tenant_guc(tenant)` 済みのこと。
+pub async fn list_triggers(
+    executor: impl sqlx::PgExecutor<'_>,
+    tenant_id: &str,
+) -> Result<Vec<TriggerRow>, sqlx::Error> {
+    let rows = sqlx::query(
+        "SELECT id, component_id, trigger_type, match_config, input_mapping, enabled, created_at \
+         FROM triggers WHERE tenant_id = $1 ORDER BY created_at DESC",
+    )
+    .bind(tenant_id)
+    .fetch_all(executor)
+    .await?;
+    rows.iter().map(TriggerRow::from_row).collect()
+}
+
+/// トリガーを 1 件物理削除する (M6c, `DELETE /triggers/{id}`)。更新行数を返す。
+///
+/// FORCE RLS 下のため呼び出し側は同一 tx で `set_tenant_guc(tenant)` 済みのこと（GUC=テナントに
+/// 一致する行しか消せない＝cross-tenant 削除は構造的に不可）。
+pub async fn delete_trigger(
+    executor: impl sqlx::PgExecutor<'_>,
+    tenant_id: &str,
+    id: &str,
+) -> Result<u64, sqlx::Error> {
+    let result = sqlx::query("DELETE FROM triggers WHERE tenant_id = $1 AND id = $2")
+        .bind(tenant_id)
+        .bind(id)
+        .execute(executor)
+        .await?;
+    Ok(result.rows_affected())
+}
+
+/// テナント内の **enabled な指定タイプのトリガー** を引く (M6c)。
+///
+/// object_storage event のルーティング（`trigger_type='object_storage'`）と chain 解決
+/// （`trigger_type='chain'`）の双方で使う。`match_config` からの式 index は避け、テナント内の
+/// 該当タイプ trigger を引いて **アプリ側で照合**する（bucket_prefix / source_component_id）。
+/// 件数はテナントあたりのトリガー数に比例（実運用で十分小さい前提）。FORCE RLS 下のため呼び出し側は
+/// 同一 tx で `set_tenant_guc(tenant)` 済みのこと（cross-tenant trigger は構造的に引けない）。
+pub async fn list_enabled_triggers_by_type(
+    executor: impl sqlx::PgExecutor<'_>,
+    tenant_id: &str,
+    trigger_type: &str,
+) -> Result<Vec<TriggerRow>, sqlx::Error> {
+    let rows = sqlx::query(
+        "SELECT id, component_id, trigger_type, match_config, input_mapping, enabled, created_at \
+         FROM triggers \
+         WHERE tenant_id = $1 AND enabled AND trigger_type = $2",
+    )
+    .bind(tenant_id)
+    .bind(trigger_type)
+    .fetch_all(executor)
+    .await?;
+    rows.iter().map(TriggerRow::from_row).collect()
+}
+
+/// 配送台帳 `trigger_deliveries` へ 1 件 INSERT する (M6c, 配送冪等の権威)。
+///
+/// 戻り値 `true` = **新規配送**（INSERT 成功）、`false` = **既配送**（PK 23505 = 同一
+/// (tenant, trigger, event_dedup_id) が既に在る → 二重起動を skip すべき）。これにより
+/// object-storage イベントの再送 / chain 上流成功の再 finalize でも downstream を 1 度だけ起動する
+/// （`executions(tenant_id, idempotency_key)` UNIQUE と併せた二重防御, §6.6）。
+///
+/// 台帳は append-only（migrations/0008_m6.sql で UPDATE/DELETE 非付与）なので、INSERT は ON CONFLICT
+/// を使わず素の INSERT で 23505 を捕捉する（配送の権威を改竄不能にする）。FORCE RLS 下のため呼び出し側は
+/// 同一 tx で `set_tenant_guc(tenant)` 済みのこと。
+pub async fn record_trigger_delivery(
+    executor: impl sqlx::PgExecutor<'_>,
+    tenant_id: &str,
+    trigger_id: &str,
+    event_dedup_id: &str,
+    execution_id: &str,
+) -> Result<bool, sqlx::Error> {
+    let r = sqlx::query(
+        "INSERT INTO trigger_deliveries \
+         (tenant_id, trigger_id, event_dedup_id, execution_id) \
+         VALUES ($1, $2, $3, $4)",
+    )
+    .bind(tenant_id)
+    .bind(trigger_id)
+    .bind(event_dedup_id)
+    .bind(execution_id)
+    .execute(executor)
+    .await;
+    match r {
+        Ok(_) => Ok(true),
+        Err(e) => {
+            // PK 23505 = 既配送。二重起動を skip するシグナルとして false を返す（エラーにしない）。
+            if matches!(&e, sqlx::Error::Database(db_err) if db_err.code().as_deref() == Some("23505"))
+            {
+                Ok(false)
+            } else {
+                Err(e)
+            }
+        }
+    }
 }
 
 #[cfg(test)]

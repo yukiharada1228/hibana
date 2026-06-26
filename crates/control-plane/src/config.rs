@@ -51,6 +51,12 @@ const DEFAULT_STUCK_EXECUTION_DEADLINE_SECS: u64 = 900;
 /// /uploads の presigned PUT URL の既定 TTL（秒, §3.4/§5.2）。
 const DEFAULT_UPLOAD_PRESIGN_TTL_SECS: u64 = 300;
 
+// --- M6 同期 Invoke / Cron（§15） ---
+/// 同期 invoke の待機上限（ミリ秒）。超過でクライアントへ 202 + execution_id にフォールバックする。
+const DEFAULT_SYNC_REPLY_TIMEOUT_MS: u64 = 5000;
+/// Cron スケジューラの due スキャン間隔（秒）。
+const DEFAULT_CRON_POLL_INTERVAL_SECS: u64 = 10;
+
 /// control-plane の起動時設定。
 #[derive(Debug, Clone)]
 pub struct Config {
@@ -133,6 +139,18 @@ pub struct Config {
     /// ロックアウト回避／他者ロックアウトを防ぐ）。
     pub trust_proxy_headers: bool,
 
+    // --- M6 同期 Invoke / Cron（§15） ---
+    /// この CP インスタンスの subject-safe 識別子（M6a, §15）。同期 invoke の reply subject
+    /// `reply.{instance_id}.{correlation_id}` に埋め込み、JobMessage を送った当該インスタンスだけが
+    /// reply を購読する（ステートレス×N の鍵）。env `INSTANCE_ID` 未設定なら `inst_{uuid}` を採番する。
+    /// M6a で AppState へ渡し、reply 購読タスク / 同期 invoke の reply subject 構築が consume する。
+    pub instance_id: String,
+    /// 同期 invoke の待機上限（ミリ秒, M6a）。超過でクライアントへ 202 + execution_id へフォールバック。
+    /// M6a で AppState へ渡し、invoke ハンドラの `tokio::time::timeout` が consume する。
+    pub sync_reply_timeout_ms: u64,
+    /// Cron スケジューラの due スキャン間隔（秒, M6b）。main.rs が `scheduler::run` へ渡して consume する。
+    pub cron_poll_interval_secs: u64,
+
     // --- 観測 (M4a, §3.8) ---
     /// ログ整形（"text" 既定 / "json"）。`json` のとき `tracing_subscriber::fmt().json()` を
     /// 有効化し、フィールドを flatten した JSON ライン形式で吐く。集約基盤（Loki/ELK 等）に
@@ -202,6 +220,14 @@ impl Config {
                 DEFAULT_UPLOAD_PRESIGN_TTL_SECS,
             )?,
             trust_proxy_headers: env_bool("TRUST_PROXY_HEADERS", false),
+
+            // M6 同期 Invoke / Cron。INSTANCE_ID 未設定なら subject-safe な `inst_{uuid}` を採番する。
+            instance_id: env_optional("INSTANCE_ID").unwrap_or_else(faas_shared::new_instance_id),
+            sync_reply_timeout_ms: env_u64("SYNC_REPLY_TIMEOUT_MS", DEFAULT_SYNC_REPLY_TIMEOUT_MS)?,
+            cron_poll_interval_secs: env_u64(
+                "CRON_POLL_INTERVAL_SECS",
+                DEFAULT_CRON_POLL_INTERVAL_SECS,
+            )?,
 
             log_format: env_or("LOG_FORMAT", "text"),
         })

@@ -892,6 +892,23 @@ impl Worker {
             warn!(%execution_id, error = %e, "failed to publish ResultMessage; will NOT ack (redeliver)");
             return false;
         }
+
+        // M6a (§15): 同期 invoke の reply 先が同梱されていれば、終端 result を **追加で** Core NATS の
+        // reply subject へも publish する（job_token を verbatim に echo 保持）。これは「速い通知」で
+        // あって正の終端化経路ではない: 終端化・計量は依然 result subject の subscriber が単一 finalize
+        // パスで担う。よって reply の publish 失敗は best-effort で握りつぶし、ack 戦略を変えない
+        // （false を返さない＝再配送を誘発しない）。所有 CP インスタンスの reply 購読タスクが
+        // correlation で待機中のハンドラを解決する。未待機（timeout 済み）なら CP 側で drop される。
+        if let Some(reply_to) = job.reply_to.as_deref() {
+            if let Err(e) = self.publish_reply(reply_to, &result).await {
+                warn!(
+                    %execution_id,
+                    reply_to,
+                    error = %e,
+                    "failed to publish sync reply (best-effort; result already published, ack unaffected)"
+                );
+            }
+        }
         true
     }
 
@@ -1367,6 +1384,26 @@ impl Worker {
             .flush()
             .await
             .map_err(|e| anyhow!("nats flush failed: {e}"))?;
+        Ok(())
+    }
+
+    /// M6a (§15): 同期 invoke の reply subject へ終端 `ResultMessage` を **追加で** publish する。
+    ///
+    /// `job.reply_to`（`reply.{instance_id}.{correlation_id}`）へ Core NATS で送る。`publish_result`
+    /// と同一の `ResultMessage`（job_token を verbatim に echo 保持）を送るため、CP のハンドラは
+    /// クライアントへ返す前にこれを署名検証できる（provenance 規約は result subject と同一, §3.3）。
+    /// これは速い通知経路であり、終端化・計量は依然 result subject の subscriber が単一 finalize パスで
+    /// 担う（reply の成否は worker の ack 戦略に影響しない＝呼び出し側で best-effort 扱い）。
+    async fn publish_reply(&self, reply_to: &str, result: &ResultMessage) -> anyhow::Result<()> {
+        let payload = serde_json::to_vec(result)?;
+        self.nats
+            .publish(reply_to.to_string(), payload.into())
+            .await
+            .map_err(|e| anyhow!("nats publish (reply) failed: {e}"))?;
+        self.nats
+            .flush()
+            .await
+            .map_err(|e| anyhow!("nats flush (reply) failed: {e}"))?;
         Ok(())
     }
 

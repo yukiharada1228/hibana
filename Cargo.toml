@@ -50,6 +50,10 @@ async-trait = "0.1"
 # --- メッセージング ---
 async-nats = "0.38"
 
+# --- 同期 invoke の per-instance waiter registry（M6a, §15）。correlation_id -> oneshot::Sender の
+# 並行マップ。reply 購読タスク（remove）と invoke ハンドラ（insert）が共有ロックなしで触る。pure-Rust。
+dashmap = "6"
+
 # --- 共有ストア (M3d, §8): 全 Axum インスタンスで共有する低レイテンシカウンタ。
 # レート制限（token-bucket）/ 同時実行 in-flight / login 失敗ロックアウトを集計する。
 # pure-Rust 構成のみを使う（当環境は cc/aws-lc 不可）。`tokio-comp` は pure-Rust の

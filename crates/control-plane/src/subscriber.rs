@@ -37,8 +37,9 @@ use futures::StreamExt;
 use serde_json::json;
 
 use faas_shared::{
-    failed_subject_wildcard, result_subject_wildcard, tenant_from_subject, ExecutionStatus,
-    FailedMessage, JobClaims, ResourceLimits, ResultMessage, UsageMetrics,
+    correlation_from_reply_subject, failed_subject_wildcard, reply_subject_wildcard,
+    result_subject_wildcard, tenant_from_subject, ExecutionStatus, FailedMessage, JobClaims,
+    ResourceLimits, ResultMessage, UsageMetrics,
 };
 
 use crate::state::AppState;
@@ -119,6 +120,87 @@ pub async fn run_failed(state: AppState) {
     }
 
     tracing::warn!(subject = %subject, "DLQ subscription ended");
+}
+
+/// 同期 invoke の reply 購読ループ (M6a, §15)。
+///
+/// Core NATS で `reply.{instance_id}.*` を 1 本購読する常駐タスク。worker が同期 invoke の終端
+/// `ResultMessage` を result subject に**加えて**この reply subject へも publish してくるので、
+/// subject 第 3 トークン（correlation_id）で per-instance waiter registry の対応 sender を解決して
+/// 結果を渡す。
+///
+/// **このタスクは署名検証も finalize もしない**。理由（§4 不変条件）:
+/// - 終端化・計量は依然 result/DLQ subscriber の単一 finalize パス（[`run`] / [`run_failed`]）が
+///   担う。reply は「既に正規経路で finalize される結果」を呼び出し元 CP インスタンスへ速く届ける
+///   per-instance 通知にすぎず、計量を二重計上しない。
+/// - reply に載る `ResultMessage` は job_token を保持する。**クライアントへ返す前の署名検証は
+///   invoke ハンドラ側で必ず行う**（reply 経路は別 transport だが provenance 検証規約は同一, §3.3）。
+///   ここでは検証せず素通しで sender へ渡し、検証責務をハンドラ 1 箇所に集約する。
+///
+/// per-instance（waiter registry を共有しない）+ reply subject への instance_id 埋め込みにより、
+/// 当該インスタンスが送ったジョブの reply だけがここへ届く（ステートレス×N の鍵）。未知の
+/// correlation（既に timeout で除去済み / 別インスタンス宛の誤配）は単に drop する（防御的）。
+pub async fn run_sync_reply(state: AppState) {
+    let subject = reply_subject_wildcard(state.instance_id());
+
+    let mut subscription = match state.nats().subscribe(subject.clone()).await {
+        Ok(sub) => sub,
+        Err(e) => {
+            tracing::error!(error = %e, subject = %subject, "failed to subscribe to sync reply subject");
+            return;
+        }
+    };
+
+    tracing::info!(
+        subject = %subject,
+        instance_id = %state.instance_id(),
+        "subscribed to sync invoke reply subject (per-instance)"
+    );
+
+    while let Some(msg) = subscription.next().await {
+        // subject 第 3 トークン（correlation_id）を取り出す。形が一致しなければ drop（防御的）。
+        let correlation = match correlation_from_reply_subject(msg.subject.as_str()) {
+            Some(c) => c.to_string(),
+            None => {
+                tracing::warn!(
+                    subject = %msg.subject,
+                    "sync reply on unexpected subject shape; dropping"
+                );
+                continue;
+            }
+        };
+
+        // ResultMessage を decode する。失敗（毒メッセージ / 旧 worker）は drop。
+        let result: ResultMessage = match serde_json::from_slice(&msg.payload) {
+            Ok(r) => r,
+            Err(e) => {
+                tracing::warn!(
+                    correlation = %correlation,
+                    error = %e,
+                    "failed to decode sync reply ResultMessage; dropping"
+                );
+                continue;
+            }
+        };
+
+        // 対応 waiter を取り出して結果を渡す。未知 correlation（timeout 済み除去 / 誤配）は drop。
+        // remove で sender を所有移譲し、二重解決を構造的に防ぐ（oneshot は 1 回 send したら消える）。
+        match state.waiters().remove(&correlation) {
+            Some((_, sender)) => {
+                // 受信側（invoke ハンドラ）が既に timeout で rx を drop していると send は Err になるが、
+                // その場合は素直に捨てる（ハンドラは 202 へフォールバック済み）。
+                let _ = sender.send(result);
+            }
+            None => {
+                tracing::debug!(
+                    correlation = %correlation,
+                    "no waiter for sync reply correlation (already timed out or foreign); dropping"
+                );
+            }
+        }
+    }
+
+    tracing::warn!(subject = %subject, "sync reply subscription ended");
 }
 
 /// subject 由来の `tenant`（M3b の権威）と署名 claim（M3c の権威）で result を反映する。
@@ -664,6 +746,23 @@ async fn commit_finalize_and_release(
     }
 
     tx.commit().await?;
+
+    // M6c (§15): chain トリガーの終端成功フック。**実際に遷移した**（finalized.is_some()）かつ
+    // Succeeded のときだけ、同一テナントの enabled な chain trigger を引き、source_component_id /
+    // on_status 一致なら downstream を起動する。再配送 / 既終端（finalized.is_none()）では発火しない
+    // ため chain は **1 度だけ**起動し（CAS が冪等の境界）、さらに `trigger_deliveries` PK で二重防御する。
+    // commit の **後**に **別 tx** で best-effort に行い、chain 起動の失敗で finalize の原子性
+    // （CAS + usage_rollups）を巻き戻さない（取りこぼしは将来の outbox で補強, 設計 §5.3(b)）。
+    if finalized.is_some() && status == ExecutionStatus::Succeeded {
+        crate::handlers::enqueue_chain_downstreams(
+            state,
+            tenant,
+            component_id,
+            execution_id,
+            output,
+        )
+        .await;
+    }
 
     if finalized.is_none() {
         // 既終端で no-op。result/DLQ で再配送と CP 双方を回しても二重 DECR しない（CAS が冪等性の境界）。

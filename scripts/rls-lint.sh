@@ -52,6 +52,10 @@ fns="$fns|find_component_by_id|find_component_by_name|active_version_storage|lis
 fns="$fns|soft_delete_component|soft_delete_version|find_version_id"
 fns="$fns|has_active_executions_for_component|has_active_executions_for_version|finalize_execution"
 fns="$fns|create_user|find_user_role|create_token|revoke_token|token_exists|bootstrap_tenant"
+# M6b Cron CRUD + due-scan（cron_due_tenant_jobs は SECURITY DEFINER で GUC 不要のため除外）。
+fns="$fns|insert_cron_job|list_cron_jobs|delete_cron_job|lock_due_cron_job|advance_cron_next_fire"
+# M6c トリガー CRUD + 配送台帳 + chain/event 解決（すべて set_tenant_guc 済み tx で呼ぶ）。
+fns="$fns|insert_trigger|list_triggers|delete_trigger|list_enabled_triggers_by_type|record_trigger_delivery"
 
 set2=$(
   grep -rnE "db::($fns)\([[:space:]]*state\.pool\(\)" \

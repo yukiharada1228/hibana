@@ -1,16 +1,21 @@
-# WASM FaaS Platform — M5 (課金・メータリング基盤)
+# WASM FaaS Platform — M6 (Invoke 経路の拡充: 同期 Invoke + 外部イベント/Cron トリガー)
 
 [![CI](https://github.com/yukiharada1228/wasm-fass/actions/workflows/ci.yml/badge.svg?branch=develop)](https://github.com/yukiharada1228/wasm-fass/actions/workflows/ci.yml)
 
 WebAssembly Component をアップロードして invoke すると、Wasmtime Worker が実行して
-結果を返す FaaS プラットフォームです。本リポジトリの現状は **仕様書.md §15 の M5
-（課金・メータリング基盤）範囲**であり、M1 の invoke 経路・M2 のアップロード/検証/デプロイ・M3 の
+結果を返す FaaS プラットフォームです。本リポジトリの現状は **仕様書.md §15 の M6
+（Invoke 経路の拡充）範囲**であり、M1 の invoke 経路・M2 のアップロード/検証/デプロイ・M3 の
 マルチテナント / 認証 / RLS / 結果出所認証 / Capability 強制 / 共有 admission ストア /
 大容量 I/O 退避・M4 の Prometheus メトリクス + `/readyz`・構造化ログ・`.failed` (DLQ) subscriber と
 OS スレッドベースの epoch ticker による完全なリトライ/タイムアウト処理・全リソース制限・
-テナント別クォータの上に、**per-execution の利用量計量（CPU fuel / wall time / peak memory /
-出力バイト）を終端 CAS と同一 tx で冪等に永続化し、テナント別期間集計（`usage_rollups`）と
-利用量参照 API（`GET /usage`）で課金可能にする**メータリング基盤を追加します。
+テナント別クォータ・M5 の per-execution 利用量計量（CPU fuel / wall time / peak memory /
+出力バイト）と冪等な期間集計（`usage_rollups`）/ 利用量参照 API（`GET /usage`）の上に、
+**非同期 invoke 一択から商用で要求される起動形態を揃える**経路拡充を追加します。具体的には
+(1) Core NATS の reply subject + correlation で結果まで待つ**同期 Invoke**（`POST /invoke?wait=1`、
+ステートレス×N を CP instance id で解く）、(2) Object Storage イベント・Component チェーン・
+スケジュール（Cron）からの**外部イベントトリガー**（トリガー登録モデル + 設定 API +
+イベントペイロード → Component input マッピング）を、いずれも **non-HTTP 起点でも冪等性・
+テナント分離・計量（M5）が破れない**ように既存の終端 finalize 経路へ合流させます。
 
 ```
                         ┌─ POST /components/{id}/versions (multipart) ─┐
@@ -58,6 +63,55 @@ Client ──HTTP──▶ control-plane ──put──▶ MinIO (Object Storag
 
 ---
 
+## M6 スコープ（と非スコープ）
+
+仕様書.md §15 M6 に準拠。非同期 invoke 一択から、商用で要求される起動形態を揃える。M6 は
+0（基盤: shared 型 / migration 0008）〜c の段階で実装しました。
+
+含む（M6a: 同期 Invoke, §6.3）:
+- `POST /invoke?wait=1` は **JetStream（永続記録）とは別に Core NATS の reply subject + correlation**
+  で結果を待ち受け、上限レイテンシ（`SYNC_REPLY_TIMEOUT_MS`）内に `200 OK` + `output` を返す。
+  `?wait` 無しの既存 `POST /invoke` は **202 のまま不変**（後方互換）
+- reply 先は invoke メッセージの **`reply-to` ヘッダ**で Worker へ伝搬。Axum×N 構成では reply subject に
+  **CP instance id**（`INSTANCE_ID`、未設定なら `inst_{uuid}` を採番）を埋め込み、JobMessage を送った
+  当該インスタンスだけが reply を購読する（ステートレス前提との整合を設計で解く, §15）
+- 同期で受けた結果も **job_token 署名を verify してから**クライアントへ返す（provenance 保全, §3.3）。
+  偽 reply / 所有インスタンス障害は 200 にならず **202 へ縮退**。同期 reply は finalize を起こさず、
+  計量は依然 result/DLQ subscriber の単一 finalize 経由（二重計上しない）
+
+含む（M6b: Cron スケジュール起動, §11）:
+- `cron_jobs`（migration 0008、FORCE RLS）に schedule（`* * * * *`）・component・input を登録する
+  トリガー設定 API（`POST /cron-jobs` / `GET /cron-jobs` / `DELETE /cron-jobs/{id}`）
+- スケジューラ（`CRON_POLL_INTERVAL_SECS` 間隔で due スキャン）が `next_fire_at` を跨いだ slot を
+  invoke へ合流させ、`next_fire_at` を前進させる。**同一スロットは複数 CP / 重複 tick でも 1 度しか
+  発火しない**（`cron:{job}:{slot}` を安定な冪等キーにした single-flight, §6.6）
+
+含む（M6c: 外部イベントトリガー, §11）:
+- `triggers`（migration 0008、FORCE RLS）に **トリガー登録モデル**（どのイベント源がどの Component を
+  起動するか）を持ち、`object_storage`（Object Storage イベント）/ `chain`（Component チェーン）の
+  trigger_type を `POST /triggers` / `GET /triggers` / `DELETE /triggers/{id}` で設定
+- Object Storage イベント受領（`POST /events/object-storage`）はテナントを **object キーの
+  `tenants/{tenant}/...` プレフィックスから導出**し principal と一致を要求（anti-spoof）。同一イベント
+  （`{bucket}/{key}/{etag}`）の再送は **`trigger_deliveries` PK + `event_idempotency_key` UNIQUE** の
+  二重防御で 1 度だけ enqueue（再送は `enqueued=0`）
+- Component チェーンは subscriber の **終端成功フックが CAS 遷移時のみ発火**し、上流 execution_id を
+  `event_dedup_id` にした配送台帳で downstream を 1 度だけ起動。イベントペイロード → Component input は
+  `input_mapping`（未指定なら event payload 素通し）で変換
+
+含まない（M7 以降の follow-up）:
+- 同期 Invoke の `.result` JetStream 化（現状 reply は Core NATS、CP 再起動で in-flight reply ドロップ）
+- Workflow Engine（多段 chain のオーケストレーション / 分岐・合流）・Cron の秒精度 / タイムゾーン指定
+- per-function 環境変数・Secrets Manager（M7, §10）、トリガーの admin API 越しの一括管理
+
+> **完了条件（仕様書 §15 M6）**: 「HTTP 同期呼び出しが上限レイテンシ内で結果を返し、Cron 登録で定時
+> 起動し、トリガー経路でも冪等性・テナント分離・計量（M5）が non-HTTP 起点で破れない」。
+> `crates/control-plane/tests/chaos_m6.rs` の S1（`?wait=1` が上限内に 200 + output、`?wait` 無しは
+> 202 不変）/ S2（毎分 cron が due slot を 1 度だけ fire し `next_fire_at` を前進）/ S3（object-storage
+> イベントの再送は `enqueued=0`、chain は上流成功で 1 度だけ起動）で end-to-end 検証する（chaos_m4/m5 と
+> 同じ作法・全 `#[ignore]`・docker compose stack + `CHAOS_TOKEN` 前提）。
+
+---
+
 ## M5 スコープ（と非スコープ）
 
 仕様書.md §15 M5 に準拠。テナント別の利用量を冪等に計測・集計し課金可能にする。
@@ -78,8 +132,7 @@ Client ──HTTP──▶ control-plane ──put──▶ MinIO (Object Storag
 - `usage_rollups` は `FORCE ROW LEVEL SECURITY` + fail-closed tenant_isolation、`faas_app` は DELETE 不可（集計改竄防止）
 - 利用量参照 API `GET /usage`（read スコープ、`from`/`to` 期間集計、`principal.tenant_id` 権威化で IDOR 面なし）
 
-含まない（M6 以降の follow-up）:
-- 同期 Invoke / 外部イベントトリガー / Cron（M6, §15）
+含まない（M5 の非スコープ。同期 Invoke / 外部イベントトリガー / Cron は M6 で実装済み）:
 - クォータ超過の課金的扱い（請求連携）・利用量の per-execution 明細 API
 
 > **完了条件（仕様書 §15 M5）**: 「障害注入（再配送・worker 落下・タイムアウト）下でも計量が
@@ -233,8 +286,8 @@ Client ──HTTP──▶ control-plane ──put──▶ MinIO (Object Storag
 - **検証パイプラインの隔離プロセス化**（§6.2 MUST。現状はインプロセス）
 - **大出力 offload**: DB 列・キーレイアウト（`io/{execution_id}/output`）は敷設済みだが、
   Worker 側の write offload は最小実装（後続スライスの TODO, §3.4）
-- 将来⬜: 同期 Invoke、OIDC 連携ログイン、外部イベントトリガー、Cron Job / Workflow Engine、
-  Secrets Manager、分散トレーシング、AI 統合、Multi Region、Result Ingestor 分離（§10 / §14）
+- 将来⬜: OIDC 連携ログイン、Workflow Engine、Secrets Manager、分散トレーシング、AI 統合、
+  Multi Region、Result Ingestor 分離（§10 / §14）。**同期 Invoke / 外部イベントトリガー / Cron は M6 で実装済み**
 
 ---
 
@@ -310,6 +363,9 @@ cp .env.example .env
 | `LOG_FORMAT` | `text` | **M4a**: ログ形式。`json` で `tracing_subscriber::fmt().json()` を有効化し、`execution_id` / `tenant_id` を flatten した 1 行 JSON で出力（集約基盤向け）。既定 `text` は従来挙動と完全互換（§3.8） |
 | `METRICS_BIND_ADDR` | `0.0.0.0:9090` | **M4a**: worker が `/metrics` + `/readyz` + `/healthz` を公開する独立 axum サーバの bind 先。JetStream pull ループから独立し、stall しても liveness が応答可能（§3.8） |
 | `BACKOFF_SECS` | `5,15,60` | **M4c**: JetStream pull consumer の `backoff` 配列（CSV、秒単位）。空文字で「固定 ack_wait 構成」に戻る（§6.6）。合計が `ACK_WAIT_SECS*MAX_DELIVER` を下回る範囲で使うこと（上回ると正規の遅延結果がトークン失効後に届く恐れ。§3.3） |
+| `INSTANCE_ID` | （未設定なら `inst_{uuid}` を採番） | **M6a**: この CP インスタンスの subject-safe 識別子。同期 invoke の reply subject `reply.{instance_id}.{correlation_id}` に埋め込み、JobMessage を送った当該インスタンスだけが reply を購読する（ステートレス×N の鍵, §6.3）。Axum×N で値が衝突しないよう各インスタンスで一意にすること（未設定なら自動採番で衝突しない） |
+| `SYNC_REPLY_TIMEOUT_MS` | `5000` | **M6a**: 同期 invoke（`POST /invoke?wait=1`）の reply 待機上限（ミリ秒）。超過でクライアントへ **202 + execution_id へフォールバック**（縮退）。HTTP 同期呼び出しの上限レイテンシ（§15 M6 完了条件） |
+| `CRON_POLL_INTERVAL_SECS` | `10` | **M6b**: Cron スケジューラの due スキャン間隔（秒）。`cron_jobs.next_fire_at` を跨いだ slot を invoke へ合流させる。短いほど発火遅延が縮むが DB スキャン頻度が上がる（§11） |
 
 > `sqlx` はコンパイル時マクロ（`query!`）ではなくランタイム API（`sqlx::query` /
 > `sqlx::query_as`）を使うため、**ビルド時に DB / MinIO / Redis は不要**です。これらは実行時のみ必要です。
@@ -354,7 +410,7 @@ make migrate   # migrations/*.sql を順に適用。default テナントを 1 �
 
 `make migrate` はコンテナ内 psql に `migrations/` 配下を順に流し込みます（`0001_init.sql`
 → `0002_m2.sql` → `0003_auth.sql` → `0004_rls.sql` → `0005_provenance.sql` →
-`0006_large_io.sql`）。control-plane 起動時にも埋め込み sqlx migrator が pending を冪等適用
+`0006_large_io.sql` → `0007_usage_metering.sql` → `0008_m6.sql`）。control-plane 起動時にも埋め込み sqlx migrator が pending を冪等適用
 するため、`make migrate` を省略しても起動時に揃います。スキーマは `tenants` / `users` /
 `api_tokens` / `components` / `component_versions` / `executions` / `audit_logs` で、全テナント
 表に `ENABLE / FORCE ROW LEVEL SECURITY` を適用済み（§3.2 M3b）。状態は TEXT + CHECK enum、
@@ -604,6 +660,55 @@ CHAOS_ALWAYS_TRAP=always-trap CHAOS_SLOW=slow \
 - chaos_c: `status=failed`（trap → result subscriber または DLQ subscriber）
 - chaos_d: `status=timeout`（epoch interruption → `Trap::Interrupt` → tokio timeout 経由）
 
+### Chaos / M6 起動形態テスト（M6 完了条件の検証）
+
+仕様書 §15 M6 完了条件「HTTP 同期呼び出しが上限レイテンシ内で結果を返し、Cron 登録で定時起動し、
+トリガー経路でも冪等性・テナント分離・計量（M5）が non-HTTP 起点で破れない」を
+`crates/control-plane/tests/chaos_m6.rs` の 3 シナリオ（S1: 同期 invoke / S2: Cron / S3: トリガー）で
+end-to-end 検証します。chaos_m4/m5 と同じ作法で、全シナリオが `#[ignore]`・docker stack +
+`CHAOS_TOKEN` + echo デプロイ済みを前提とします（公開 API だけを使うブラックボックステスト）。
+
+```bash
+# 共通: docker stack を起動して bootstrap + token + echo を用意
+make up && make migrate && make bootstrap
+export CHAOS_TOKEN=$(make -s login | tail -1)
+make build-component && make deploy
+
+# S1 — 同期 Invoke: ?wait=1 が上限レイテンシ内に 200 + output、?wait 無しは 202 不変
+cargo test -p faas-control-plane --test chaos_m6 \
+  -- --ignored chaos_s1_sync_invoke_returns_200_within_timeout --nocapture
+
+# S2 — Cron: 毎分 cron を登録 → due slot を 1 度だけ fire し next_fire_at が前進（最大 ~100 秒待つ）
+cargo test -p faas-control-plane --test chaos_m6 \
+  -- --ignored chaos_s2_cron_fires_once_per_slot --nocapture
+
+# S3 — トリガー: object-storage イベント再送は enqueued=0（冪等）/ chain は上流成功で 1 度だけ起動
+cargo test -p faas-control-plane --test chaos_m6 \
+  -- --ignored chaos_s3_trigger_idempotent_and_chain_fires_once --nocapture
+```
+
+手で起動形態を叩く場合の最小手順:
+
+```bash
+# 同期 Invoke（?wait=1 で結果まで待つ。SYNC_REPLY_TIMEOUT_MS 内に 200 が返る）
+curl -s -X POST "http://localhost:8080/invoke?wait=1" \
+  -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
+  -d '{"component":"echo","input":{"hello":"sync"}}'
+# => 200 {"execution_id":"exec_xxx","status":"succeeded","output":{...}}（縮退時は 202 + pending）
+
+# Cron 登録（毎分起動。CRON_POLL_INTERVAL_SECS 間隔で due slot を fire）
+curl -s -X POST http://localhost:8080/cron-jobs \
+  -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
+  -d '{"component":"echo","schedule":"* * * * *","input":{"hello":"cron"}}'
+# => 201 {"cron_job_id":"...","next_fire_at":"..."}
+
+# トリガー登録（object_storage イベントで echo を起動）
+curl -s -X POST http://localhost:8080/triggers \
+  -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
+  -d '{"component":"echo","trigger_type":"object_storage","match_config":{"bucket_prefix":"tenants/"}}'
+# => 201 {"trigger_id":"..."}
+```
+
 ---
 
 ## エンドポイント一覧
@@ -629,6 +734,14 @@ CHAOS_ALWAYS_TRAP=always-trap CHAOS_SLOW=slow \
 | `POST /uploads` | invoke | 大入力アップロード用 single-key presigned PUT URL を発行（`execution_id` 予約。行 INSERT/INCR なし, §5.2/§6.4） |
 | `GET /executions/{id}` | read | 実行状態の参照（`input_ref`/`output_ref` を含む, §6.4） |
 | `GET /usage` | read | **M5**: テナント利用量参照。`from`/`to`（`YYYY-MM-DD`・UTC・既定は直近30日）で期間集計を返す。`principal.tenant_id` を権威化（cross-tenant パスなし）, §15 |
+| `POST /invoke?wait=1` | invoke | **M6a**: 同期 Invoke。reply subject + correlation で結果を待ち、上限レイテンシ（`SYNC_REPLY_TIMEOUT_MS`）内に 200 + output。縮退時は 202 へ（§6.3） |
+| `POST /cron-jobs` | invoke | **M6b**: Cron トリガー登録（`schedule` = `* * * * *`、component、input）。201 + `next_fire_at`（§11） |
+| `GET /cron-jobs` | read | **M6b**: 自テナントの Cron 登録一覧（`next_fire_at` 含む, §11） |
+| `DELETE /cron-jobs/{id}` | invoke | **M6b**: Cron 登録の削除（自テナント限定。他テナントは 404, §11） |
+| `POST /triggers` | invoke | **M6c**: 外部イベントトリガー登録（`trigger_type` = `object_storage` / `chain`、`match_config`、任意 `input_mapping`）。201 + `trigger_id`（§11） |
+| `GET /triggers` | read | **M6c**: 自テナントのトリガー登録一覧（§11） |
+| `DELETE /triggers/{id}` | invoke | **M6c**: トリガー登録の削除（自テナント限定。他テナントは 404, §11） |
+| `POST /events/object-storage` | invoke | **M6c**: Object Storage イベント受領。テナントは object キーの `tenants/{tenant}/...` から導出し principal と一致を要求（anti-spoof）。同一 `{bucket}/{key}/{etag}` 再送は `enqueued=0`（冪等, §6.6 / §11） |
 
 > **`GET /usage` の集計セマンティクス（課金解釈の明示, M5）**: `invocation_count` と
 > `succeeded_count`/`failed_count`/`timeout_count` は **全終端実行**で +1 される（worker 落下を
@@ -679,13 +792,15 @@ migrations/0004_rls.sql    # M3b: 全テナント表に ENABLE / FORCE ROW LEVEL
 migrations/0005_provenance.sql  # M3c: 署名鍵 kid / idempotency_key UNIQUE / audit_logs (append-only)
 migrations/0006_large_io.sql    # M3d: input_ref / output_ref 列、tenants.quotas、大容量 I/O 用
 migrations/0007_usage_metering.sql  # M5: executions 計量5列 + usage_rollups（FORCE RLS / DELETE 不可）
+migrations/0008_m6.sql     # M6: cron_jobs / triggers / trigger_deliveries（FORCE RLS、冪等配送台帳）
 crates/shared/             # faas-shared: 型・NATS subject・メッセージ・エラー（共有契約の唯一の真実）
-                           #   FailedMessage / failed_subject 等の M4c DLQ 型を含む
+                           #   FailedMessage / failed_subject 等の M4c DLQ 型 + M6 reply subject / instance id を含む
 crates/control-plane/      # faas-control-plane (bin): axum + storage(MinIO) + validation(wasmparser)
                            #   admission(Redis) / signing(Ed25519) / authz / RLS / subscriber
                            #   reaper + DLQ subscriber + metrics (M4a/c)
 crates/control-plane/tests/chaos_m4.rs  # M4 障害注入の end-to-end テスト（#[ignore]）
 crates/control-plane/tests/chaos_m5.rs  # M5 冪等会計の end-to-end テスト（E1: 重複は+1 / E2: N件は+N, #[ignore]）
+crates/control-plane/tests/chaos_m6.rs  # M6 起動形態の end-to-end テスト（S1: 同期 / S2: Cron / S3: トリガー, #[ignore]）
 crates/control-plane/src/metrics.rs     # M4a: Prometheus Registry とメトリクス定義
 crates/worker/             # faas-worker (bin): wasmtime + async-nats + reqwest + cwasm キャッシュ
                            #   epoch ticker は OS スレッド (chaos_d 対策。M4b 設計メモ参照)
@@ -693,22 +808,22 @@ crates/worker/src/metrics.rs            # M4a: worker 側 Prometheus 公開（�
 components/echo/           # サンプル Component（cdylib, wasm32-wasip2）
 components/always-trap/    # M4 chaos_c 用: handle 入口で panic（trap → DLQ 経路）
 components/slow/           # M4 chaos_d 用: handle が tight loop（epoch interrupt → timeout 経路）
-仕様書.md                  # 全体仕様（M4 範囲は §15 M4 / §3.8 / §4.3 / §6.6 / §8、M5 範囲は §15 M5 / §14 メータリング行）
+仕様書.md                  # 全体仕様（M5 範囲は §15 M5 / §14 メータリング行、M6 範囲は §15 M6 / §6.3 / §11 / §14 同期 Invoke・トリガー・Cron 行）
 ```
 
 ---
 
 ## 次のマイルストーン（仕様書 §15）
 
-M4 完了済み（本リポジトリの現状）。次は M5 以降の将来⬜:
+M6 完了済み（本リポジトリの現状）。次は M7 以降の将来⬜:
 
-- **M5 以降（商用マルチテナント SaaS 化, §15）**: 商用クラウド SaaS として成立させる段階実装。
+- **M7 以降（商用マルチテナント SaaS 化, §15）**: 商用クラウド SaaS として成立させる段階実装。
   基本線は **M5 課金・メータリング → M6 Invoke 拡充（同期 Invoke + 外部イベント/Cron トリガー）
   → M7 デプロイ運用（canary / rollback / Secrets）→ M8 弾力スケール + テナント間アイソレーション
-  → M9 サンドボックス強化・サプライチェーン**。分散トレーシング（OpenTelemetry）は高レバレッジで
-  前倒し推奨。Workflow Engine / Result Ingestor 分離 / Multi Region は固定順序を持たない**需要発火型**。
-  AI/LLM はプラットフォーム機能ではなく Capability 経由の外部呼び出し（§4.4 / §13）で充足するため、
-  ロードマップ項目から除外。
+  → M9 サンドボックス強化・サプライチェーン**（M5/M6 は完了済み）。分散トレーシング（OpenTelemetry）は
+  高レバレッジで前倒し推奨。Workflow Engine / Result Ingestor 分離 / Multi Region は固定順序を
+  持たない**需要発火型**。AI/LLM はプラットフォーム機能ではなく Capability 経由の外部呼び出し
+  （§4.4 / §13）で充足するため、ロードマップ項目から除外。
 - **M4 follow-ups**（M4 範囲内で残る配線。`crates/control-plane/src/metrics.rs` 等の
   メトリクス登録は完了しているが record 配線が未到達）:
   - HTTP middleware で `faas_http_requests_total` / `_duration_seconds` の observe 配線
