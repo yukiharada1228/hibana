@@ -13,14 +13,17 @@ mod admission;
 mod auth;
 mod authz;
 mod config;
+mod cron;
 mod crypto;
 mod db;
+mod enqueue;
 mod error;
 mod extract;
 mod handlers;
 mod login;
 mod metrics;
 mod reaper;
+mod scheduler;
 mod signing;
 mod state;
 mod storage;
@@ -183,12 +186,25 @@ async fn main() -> anyhow::Result<()> {
         store,
         config.admission(),
         metrics,
+        config.instance_id.clone(),
+        config.sync_reply_timeout_ms,
     );
 
     // --- result 購読タスク ---
     let sub_state = state.clone();
     tokio::spawn(async move {
         subscriber::run(sub_state).await;
+    });
+
+    // --- 同期 invoke reply 購読タスク (M6a, §15) ---
+    // Core NATS で `reply.{instance_id}.*` を 1 本購読し、worker が同期 invoke の終端 result を
+    // 追加 publish してきたら、subject 第 3 トークン（correlation_id）で per-instance waiter registry
+    // の対応 sender を解決して結果を渡す。**当該インスタンスが送ったジョブの reply だけ** を受け取る
+    // （reply subject に埋めた instance_id による per-instance 隔離＝ステートレス×N の鍵, §4 不変条件）。
+    // 所有インスタンスが死ねば waiter は解決されず CP/クライアント timeout で 202 へ縮退する。
+    let reply_state = state.clone();
+    tokio::spawn(async move {
+        subscriber::run_sync_reply(reply_state).await;
     });
 
     // --- failed (DLQ) 購読タスク (M4c, §6.6 MUST) ---
@@ -213,6 +229,17 @@ async fn main() -> anyhow::Result<()> {
     let stuck_deadline = config.stuck_execution_deadline_secs;
     tokio::spawn(async move {
         reaper::run(reaper_state, reaper_interval, inflight_ttl, stuck_deadline).await;
+    });
+
+    // --- Cron スケジューラタスク (M6b, §11 / §15) ---
+    // CRON_POLL_INTERVAL_SECS 周期で due な Cron ジョブを全テナント横断で引き（cron_due_tenant_jobs()
+    // = SECURITY DEFINER）、各テナントの GUC 済み tx で FOR UPDATE SKIP LOCKED により single-flight で
+    // 1 ジョブずつ掴んで HTTP invoke と同一 enqueue 正規パスへ合流させる。冪等性（cron slot キー +
+    // UNIQUE）・provenance（job_token 署名）・計量（単一 finalize）は enqueue ヘルパが担保する。
+    let scheduler_state = state.clone();
+    let cron_poll_interval = config.cron_poll_interval_secs;
+    tokio::spawn(async move {
+        scheduler::run(scheduler_state, cron_poll_interval).await;
     });
 
     // --- ルータ ---
@@ -255,6 +282,10 @@ fn build_router(state: AppState) -> Router {
         // GET /usage: テナント利用量参照 (M5, §15 / §6.0)。principal.tenant_id を権威化し
         // cross-tenant path を持たない（/tenants/{id}/usage の IDOR 面を作らない）。
         .route("/usage", get(handlers::get_usage))
+        // GET /cron-jobs: テナントの Cron ジョブ一覧 (M6b, §15)。
+        .route("/cron-jobs", get(handlers::list_cron_jobs))
+        // GET /triggers: テナントのトリガー一覧 (M6c, §15)。
+        .route("/triggers", get(handlers::list_triggers))
         .route_layer(axum::middleware::from_fn(require_scope(Scope::Read)));
 
     // --- Invoke スコープ ---
@@ -262,6 +293,13 @@ fn build_router(state: AppState) -> Router {
         .route("/invoke", post(handlers::invoke))
         // POST /uploads: 大入力アップロード用の署名付き PUT URL 発行（§5.2 / §6.4。invoke スコープ）。
         .route("/uploads", post(handlers::create_upload))
+        // POST /events/object-storage: Object Storage 通知の取込 (M6c, §15)。tenant_id は
+        // オブジェクトキーの tenants/{tenant} プレフィックスから導出し principal と一致を要求する
+        // （本文盲信せず anti-spoof）。component を起動する性質上 Invoke スコープに置く。
+        .route(
+            "/events/object-storage",
+            post(handlers::object_storage_event),
+        )
         .route_layer(axum::middleware::from_fn(require_scope(Scope::Invoke)));
 
     // --- Deploy スコープ（component / version の作成） ---
@@ -271,6 +309,10 @@ fn build_router(state: AppState) -> Router {
             "/components/{component_id}/versions",
             post(handlers::upload_version),
         )
+        // POST /cron-jobs: Cron ジョブ登録 (M6b, §15。component ライフサイクル相当の Deploy スコープ)。
+        .route("/cron-jobs", post(handlers::create_cron_job))
+        // POST /triggers: トリガー登録 (M6c, §15。component ライフサイクル相当の Deploy スコープ)。
+        .route("/triggers", post(handlers::create_trigger))
         .route_layer(axum::middleware::from_fn(require_scope(Scope::Deploy)));
 
     // --- Admin スコープ（全 DELETE・active-version 切替・user/token 管理） ---
@@ -290,6 +332,10 @@ fn build_router(state: AppState) -> Router {
         .route("/tenants/{tenant_id}/users", post(handlers::create_user))
         .route("/tokens", post(handlers::create_token))
         .route("/tokens/{token_id}", delete(handlers::revoke_token))
+        // DELETE /cron-jobs/{id}: Cron ジョブ削除 (M6b, §15。他 DELETE と整合の Admin スコープ)。
+        .route("/cron-jobs/{id}", delete(handlers::delete_cron_job))
+        // DELETE /triggers/{id}: トリガー削除 (M6c, §15。他 DELETE と整合の Admin スコープ)。
+        .route("/triggers/{id}", delete(handlers::delete_trigger))
         .route_layer(axum::middleware::from_fn(require_scope(Scope::Admin)));
 
     // 認証必須ルート（スコープ別ルータを統合し、authenticate で principal を確立）。
@@ -550,6 +596,9 @@ mod migration_tests {
     // MIGRATOR と同じ migrations/ ディレクトリを参照する（main.rs から見た相対パス）。
     const USAGE_METERING_SQL: &str = include_str!("../../../migrations/0007_usage_metering.sql");
 
+    // 0008_m6.sql のソースも同様にコンパイル時埋め込み（DB-free 文字列不変条件検査用）。
+    const M6_SQL: &str = include_str!("../../../migrations/0008_m6.sql");
+
     // MIGRATOR が 0007 を**コンパイル時収集**していること（sqlx::migrate! の埋め込み検証）。
     // live DB を要さない（iter() は埋め込み済みメタデータを走査するだけ）。
     #[test]
@@ -613,6 +662,154 @@ mod migration_tests {
                 && !USAGE_METERING_SQL.contains("GRANT  SELECT, INSERT, UPDATE, DELETE")
                 && !USAGE_METERING_SQL.contains("GRANT SELECT, INSERT, UPDATE, DELETE"),
             "DELETE must not be granted to faas_app on usage_rollups"
+        );
+    }
+
+    // ---- 0008_m6.sql の DB-free 文字列不変条件 -------------------------------
+
+    // MIGRATOR が 0008 を**コンパイル時収集**していること（sqlx::migrate! の埋め込み検証）。
+    #[test]
+    fn migrator_includes_version_8() {
+        let v8 = MIGRATOR
+            .iter()
+            .find(|m| m.version == 8)
+            .expect("migration version 8 (0008_m6) must be collected by MIGRATOR");
+        assert!(
+            v8.description.contains("m6"),
+            "unexpected 0008 description: {}",
+            v8.description
+        );
+    }
+
+    // 0008 を BASELINE_VERSIONS に入れていないこと（= MIGRATOR.run が通常適用する）。
+    #[test]
+    fn version_8_is_not_baselined() {
+        assert!(
+            !super::BASELINE_VERSIONS.iter().any(|(v, _)| *v == 8),
+            "0008 must not be baselined; MIGRATOR.run applies it normally"
+        );
+    }
+
+    // 0008 の 3 表が ENABLE + FORCE RLS であること（0007 と同型の DDL 不変条件）。
+    // 桁揃え（空白数）に依存しないよう、行を正規化して `ALTER TABLE {table} ... ROW LEVEL SECURITY` を探す。
+    #[test]
+    fn m6_tables_are_force_rls() {
+        // 連続空白を 1 個に潰した正規化版で部分文字列照合する。
+        let normalized: String = {
+            let mut s = String::with_capacity(M6_SQL.len());
+            let mut prev_space = false;
+            for c in M6_SQL.chars() {
+                if c == ' ' || c == '\t' {
+                    if !prev_space {
+                        s.push(' ');
+                    }
+                    prev_space = true;
+                } else {
+                    s.push(c);
+                    prev_space = false;
+                }
+            }
+            s
+        };
+        for table in ["cron_jobs", "triggers", "trigger_deliveries"] {
+            assert!(
+                normalized.contains(&format!("ALTER TABLE {table} FORCE ROW LEVEL SECURITY")),
+                "{table} must FORCE ROW LEVEL SECURITY"
+            );
+            assert!(
+                normalized.contains(&format!("ALTER TABLE {table} ENABLE ROW LEVEL SECURITY")),
+                "{table} must ENABLE ROW LEVEL SECURITY"
+            );
+        }
+    }
+
+    // 0008 の tenant_isolation が fail-closed（current_setting('app.tenant_id') 第 2 引数なし）。
+    #[test]
+    fn m6_tenant_isolation_is_fail_closed() {
+        assert!(
+            M6_SQL.contains("current_setting('app.tenant_id')"),
+            "tenant_isolation must gate on current_setting('app.tenant_id')"
+        );
+        assert!(
+            !M6_SQL.contains("current_setting('app.tenant_id', true)")
+                && !M6_SQL.contains("current_setting('app.tenant_id', TRUE)"),
+            "tenant_isolation must NOT use the second-arg fallback (must fail closed)"
+        );
+        // 3 表それぞれに tenant_isolation ポリシーが定義されていること。
+        for table in ["cron_jobs", "triggers", "trigger_deliveries"] {
+            assert!(
+                M6_SQL.contains(&format!("CREATE POLICY tenant_isolation ON {table}")),
+                "{table} must have a tenant_isolation policy"
+            );
+        }
+    }
+
+    // trigger_deliveries は SELECT/INSERT のみ付与し、UPDATE/DELETE は付与しない（配送台帳の改竄不能）。
+    #[test]
+    fn m6_trigger_deliveries_does_not_grant_update_or_delete() {
+        // SELECT/INSERT のみが付与される。
+        assert!(
+            M6_SQL.contains(
+                "GRANT  SELECT, INSERT                 ON trigger_deliveries TO   faas_app;"
+            ) || M6_SQL.contains("GRANT SELECT, INSERT ON trigger_deliveries TO faas_app;"),
+            "trigger_deliveries must be granted only SELECT/INSERT"
+        );
+        // UPDATE/DELETE は防御的に REVOKE され、trigger_deliveries への DELETE/UPDATE GRANT は無いこと。
+        assert!(
+            M6_SQL.contains(
+                "REVOKE UPDATE, DELETE                 ON trigger_deliveries FROM faas_app;"
+            ) || M6_SQL.contains("REVOKE UPDATE, DELETE ON trigger_deliveries FROM faas_app;"),
+            "trigger_deliveries must REVOKE UPDATE, DELETE from faas_app"
+        );
+        assert!(
+            !M6_SQL.contains("DELETE ON trigger_deliveries TO")
+                && !M6_SQL.contains("DELETE                 ON trigger_deliveries TO"),
+            "DELETE must not be granted to faas_app on trigger_deliveries"
+        );
+    }
+
+    // executions に chain_depth 列が additive（DEFAULT 0, backfill 不要）で追加されること（M6c 暴走防止）。
+    #[test]
+    fn m6_adds_executions_chain_depth() {
+        assert!(
+            M6_SQL.contains("ALTER TABLE executions ADD COLUMN IF NOT EXISTS chain_depth")
+                && M6_SQL.contains("INTEGER NOT NULL DEFAULT 0"),
+            "executions.chain_depth must be added additively with DEFAULT 0"
+        );
+    }
+
+    // cron_jobs / triggers は CRUD（DELETE を含む）が付与されること（CRUD API が DELETE する）。
+    #[test]
+    fn m6_cron_and_triggers_grant_crud() {
+        for table in ["cron_jobs", "triggers"] {
+            assert!(
+                M6_SQL.contains(&format!("GRANT  SELECT, INSERT, UPDATE, DELETE ON {table}"))
+                    || M6_SQL.contains(&format!("GRANT SELECT, INSERT, UPDATE, DELETE ON {table}")),
+                "{table} must be granted SELECT/INSERT/UPDATE/DELETE (CRUD)"
+            );
+        }
+    }
+
+    // 全テナント巡回用 cron_due_tenant_jobs() が SECURITY DEFINER で定義され、EXECUTE が
+    // PUBLIC から剥奪され faas_app にのみ付与されること（reaper の認証前参照と同型）。
+    #[test]
+    fn m6_cron_due_function_is_security_definer() {
+        assert!(
+            M6_SQL.contains("CREATE FUNCTION cron_due_tenant_jobs()"),
+            "cron_due_tenant_jobs() must be defined"
+        );
+        assert!(
+            M6_SQL.contains("SECURITY DEFINER"),
+            "cron_due_tenant_jobs() must be SECURITY DEFINER (cross-tenant scan under owner)"
+        );
+        assert!(
+            M6_SQL.contains("REVOKE EXECUTE ON FUNCTION cron_due_tenant_jobs() FROM PUBLIC;"),
+            "cron_due_tenant_jobs() EXECUTE must be revoked from PUBLIC"
+        );
+        assert!(
+            M6_SQL.contains("GRANT  EXECUTE ON FUNCTION cron_due_tenant_jobs() TO   faas_app;")
+                || M6_SQL.contains("GRANT EXECUTE ON FUNCTION cron_due_tenant_jobs() TO faas_app;"),
+            "cron_due_tenant_jobs() EXECUTE must be granted to faas_app"
         );
     }
 }

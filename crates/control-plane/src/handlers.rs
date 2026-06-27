@@ -19,18 +19,17 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
 use faas_shared::{
-    component_object_key, invoke_subject, new_component_id, new_execution_id, new_tenant_id,
-    new_token_id, new_user_id, new_version_id, ExecutionStatus, FaasError, JobClaims, JobMessage,
-    ResourceLimits, Role, Scope,
+    component_object_key, new_component_id, new_execution_id, new_tenant_id, new_token_id,
+    new_user_id, new_version_id, ExecutionStatus, FaasError, ResourceLimits, Role, Scope,
 };
 use sha2::{Digest, Sha256};
-use sqlx::Acquire as _;
 
 use crate::admission::{self, Decision};
 use crate::auth::{hash_token, Principal};
 use crate::authz::{require_admin_role, resolve_token_scopes};
 use crate::crypto::{generate_secret, hash_password};
 use crate::db;
+use crate::enqueue;
 use crate::error::AppError;
 use crate::extract::JsonBody;
 use crate::state::AppState;
@@ -394,6 +393,46 @@ pub struct InvokeResponse {
     pub status: ExecutionStatus,
 }
 
+/// M6a (§15): `POST /invoke` の同期モード判定クエリ。`?wait=1`（または `Prefer: wait` ヘッダ）で
+/// 同期呼び出しを要求する。未指定は従来どおり非同期（202）で後方互換。
+#[derive(Debug, Deserialize)]
+pub struct InvokeQuery {
+    /// `1` / `true` で同期モード。`Prefer: wait` ヘッダでも同義（どちらか一方で十分）。
+    #[serde(default)]
+    pub wait: Option<String>,
+}
+
+/// M6a (§15): 同期 invoke が上限レイテンシ内に結果を得たときの 200 応答。
+///
+/// reply で受けた `ResultMessage` を **署名検証してから** この形でクライアントへ返す（provenance 保全,
+/// §3.3）。timeout 時は本応答ではなく 202 + `InvokeResponse`（execution_id）へフォールバックする。
+#[derive(Debug, Serialize)]
+pub struct SyncInvokeResponse {
+    pub execution_id: String,
+    /// 終端状態（succeeded | failed | timeout）。worker が組んだ result の status をそのまま返す。
+    pub status: ExecutionStatus,
+    /// 成功時の出力（インライン）。失敗/timeout では null。
+    pub output: Option<Value>,
+    /// 失敗/timeout 時のエラーメッセージ。成功では null。
+    pub error: Option<String>,
+}
+
+/// `?wait` クエリ または `Prefer: wait` ヘッダから同期モードか判定する (M6a, §15)。
+///
+/// `?wait=1` / `?wait=true`（大小無視）、または `Prefer` ヘッダ値に `wait` を含むとき true。
+/// それ以外（未指定 / `?wait=0` 等）は false（= 従来どおり非同期 202、後方互換）。
+fn wants_sync_invoke(query: &InvokeQuery, headers: &HeaderMap) -> bool {
+    let wait_q = query.wait.as_deref().is_some_and(|v| {
+        let v = v.trim();
+        v.eq_ignore_ascii_case("1") || v.eq_ignore_ascii_case("true")
+    });
+    let prefer_h = headers
+        .get("Prefer")
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|v| v.to_ascii_lowercase().contains("wait"));
+    wait_q || prefer_h
+}
+
 /// M4a (§3.8): 全ログを execution_id / tenant_id で相関できるよう、ハンドラ全体を `invoke` span で
 /// 包む。`execution_id` は本関数内で確定する（new_execution_id() または予約済み id）ため、
 /// span 自体は最初は `Empty` で開き、確定後に `Span::current().record(...)` で詰める。
@@ -402,6 +441,7 @@ pub struct InvokeResponse {
 pub async fn invoke(
     State(state): State<AppState>,
     principal: Principal,
+    Query(query): Query<InvokeQuery>,
     headers: HeaderMap,
     JsonBody(req): JsonBody<InvokeRequest>,
 ) -> Result<Response, AppError> {
@@ -614,186 +654,137 @@ pub async fn invoke(
         None => None,
     };
 
-    // --- 署名トークンを mint (M3c, §3.3) ---
+    // --- 署名トークンの exp を計算 (M3c, §3.3) ---
     // exp は壁時計上限 + TTL 定数から計算する（worker の consumer ack_wait/max_deliver と同一定数）。
+    // 実際の claim 組み立て + 署名 + pending INSERT + publish は enqueue_execution ヘルパに閉じる
+    // （M6-0: HTTP/Cron/event/chain の全入口が同一の provenance/冪等/計量パスを共有する, §15）。
     let iat = chrono::Utc::now().timestamp();
     let exp = iat + state.token_exp_offset_secs(active.max_wall_time_ms);
-    let kid = state.signer().kid().to_string();
-    let claims = JobClaims {
-        execution_id: execution_id.clone(),
-        tenant_id: tenant.to_string(),
-        version_id: active.version_id.clone(),
-        kid: kid.clone(),
-        iat,
-        exp,
-    };
-    let job_token = state.signer().sign(&claims);
 
-    // 1) executions に pending を記録 (worker/result が後で遷移させる)。冪等列も併せて保存する。
-    //
-    // 並行同一 key 競合の backstop (§6.6 #5): 部分 UNIQUE 違反(23505) を捕捉し、再 SELECT して
-    // 同一 body→既存返却 / 異 body→409 を判定する（index が権威; SELECT は fast path）。
-    //
-    // INSERT は **savepoint**（sqlx の nested begin = SAVEPOINT）で包む。Postgres では
-    // 失敗ステートメントが tx 全体を abort し、以後のコマンドは 25P02 で弾かれる。savepoint
-    // 内で INSERT し、23505 なら savepoint を rollback して abort 部分状態を解消してから、
-    // 外側 tx で再 SELECT する（こうしないと再 SELECT が aborted-tx エラーになり 500 になる）。
-    let insert_result = {
-        let mut sp = match tx.begin().await {
-            Ok(sp) => sp,
-            Err(e) => {
-                release_if_reserved!();
-                return Err(e.into());
-            }
-        };
-        let r = db::insert_pending_execution_with_provenance(
-            &mut *sp,
-            &execution_id,
+    // --- M6a (§15): 同期モード判定と reply 経路の準備 ---
+    // 同期モード（?wait=1 / Prefer: wait）のとき、correlation_id を採番し reply_to =
+    // reply_subject(instance_id, correlation_id) を JobMessage に同梱する。worker は終端 result を
+    // result subject に加えてこの reply subject へも publish し、当該インスタンスの reply 購読タスクが
+    // correlation で waiter を解決する。admission/冪等/INSERT/publish 自体は非同期と完全に同一で、
+    // 違いは「reply_to を載せて publish 後に上限レイテンシまで待つか」だけ（後方互換）。
+    let sync = wants_sync_invoke(&query, &headers);
+    let correlation_id: Option<String> = sync.then(faas_shared::new_correlation_id);
+    let reply_to: Option<String> = correlation_id
+        .as_deref()
+        .map(|corr| faas_shared::reply_subject(state.instance_id(), corr));
+
+    // M6a (§15): waiter は **publish より前**に登録する（register-before-publish）。echo のような
+    // 高速 component では worker の reply が publish 直後・ハンドラが待機に到達する前に届き得るため、
+    // publish 後に登録すると reply を取りこぼし常に 202 へ縮退してしまう。correlation 採番時点で
+    // oneshot を作って registry に載せておき、reply の取りこぼしを構造的に無くす。Enqueued 以外
+    // （冪等ヒット / publish 失敗 / DB 失敗）の分岐では登録した waiter を除去する（leak 防止）。
+    let sync_rx = correlation_id.as_deref().map(|corr| {
+        let (tx, rx) = tokio::sync::oneshot::channel::<faas_shared::ResultMessage>();
+        state.waiters().insert(corr.to_string(), tx);
+        rx
+    });
+
+    // --- pending INSERT(provenance+冪等列) → commit → job_token 署名 → JobMessage publish ---
+    // tx は set_tenant_guc 済み。ヘルパが savepoint で 23505 を捕捉し、再 SELECT して
+    // IdempotentHit を返す（HTTP 側で「同一 body→既存返却 / 異 body→409」を最終判定する）。
+    let outcome = enqueue::enqueue_execution(
+        &state,
+        tx,
+        enqueue::EnqueueRequest {
             tenant,
-            &component.id,
-            &active.version_id,
-            &req.input,
-            idem_key.as_deref(),
-            request_hash.as_deref(),
-            Some(&kid),
-            input_ref.as_deref(),
-        )
-        .await;
-        match r {
-            Ok(()) => {
-                // savepoint を release（外側 tx に取り込む）。
-                if let Err(e) = sp.commit().await {
-                    release_if_reserved!();
-                    return Err(e.into());
-                }
-                Ok(())
-            }
-            Err(e) => {
-                // savepoint を rollback して abort 部分状態を解消する（外側 tx は生き続ける）。
-                if let Err(re) = sp.rollback().await {
-                    release_if_reserved!();
-                    return Err(re.into());
-                }
-                Err(e)
-            }
-        }
-    };
+            component_name: &req.component,
+            component_id: &component.id,
+            version_id: &active.version_id,
+            version: &active.version,
+            wasm_sha256: &active.wasm_sha256,
+            wasm_url,
+            input_url,
+            input: &req.input,
+            input_ref: input_ref.as_deref(),
+            execution_id: execution_id.clone(),
+            idempotency_key: idem_key.as_deref(),
+            request_hash: request_hash.as_deref(),
+            iat,
+            exp,
+            reply_to: reply_to.clone(),
+            origin: "http_invoke",
+            chain_depth: 0,
+        },
+    )
+    .await;
 
-    if let Err(e) = insert_result {
-        // INSERT が失敗した = この invoke は **新規 pending 行を作っていない**。予約した
-        // in-flight スロットは終端 DECR の対象にならない（pending 行が無いため）ので、
-        // どの分岐で抜けるにせよ必ず release する（leak 防止）。冪等ヒット側のスロットは
-        // 既存 pending 行に紐づく別予約であり、これとは独立。
-        if is_unique_violation(&e) {
-            if let (Some(key), Some(hash)) = (idem_key.as_deref(), request_hash.as_deref()) {
-                if let Some((existing_id, existing_status, stored_hash)) =
-                    db::find_execution_by_idempotency_key(&mut *tx, tenant, key).await?
-                {
-                    release_if_reserved!();
-                    return finish_idempotent_hit(
-                        tx,
-                        tenant,
-                        existing_id,
-                        existing_status,
-                        stored_hash,
-                        hash,
+    match outcome {
+        // 新規 pending を確定し publish 済み。commit 後はスロットが pending 行に紐づく（DB COUNT が
+        // 真実として数える）ため、ここで release はしない——subscriber の finalize で DECR され、
+        // 取りこぼしは reaper の DB COUNT 再同期が補正する。
+        Ok(enqueue::EnqueueOutcome::Enqueued { execution_id }) => {
+            // M6a (§15): 同期モードなら（publish 前に登録済みの）waiter を上限レイテンシまで待つ。
+            // 非同期は従来どおり 202。
+            match (correlation_id, sync_rx) {
+                (Some(corr), Some(rx)) => {
+                    Ok(wait_for_sync_reply(&state, corr, rx, execution_id).await)
+                }
+                _ => {
+                    // 非同期 invoke は 202 Accepted のまま不変（後方互換）。
+                    Ok((
+                        StatusCode::ACCEPTED,
+                        Json(InvokeResponse {
+                            execution_id,
+                            status: ExecutionStatus::Pending,
+                        }),
                     )
-                    .await
-                    .map(IntoResponse::into_response);
+                        .into_response())
                 }
             }
         }
-        release_if_reserved!();
-        return Err(e.into());
-    }
-
-    // tx を確定してから publish する（NATS publish をトランザクション境界の外に出す:
-    // ネットワーク publish 中に tx/接続を保持しない）。
-    // commit 後は pending 行が確定し、in-flight スロットは「その pending 行が保持する」状態に
-    // 移る（DB COUNT がそれを真実として数える）。よって以後の失敗（publish 失敗等）では
-    // **release しない** ——スロットは pending 行に紐づき、subscriber の finalize で DECR され、
-    // 取りこぼしは reaper の DB COUNT 再同期が補正する。
-    if let Err(e) = tx.commit().await {
-        release_if_reserved!();
-        return Err(e.into());
-    }
-
-    // 2) JobMessage を invoke_subject へ publish。worker は wasm_url から本体を取得し、
-    //    wasm_sha256 をキャッシュ/事前コンパイルのキーにする (§3.6)。
-    let job = JobMessage {
-        execution_id: execution_id.clone(),
-        tenant_id: tenant.to_string(),
-        component: req.component,
-        version: active.version,
-        wasm_sha256: active.wasm_sha256,
-        wasm_url,
-        // インライン入力。大入力時（input_url が在るとき）は worker が input_url を優先する。
-        input: req.input,
-        // M3d (§3.4): 大入力の退避オブジェクトへの、そのキー限定の短命 presigned GET URL。
-        input_url,
-        // M3c: control-plane が署名した不透明トークン。worker は verbatim に echo する。
-        job_token,
-    };
-    let payload = serde_json::to_vec(&job)?;
-
-    // --- 冪等性 layer 3: Nats-Msg-Id = execution_id (§6.6) ---
-    // JetStream publish で per-stream の重複排除ウィンドウに execution_id を渡す。
-    // CP のリトライで同一 execution_id を再 publish しても二重 enqueue されない。
-    //
-    // M4d (§8): publish 自体は MaxAckPending 制限を直接 ack エラーとして返さない（JetStream の
-    // MaxAckPending は consumer 側の「配送済み未 ack」の頭打ち）。が、ストリーム書き込みの
-    // TimedOut / BrokenPipe / Other は **下流が詰まっている**シグナルなので、500（リトライ抑制）
-    // ではなく 429（バックオフ後リトライ）で返す方がクライアント挙動として正しい
-    // （§8 line 749「キュー滞留時もバックプレッシャとして 429」MUST）。pending 行は既に commit
-    // 済み（孤児だが reaper の stuck-execution sweeper が deadline で failed に倒す = 二段救済）。
-    let mut nats_headers = async_nats::HeaderMap::new();
-    nats_headers.insert("Nats-Msg-Id", execution_id.as_str());
-    let ack = match state
-        .jetstream()
-        .publish_with_headers(invoke_subject(tenant), nats_headers, payload.into())
-        .await
-    {
-        Ok(a) => a,
-        Err(e) => {
-            tracing::warn!(
-                tenant = %tenant,
-                error = %e,
-                kind = ?e.kind(),
-                "jetstream publish failed; returning 429 backpressure"
-            );
+        // 冪等ヒット（23505 race）: この invoke は **新規 pending 行を作っていない**。予約した
+        // in-flight スロットは終端 DECR の対象にならない（pending 行が無い）ので必ず release する
+        // （leak 防止）。冪等ヒット側のスロットは既存 pending 行に紐づく別予約であり独立。
+        Ok(enqueue::EnqueueOutcome::IdempotentHit {
+            execution_id: existing_id,
+            status,
+            stored_request_hash,
+        }) => {
+            // 新規 publish しなかった = この correlation には reply が来ない。登録済み waiter を除去する。
+            if let Some(corr) = &correlation_id {
+                state.waiters().remove(corr);
+            }
+            release_if_reserved!();
+            finish_idempotent_hit_after_enqueue(
+                &state,
+                tenant,
+                existing_id,
+                status,
+                stored_request_hash.as_deref(),
+                request_hash.as_deref(),
+            )
+            .await
+            .map(IntoResponse::into_response)
+        }
+        // publish 失敗（バックプレッシャ）: 500 ではなく 429 + Retry-After（§8 MUST）。pending 行は
+        // 既に commit 済み（孤児だが reaper の stuck-execution sweeper が deadline で failed に倒す）。
+        // スロットは pending 行に紐づくため release しない。
+        Err(enqueue::EnqueueError::PublishBackpressure) => {
+            // publish 失敗 = reply は来ない。登録済み waiter を除去する（leak 防止）。
+            if let Some(corr) = &correlation_id {
+                state.waiters().remove(corr);
+            }
             state
                 .metrics()
                 .admission_rejections_total
                 .with_label_values(&["publish_backpressure"])
                 .inc();
-            return Ok(admission::RateLimited::publish_backpressure().into_response());
+            Ok(admission::RateLimited::publish_backpressure().into_response())
         }
-    };
-    // PublishAck を待ち、stream が受理したことを確認する（落ちてもジョブは DB に記録済み）。
-    if let Err(e) = ack.await {
-        tracing::warn!(
-            tenant = %tenant,
-            error = %e,
-            kind = ?e.kind(),
-            "jetstream publish ack failed; returning 429 backpressure"
-        );
-        state
-            .metrics()
-            .admission_rejections_total
-            .with_label_values(&["publish_backpressure"])
-            .inc();
-        return Ok(admission::RateLimited::publish_backpressure().into_response());
+        // DB 層など他失敗。INSERT が失敗していれば pending 行は無いので予約スロットを release する。
+        Err(enqueue::EnqueueError::Other(e)) => {
+            if let Some(corr) = &correlation_id {
+                state.waiters().remove(corr);
+            }
+            release_if_reserved!();
+            Err(e)
+        }
     }
-
-    // 3) 202 Accepted。
-    Ok((
-        StatusCode::ACCEPTED,
-        Json(InvokeResponse {
-            execution_id,
-            status: ExecutionStatus::Pending,
-        }),
-    )
-        .into_response())
 }
 
 // ---------------------------------------------------------------------------
@@ -898,6 +889,144 @@ async fn finish_idempotent_hit(
             status,
         }),
     ))
+}
+
+/// `enqueue_execution` が 23505 race で `IdempotentHit` を返した後の応答を確定する (M6-0)。
+///
+/// ヘルパ側で tx は既に commit 済み（read-only で解放）なので、ここは tx を引き継がない版。
+/// 同一 body→既存返却 / 異 body→409。409（key 再利用 + body 不一致）のときだけ **新しい tx** を
+/// 張り、principal テナントで GUC を設定してから `idempotency_conflict` を audit_logs に追記して
+/// commit する（§3.7。tenant_id は GUC と一致し WITH CHECK を通す）。`finish_idempotent_hit` の
+/// 「tx を持つ版」と弁別する（fast-path 経路は依然 tx を持ち続ける）。
+async fn finish_idempotent_hit_after_enqueue(
+    state: &AppState,
+    tenant: &str,
+    existing_id: String,
+    existing_status: ExecutionStatus,
+    stored_hash: Option<&str>,
+    current_hash: Option<&str>,
+) -> Result<(StatusCode, Json<InvokeResponse>), AppError> {
+    // body hash が一致しなければ 409（同一キーで異なるリクエスト body）。
+    // current_hash が None（Idempotency-Key 無し）の race は通常起こらないが、その場合も
+    // 不一致扱いにせず（key が無ければ衝突しない）既存返却に倒す。
+    if let (Some(current), stored) = (current_hash, stored_hash) {
+        if stored != Some(current) {
+            // 監査追記（best-effort: 失敗しても 409 応答は返す）。生 body/hash は載せない。
+            if let Ok(mut tx) = state.pool().begin().await {
+                if db::set_tenant_guc(&mut tx, tenant).await.is_ok() {
+                    let detail = json!({ "reason": "request_body_hash_mismatch" });
+                    let _ = db::insert_audit_log(
+                        &mut *tx,
+                        tenant,
+                        None,
+                        "idempotency_conflict",
+                        Some(&existing_id),
+                        Some(&detail),
+                    )
+                    .await;
+                    let _ = tx.commit().await;
+                }
+            }
+            return Err(FaasError::Conflict(
+                "idempotency key reused with a different request body".into(),
+            )
+            .into());
+        }
+    }
+    // 既存 execution の現在状態をそのまま返す。
+    Ok((
+        StatusCode::ACCEPTED,
+        Json(InvokeResponse {
+            execution_id: existing_id,
+            status: existing_status,
+        }),
+    ))
+}
+
+/// M6a (§15): 同期 invoke の publish 後、上限レイテンシまで reply を待って応答を確定する。
+///
+/// 手順（§5.1 / §4 不変条件）: waiter は呼び出し側が **publish 前に** 登録済みで、本関数はその
+/// 受信端 `rx` を受け取って待つ（register-before-publish で高速 reply を取りこぼさない）。
+/// - reply 到達 → 受信 `ResultMessage` を **`state.verifier().verify()` で署名検証してから**
+///   200 + 結果を返す（provenance 保全, §3.3。reply は別 transport だが検証規約は同一）。
+///   verify 失敗 / claim 不整合（execution_id 不一致）は **偽の reply** として握り、202 へ縮退する
+///   （正規の終端化・計量は依然 result/DLQ subscriber の単一 finalize パスが担う）。
+/// - timeout → waiter を除去（leak 防止）して 202 + execution_id へフォールバックする。worker は
+///   バックグラウンドで実行を続け、result/DLQ/sweeper が finalize する。
+///
+/// 所有インスタンス障害時は reply 購読タスクごと失われ waiter は解決されないため、この timeout が
+/// 確実に発火して 202 へ縮退する（ステートレス×N の fail-safe, §4 不変条件）。
+async fn wait_for_sync_reply(
+    state: &AppState,
+    correlation_id: String,
+    rx: tokio::sync::oneshot::Receiver<faas_shared::ResultMessage>,
+    execution_id: String,
+) -> Response {
+    // 上限レイテンシまで待つ（waiter は呼び出し側が publish 前に登録済み）。
+    let waited = tokio::time::timeout(state.sync_reply_timeout(), rx).await;
+
+    // 202 フォールバック応答（timeout / 偽 reply）を組む共通クロージャ。waiter は除去済みにする。
+    let fallback_202 = |state: &AppState| {
+        // timeout 経路は remove で leak を防ぐ。reply 経路は run_sync_reply が既に remove 済みだが、
+        // remove は冪等なので二重呼びは無害（None になるだけ）。
+        state.waiters().remove(&correlation_id);
+        (
+            StatusCode::ACCEPTED,
+            Json(InvokeResponse {
+                execution_id: execution_id.clone(),
+                status: ExecutionStatus::Pending,
+            }),
+        )
+            .into_response()
+    };
+
+    match waited {
+        // reply 到達。
+        Ok(Ok(result)) => {
+            // provenance 検証: job_token 署名 + claim.execution_id 照合を通したものだけ 200 で返す。
+            match state.verifier().verify(&result.job_token) {
+                Ok(claims) if claims.execution_id == execution_id => (
+                    StatusCode::OK,
+                    Json(SyncInvokeResponse {
+                        execution_id,
+                        status: result.status,
+                        output: result.output,
+                        error: result.error,
+                    }),
+                )
+                    .into_response(),
+                Ok(claims) => {
+                    // claim.execution_id 不一致 = 別実行の reply の誤配。偽結果として 200 で返さない。
+                    tracing::warn!(
+                        execution_id = %execution_id,
+                        claim_execution_id = %claims.execution_id,
+                        "sync reply claim execution_id mismatch; falling back to 202"
+                    );
+                    fallback_202(state)
+                }
+                Err(e) => {
+                    // 署名検証失敗 = 偽 reply（鍵を持たない第三者が waiter を解決しようとした等）。
+                    // 200 で返さず 202 へ縮退する（クライアントへ未検証の結果を渡さない, §3.3）。
+                    tracing::warn!(
+                        execution_id = %execution_id,
+                        reason = %e,
+                        "sync reply token verification failed; falling back to 202"
+                    );
+                    fallback_202(state)
+                }
+            }
+        }
+        // sender が drop された（registry から誤って除去された等）。フォールバック。
+        Ok(Err(_)) => {
+            tracing::warn!(
+                execution_id = %execution_id,
+                "sync reply channel closed without a value; falling back to 202"
+            );
+            fallback_202(state)
+        }
+        // timeout: 上限レイテンシ内に reply が来なかった。202 へフォールバック。
+        Err(_) => fallback_202(state),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1738,6 +1867,784 @@ fn bootstrap_token_matches(provided: &str, expected: &str) -> bool {
 }
 
 /// UNIQUE 制約違反 (重複 name / version 等) を 400 にマップする。それ以外は内部エラー。
+// ---------------------------------------------------------------------------
+// Cron ジョブ CRUD (M6b, §11 / §15)
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Deserialize)]
+pub struct CreateCronJobRequest {
+    /// 起動する Component 名（テナント内一意。存在検証する）。
+    pub component: String,
+    /// cron 式（5 フィールド: 分 時 日 月 曜）。登録時にパース検証する（不正は 422）。
+    pub schedule: String,
+    /// fire 時に Component へ渡す入力（未指定は `null`）。
+    #[serde(default)]
+    pub input: Value,
+}
+
+#[derive(Debug, Serialize)]
+pub struct CreateCronJobResponse {
+    pub cron_job_id: String,
+    pub component_id: String,
+    pub schedule: String,
+    /// 初回発火予定時刻（RFC3339, UTC）。
+    pub next_fire_at: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct CronJobListItemResponse {
+    pub cron_job_id: String,
+    pub component_id: String,
+    pub schedule: String,
+    pub input: Value,
+    pub enabled: bool,
+    pub next_fire_at: String,
+    pub created_at: String,
+}
+
+/// POST /cron-jobs — Cron ジョブを登録する (M6b, Deploy スコープ, §15)。
+///
+/// 手順:
+/// 1. component 名を解決（不在は 404）。FK + 存在検証で「実在 component だけを登録」を担保する。
+/// 2. cron 式をパース（不正は 422）し、初回 `next_fire_at`（いま以後の最初の発火）を計算する。
+/// 3. set_tenant_guc 済み tx で 1 行 INSERT する（FORCE RLS 下）。
+///
+/// 登録は計量・enqueue を起こさない（実際の起動は CRON_POLL_INTERVAL_SECS のスケジューラが行う）。
+pub async fn create_cron_job(
+    State(state): State<AppState>,
+    principal: Principal,
+    JsonBody(req): JsonBody<CreateCronJobRequest>,
+) -> Result<impl IntoResponse, AppError> {
+    let tenant = &principal.tenant_id;
+
+    if req.component.trim().is_empty() {
+        return Err(FaasError::InvalidRequest("component must not be empty".into()).into());
+    }
+
+    // cron 式をパースし初回 next_fire_at を計算する（DB アクセス前に検証して 422 を早く返す）。
+    let now = chrono::Utc::now();
+    let next_fire_at = crate::cron::first_fire_after(req.schedule.trim(), now)
+        .map_err(|e| FaasError::InvalidRequest(format!("invalid cron schedule: {e}")))?;
+
+    let mut tx = state.pool().begin().await?;
+    db::set_tenant_guc(&mut tx, tenant).await?;
+
+    // 対象 component の存在確認（不在は 404; FK でも担保するが明示的に弁別する）。
+    let component = db::find_component_by_name(&mut *tx, tenant, req.component.trim())
+        .await?
+        .ok_or_else(|| FaasError::NotFound(format!("component '{}'", req.component)))?;
+
+    let cron_job_id = faas_shared::new_cron_job_id();
+    db::insert_cron_job(
+        &mut *tx,
+        &cron_job_id,
+        tenant,
+        &component.id,
+        req.schedule.trim(),
+        &req.input,
+        next_fire_at,
+    )
+    .await?;
+    tx.commit().await?;
+
+    tracing::info!(
+        cron_job_id = %cron_job_id,
+        component_id = %component.id,
+        schedule = %req.schedule.trim(),
+        next_fire_at = %next_fire_at.to_rfc3339(),
+        "cron job registered"
+    );
+
+    Ok((
+        StatusCode::CREATED,
+        Json(CreateCronJobResponse {
+            cron_job_id,
+            component_id: component.id,
+            schedule: req.schedule.trim().to_string(),
+            next_fire_at: next_fire_at.to_rfc3339(),
+        }),
+    ))
+}
+
+/// GET /cron-jobs — テナントの Cron ジョブ一覧 (M6b, Read スコープ, §15)。新しい順。
+pub async fn list_cron_jobs(
+    State(state): State<AppState>,
+    principal: Principal,
+) -> Result<impl IntoResponse, AppError> {
+    let tenant = &principal.tenant_id;
+
+    let mut tx = state.pool().begin().await?;
+    db::set_tenant_guc(&mut tx, tenant).await?;
+    let items = db::list_cron_jobs(&mut *tx, tenant).await?;
+    tx.commit().await?;
+
+    let body: Vec<CronJobListItemResponse> = items
+        .into_iter()
+        .map(|c| CronJobListItemResponse {
+            cron_job_id: c.id,
+            component_id: c.component_id,
+            schedule: c.schedule,
+            input: c.input,
+            enabled: c.enabled,
+            next_fire_at: c.next_fire_at.to_rfc3339(),
+            created_at: c.created_at.to_rfc3339(),
+        })
+        .collect();
+
+    Ok(Json(body))
+}
+
+/// DELETE /cron-jobs/{id} — Cron ジョブを削除する (M6b, Admin スコープ, §15)。
+///
+/// set_tenant_guc 済み tx で物理削除する（GUC=テナントに一致する行しか消せない）。不在は 404。
+pub async fn delete_cron_job(
+    State(state): State<AppState>,
+    principal: Principal,
+    Path(id): Path<String>,
+) -> Result<impl IntoResponse, AppError> {
+    let tenant = &principal.tenant_id;
+
+    let mut tx = state.pool().begin().await?;
+    db::set_tenant_guc(&mut tx, tenant).await?;
+    let affected = db::delete_cron_job(&mut *tx, tenant, &id).await?;
+    tx.commit().await?;
+
+    if affected == 0 {
+        return Err(FaasError::NotFound(format!("cron job '{id}'")).into());
+    }
+    tracing::info!(cron_job_id = %id, "cron job deleted");
+    Ok(StatusCode::NO_CONTENT)
+}
+
+// ---------------------------------------------------------------------------
+// トリガー CRUD + Object Storage イベント取込 (M6c, §11 / §15)
+// ---------------------------------------------------------------------------
+
+/// `trigger_type` の許容値（登録時に検証する）。
+const TRIGGER_TYPE_OBJECT_STORAGE: &str = "object_storage";
+const TRIGGER_TYPE_CHAIN: &str = "chain";
+
+/// Component チェーンの最大ホップ深さ (§15 M6c, 暴走防止)。root（HTTP/Cron/Object Storage）= 0 を
+/// 起点に、chain 下流ごとに +1 する。`upstream_depth + 1 > MAX_CHAIN_DEPTH` の下流は起動しない。
+/// これにより A→B→A のような循環チェーン（各ホップが別 execution_id ＝ 別配送キーで冪等を素通りする）が
+/// 有界化される。固定上限（運用上 8 ホップを超える正当なチェーンは想定しない）。
+const MAX_CHAIN_DEPTH: i32 = 8;
+
+#[derive(Debug, Deserialize)]
+pub struct CreateTriggerRequest {
+    /// 起動対象（downstream）Component 名（テナント内一意。存在検証する）。
+    pub component: String,
+    /// トリガー種別: `object_storage` | `chain`。
+    pub trigger_type: String,
+    /// 種別ごとのマッチ条件。
+    /// - object_storage: `{"bucket_prefix": "..."}`（任意。未指定なら全 put にマッチ）
+    /// - chain:          `{"source_component_id": "cmp_...", "on_status": "succeeded"}`（source 必須）
+    #[serde(default)]
+    pub match_config: Value,
+    /// payload→input マッピング（JSON Pointer ベース。未指定なら event payload / 上流 output を素通し）。
+    #[serde(default)]
+    pub input_mapping: Option<Value>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct CreateTriggerResponse {
+    pub trigger_id: String,
+    pub component_id: String,
+    pub trigger_type: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct TriggerListItemResponse {
+    pub trigger_id: String,
+    pub component_id: String,
+    pub trigger_type: String,
+    pub match_config: Value,
+    pub input_mapping: Option<Value>,
+    pub enabled: bool,
+    pub created_at: String,
+}
+
+/// POST /triggers — 外部イベント / chain トリガーを登録する (M6c, Deploy スコープ, §15)。
+///
+/// 手順:
+/// 1. component（downstream 起動対象）名を解決（不在は 404）。FK + 存在検証で実在 component だけ登録。
+/// 2. `trigger_type` を許容値に制限（object_storage | chain。それ以外は 422）。
+/// 3. 種別ごとに `match_config` を **登録時検証**する（chain は source_component_id 必須・実在検証、
+///    object_storage は bucket_prefix が文字列であること）。
+/// 4. `input_mapping` を `validate_input_mapping` で検証（不正な JSON Pointer 形は 422）。
+/// 5. set_tenant_guc 済み tx で 1 行 INSERT（FORCE RLS 下）。
+///
+/// 登録は計量・enqueue を起こさない（起動は event 取込 / chain フックが行う）。
+pub async fn create_trigger(
+    State(state): State<AppState>,
+    principal: Principal,
+    JsonBody(req): JsonBody<CreateTriggerRequest>,
+) -> Result<impl IntoResponse, AppError> {
+    let tenant = &principal.tenant_id;
+
+    if req.component.trim().is_empty() {
+        return Err(FaasError::InvalidRequest("component must not be empty".into()).into());
+    }
+    let trigger_type = req.trigger_type.trim();
+    if trigger_type != TRIGGER_TYPE_OBJECT_STORAGE && trigger_type != TRIGGER_TYPE_CHAIN {
+        return Err(FaasError::InvalidRequest(format!(
+            "trigger_type must be '{TRIGGER_TYPE_OBJECT_STORAGE}' or '{TRIGGER_TYPE_CHAIN}'"
+        ))
+        .into());
+    }
+
+    // input_mapping の形を登録時に検証する（不正は 422。実行時の解決失敗は null 化で吸収する）。
+    faas_shared::validate_input_mapping(req.input_mapping.as_ref())
+        .map_err(FaasError::InvalidRequest)?;
+
+    let mut tx = state.pool().begin().await?;
+    db::set_tenant_guc(&mut tx, tenant).await?;
+
+    // 起動対象（downstream）component の存在確認（不在は 404）。
+    let component = db::find_component_by_name(&mut *tx, tenant, req.component.trim())
+        .await?
+        .ok_or_else(|| FaasError::NotFound(format!("component '{}'", req.component)))?;
+
+    // 種別ごとの match_config 検証。
+    match trigger_type {
+        TRIGGER_TYPE_OBJECT_STORAGE => {
+            // bucket_prefix は任意だが、在るなら文字列であること（誤った型を 422 で弾く）。
+            if let Some(bp) = req.match_config.get("bucket_prefix") {
+                if !bp.is_string() {
+                    return Err(FaasError::InvalidRequest(
+                        "match_config.bucket_prefix must be a string".into(),
+                    )
+                    .into());
+                }
+            }
+        }
+        TRIGGER_TYPE_CHAIN => {
+            // chain は上流 component を source_component_id で必ず指定し、テナント内に実在すること。
+            let source_id = req
+                .match_config
+                .get("source_component_id")
+                .and_then(Value::as_str)
+                .ok_or_else(|| {
+                    FaasError::InvalidRequest(
+                        "chain trigger requires match_config.source_component_id".into(),
+                    )
+                })?;
+            if db::find_component_by_id(&mut *tx, tenant, source_id)
+                .await?
+                .is_none()
+            {
+                return Err(FaasError::NotFound(format!("source component '{source_id}'")).into());
+            }
+            // on_status は任意（未指定は 'succeeded' を既定とする）。在るなら文字列。
+            if let Some(on) = req.match_config.get("on_status") {
+                if !on.is_string() {
+                    return Err(FaasError::InvalidRequest(
+                        "match_config.on_status must be a string".into(),
+                    )
+                    .into());
+                }
+            }
+        }
+        _ => unreachable!("trigger_type validated above"),
+    }
+
+    let trigger_id = faas_shared::new_trigger_id();
+    db::insert_trigger(
+        &mut *tx,
+        &trigger_id,
+        tenant,
+        &component.id,
+        trigger_type,
+        &req.match_config,
+        req.input_mapping.as_ref(),
+    )
+    .await?;
+    tx.commit().await?;
+
+    tracing::info!(
+        trigger_id = %trigger_id,
+        component_id = %component.id,
+        trigger_type = %trigger_type,
+        "trigger registered"
+    );
+
+    Ok((
+        StatusCode::CREATED,
+        Json(CreateTriggerResponse {
+            trigger_id,
+            component_id: component.id,
+            trigger_type: trigger_type.to_string(),
+        }),
+    ))
+}
+
+/// GET /triggers — テナントのトリガー一覧 (M6c, Read スコープ, §15)。新しい順。
+pub async fn list_triggers(
+    State(state): State<AppState>,
+    principal: Principal,
+) -> Result<impl IntoResponse, AppError> {
+    let tenant = &principal.tenant_id;
+
+    let mut tx = state.pool().begin().await?;
+    db::set_tenant_guc(&mut tx, tenant).await?;
+    let items = db::list_triggers(&mut *tx, tenant).await?;
+    tx.commit().await?;
+
+    let body: Vec<TriggerListItemResponse> = items
+        .into_iter()
+        .map(|t| TriggerListItemResponse {
+            trigger_id: t.id,
+            component_id: t.component_id,
+            trigger_type: t.trigger_type,
+            match_config: t.match_config,
+            input_mapping: t.input_mapping,
+            enabled: t.enabled,
+            created_at: t.created_at.to_rfc3339(),
+        })
+        .collect();
+
+    Ok(Json(body))
+}
+
+/// DELETE /triggers/{id} — トリガーを削除する (M6c, Admin スコープ, §15)。
+///
+/// set_tenant_guc 済み tx で物理削除する（GUC=テナントに一致する行しか消せない）。不在は 404。
+pub async fn delete_trigger(
+    State(state): State<AppState>,
+    principal: Principal,
+    Path(id): Path<String>,
+) -> Result<impl IntoResponse, AppError> {
+    let tenant = &principal.tenant_id;
+
+    let mut tx = state.pool().begin().await?;
+    db::set_tenant_guc(&mut tx, tenant).await?;
+    let affected = db::delete_trigger(&mut *tx, tenant, &id).await?;
+    tx.commit().await?;
+
+    if affected == 0 {
+        return Err(FaasError::NotFound(format!("trigger '{id}'")).into());
+    }
+    tracing::info!(trigger_id = %id, "trigger deleted");
+    Ok(StatusCode::NO_CONTENT)
+}
+
+// ---------------------------------------------------------------------------
+// Object Storage イベント取込 (M6c, §11 / §15)
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Deserialize)]
+pub struct ObjectStorageEventRequest {
+    /// バケット名。
+    pub bucket: String,
+    /// オブジェクトキー。**テナントは本文の任意フィールドではなくこのキーの
+    /// `tenants/{tenant_id}/...` プレフィックスから導出する**（anti-spoof, §3.2 / §3.3）。
+    pub key: String,
+    /// オブジェクトの ETag（バージョン識別子。event_dedup_id に含めて再送を冪等吸収する）。
+    #[serde(default)]
+    pub etag: String,
+    /// イベント種別（"put" 等。観測用。現状は put のみを対象に扱う）。
+    #[serde(default)]
+    pub event: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ObjectStorageEventResponse {
+    /// 起動された execution の数（マッチ × 新規配送のみ。再送/重複は 0）。
+    pub enqueued: usize,
+    /// 起動された execution_id 群（観測用）。
+    pub execution_ids: Vec<String>,
+}
+
+/// POST /events/object-storage — Object Storage 通知を取り込み、マッチする trigger を起動する
+/// (M6c, Invoke スコープ, §15)。
+///
+/// **テナント分離 (anti-spoof, §3.2 / §3.3)**: tenant_id は本文の任意フィールドではなく
+/// **オブジェクトキーの `tenants/{tenant_id}/...` プレフィックス**から導出する。さらに principal の
+/// テナント（呼び出しトークンのテナント）と一致することを要求し、別テナントのオブジェクトキーを
+/// 詐称して他テナントの trigger を起動できないようにする（principal=GUC=導出テナントの三重一致）。
+///
+/// **冪等性 (§6.6)**: `event_dedup_id = {bucket}/{key}/{etag}`（同一オブジェクト同一版は同一）。
+/// マッチした各 trigger について `trigger_deliveries` へ INSERT（PK 23505 = 既配送 → skip）してから
+/// `event_idempotency_key(trigger_id, dedup)` を idempotency_key に enqueue する。再送は配送台帳 +
+/// `executions(tenant_id, idempotency_key)` UNIQUE の二重防御で 1 度だけ起動する。
+///
+/// **計量・provenance**: enqueue は HTTP/Cron と同一の `enqueue_execution(origin="event")` 正規パスを
+/// 通るため、job_token 署名・subscriber 検証・usage_rollups 計量が non-HTTP 起点でも保たれる。
+pub async fn object_storage_event(
+    State(state): State<AppState>,
+    principal: Principal,
+    JsonBody(req): JsonBody<ObjectStorageEventRequest>,
+) -> Result<impl IntoResponse, AppError> {
+    if req.bucket.trim().is_empty() || req.key.trim().is_empty() {
+        return Err(FaasError::InvalidRequest("bucket and key must not be empty".into()).into());
+    }
+    // etag は event_dedup_id のオブジェクト版識別子。空だと同一キーの別アップロードが同一 dedup_id に
+    // 潰れ、2 回目が「既配送」として黙って skip される（再 put が再発火しない）。空 etag は拒否し、
+    // 通知元に version 識別子の付与を要求する（黙ってバージョンを畳まない）。
+    if req.etag.trim().is_empty() {
+        return Err(FaasError::InvalidRequest(
+            "etag must not be empty (it is the object-version discriminator for delivery idempotency)"
+                .into(),
+        )
+        .into());
+    }
+
+    // テナントをオブジェクトキーの `tenants/{tenant_id}/...` プレフィックスから導出する（本文盲信しない）。
+    let derived_tenant = tenant_from_object_key(&req.key).ok_or_else(|| {
+        FaasError::InvalidRequest("object key must be under 'tenants/{tenant_id}/' prefix".into())
+    })?;
+
+    // principal（呼び出しトークン）のテナントと導出テナントが一致しなければ拒否する（cross-tenant
+    // spoof 防止: 別テナントのオブジェクトキーで他テナント trigger を起動できない）。
+    if derived_tenant != principal.tenant_id {
+        tracing::warn!(
+            caller_tenant = %principal.tenant_id,
+            derived_tenant = %derived_tenant,
+            "object-storage event key tenant != caller tenant; rejecting (anti-spoof)"
+        );
+        return Err(FaasError::Forbidden.into());
+    }
+    let tenant = derived_tenant;
+
+    // 配送冪等の安定識別子（同一オブジェクト同一版は同一）。
+    let event_dedup_id = format!(
+        "{}/{}/{}",
+        req.bucket.trim(),
+        req.key.trim(),
+        req.etag.trim()
+    );
+
+    let mut tx = state.pool().begin().await?;
+    db::set_tenant_guc(&mut tx, tenant).await?;
+
+    // テナント内の enabled な object_storage trigger を引き、bucket_prefix で照合する。
+    let triggers =
+        db::list_enabled_triggers_by_type(&mut *tx, tenant, TRIGGER_TYPE_OBJECT_STORAGE).await?;
+    tx.commit().await?;
+
+    // event payload（mapping の source）。key/bucket/etag を素直に渡す（mapping 未指定はこれが素通し input）。
+    let event_payload = json!({
+        "bucket": req.bucket.trim(),
+        "key": req.key.trim(),
+        "etag": req.etag.trim(),
+        "event": req.event,
+    });
+
+    let mut execution_ids = Vec::new();
+    for trg in &triggers {
+        // bucket_prefix が指定されていれば key の前方一致で照合する（未指定は全 put にマッチ）。
+        if let Some(prefix) = trg
+            .match_config
+            .get("bucket_prefix")
+            .and_then(Value::as_str)
+        {
+            if !req.key.trim().starts_with(prefix) {
+                continue;
+            }
+        }
+        // input_mapping を評価して downstream input を構築する（未指定は event payload 素通し）。
+        let input = faas_shared::apply_input_mapping(trg.input_mapping.as_ref(), &event_payload);
+        let idem_key = faas_shared::event_idempotency_key(&trg.id, &event_dedup_id);
+
+        match enqueue_via_trigger(
+            &state,
+            tenant,
+            &trg.id,
+            &trg.component_id,
+            &event_dedup_id,
+            &idem_key,
+            input,
+            0, // Object Storage イベントは root 起動（chain ホップ深さ 0）。
+        )
+        .await?
+        {
+            Some(execution_id) => execution_ids.push(execution_id),
+            None => { /* 既配送 or active version 無し or 冪等ヒット → skip（二重起動しない）*/
+            }
+        }
+    }
+
+    Ok((
+        StatusCode::ACCEPTED,
+        Json(ObjectStorageEventResponse {
+            enqueued: execution_ids.len(),
+            execution_ids,
+        }),
+    ))
+}
+
+/// オブジェクトキーの `tenants/{tenant_id}/...` プレフィックスからテナントを抽出する (M6c, anti-spoof)。
+///
+/// 形が `tenants/{tenant_id}/...`（第 1 セグメント == "tenants"、第 2 セグメント非空）でなければ
+/// `None`（呼び出し側が 400 へ写像）。本文の任意フィールドではなく **キー構造**を権威にすることで、
+/// テナント詐称によるクロステナント起動を構造的に封じる（§3.2 の subject-tenant と同思想）。
+fn tenant_from_object_key(key: &str) -> Option<&str> {
+    let mut it = key.trim_start_matches('/').split('/');
+    match (it.next(), it.next()) {
+        (Some("tenants"), Some(t)) if !t.is_empty() => Some(t),
+        _ => None,
+    }
+}
+
+/// トリガー（event / chain）起点で downstream を 1 件 enqueue する共通ヘルパ (M6c)。
+///
+/// 手順（配送台帳 → 解決 → presign → enqueue を 1 関数に閉じる）:
+/// 1. `set_tenant_guc(tenant)` 済み tx で `record_trigger_delivery`（PK 23505 = 既配送 → `Ok(None)`）。
+/// 2. component_id → component 名 → active version を解決（active 無しは起動不能 → 配送のみ残し `None`）。
+/// 3. wasm 本体の短命 presigned GET URL を発行し、iat/exp を HTTP/Cron と同じ計算で確定。
+/// 4. `enqueue_execution(origin="event", idempotency_key=Some(idem_key))` へ合流（同一 tx を commit）。
+///
+/// 戻り値: `Some(execution_id)` = 新規起動、`None` = 既配送 / active version 無し / 冪等ヒット（skip）。
+/// 配送台帳 INSERT と pending INSERT は **同一 tx**（`enqueue_execution` が commit）なので、配送が
+/// 記録されたのに enqueue されない・その逆という乖離は起きない（all-or-nothing）。
+#[allow(clippy::too_many_arguments)]
+async fn enqueue_via_trigger(
+    state: &AppState,
+    tenant: &str,
+    trigger_id: &str,
+    component_id: &str,
+    event_dedup_id: &str,
+    idem_key: &str,
+    input: Value,
+    chain_depth: i32,
+) -> Result<Option<String>, AppError> {
+    let mut tx = state.pool().begin().await?;
+    db::set_tenant_guc(&mut tx, tenant).await?;
+
+    // 起動する execution_id を先に確定し、配送台帳にも実 id を残す（"pending" プレースホルダではなく
+    // 配送 → 起動の対応を監査可能にする）。台帳 INSERT が dedup ゲートなので id 採番より前段に置く。
+    let execution_id = new_execution_id();
+
+    // 配送台帳 INSERT。既配送（23505）なら二重起動を skip（None）。台帳と pending を同一 tx に閉じる。
+    if !db::record_trigger_delivery(&mut *tx, tenant, trigger_id, event_dedup_id, &execution_id)
+        .await?
+    {
+        tx.rollback().await?;
+        tracing::debug!(
+            tenant = %tenant,
+            %trigger_id,
+            %event_dedup_id,
+            "trigger event already delivered; skipping double-fire"
+        );
+        return Ok(None);
+    }
+
+    // downstream component → active version を解決する。
+    let Some(component) = db::find_component_by_id(&mut *tx, tenant, component_id).await? else {
+        // 起動対象 component が消えている（trigger は残存）。配送だけ記録して skip する。
+        tx.commit().await?;
+        tracing::warn!(
+            tenant = %tenant,
+            %trigger_id,
+            %component_id,
+            "trigger references missing component; recorded delivery but skipped enqueue"
+        );
+        return Ok(None);
+    };
+    let Some(active) = db::active_version_storage(&mut *tx, tenant, &component.name).await? else {
+        // active version 無し → 起動不能。配送は記録済みなので再送は skip される（取りこぼし防止は将来課題）。
+        tx.commit().await?;
+        tracing::warn!(
+            tenant = %tenant,
+            %trigger_id,
+            component = %component.name,
+            "trigger's component has no active version; recorded delivery but skipped enqueue"
+        );
+        return Ok(None);
+    };
+
+    let wasm_url = state
+        .storage()
+        .presign_get(&active.storage_uri, state.presign_ttl())
+        .await?;
+    let iat = chrono::Utc::now().timestamp();
+    let exp = iat + state.token_exp_offset_secs(active.max_wall_time_ms);
+    let request_hash = invoke_request_hash_for(&component.name, &input, None);
+
+    // HTTP/Cron と同一の enqueue 正規パスへ合流（origin="event", reply_to=None）。
+    let outcome = enqueue::enqueue_execution(
+        state,
+        tx,
+        enqueue::EnqueueRequest {
+            tenant,
+            component_name: &component.name,
+            component_id: &component.id,
+            version_id: &active.version_id,
+            version: &active.version,
+            wasm_sha256: &active.wasm_sha256,
+            wasm_url,
+            input_url: None,
+            input: &input,
+            input_ref: None,
+            execution_id: execution_id.clone(),
+            idempotency_key: Some(idem_key),
+            request_hash: Some(&request_hash),
+            iat,
+            exp,
+            reply_to: None,
+            origin: "event",
+            chain_depth,
+        },
+    )
+    .await;
+
+    match outcome {
+        Ok(enqueue::EnqueueOutcome::Enqueued { execution_id }) => {
+            tracing::info!(
+                tenant = %tenant,
+                %trigger_id,
+                %execution_id,
+                "trigger fired (enqueued)"
+            );
+            Ok(Some(execution_id))
+        }
+        // 冪等ヒット: 配送台帳をすり抜けた同一 idempotency_key（理論上稀）も二重起動しない。
+        Ok(enqueue::EnqueueOutcome::IdempotentHit { execution_id, .. }) => {
+            tracing::debug!(
+                tenant = %tenant,
+                %trigger_id,
+                existing_execution_id = %execution_id,
+                "trigger event idempotent hit; skipping double-fire"
+            );
+            Ok(None)
+        }
+        // publish 失敗（バックプレッシャ）: non-HTTP は 429 を返す先がない。pending 行は commit 済みで
+        // reaper の sweeper が deadline で failed に倒す。配送台帳も記録済みなので再送は skip される。
+        Err(enqueue::EnqueueError::PublishBackpressure) => {
+            tracing::warn!(
+                tenant = %tenant,
+                %trigger_id,
+                "trigger fire publish backpressure; pending row left for sweeper"
+            );
+            Ok(None)
+        }
+        Err(enqueue::EnqueueError::Other(e)) => Err(e),
+    }
+}
+
+/// chain トリガー起点で downstream を enqueue する（subscriber の終端成功フックから呼ぶ, M6c）。
+///
+/// 上流 execution が **実際に Succeeded へ遷移した**ときだけ、同一テナントの enabled な chain trigger を
+/// 引き、`match_config.source_component_id == 上流 component_id` && `on_status` 一致なら downstream を
+/// 起動する。`event_dedup_id = 上流 execution_id`（再 finalize は CAS no-op でフックが発火しない上、
+/// 配送台帳 PK で二重防御）。finalize tx の **後**（commit 後）に **別 tx** で best-effort に行うため、
+/// この関数は `enqueue_via_trigger` を介して独立 tx で完結する（finalize の原子性を chain 失敗で壊さない）。
+///
+/// upstream の output を `input_mapping` で downstream input へ変換する（未指定は output 素通し）。
+pub(crate) async fn enqueue_chain_downstreams(
+    state: &AppState,
+    tenant: &str,
+    source_component_id: &str,
+    upstream_execution_id: &str,
+    upstream_output: Option<&Value>,
+) {
+    // 上流の chain 深さと、テナント内の enabled な chain trigger を 1 tx で引く。引けない/失敗は
+    // ログのみ（best-effort: finalize は既に commit 済み）。
+    let (upstream_depth, triggers) = {
+        let res: anyhow::Result<(i32, Vec<db::TriggerRow>)> = async {
+            let mut tx = state.pool().begin().await?;
+            db::set_tenant_guc(&mut tx, tenant).await?;
+            // 行不在（GC 済み等）は 0 とみなす（保守的に root 扱い）。
+            let depth = db::execution_chain_depth(&mut *tx, tenant, upstream_execution_id)
+                .await?
+                .unwrap_or(0);
+            let t = db::list_enabled_triggers_by_type(&mut *tx, tenant, TRIGGER_TYPE_CHAIN).await?;
+            tx.commit().await?;
+            Ok((depth, t))
+        }
+        .await;
+        match res {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::warn!(
+                    tenant = %tenant,
+                    error = %e,
+                    "failed to load chain triggers on terminal success; skipping chain (best-effort)"
+                );
+                return;
+            }
+        }
+    };
+
+    // 暴走防止 (§15 M6c): 下流は新規 execution_id を持つため配送台帳の冪等キーだけでは A→B→A の
+    // 循環チェーンを止められない（各ホップが別配送キーで自己増殖する）。上流深さ+1 が上限を超えるなら
+    // この終端からの chain は一切起動しない（深さで全循環を有界化する）。
+    let next_depth = upstream_depth + 1;
+    if next_depth > MAX_CHAIN_DEPTH {
+        tracing::warn!(
+            tenant = %tenant,
+            upstream = %upstream_execution_id,
+            upstream_depth,
+            max = MAX_CHAIN_DEPTH,
+            "chain depth limit reached; not firing further downstreams (cycle/runaway guard)"
+        );
+        return;
+    }
+
+    // 上流 output（mapping の source）。None は null として扱う（mapping 未指定なら null が素通し input）。
+    let source = upstream_output.cloned().unwrap_or(Value::Null);
+
+    for trg in &triggers {
+        // source_component_id が一致しなければ対象外。
+        let matches_source = trg
+            .match_config
+            .get("source_component_id")
+            .and_then(Value::as_str)
+            == Some(source_component_id);
+        if !matches_source {
+            continue;
+        }
+        // on_status は未指定なら "succeeded" 既定。フックは Succeeded 遷移時のみ呼ばれるので
+        // succeeded 以外を要求する trigger はスキップする。
+        let on_status = trg
+            .match_config
+            .get("on_status")
+            .and_then(Value::as_str)
+            .unwrap_or("succeeded");
+        if on_status != "succeeded" {
+            continue;
+        }
+
+        let input = faas_shared::apply_input_mapping(trg.input_mapping.as_ref(), &source);
+        let idem_key = faas_shared::event_idempotency_key(&trg.id, upstream_execution_id);
+
+        // downstream を enqueue する。失敗はログのみ（chain は best-effort で finalize を巻き戻さない）。
+        match enqueue_via_trigger(
+            state,
+            tenant,
+            &trg.id,
+            &trg.component_id,
+            upstream_execution_id,
+            &idem_key,
+            input,
+            next_depth,
+        )
+        .await
+        {
+            Ok(Some(execution_id)) => {
+                tracing::info!(
+                    tenant = %tenant,
+                    trigger_id = %trg.id,
+                    upstream = %upstream_execution_id,
+                    downstream = %execution_id,
+                    "chain trigger fired downstream"
+                );
+            }
+            Ok(None) => { /* 既配送 / active 無し / 冪等ヒット → 1 度だけ起動の保証どおり skip */
+            }
+            Err(e) => {
+                tracing::warn!(
+                    tenant = %tenant,
+                    trigger_id = %trg.id,
+                    upstream = %upstream_execution_id,
+                    error = %e.0,
+                    "chain downstream enqueue failed (best-effort; not retried this slice)"
+                );
+            }
+        }
+    }
+}
+
 fn map_unique_violation(e: sqlx::Error, msg: &str) -> AppError {
     if let sqlx::Error::Database(db_err) = &e {
         // Postgres unique_violation = 23505
@@ -1749,6 +2656,10 @@ fn map_unique_violation(e: sqlx::Error, msg: &str) -> AppError {
 }
 
 /// Postgres の unique_violation (23505) かどうか（冪等 race の backstop 判定）。
+///
+/// M6-0 で invoke の 23505 捕捉は `enqueue::enqueue_execution` 内へ移ったため、本関数は現在
+/// テスト（分類の回帰確認）でのみ参照される。重複定義を避けつつ回帰テストを残すため cfg(test)。
+#[cfg(test)]
 fn is_unique_violation(e: &sqlx::Error) -> bool {
     matches!(e, sqlx::Error::Database(db_err) if db_err.code().as_deref() == Some("23505"))
 }
@@ -1844,6 +2755,18 @@ fn validate_idempotency_key(key: &str) -> faas_shared::Result<()> {
 /// バイト列の sha256 hex を返す。serde_json::to_vec はキーをソートしないため、
 /// `canonical_json_bytes` で明示的にソートして直列化する。
 fn invoke_request_hash(component: &str, input: &Value, input_ref: Option<&str>) -> String {
+    invoke_request_hash_for(component, input, input_ref)
+}
+
+/// `invoke_request_hash` の crate 内公開版（M6b: Cron スケジューラが同一正準化で body hash を作る）。
+///
+/// HTTP invoke と Cron fire で **同じ正準化規則**（キーソート + (component,input,input_ref) 包含）を
+/// 共有することで、冪等列の body hash 解釈が起点に依らず一貫する。
+pub(crate) fn invoke_request_hash_for(
+    component: &str,
+    input: &Value,
+    input_ref: Option<&str>,
+) -> String {
     let v = json!({ "component": component, "input": input, "input_ref": input_ref });
     let bytes = canonical_json_bytes(&v);
     let mut hasher = Sha256::new();
@@ -1909,6 +2832,90 @@ fn write_canonical(v: &Value, out: &mut Vec<u8>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // --- M6a 同期 invoke モード判定（DB-free） ---
+
+    /// `?wait=1` / `?wait=true`（大小無視）、または `Prefer: wait` ヘッダで同期モードになる。
+    /// 未指定 / `?wait=0` は非同期（後方互換）。
+    #[test]
+    fn wants_sync_invoke_query_and_prefer_header() {
+        let no_headers = HeaderMap::new();
+
+        // ?wait なし → 非同期。
+        let q = InvokeQuery { wait: None };
+        assert!(!wants_sync_invoke(&q, &no_headers));
+
+        // ?wait=1 / true（大小無視・前後空白許容）→ 同期。
+        for v in ["1", "true", "TRUE", " True "] {
+            let q = InvokeQuery {
+                wait: Some(v.to_string()),
+            };
+            assert!(
+                wants_sync_invoke(&q, &no_headers),
+                "wait={v:?} must be sync"
+            );
+        }
+
+        // ?wait=0 / その他 → 非同期。
+        for v in ["0", "false", "no", ""] {
+            let q = InvokeQuery {
+                wait: Some(v.to_string()),
+            };
+            assert!(
+                !wants_sync_invoke(&q, &no_headers),
+                "wait={v:?} must be async"
+            );
+        }
+
+        // Prefer: wait ヘッダ単独でも同期（?wait 無し）。
+        let q = InvokeQuery { wait: None };
+        let mut h = HeaderMap::new();
+        h.insert("Prefer", "wait".parse().unwrap());
+        assert!(wants_sync_invoke(&q, &h));
+        // RFC 7240 風の "respond-async" など wait を含まない Prefer は非同期。
+        let mut h2 = HeaderMap::new();
+        h2.insert("Prefer", "respond-async".parse().unwrap());
+        assert!(!wants_sync_invoke(&q, &h2));
+    }
+
+    // --- M6c object-storage イベントのテナント導出（DB-free, anti-spoof） ---
+
+    /// オブジェクトキーの `tenants/{tenant}/...` プレフィックスからテナントを導出する。本文盲信
+    /// ではなくキー構造を権威にする（§3.2 の subject-tenant と同思想）。形不一致は None（→ 400）。
+    #[test]
+    fn tenant_from_object_key_extracts_prefix_or_rejects() {
+        // 正常: tenants/{tenant}/... の第 2 セグメントを抽出（先頭スラッシュ許容）。
+        assert_eq!(
+            tenant_from_object_key("tenants/ten_a/in/file.txt"),
+            Some("ten_a")
+        );
+        assert_eq!(tenant_from_object_key("/tenants/ten_b/x"), Some("ten_b"));
+        // 末尾要素が無くても第 2 セグメントがあれば抽出できる。
+        assert_eq!(tenant_from_object_key("tenants/ten_c/"), Some("ten_c"));
+        // 不正: tenants プレフィックスでない / 第 2 セグメント空 / プレフィックスのみ。
+        assert_eq!(tenant_from_object_key("uploads/ten_a/x"), None);
+        assert_eq!(tenant_from_object_key("tenants//x"), None);
+        assert_eq!(tenant_from_object_key("tenants"), None);
+        assert_eq!(tenant_from_object_key(""), None);
+    }
+
+    /// M6c: event_dedup_id（{bucket}/{key}/{etag}）は同一オブジェクト同一版で安定・別版で異なる。
+    /// `event_idempotency_key(trigger_id, dedup)` が配送冪等の安定キーになることを確認する。
+    #[test]
+    fn event_dedup_and_idempotency_key_are_stable() {
+        let dedup1 = format!("{}/{}/{}", "buck", "tenants/ten_a/in.txt", "etag1");
+        let dedup2 = format!("{}/{}/{}", "buck", "tenants/ten_a/in.txt", "etag2");
+        // 同一入力は同一キー（再送を冪等吸収する根拠）。
+        assert_eq!(
+            faas_shared::event_idempotency_key("trg_1", &dedup1),
+            faas_shared::event_idempotency_key("trg_1", &dedup1)
+        );
+        // etag が変われば（= オブジェクト更新）別キーになり別 execution として起動できる。
+        assert_ne!(
+            faas_shared::event_idempotency_key("trg_1", &dedup1),
+            faas_shared::event_idempotency_key("trg_1", &dedup2)
+        );
+    }
 
     // --- GET /usage 純関数 ---
 

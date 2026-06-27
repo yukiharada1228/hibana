@@ -62,6 +62,40 @@ pub fn new_token_id() -> String {
     new_prefixed_id("tok")
 }
 
+/// `inst_*` CP インスタンス ID を生成する (M6a, §15)。
+///
+/// env `INSTANCE_ID` 未設定時に各 CP インスタンスが起動時に採番する subject-safe な識別子。
+/// 同期 invoke の reply subject `reply.{instance_id}.{correlation_id}` に埋め込む（ステートレス×N で
+/// 「どのインスタンスが reply を保持するか」を一意化する鍵）。
+pub fn new_instance_id() -> String {
+    new_prefixed_id("inst")
+}
+
+/// `corr_*` 同期 invoke の correlation ID を生成する (M6a, §15)。
+///
+/// 1 回の同期 invoke ごとに採番する不透明・subject-safe な ID。reply subject
+/// `reply.{instance_id}.{correlation_id}` の第 3 トークンに埋め込み、reply 購読タスクが
+/// per-instance waiter registry の sender を解決する鍵にする。worker は中身を解釈しない。
+pub fn new_correlation_id() -> String {
+    new_prefixed_id("corr")
+}
+
+/// `cron_*` Cron ジョブ ID を生成する (M6b, §15)。
+///
+/// `POST /cron-jobs` で採番する登録 ID。`cron_idempotency_key(cron_job_id, slot)` の第 1 要素として
+/// 安定冪等キーに埋め込むため subject/キー空間に害のない uuid-simple 由来とする。
+pub fn new_cron_job_id() -> String {
+    new_prefixed_id("cron")
+}
+
+/// `trg_*` トリガー ID を生成する (M6c, §15)。
+///
+/// `POST /triggers` で採番する登録 ID。`event_idempotency_key(trigger_id, dedup)` の第 1 要素として
+/// 安定冪等キーに埋め込むため subject/キー空間に害のない uuid-simple 由来とする。
+pub fn new_trigger_id() -> String {
+    new_prefixed_id("trg")
+}
+
 // ============================================================================
 // 実行状態
 // ============================================================================
@@ -235,6 +269,43 @@ pub fn failed_subject_wildcard() -> &'static str {
     "tenant.*.component.failed"
 }
 
+/// M6a (§15): 同期 invoke の Core NATS reply subject `reply.{instance_id}.{correlation_id}`。
+///
+/// JobMessage を publish した **当該 CP インスタンスだけ** が `reply.{instance_id}.*` を購読し、
+/// worker が終端 result を **追加で** ここへ publish する。reply 経路はテナントを含めない
+/// （終端化は依然 `tenant.*.component.result` 経由で subscriber が subject 由来テナントから行い、
+/// reply は「既に検証・finalize される結果」を呼び出し元 CP インスタンスへ届ける per-instance 通知に
+/// すぎない）。`instance_id` / `correlation_id` はいずれも subject-safe（`.`/`*`/`>`/空白を含まない）
+/// に採番されるため、subject は常に固定 3 トークンに収まる。
+pub fn reply_subject(instance_id: &str, correlation_id: &str) -> String {
+    format!("reply.{instance_id}.{correlation_id}")
+}
+
+/// M6a (§15): あるインスタンスが購読する reply ワイルドカード `reply.{instance_id}.*`。
+///
+/// `*` は 1 トークン（correlation_id）に一致する。各 CP インスタンスはこれを 1 本だけ購読し、
+/// 自分が送ったジョブの reply のみを受け取る（per-instance 隔離＝ステートレス×N の鍵）。
+pub fn reply_subject_wildcard(instance_id: &str) -> String {
+    format!("reply.{instance_id}.*")
+}
+
+/// M6a (§15): `reply.{instance_id}.{correlation_id}` 形の subject から第 3 トークン
+/// （correlation_id）を取り出す。
+///
+/// reply 購読タスクが受信 subject から correlation_id を導出し、per-instance waiter registry の
+/// 対応する sender を解決するために使う。形が一致しなければ `None`（防御的に drop する）。
+pub fn correlation_from_reply_subject(subject: &str) -> Option<&str> {
+    let mut parts = subject.split('.');
+    match (parts.next(), parts.next(), parts.next()) {
+        (Some("reply"), Some(instance), Some(correlation))
+            if !instance.is_empty() && !correlation.is_empty() && parts.next().is_none() =>
+        {
+            Some(correlation)
+        }
+        _ => None,
+    }
+}
+
 /// `tenant.{tenant}.component.{kind}` 形の subject から第 2 トークン（テナント ID）を取り出す。
 ///
 /// subscriber が `tenant.*.component.result` のワイルドカード購読で受けた実際の subject から
@@ -286,6 +357,114 @@ pub fn io_output_key(tenant_id: &str, execution_id: &str) -> String {
 }
 
 // ============================================================================
+// 安定冪等キー生成 (M6, §6.6 layer 1)
+// ============================================================================
+//
+// non-HTTP 起点（Cron / 外部イベント / chain）が「論理的な 1 回の発火」ごとに **安定** な
+// 冪等キーを作るための唯一の真実。同一発火（同一スロット / 同一イベント）は何度評価しても
+// 同一キーになり、`executions(tenant_id, idempotency_key)` の部分 UNIQUE がスケジューラ /
+// イベント取込の二重発火・再送を 23505 → 既存返却で吸収する（HTTP の Idempotency-Key と
+// 同一の layer 1 を non-HTTP 起点でも共有する）。
+
+/// M6b (§15): Cron 1 fire ごとに安定な冪等キー `cron:{cron_job_id}:{scheduled_slot_unix}`。
+///
+/// `scheduled_slot_unix` は当該 fire の発火スロット（`floor(next_fire_at)` の unix 秒）。同一
+/// スロットは同一キーになるため、複数 CP が同一 due を観測しても
+/// `executions(tenant_id, idempotency_key)` UNIQUE で 2 件目以降が既存に倒れ二重発火しない
+/// （`FOR UPDATE SKIP LOCKED` の行ロックと併せた二重防御, §15 M6b）。
+pub fn cron_idempotency_key(cron_job_id: &str, scheduled_slot_unix: i64) -> String {
+    format!("cron:{cron_job_id}:{scheduled_slot_unix}")
+}
+
+/// M6c (§15): イベント 1 配送ごとに安定な冪等キー `event:{trigger_id}:{event_dedup_id}`。
+///
+/// `event_dedup_id` は外部イベントの安定識別子（Object Storage: `bucket/key/etag`、chain:
+/// 上流 execution_id）。同一イベントの再送 / 同一上流成功の再 finalize は同一キーになり、
+/// `executions(tenant_id, idempotency_key)` UNIQUE と `trigger_deliveries` PK の二重防御で
+/// downstream を 1 度だけ起動する（§15 M6c）。
+pub fn event_idempotency_key(trigger_id: &str, event_dedup_id: &str) -> String {
+    format!("event:{trigger_id}:{event_dedup_id}")
+}
+
+// ============================================================================
+// input_mapping（payload→Component input 変換, M6c §11 / §15）
+// ============================================================================
+//
+// 外部イベントの payload（Object Storage 通知）や上流 Component の output を、downstream
+// Component の input へ変換するための **JSON Pointer ベースの単純マッピング**。トリガー登録時
+// （`POST /triggers`）に `validate_input_mapping` で形を検証し（不正は 422）、fire 時に
+// `apply_input_mapping` で評価する。マッピングは「起点（イベント/上流）を信用しすぎず、必要な
+// 値だけを Component input へ写像する」ための明示的な射であり、テナント分離・provenance とは
+// 直交する（テナントは subject/オブジェクトキー由来で別途権威化する）。
+
+/// `input_mapping` の形を検証する (M6c, `POST /triggers` 登録時)。
+///
+/// 受理する形（いずれも DB-free で純粋に構造のみ検証する。解決時の値は実行時に決まる）:
+/// - `None`（未指定）: 素通し（event payload / 上流 output をそのまま input にする）。
+/// - `Some(Object)`: `{ "<dest_field>": "<json_pointer>" }` の map。各値は **JSON Pointer 文字列**
+///   （空文字 = ルート、または `/` 始まりの RFC6901 表現）でなければならない。値が文字列でない、
+///   または `/` 始まりでない非空文字列は不正（登録時 422）。
+///
+/// 不正な mapping は `Err(理由)` を返し、呼び出し側（handlers）が 422 へ写像する。
+pub fn validate_input_mapping(
+    mapping: Option<&serde_json::Value>,
+) -> std::result::Result<(), String> {
+    let Some(m) = mapping else {
+        return Ok(()); // 未指定 = 素通し（合法）。
+    };
+    // JSON の null も「未指定」と同義に扱う（素通し）。
+    if m.is_null() {
+        return Ok(());
+    }
+    let obj = m.as_object().ok_or_else(|| {
+        "input_mapping must be an object mapping dest fields to JSON Pointer strings".to_string()
+    })?;
+    for (dest, ptr) in obj {
+        let s = ptr
+            .as_str()
+            .ok_or_else(|| format!("input_mapping['{dest}'] must be a JSON Pointer string"))?;
+        // 空文字（ルート）は合法。非空は RFC6901 表現として `/` 始まりを要求する。
+        if !s.is_empty() && !s.starts_with('/') {
+            return Err(format!(
+                "input_mapping['{dest}'] = '{s}' is not a valid JSON Pointer (must be empty or start with '/')"
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// `input_mapping` を `source`（event payload / 上流 output）に対して評価し、Component input を構築する
+/// (M6c, fire 時)。
+///
+/// - `mapping` が `None` または null: `source` を **そのまま** input にする（素通し）。
+/// - `mapping` が Object: 各 `(dest_field, json_pointer)` について `source` の pointer 位置の値を引き、
+///   新しい Object の `dest_field` に格納する。**解決不能な pointer は `null`** を入れる
+///   （実行時に解決できない参照で fire 全体を失敗させず、Component 側で欠落を判断させる）。
+///
+/// 登録時に `validate_input_mapping` を通っている前提（pointer は妥当な形）。`source` 側は外部由来
+/// なので任意の構造を取り得るが、JSON Pointer 評価は `serde_json::Value::pointer` に委譲して安全に行う。
+pub fn apply_input_mapping(
+    mapping: Option<&serde_json::Value>,
+    source: &serde_json::Value,
+) -> serde_json::Value {
+    match mapping.filter(|m| !m.is_null()).and_then(|m| m.as_object()) {
+        None => source.clone(), // 未指定 / null = 素通し。
+        Some(obj) => {
+            let mut out = serde_json::Map::with_capacity(obj.len());
+            for (dest, ptr) in obj {
+                let resolved = ptr
+                    .as_str()
+                    .and_then(|p| source.pointer(p))
+                    .cloned()
+                    .unwrap_or(serde_json::Value::Null);
+                out.insert(dest.clone(), resolved);
+            }
+            serde_json::Value::Object(out)
+        }
+    }
+}
+
+// ============================================================================
 // NATS メッセージ
 // ============================================================================
 
@@ -325,6 +504,19 @@ pub struct JobMessage {
     /// 扱い、result にそのまま echo する。旧 CP のメッセージとの互換のため serde default。
     #[serde(default)]
     pub job_token: String,
+    /// M6a (§15): 同期 invoke の Core NATS reply 先 `reply.{instance_id}.{correlation_id}`。
+    /// `Some` のとき worker は終端 result を `publish_result`（result subject）に **加えて**
+    /// この reply subject へも **同一 ResultMessage** を publish する（job_token を verbatim に echo）。
+    /// `None`（既定・非同期 invoke / Cron / event）なら reply は publish しない。**揮発フィールド**で
+    /// DB には永続化しない（correlation の漏洩面を作らない）。旧 CP のメッセージとの互換のため
+    /// serde default、`None` は wire に出さない（skip_serializing_if）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reply_to: Option<String>,
+    /// M6 (§15): 起動由来 `"http_invoke"`（既定）/ `"cron"` / `"event"` / `"chain"`。観測・監査用で、
+    /// worker は解釈しない（finalize/計量/provenance は origin に依らず単一の正規パスを通る）。
+    /// 旧 CP のメッセージとの互換のため serde default、`None` は wire に出さない。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub origin: Option<String>,
 }
 
 /// worker が 1 実行ごとに計測したリソース利用量 (M5, §15)。
@@ -824,6 +1016,111 @@ mod tests {
         );
     }
 
+    /// M6a (§15): reply subject の形・ワイルドカード・correlation 抽出が一貫している。
+    #[test]
+    fn reply_subject_format_and_correlation_extraction() {
+        assert_eq!(reply_subject("inst_1", "corr_9"), "reply.inst_1.corr_9");
+        assert_eq!(reply_subject_wildcard("inst_1"), "reply.inst_1.*");
+        // 具体 subject はワイルドカードの 1 トークン（correlation_id）に収まる。
+        assert_eq!(
+            reply_subject("inst_1", "corr_9").split('.').count(),
+            reply_subject_wildcard("inst_1").split('.').count()
+        );
+        // 第 3 トークン（correlation_id）を抽出できる。
+        assert_eq!(
+            correlation_from_reply_subject("reply.inst_1.corr_9"),
+            Some("corr_9")
+        );
+        // 形が一致しないものは None（防御的に drop）。
+        assert_eq!(correlation_from_reply_subject("reply.inst_1"), None);
+        assert_eq!(
+            correlation_from_reply_subject("reply.inst_1.corr_9.extra"),
+            None
+        );
+        assert_eq!(correlation_from_reply_subject("other.inst_1.corr_9"), None);
+        assert_eq!(correlation_from_reply_subject("reply..corr_9"), None);
+        assert_eq!(correlation_from_reply_subject("reply.inst_1."), None);
+    }
+
+    /// M6 (§15): cron / event の安定冪等キーは入力ごとに決定的・単射的。
+    #[test]
+    fn idempotency_keys_are_stable_and_distinct() {
+        // 同一入力は同一キー（決定的）。
+        assert_eq!(
+            cron_idempotency_key("cron_1", 1_700_000_000),
+            "cron:cron_1:1700000000"
+        );
+        assert_eq!(
+            event_idempotency_key("trg_1", "bucket/key/etag"),
+            "event:trg_1:bucket/key/etag"
+        );
+        // job / slot が変われば別キー（同一スロットのみ衝突＝二重発火吸収の前提）。
+        assert_ne!(
+            cron_idempotency_key("cron_1", 100),
+            cron_idempotency_key("cron_1", 101)
+        );
+        assert_ne!(
+            cron_idempotency_key("cron_1", 100),
+            cron_idempotency_key("cron_2", 100)
+        );
+        // cron 由来と event 由来は名前空間が分かれて衝突しない。
+        assert_ne!(
+            cron_idempotency_key("x", 1),
+            event_idempotency_key("x", "1")
+        );
+    }
+
+    /// M6c (§15): `validate_input_mapping` は未指定/null を素通しとして受理し、Object 値が
+    /// JSON Pointer 文字列であることを要求する（不正形は登録時 422 の根拠になる）。
+    #[test]
+    fn validate_input_mapping_accepts_passthrough_and_rejects_bad_pointers() {
+        // 未指定 / null は素通し（合法）。
+        assert!(validate_input_mapping(None).is_ok());
+        assert!(validate_input_mapping(Some(&serde_json::Value::Null)).is_ok());
+        // 空文字（ルート）と `/` 始まりの pointer は合法。
+        assert!(validate_input_mapping(Some(&serde_json::json!({
+            "whole": "",
+            "key": "/Records/0/s3/object/key",
+        })))
+        .is_ok());
+        // Object でない（配列/スカラ）は不正。
+        assert!(validate_input_mapping(Some(&serde_json::json!(["x"]))).is_err());
+        assert!(validate_input_mapping(Some(&serde_json::json!(42))).is_err());
+        // 値が文字列でない、または `/` 始まりでない非空文字列は不正。
+        assert!(validate_input_mapping(Some(&serde_json::json!({ "k": 1 }))).is_err());
+        assert!(validate_input_mapping(Some(&serde_json::json!({ "k": "no_slash" }))).is_err());
+    }
+
+    /// M6c (§15): `apply_input_mapping` は未指定で素通し、Object 指定で JSON Pointer を引き、
+    /// 解決不能な pointer は null に倒す（fire を失敗させない）。
+    #[test]
+    fn apply_input_mapping_passthrough_and_pointer_resolution() {
+        let src = serde_json::json!({
+            "bucket": "b1",
+            "object": { "key": "tenants/ten_a/in.txt", "etag": "e1" }
+        });
+        // 未指定は素通し（source をそのまま input にする）。
+        assert_eq!(apply_input_mapping(None, &src), src);
+        assert_eq!(
+            apply_input_mapping(Some(&serde_json::Value::Null), &src),
+            src
+        );
+        // Object 指定: pointer を引いて新 input を構築。空文字 pointer はルート（source 全体）。
+        let mapping = serde_json::json!({
+            "key": "/object/key",
+            "tag": "/object/etag",
+            "missing": "/does/not/exist",
+            "all": "",
+        });
+        let out = apply_input_mapping(Some(&mapping), &src);
+        assert_eq!(out["key"], serde_json::json!("tenants/ten_a/in.txt"));
+        assert_eq!(out["tag"], serde_json::json!("e1"));
+        // 解決不能な pointer は null（fire を止めない）。
+        assert_eq!(out["missing"], serde_json::Value::Null);
+        // ルート pointer は source 全体。
+        assert_eq!(out["all"], src);
+    }
+
     /// M4c: failed (DLQ) subject の形と、`tenant_from_subject` が `.failed` でも第 2 トークンを
     /// 抽出できることを担保する（subscriber は subject 由来テナントを唯一の権威にする）。
     #[test]
@@ -1023,12 +1320,40 @@ mod tests {
             input: serde_json::json!({"k": "v"}),
             input_url: None,
             job_token: "payload.sig".into(),
+            reply_to: None,
+            origin: None,
         };
         let json = serde_json::to_string(&job).unwrap();
         let back: JobMessage = serde_json::from_str(&json).unwrap();
         assert_eq!(back.wasm_sha256, "abc123");
         assert_eq!(back.wasm_url, "http://localhost:9000/faas-components/x?sig");
         assert_eq!(back.job_token, "payload.sig");
+        // M6: reply_to / origin は None のとき wire に現れない（skip_serializing_if）。
+        assert!(!json.contains("reply_to"));
+        assert!(!json.contains("origin"));
+    }
+
+    /// M6 (§15): `reply_to` / `origin` を載せた JobMessage が round-trip し、
+    /// `None` のときは wire から省かれる（後方互換: 旧 worker が未知キーで困らない）。
+    #[test]
+    fn job_message_roundtrip_includes_m6_fields() {
+        let job = JobMessage {
+            execution_id: "exec_1".into(),
+            tenant_id: "ten_a".into(),
+            component: "echo".into(),
+            version: "1.0.0".into(),
+            wasm_sha256: "abc123".into(),
+            wasm_url: "http://x".into(),
+            input: serde_json::json!({}),
+            input_url: None,
+            job_token: "payload.sig".into(),
+            reply_to: Some("reply.inst_1.corr_9".into()),
+            origin: Some("cron".into()),
+        };
+        let json = serde_json::to_string(&job).unwrap();
+        let back: JobMessage = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.reply_to.as_deref(), Some("reply.inst_1.corr_9"));
+        assert_eq!(back.origin.as_deref(), Some("cron"));
     }
 
     /// 旧 CP/worker が出した job_token なしのメッセージも serde(default) で復号でき、
@@ -1038,6 +1363,9 @@ mod tests {
         let job_json = r#"{"execution_id":"exec_1","tenant_id":"default","component":"echo","version":"1.0.0","wasm_sha256":"abc","wasm_url":"http://x","input":{}}"#;
         let job: JobMessage = serde_json::from_str(job_json).unwrap();
         assert_eq!(job.job_token, "");
+        // M6: reply_to / origin も serde default で None（旧メッセージ互換）。
+        assert_eq!(job.reply_to, None);
+        assert_eq!(job.origin, None);
 
         let res_json = r#"{"execution_id":"exec_1","tenant_id":"default","status":"succeeded","output":null,"error":null}"#;
         let res: ResultMessage = serde_json::from_str(res_json).unwrap();
@@ -1380,6 +1708,7 @@ mod tests {
         assert!(new_tenant_id().starts_with("ten_"));
         assert!(new_user_id().starts_with("usr_"));
         assert!(new_token_id().starts_with("tok_"));
+        assert!(new_instance_id().starts_with("inst_"));
     }
 
     /// 採番した ID は subject / キー空間に安全に埋め込めること。
@@ -1393,6 +1722,7 @@ mod tests {
             new_component_id(),
             new_version_id(),
             new_execution_id(),
+            new_instance_id(),
         ];
         for id in ids {
             assert!(

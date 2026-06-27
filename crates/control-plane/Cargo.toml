@@ -46,6 +46,9 @@ async-nats = { workspace = true }
 # Stream トレイト (Subscriber は futures::Stream を実装)。async-nats と整合。
 futures = "0.3"
 
+# 同期 invoke の per-instance waiter registry（M6a, §15）: correlation_id -> oneshot::Sender。
+dashmap = { workspace = true }
+
 # 共有ストア（M3d, §8）。レート制限 / in-flight / login ロックアウトを全 Axum
 # インスタンスで共有するカウンタ。Lua アトミック操作で TOCTOU を避ける。pure-Rust 構成。
 redis = { workspace = true }

@@ -5,7 +5,10 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+use dashmap::DashMap;
+use faas_shared::ResultMessage;
 use sqlx::PgPool;
+use tokio::sync::oneshot;
 
 use crate::db::TenantQuotaOverrides;
 use crate::metrics::Metrics;
@@ -112,6 +115,16 @@ pub struct ResolvedAdmissionParams {
     pub inflight: InflightParams,
 }
 
+/// M6a (§15): 同期 invoke の per-instance waiter registry の型エイリアス。
+///
+/// correlation_id（同期 invoke 1 回ごとに採番した不透明 ID）→ 結果を 1 回だけ受け取る
+/// `oneshot::Sender<ResultMessage>` の並行マップ。invoke ハンドラが publish 後に insert し、
+/// reply 購読タスクが reply 到達時に remove して send する。**per-instance（共有しない）** で、
+/// reply subject に埋め込んだ `instance_id` により「JobMessage を送った当該インスタンスだけが
+/// reply を受け取る」を成立させる（ステートレス×N の鍵, §4 不変条件）。`DashMap` でロック競合を
+/// 避けつつ、timeout 時はハンドラ自身が除去して leak を防ぐ。
+pub type WaiterRegistry = Arc<DashMap<String, oneshot::Sender<ResultMessage>>>;
+
 /// ハンドラへ注入する共有状態。`Clone` は内部 `Arc` により安価。
 #[derive(Clone)]
 pub struct AppState {
@@ -148,6 +161,13 @@ struct Inner {
     /// 観測メトリクス（M4a, §3.8）。`/metrics` ハンドラ + 計装点（invoke / finalize / reaper）から
     /// 参照する。Registry はプロセスで 1 つ。Arc で共有して clone コストをゼロに抑える。
     metrics: Arc<Metrics>,
+    /// M6a (§15): この CP インスタンスの subject-safe 識別子（env `INSTANCE_ID` or `inst_{uuid}`）。
+    /// 同期 invoke の reply subject `reply.{instance_id}.{correlation_id}` に埋め込む。
+    instance_id: String,
+    /// M6a (§15): 同期 invoke の待機上限。超過でクライアントへ 202 + execution_id へフォールバックする。
+    sync_reply_timeout: Duration,
+    /// M6a (§15): 同期 invoke の per-instance waiter registry（correlation_id -> oneshot::Sender）。
+    waiters: WaiterRegistry,
 }
 
 impl AppState {
@@ -166,6 +186,8 @@ impl AppState {
         store: Arc<dyn Store>,
         admission: AdmissionConfig,
         metrics: Arc<Metrics>,
+        instance_id: String,
+        sync_reply_timeout_ms: u64,
     ) -> Self {
         // invoke の JetStream publish 用 context は NATS クライアントから構築する。
         let jetstream = async_nats::jetstream::new(nats.clone());
@@ -185,6 +207,10 @@ impl AppState {
                 store,
                 admission,
                 metrics,
+                instance_id,
+                sync_reply_timeout: Duration::from_millis(sync_reply_timeout_ms),
+                // 同期 invoke の waiter registry はプロセス起動時に空で作る（per-instance, M6a）。
+                waiters: Arc::new(DashMap::new()),
             }),
         }
     }
@@ -260,6 +286,25 @@ impl AppState {
     /// 観測メトリクス（M4a, §3.8）。`/metrics` ハンドラ + 計装点（invoke / finalize / reaper）。
     pub fn metrics(&self) -> &Metrics {
         self.inner.metrics.as_ref()
+    }
+
+    /// M6a (§15): この CP インスタンスの subject-safe 識別子。同期 invoke の reply subject
+    /// `reply.{instance_id}.{correlation_id}` 構築と reply 購読 wildcard に使う。
+    pub fn instance_id(&self) -> &str {
+        &self.inner.instance_id
+    }
+
+    /// M6a (§15): 同期 invoke の待機上限。invoke ハンドラが `tokio::time::timeout` に渡す。
+    pub fn sync_reply_timeout(&self) -> Duration {
+        self.inner.sync_reply_timeout
+    }
+
+    /// M6a (§15): 同期 invoke の per-instance waiter registry（correlation_id -> oneshot::Sender）。
+    ///
+    /// invoke ハンドラ（publish 後に insert / timeout 時に remove）と reply 購読タスク（reply 到達時に
+    /// remove して send）の両方が触る。clone は内部 `Arc` なので安価。
+    pub fn waiters(&self) -> &WaiterRegistry {
+        &self.inner.waiters
     }
 }
 

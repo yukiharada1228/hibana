@@ -72,6 +72,12 @@ TRUST_PROXY_HEADERS             ?= false
 # 大 I/O アップロード（§3.4/§5.2）: presigned PUT URL の TTL（秒）。
 UPLOAD_PRESIGN_TTL_SECS         ?= 300
 
+# --- M6: 同期 Invoke / Cron スケジューラ（§15） ---
+# INSTANCE_ID は未設定なら CP 起動時に inst_{uuid} を採番する（Axum×N では一意な値を与えること）。
+INSTANCE_ID                     ?=
+SYNC_REPLY_TIMEOUT_MS           ?= 5000
+CRON_POLL_INTERVAL_SECS         ?= 10
+
 # invoke / deploy ターゲット用。BIND_ADDR の 0.0.0.0 は curl 先として localhost に読み替える。
 BASE_URL ?= http://localhost:$(lastword $(subst :, ,$(BIND_ADDR)))
 
