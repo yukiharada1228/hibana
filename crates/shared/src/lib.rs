@@ -65,6 +65,11 @@ pub fn new_token_id() -> String {
     new_prefixed_id("tok")
 }
 
+/// `sec_*`（M7c: per-function secret のメタ行 id）。
+pub fn new_secret_id() -> String {
+    new_prefixed_id("sec")
+}
+
 /// `inst_*` CP インスタンス ID を生成する (M6a, §15)。
 ///
 /// env `INSTANCE_ID` 未設定時に各 CP インスタンスが起動時に採番する subject-safe な識別子。

@@ -63,9 +63,14 @@ fns="$fns|traffic_split_for_component|version_stats_for_component"
 # M7b per-function config + capability env 承認（すべて set_tenant_guc 済み tx で呼ぶ）。
 fns="$fns|version_capabilities|set_version_capabilities"
 fns="$fns|upsert_function_config|list_function_configs|delete_function_config"
+# M7c Secrets Manager（すべて set_tenant_guc 済み tx で呼ぶ）。
+# secrets_stale_kek / _all / secrets_kek_kid_counts_all は SECURITY DEFINER で GUC 不要のため
+# 意図的に除外する（M6 の cron_due_tenant_jobs と同じ扱い）。
+fns="$fns|insert_secret_meta|find_live_secret_by_name|list_secrets_meta|insert_secret_version"
+fns="$fns|bump_secret_current_version|soft_delete_secret|find_secret_version|resolve_for_injection"
 
 set2=$(
-  grep -rnE "db::($fns)\([[:space:]]*state\.pool\(\)" \
+  grep -rnE "(db|secrets)::($fns)\([[:space:]]*state\.pool\(\)" \
     --include=*.rs crates/ 2>/dev/null \
   || true
 )

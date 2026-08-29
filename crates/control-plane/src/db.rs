@@ -1088,6 +1088,212 @@ pub async fn replace_function_configs(
     Ok(())
 }
 
+// ---------------------------------------------------------------------------
+// M7c: Secrets Manager（function_secrets / function_secret_versions, migration 0011）
+//
+// **平文も暗号文もこの層より上へ素で流さない**。値は `secrets.rs` の封筒 [`crate::secrets::Envelope`]
+// としてのみ受け渡す。版台帳は追記専用（faas_app に UPDATE/DELETE が無い）なので、値の更新
+// （rotate）も KEK 再ラップ（rekey）も「新しい version 行の INSERT」で表現する。
+// すべて set_tenant_guc 済み tx で呼ぶこと。
+// ---------------------------------------------------------------------------
+
+/// `function_secrets` のメタデータ 1 行（**値は含まない**）。
+#[derive(Debug, Clone)]
+pub struct SecretMetaRow {
+    pub id: String,
+    pub name: String,
+    pub current_version: i32,
+    /// 作成時刻。M7c-3 の execution 基準の世代解決（§4.7）で参照する。
+    #[allow(dead_code)]
+    pub created_at: chrono::DateTime<chrono::Utc>,
+    pub updated_at: chrono::DateTime<chrono::Utc>,
+}
+
+/// secret メタ行を作成する（版行は別途 `insert_secret_version` で INSERT する）。
+///
+/// 生存行の同名重複は部分 UNIQUE index 違反（23505）。呼び出し側が捕捉して
+/// 「既存 → rotate」へ倒す。
+pub async fn insert_secret_meta(
+    executor: impl sqlx::PgExecutor<'_>,
+    tenant_id: &str,
+    secret_id: &str,
+    component_id: &str,
+    name: &str,
+    current_version: i32,
+) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        "INSERT INTO function_secrets \
+         (id, tenant_id, component_id, name, current_version) \
+         VALUES ($1, $2, $3, $4, $5)",
+    )
+    .bind(secret_id)
+    .bind(tenant_id)
+    .bind(component_id)
+    .bind(name)
+    .bind(current_version)
+    .execute(executor)
+    .await?;
+    Ok(())
+}
+
+/// 生存している secret を名前で引く（**メタのみ**）。
+pub async fn find_live_secret_by_name(
+    executor: impl sqlx::PgExecutor<'_>,
+    tenant_id: &str,
+    component_id: &str,
+    name: &str,
+) -> Result<Option<SecretMetaRow>, sqlx::Error> {
+    let row = sqlx::query(
+        "SELECT id, name, current_version, created_at, updated_at FROM function_secrets \
+          WHERE tenant_id = $1 AND component_id = $2 AND name = $3 AND deleted_at IS NULL",
+    )
+    .bind(tenant_id)
+    .bind(component_id)
+    .bind(name)
+    .fetch_optional(executor)
+    .await?;
+
+    row.map(|r| {
+        Ok(SecretMetaRow {
+            id: r.try_get("id")?,
+            name: r.try_get("name")?,
+            current_version: r.try_get("current_version")?,
+            created_at: r.try_get("created_at")?,
+            updated_at: r.try_get("updated_at")?,
+        })
+    })
+    .transpose()
+}
+
+/// component の生存 secret を全件引く（**メタのみ**。値も value_len も kek_kid も返さない）。
+pub async fn list_secrets_meta(
+    executor: impl sqlx::PgExecutor<'_>,
+    tenant_id: &str,
+    component_id: &str,
+) -> Result<Vec<SecretMetaRow>, sqlx::Error> {
+    let rows = sqlx::query(
+        "SELECT id, name, current_version, created_at, updated_at FROM function_secrets \
+          WHERE tenant_id = $1 AND component_id = $2 AND deleted_at IS NULL ORDER BY name",
+    )
+    .bind(tenant_id)
+    .bind(component_id)
+    .fetch_all(executor)
+    .await?;
+
+    rows.into_iter()
+        .map(|r| {
+            Ok(SecretMetaRow {
+                id: r.try_get("id")?,
+                name: r.try_get("name")?,
+                current_version: r.try_get("current_version")?,
+                created_at: r.try_get("created_at")?,
+                updated_at: r.try_get("updated_at")?,
+            })
+        })
+        .collect()
+}
+
+/// 版台帳へ 1 行 INSERT する（追記専用）。`reason` は `'create' | 'rotate' | 'rekey'`。
+pub async fn insert_secret_version(
+    executor: impl sqlx::PgExecutor<'_>,
+    tenant_id: &str,
+    secret_id: &str,
+    version: i32,
+    env: &crate::secrets::Envelope,
+    reason: &str,
+    created_by: Option<&str>,
+) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        "INSERT INTO function_secret_versions \
+         (tenant_id, secret_id, version, kek_kid, wrapped_dek, dek_nonce, nonce, ciphertext, \
+          value_len, reason, created_by) \
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)",
+    )
+    .bind(tenant_id)
+    .bind(secret_id)
+    .bind(version)
+    .bind(&env.kek_kid)
+    .bind(&env.wrapped_dek)
+    .bind(&env.dek_nonce)
+    .bind(&env.nonce)
+    .bind(&env.ciphertext)
+    .bind(env.value_len)
+    .bind(reason)
+    .bind(created_by)
+    .execute(executor)
+    .await?;
+    Ok(())
+}
+
+/// `current_version` を前進させる（rotate / rekey 後の切替）。
+pub async fn bump_secret_current_version(
+    executor: impl sqlx::PgExecutor<'_>,
+    tenant_id: &str,
+    secret_id: &str,
+    version: i32,
+) -> Result<bool, sqlx::Error> {
+    let r = sqlx::query(
+        "UPDATE function_secrets SET current_version = $3, updated_at = now() \
+          WHERE tenant_id = $1 AND id = $2 AND deleted_at IS NULL",
+    )
+    .bind(tenant_id)
+    .bind(secret_id)
+    .bind(version)
+    .execute(executor)
+    .await?;
+    Ok(r.rows_affected() > 0)
+}
+
+/// secret を soft delete する。版台帳は残る（追記専用なので消せない ＝ 監査上も残す）。
+///
+/// 生存行の部分 UNIQUE index から外れるため、**同名で作り直せる**（インシデント対応の基本操作）。
+pub async fn soft_delete_secret(
+    executor: impl sqlx::PgExecutor<'_>,
+    tenant_id: &str,
+    secret_id: &str,
+) -> Result<bool, sqlx::Error> {
+    let r = sqlx::query(
+        "UPDATE function_secrets SET deleted_at = now(), updated_at = now() \
+          WHERE tenant_id = $1 AND id = $2 AND deleted_at IS NULL",
+    )
+    .bind(tenant_id)
+    .bind(secret_id)
+    .execute(executor)
+    .await?;
+    Ok(r.rows_affected() > 0)
+}
+
+/// 指定 secret の指定版の封筒を引く。
+pub async fn find_secret_version(
+    executor: impl sqlx::PgExecutor<'_>,
+    tenant_id: &str,
+    secret_id: &str,
+    version: i32,
+) -> Result<Option<crate::secrets::Envelope>, sqlx::Error> {
+    let row = sqlx::query(
+        "SELECT kek_kid, wrapped_dek, dek_nonce, nonce, ciphertext, value_len \
+           FROM function_secret_versions \
+          WHERE tenant_id = $1 AND secret_id = $2 AND version = $3",
+    )
+    .bind(tenant_id)
+    .bind(secret_id)
+    .bind(version)
+    .fetch_optional(executor)
+    .await?;
+
+    row.map(|r| {
+        Ok(crate::secrets::Envelope {
+            kek_kid: r.try_get("kek_kid")?,
+            wrapped_dek: r.try_get("wrapped_dek")?,
+            dek_nonce: r.try_get("dek_nonce")?,
+            nonce: r.try_get("nonce")?,
+            ciphertext: r.try_get("ciphertext")?,
+            value_len: r.try_get("value_len")?,
+        })
+    })
+    .transpose()
+}
+
 /// version を soft delete する (deleted_at=now(), §6.7)。
 ///
 /// 既に削除済み / 不在の場合は更新 0 行。active version 保護・参照保護は呼び出し側で行う。

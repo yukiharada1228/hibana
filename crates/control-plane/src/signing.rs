@@ -169,9 +169,18 @@ impl Verifier {
 ///
 /// いずれも 32 バイトちょうどでなければエラー。
 pub fn decode_seed(raw: &str) -> anyhow::Result<[u8; 32]> {
+    decode_key32(raw, "JOB_SIGNING_KEY")
+}
+
+/// 32 バイト鍵素材を hex / base64url / base64 のいずれかから復号する（M7c で一般化）。
+///
+/// `env_name` はエラーメッセージに埋める env 変数名。`decode_seed` は
+/// `decode_key32(raw, "JOB_SIGNING_KEY")` の薄いラッパであり、M7c の `SECRETS_MASTER_KEY` /
+/// `SECRETS_RETIRED_KEYS` も同じ復号規則を共有する（鍵素材の受理形式を 1 箇所に保つ）。
+pub fn decode_key32(raw: &str, env_name: &str) -> anyhow::Result<[u8; 32]> {
     let raw = raw.trim();
     if raw.is_empty() {
-        anyhow::bail!("JOB_SIGNING_KEY is empty");
+        anyhow::bail!("{env_name} is empty");
     }
 
     // 1. hex（64 文字）。
@@ -182,7 +191,7 @@ pub fn decode_seed(raw: &str) -> anyhow::Result<[u8; 32]> {
             let lo = hex_val(raw.as_bytes()[i * 2 + 1]);
             match (hi, lo) {
                 (Some(h), Some(l)) => *byte = (h << 4) | l,
-                _ => anyhow::bail!("JOB_SIGNING_KEY: invalid hex"),
+                _ => anyhow::bail!("{env_name}: invalid hex"),
             }
         }
         return Ok(out);
@@ -190,22 +199,22 @@ pub fn decode_seed(raw: &str) -> anyhow::Result<[u8; 32]> {
 
     // 2. base64url（no-pad）。
     if let Some(bytes) = b64url_decode(raw) {
-        return to_seed32(bytes);
+        return to_seed32(bytes, env_name);
     }
 
     // 3. 標準 base64（'+'/'/' と '=' パディング）。手実装（外部 base64 依存を避ける）。
     if let Some(bytes) = std_base64_decode(raw) {
-        return to_seed32(bytes);
+        return to_seed32(bytes, env_name);
     }
 
-    anyhow::bail!("JOB_SIGNING_KEY: not valid hex / base64url / base64 of a 32-byte seed")
+    anyhow::bail!("{env_name}: not valid hex / base64url / base64 of a 32-byte seed")
 }
 
-fn to_seed32(bytes: Vec<u8>) -> anyhow::Result<[u8; 32]> {
+fn to_seed32(bytes: Vec<u8>, env_name: &str) -> anyhow::Result<[u8; 32]> {
     let arr: [u8; 32] = bytes
         .as_slice()
         .try_into()
-        .map_err(|_| anyhow::anyhow!("JOB_SIGNING_KEY must decode to exactly 32 bytes"))?;
+        .map_err(|_| anyhow::anyhow!("{env_name} must decode to exactly 32 bytes"))?;
     Ok(arr)
 }
 

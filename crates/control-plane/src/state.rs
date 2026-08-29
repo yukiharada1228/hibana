@@ -168,6 +168,9 @@ struct Inner {
     sync_reply_timeout: Duration,
     /// M6a (§15): 同期 invoke の per-instance waiter registry（correlation_id -> oneshot::Sender）。
     waiters: WaiterRegistry,
+    /// M7c (§10 / §15): secret の KEK キーリング。**control-plane だけが持つ**（worker は
+    /// keyless by design, §3.3）。暗号化は常に active kid、復号は行の kid で選ぶ。
+    secret_keyring: Arc<crate::secrets::SecretKeyring>,
 }
 
 impl AppState {
@@ -188,6 +191,7 @@ impl AppState {
         metrics: Arc<Metrics>,
         instance_id: String,
         sync_reply_timeout_ms: u64,
+        secret_keyring: Arc<crate::secrets::SecretKeyring>,
     ) -> Self {
         // invoke の JetStream publish 用 context は NATS クライアントから構築する。
         let jetstream = async_nats::jetstream::new(nats.clone());
@@ -211,6 +215,7 @@ impl AppState {
                 sync_reply_timeout: Duration::from_millis(sync_reply_timeout_ms),
                 // 同期 invoke の waiter registry はプロセス起動時に空で作る（per-instance, M6a）。
                 waiters: Arc::new(DashMap::new()),
+                secret_keyring,
             }),
         }
     }
@@ -229,6 +234,12 @@ impl AppState {
     }
 
     /// ジョブ署名器（invoke が sign、subscriber が verify に使う）。
+    /// secret の KEK キーリング (M7c)。**平文の鍵素材はここから外へ出さない**
+    /// （`secrets::encrypt` / `decrypt` / `rewrap` が参照するだけ）。
+    pub fn secret_keyring(&self) -> &crate::secrets::SecretKeyring {
+        &self.inner.secret_keyring
+    }
+
     pub fn signer(&self) -> &Signer {
         &self.inner.signer
     }

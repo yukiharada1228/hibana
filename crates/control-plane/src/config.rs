@@ -58,6 +58,19 @@ const DEFAULT_SYNC_REPLY_TIMEOUT_MS: u64 = 5000;
 /// Cron スケジューラの due スキャン間隔（秒）。
 const DEFAULT_CRON_POLL_INTERVAL_SECS: u64 = 10;
 
+// --- M7 デプロイ運用 / Secrets（§10 / §15） ---
+/// 内部専用 listener の bind アドレス。`POST /internal/job-env` だけを載せる。
+/// **既定は loopback**（公開 listener と分けることが露出ガードの本体）。
+const DEFAULT_INTERNAL_BIND_ADDR: &str = "127.0.0.1:8081";
+/// `/internal/job-env` の per-IP 上限（req/分）。無認証面のグローバル保護。
+const DEFAULT_JOB_ENV_EXCHANGE_RATE_PER_MIN: u64 = 600;
+/// `.env.example` に置く既知プレースホルダ。**この値のまま起動させない**（下記 MUST）。
+///
+/// `JOB_SIGNING_KEY` と違い secret の**暗号文は DB に永続する**ため、既知鍵で暗号化して
+/// しまうと影響が長期に残る。さらに Makefile は `include .env` + `export` するので、値は
+/// 全 make 子プロセスへ export される。よって warn ではなく**起動失敗**にする。
+const SECRETS_MASTER_KEY_PLACEHOLDER: &str = "CHANGE_ME_REPLACE_WITH_32_BYTE_KEY_BEFORE_USE";
+
 /// control-plane の起動時設定。
 ///
 /// **`Debug` は手動実装**（M7-0, §5.1）。秘密フィールドは `Redacted<String>` で包んであるため
@@ -156,6 +169,21 @@ pub struct Config {
     /// Cron スケジューラの due スキャン間隔（秒, M6b）。main.rs が `scheduler::run` へ渡して consume する。
     pub cron_poll_interval_secs: u64,
 
+    // --- M7c Secrets Manager（§10 / §15） ---
+    /// 現行 KEK（32 バイト）。hex / base64url / base64。新規暗号化は常にこの鍵で行う。
+    pub secrets_master_key: Redacted<String>,
+    /// 現行 KEK の kid。`function_secret_versions.kek_kid` に記録され、復号時の鍵選択に使う。
+    pub secrets_master_kid: String,
+    /// 復号専用の旧 KEK 群（`kid:key,kid:key` の CSV）。再ラップが全行に行き渡るまで残す。
+    /// **早期撤去は復号不能 ＝ データ喪失**（signing の overlap と同じ規律）。
+    pub secrets_retired_keys: Redacted<String>,
+    /// 内部専用 listener の bind アドレス（`POST /internal/job-env` のみ）。**公開してはならない**。
+    pub internal_bind_addr: String,
+    /// `/internal/job-env` の per-IP 上限（req/分）。
+    /// M7c-3（内部 listener + 引き換えハンドラ）で consume する。
+    #[allow(dead_code)]
+    pub job_env_exchange_rate_per_min: u64,
+
     // --- 観測 (M4a, §3.8) ---
     /// ログ整形（"text" 既定 / "json"）。`json` のとき `tracing_subscriber::fmt().json()` を
     /// 有効化し、フィールドを flatten した JSON ライン形式で吐く。集約基盤（Loki/ELK 等）に
@@ -190,6 +218,10 @@ impl std::fmt::Debug for Config {
             .field("s3_secret_key", &self.s3_secret_key)
             .field("job_signing_key", &self.job_signing_key)
             .field("job_signing_kid", &self.job_signing_kid)
+            .field("secrets_master_key", &self.secrets_master_key)
+            .field("secrets_master_kid", &self.secrets_master_kid)
+            .field("secrets_retired_keys", &self.secrets_retired_keys)
+            .field("internal_bind_addr", &self.internal_bind_addr)
             .field("instance_id", &self.instance_id)
             .finish_non_exhaustive()
     }
@@ -217,8 +249,54 @@ impl Config {
         self.job_signing_key.expose()
     }
 
+    /// KEK キーリングを構築する (M7c, §4.4)。**秘密の平文がここから外へ出ない**ように、
+    /// 生文字列ではなく組み立て済みの [`crate::secrets::SecretKeyring`] を返す。
+    ///
+    /// `SECRETS_RETIRED_KEYS` は `kid:key,kid:key` の CSV。空要素は無視し、形式不正は
+    /// 起動失敗にする（黙って無視すると「retired 鍵を書いたのに復号できない」になる）。
+    pub fn secret_keyring(&self) -> anyhow::Result<crate::secrets::SecretKeyring> {
+        let active =
+            crate::signing::decode_key32(self.secrets_master_key.expose(), "SECRETS_MASTER_KEY")?;
+
+        let mut retired = Vec::new();
+        for entry in self.secrets_retired_keys.expose().split(',') {
+            let entry = entry.trim();
+            if entry.is_empty() {
+                continue;
+            }
+            let (kid, raw) = entry.split_once(':').ok_or_else(|| {
+                anyhow::anyhow!("SECRETS_RETIRED_KEYS entries must be 'kid:key' (comma separated)")
+            })?;
+            let kid = kid.trim();
+            if kid.is_empty() {
+                anyhow::bail!("SECRETS_RETIRED_KEYS: empty kid");
+            }
+            retired.push((
+                kid.to_string(),
+                crate::signing::decode_key32(raw.trim(), "SECRETS_RETIRED_KEYS")?,
+            ));
+        }
+
+        Ok(crate::secrets::SecretKeyring::new(
+            self.secrets_master_kid.clone(),
+            active,
+            retired,
+        ))
+    }
+
     /// プロセス環境から設定を読み込む。必須キー欠損はエラー。
     pub fn from_env() -> anyhow::Result<Self> {
+        // M7c (§4.4 MUST): `.env.example` の既知プレースホルダのままでは**起動させない**。
+        // 署名鍵と違い secret の暗号文は DB に永続するため、公開リポジトリに載る既知鍵で
+        // 暗号化してしまうと影響が長く残る（warn では見逃される）。
+        let secrets_master_key = env_required("SECRETS_MASTER_KEY")?;
+        if secrets_master_key.trim() == SECRETS_MASTER_KEY_PLACEHOLDER {
+            anyhow::bail!(
+                "SECRETS_MASTER_KEY is still the placeholder from .env.example; \
+                 generate a real 32-byte key (e.g. `openssl rand -hex 32`) before starting"
+            );
+        }
+
         let database_url = env_required("DATABASE_URL")?;
         // 未設定なら database_url にフォールバック（所有者 1 本運用の開発用途）。
         let migration_database_url =
@@ -282,6 +360,14 @@ impl Config {
                 DEFAULT_CRON_POLL_INTERVAL_SECS,
             )?,
 
+            secrets_master_key: Redacted::new(secrets_master_key),
+            secrets_master_kid: env_required("SECRETS_MASTER_KID")?,
+            secrets_retired_keys: Redacted::new(env_or("SECRETS_RETIRED_KEYS", "")),
+            internal_bind_addr: env_or("INTERNAL_BIND_ADDR", DEFAULT_INTERNAL_BIND_ADDR),
+            job_env_exchange_rate_per_min: env_u64(
+                "JOB_ENV_EXCHANGE_RATE_PER_MIN",
+                DEFAULT_JOB_ENV_EXCHANGE_RATE_PER_MIN,
+            )?,
             log_format: env_or("LOG_FORMAT", "text"),
         })
     }
