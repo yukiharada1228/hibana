@@ -384,6 +384,132 @@ pub fn rewrap(
     })
 }
 
+/// **execution 基準**で解決した secret 1 件（注入用）。
+pub struct ResolvedSecret {
+    pub name: String,
+    /// 実際に注入した世代（execution 基準で固定された値）。監査・デバッグ用。
+    #[allow(dead_code)]
+    pub version: i32,
+    pub value: faas_shared::Redacted<String>,
+}
+
+/// job-env 引き換え専用の復号 API (§5.2)。**secrets.rs が公開する復号系はこれ 1 本だけ**。
+///
+/// # 世代を execution に固定する理由 (§4.7.1 MUST)
+///
+/// 「引き換え時点の `current_version` を解決する」実装だと、worker がクラッシュして再配送される
+/// 間に `POST .../rotate` が走ったとき、同一 `execution_id` の 1 回目の試行は旧値・2 回目は新値で
+/// 走る。at-least-once なので **両方の資格情報が外部 API へ到達しうる**（rotation の目的である
+/// 「旧鍵を止める」が保証されず、旧鍵の最終使用時刻も特定できない）。版台帳が追記専用で旧世代を
+/// 保持しているのだから、注入側もその利点を使う。
+///
+/// → `executions.created_at` 以前に作られた**最大 version** を `JOIN LATERAL` で取る。
+/// `ON TRUE` は INNER 相当なので、**世代を 1 つも解決できない secret は行が返らない**。
+/// 生存 secret があるのに世代が解決できないケースは呼び出し側が検出して fail-closed に倒す。
+/// `reason='rekey'` 行は同一平文なので選ばれても等価。
+///
+/// `allowed` は `capabilities.env`（admin 承認）の許可リスト。**許可リストが権威**であり、
+/// 値が DB に存在しても載っていない名前は返さない（worker 側にも同じフィルタがある二重防御）。
+pub async fn resolve_for_injection(
+    tx: &mut sqlx::PgConnection,
+    keyring: &SecretKeyring,
+    tenant_id: &str,
+    component_id: &str,
+    execution_created_at: chrono::DateTime<chrono::Utc>,
+    allowed: &std::collections::BTreeSet<String>,
+) -> Result<Vec<ResolvedSecret>, SecretError> {
+    use sqlx::Row as _;
+
+    if allowed.is_empty() {
+        return Ok(Vec::new());
+    }
+    let names: Vec<String> = allowed.iter().cloned().collect();
+
+    let rows = sqlx::query(SECRET_INJECTION_SQL)
+        .bind(tenant_id)
+        .bind(component_id)
+        .bind(execution_created_at)
+        .bind(&names)
+        .fetch_all(&mut *tx)
+        .await
+        .map_err(|_| SecretError::VersionUnresolved)?;
+
+    // 生存 secret の件数と解決できた世代の件数が食い違ったら fail-closed（§4.7.1）。
+    let live: i64 = sqlx::query(
+        "SELECT count(*) AS n FROM function_secrets \
+          WHERE tenant_id = $1 AND component_id = $2 AND deleted_at IS NULL AND name = ANY($3)",
+    )
+    .bind(tenant_id)
+    .bind(component_id)
+    .bind(&names)
+    .fetch_one(&mut *tx)
+    .await
+    .map_err(|_| SecretError::VersionUnresolved)?
+    .try_get("n")
+    .map_err(|_| SecretError::VersionUnresolved)?;
+
+    if live != rows.len() as i64 {
+        return Err(SecretError::VersionUnresolved);
+    }
+
+    let mut out = Vec::with_capacity(rows.len());
+    for r in rows {
+        let secret_id: String = r
+            .try_get("secret_id")
+            .map_err(|_| SecretError::BadEnvelope)?;
+        let name: String = r.try_get("name").map_err(|_| SecretError::BadEnvelope)?;
+        let version: i32 = r.try_get("version").map_err(|_| SecretError::BadEnvelope)?;
+        let envelope = Envelope {
+            kek_kid: r.try_get("kek_kid").map_err(|_| SecretError::BadEnvelope)?,
+            wrapped_dek: r
+                .try_get("wrapped_dek")
+                .map_err(|_| SecretError::BadEnvelope)?,
+            dek_nonce: r
+                .try_get("dek_nonce")
+                .map_err(|_| SecretError::BadEnvelope)?,
+            nonce: r.try_get("nonce").map_err(|_| SecretError::BadEnvelope)?,
+            ciphertext: r
+                .try_get("ciphertext")
+                .map_err(|_| SecretError::BadEnvelope)?,
+            value_len: r
+                .try_get("value_len")
+                .map_err(|_| SecretError::BadEnvelope)?,
+        };
+
+        let plaintext = decrypt(
+            keyring,
+            &envelope,
+            tenant_id,
+            component_id,
+            &secret_id,
+            &name,
+            version,
+        )?;
+        let value = String::from_utf8(plaintext.to_vec()).map_err(|_| SecretError::BadEnvelope)?;
+
+        out.push(ResolvedSecret {
+            name,
+            version,
+            value: faas_shared::Redacted::new(value),
+        });
+    }
+    Ok(out)
+}
+
+/// 注入クエリ (§4.7.1)。**`current_version` を参照しない**（execution 基準に固定する）。
+const SECRET_INJECTION_SQL: &str = "SELECT s.id AS secret_id, s.name, \
+        v.version, v.kek_kid, v.wrapped_dek, v.dek_nonce, v.nonce, v.ciphertext, v.value_len \
+   FROM function_secrets s \
+   JOIN LATERAL ( \
+        SELECT * FROM function_secret_versions v2 \
+         WHERE v2.tenant_id = s.tenant_id AND v2.secret_id = s.id \
+           AND v2.created_at <= $3 \
+         ORDER BY v2.version DESC LIMIT 1 \
+   ) v ON TRUE \
+  WHERE s.tenant_id = $1 AND s.component_id = $2 \
+    AND s.deleted_at IS NULL AND s.name = ANY($4) \
+  ORDER BY s.name";
+
 /// 監査ログ `detail` の**唯一の構築点** (§5.3)。
 ///
 /// `db::insert_audit_log` の `detail: Option<&Value>` は任意 JSON を受け取れてしまうため、
@@ -538,6 +664,35 @@ mod tests {
         assert_ne!(dek_aad("t", "s", 1, "k"), dek_aad("t", "s", 2, "k"));
         // ドメインタグで用途が分離されている。
         assert_ne!(value_aad("t", "c", "n"), dek_aad("t", "c", 0, "n"));
+    }
+
+    /// 注入クエリは **execution 基準**（`current_version` を参照しない）。
+    ///
+    /// 参照してしまうと、worker 再配送中に rotate が走ったとき同一 execution の 1 回目と 2 回目で
+    /// 別の資格情報が外部へ出る（at-least-once なので両方到達しうる）。
+    #[test]
+    fn secret_injection_sql_is_execution_pinned() {
+        assert!(
+            SECRET_INJECTION_SQL.contains("v2.created_at <= $3"),
+            "the generation must be pinned to executions.created_at"
+        );
+        assert!(
+            !SECRET_INJECTION_SQL.contains("current_version"),
+            "resolving via current_version would break redelivery determinism"
+        );
+        assert!(
+            SECRET_INJECTION_SQL.contains("JOIN LATERAL")
+                && SECRET_INJECTION_SQL.contains("ON TRUE"),
+            "an INNER-equivalent LATERAL makes unresolvable generations disappear (fail-closed)"
+        );
+        assert!(
+            SECRET_INJECTION_SQL.contains("s.deleted_at IS NULL"),
+            "soft-deleted secrets must never be injected"
+        );
+        assert!(
+            SECRET_INJECTION_SQL.contains("s.tenant_id = $1"),
+            "the injection query must be tenant-scoped in the predicate as well as under RLS"
+        );
     }
 
     /// 監査 detail に値を載せる型経路が存在しない（シグネチャが値を受け取らない）。

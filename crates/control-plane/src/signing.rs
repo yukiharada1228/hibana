@@ -18,7 +18,10 @@ use std::collections::HashMap;
 
 use ed25519_dalek::{Signature, Signer as _, SigningKey, VerifyingKey};
 
-use faas_shared::{b64url_decode, b64url_encode, job_claims_signing_bytes, JobClaims};
+use faas_shared::{
+    b64url_decode, b64url_encode, env_claims_signing_bytes, job_claims_signing_bytes, EnvClaims,
+    JobClaims,
+};
 
 /// 署名 / 検証の失敗理由（audit detail の `reason` に載せる安定文字列）。
 ///
@@ -106,6 +109,22 @@ impl Signer {
         )
     }
 
+    /// env-token（secret 引き換え専用）を署名する (M7c, §4.6)。
+    ///
+    /// 鍵は job_token と同じ Ed25519 鍵を流用するが、署名バイトの**ドメインタグが異なる**ため
+    /// （`faas-env-token-v1` vs `faas-job-token-v1`）、両者を相互に使い回すことはできない。
+    /// 用途の取り違えは `aud` の検査でも二重に防ぐ。
+    pub fn sign_env(&self, claims: &EnvClaims) -> String {
+        let signing_bytes = env_claims_signing_bytes(claims);
+        let sig: Signature = self.key.sign(&signing_bytes);
+        let payload = serde_json::to_vec(claims).expect("EnvClaims serialize never fails");
+        format!(
+            "{}.{}",
+            b64url_encode(&payload),
+            b64url_encode(&sig.to_bytes())
+        )
+    }
+
     /// 検証器への参照（subscriber が `state.verifier()` 経由で使う）。
     pub fn verifier(&self) -> &Verifier {
         &self.verifier
@@ -152,6 +171,40 @@ impl Verifier {
 
         // 検証も signer と同一の正準バイトを再導出して行う（JSON 順序を信用しない）。
         let signing_bytes = job_claims_signing_bytes(&claims);
+        key.verify_strict(&signing_bytes, &signature)
+            .map_err(|_| VerifyError::BadSignature)?;
+
+        Ok(claims)
+    }
+
+    /// env-token を検証し、成功時に正準パース済みの [`EnvClaims`] を返す (M7c, §4.6)。
+    ///
+    /// `verify` と同じ手順（b64url 2 セグメント → JSON → **正準バイト再導出** → kid で鍵選択 →
+    /// `verify_strict`）だが、署名バイトのドメインタグが異なるため job_token を渡しても通らない。
+    /// `aud` の検査は呼び出し側（引き換えハンドラ）が行う（claim 内容の検査は署名検証の後、
+    /// という `verify` の分業と揃える）。
+    pub fn verify_env(&self, token: &str) -> Result<EnvClaims, VerifyError> {
+        let mut parts = token.split('.');
+        let seg0 = parts.next().ok_or(VerifyError::MalformedToken)?;
+        let seg1 = parts.next().ok_or(VerifyError::MalformedToken)?;
+        if parts.next().is_some() {
+            return Err(VerifyError::MalformedToken);
+        }
+
+        let payload = b64url_decode(seg0).ok_or(VerifyError::PayloadDecode)?;
+        let claims: EnvClaims =
+            serde_json::from_slice(&payload).map_err(|_| VerifyError::PayloadJson)?;
+
+        let sig_bytes = b64url_decode(seg1).ok_or(VerifyError::SignatureDecode)?;
+        let sig_arr: [u8; 64] = sig_bytes
+            .as_slice()
+            .try_into()
+            .map_err(|_| VerifyError::SignatureDecode)?;
+        let signature = Signature::from_bytes(&sig_arr);
+
+        let key = self.keys.get(&claims.kid).ok_or(VerifyError::UnknownKid)?;
+
+        let signing_bytes = env_claims_signing_bytes(&claims);
         key.verify_strict(&signing_bytes, &signature)
             .map_err(|_| VerifyError::BadSignature)?;
 

@@ -1263,6 +1263,45 @@ pub async fn soft_delete_secret(
     Ok(r.rows_affected() > 0)
 }
 
+/// テナントが `active` かどうか (M7c: `/internal/job-env` は認証 middleware 外なので個別確認する)。
+///
+/// `auth::authenticate` が middleware で行っている停止テナント遮断と同じ判定を、middleware の
+/// 外にある内部エンドポイントで**明示的に**行うためのもの（§4.6.1 (3) の MUST）。
+/// RLS 下の GUC を必要としない参照なので、SECURITY DEFINER 関数と同じく GUC 前に呼べる。
+pub async fn tenant_is_active(
+    executor: impl sqlx::PgExecutor<'_>,
+    tenant_id: &str,
+) -> Result<bool, sqlx::Error> {
+    let row = sqlx::query(
+        "SELECT EXISTS (SELECT 1 FROM tenants WHERE id = $1 AND status = 'active') AS ok",
+    )
+    .bind(tenant_id)
+    .fetch_one(executor)
+    .await?;
+    row.try_get("ok")
+}
+
+/// component に**生存する secret が 1 件以上あるか**（M7c: enqueue 時の env-token 要否判定）。
+///
+/// 件数も名前も返さない（wire に載せる情報を「有無」だけに絞るため）。
+pub async fn component_has_live_secrets(
+    executor: impl sqlx::PgExecutor<'_>,
+    tenant_id: &str,
+    component_id: &str,
+) -> Result<bool, sqlx::Error> {
+    let row = sqlx::query(
+        "SELECT EXISTS ( \
+             SELECT 1 FROM function_secrets \
+              WHERE tenant_id = $1 AND component_id = $2 AND deleted_at IS NULL \
+         ) AS present",
+    )
+    .bind(tenant_id)
+    .bind(component_id)
+    .fetch_one(executor)
+    .await?;
+    row.try_get("present")
+}
+
 /// 指定 secret の指定版の封筒を引く。
 pub async fn find_secret_version(
     executor: impl sqlx::PgExecutor<'_>,

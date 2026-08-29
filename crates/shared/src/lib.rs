@@ -525,6 +525,23 @@ pub struct JobMessage {
     /// 旧 CP のメッセージとの互換のため serde default、`None` は wire に出さない。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub origin: Option<String>,
+    /// M7c (§4.6): secret 引き換え専用の短命トークン（[`EnvClaims`] を署名したもの）。
+    ///
+    /// CP は enqueue 時、当該 component に**生存する secret が 1 件以上あるときだけ** `Some` を載せる
+    /// （secret 名も件数も wire に載せない。`Some` かどうかがそのままシグナルになる）。worker はこれを
+    /// CP の内部エンドポイント `POST /internal/job-env` に提示して復号済み env を受け取る。
+    ///
+    /// **MUST NOT**: worker はこの値を `ResultMessage` / `FailedMessage` / reply subject へ
+    /// echo してはならない。echo すると result / DLQ / reply の購読権しか持たない主体が
+    /// 引き換えトークンを得て secret を読めるようになり、この方式の優位性が消える
+    /// （`reply_to` の「揮発フィールドで DB に永続化しない」と同型の宣言）。
+    ///
+    /// **MUST NOT**: `JobMessage` に平文 secret / KEK / DEK を載せてはならない。wire に出る
+    /// secret 由来の情報はこのトークンだけである。
+    ///
+    /// 旧 CP のメッセージとの互換のため serde default、`None` は wire に出さない。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub env_token: Option<String>,
 }
 
 /// worker が 1 実行ごとに計測したリソース利用量 (M5, §15)。
@@ -715,6 +732,68 @@ pub fn job_claims_signing_bytes(c: &JobClaims) -> Vec<u8> {
     write_len_prefixed(&mut out, c.execution_id.as_bytes());
     write_len_prefixed(&mut out, c.tenant_id.as_bytes());
     write_len_prefixed(&mut out, c.version_id.as_bytes());
+    write_len_prefixed(&mut out, c.kid.as_bytes());
+    out.extend_from_slice(&c.iat.to_be_bytes());
+    out.extend_from_slice(&c.exp.to_be_bytes());
+    out
+}
+
+/// job-env 引き換えトークンの claim (M7c, §4.6)。
+///
+/// **`JobClaims` を流用しない理由**: `job_token` は `JobMessage` だけでなく `ResultMessage` /
+/// `FailedMessage` にも verbatim に echo される。流用すると、result / DLQ / reply の購読権しか
+/// 持たない主体が引き換えトークンを手に入れて secret を読めてしまい、「worker が CP から
+/// 引き換える方式は、平文を JobMessage に載せる方式より厳密に優位」という論証が崩れる。
+/// 専用 claim にし、ドメインタグと `aud` の両方で job_token と相互に使い回せなくする。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct EnvClaims {
+    /// `exec_*`。引き換え時に executions 行と突き合わせる。
+    pub execution_id: String,
+    /// `ten_*`（権威的テナント）。
+    pub tenant_id: String,
+    /// `ver_*`。この版の `capabilities.env` が注入可能な名前を決める。
+    pub version_id: String,
+    /// `cmp_*`。secret の所属 component。
+    pub component_id: String,
+    /// 用途識別子。**常に `"job-env"`**。不一致は 401（job_token との取り違え防止）。
+    pub aud: String,
+    /// 検証側の公開鍵を選ぶ key id。
+    pub kid: String,
+    /// 発行時刻（unix 秒）。
+    pub iat: i64,
+    /// 有効期限（unix 秒）。job_token と同じ TTL 式で有限。
+    pub exp: i64,
+}
+
+/// env-token の `aud`。
+pub const ENV_TOKEN_AUDIENCE: &str = "job-env";
+
+/// env-token の署名バイトのドメインタグ。`JOB_TOKEN_DOMAIN` と**別**であることが本質
+/// （同じ鍵を使っても job_token と env_token を相互に使い回せない）。
+const ENV_TOKEN_DOMAIN: &[u8] = b"faas-env-token-v1";
+
+/// env-token の claim から **正準** 署名バイト列を組み立てる (M7c, §4.6)。
+///
+/// `job_claims_signing_bytes` と同じ作法（ドメインタグ + 4 バイト BE 長さ前置 + 固定順）。
+/// serde_json を使わない理由も同じ（map/key 順序が非正準でドリフトすると検証が黙って壊れる）。
+pub fn env_claims_signing_bytes(c: &EnvClaims) -> Vec<u8> {
+    let mut out = Vec::with_capacity(
+        4 + ENV_TOKEN_DOMAIN.len()
+            + 5 * 4
+            + c.execution_id.len()
+            + c.tenant_id.len()
+            + c.version_id.len()
+            + c.component_id.len()
+            + c.aud.len()
+            + c.kid.len()
+            + 16,
+    );
+    write_len_prefixed(&mut out, ENV_TOKEN_DOMAIN);
+    write_len_prefixed(&mut out, c.execution_id.as_bytes());
+    write_len_prefixed(&mut out, c.tenant_id.as_bytes());
+    write_len_prefixed(&mut out, c.version_id.as_bytes());
+    write_len_prefixed(&mut out, c.component_id.as_bytes());
+    write_len_prefixed(&mut out, c.aud.as_bytes());
     write_len_prefixed(&mut out, c.kid.as_bytes());
     out.extend_from_slice(&c.iat.to_be_bytes());
     out.extend_from_slice(&c.exp.to_be_bytes());
@@ -1365,6 +1444,7 @@ mod tests {
             job_token: "payload.sig".into(),
             reply_to: None,
             origin: None,
+            env_token: None,
         };
         let json = serde_json::to_string(&job).unwrap();
         let back: JobMessage = serde_json::from_str(&json).unwrap();
@@ -1374,6 +1454,57 @@ mod tests {
         // M6: reply_to / origin は None のとき wire に現れない（skip_serializing_if）。
         assert!(!json.contains("reply_to"));
         assert!(!json.contains("origin"));
+        // M7c: env_token も同様（secret を持たない component では wire に一切現れない）。
+        assert!(!json.contains("env_token"));
+    }
+
+    /// M7c (§4.6): env-token の署名バイトが job_token と**別のドメインタグ**を持ち、
+    /// 同じフィールド値でも衝突しないこと（両者を相互に使い回せないことの根拠）。
+    #[test]
+    fn env_token_signing_bytes_are_domain_separated_from_job_token() {
+        let job = JobClaims {
+            execution_id: "exec_1".into(),
+            tenant_id: "ten_a".into(),
+            version_id: "ver_1".into(),
+            kid: "k1".into(),
+            iat: 1,
+            exp: 2,
+        };
+        let env = EnvClaims {
+            execution_id: "exec_1".into(),
+            tenant_id: "ten_a".into(),
+            version_id: "ver_1".into(),
+            component_id: "cmp_1".into(),
+            aud: ENV_TOKEN_AUDIENCE.into(),
+            kid: "k1".into(),
+            iat: 1,
+            exp: 2,
+        };
+        let jb = job_claims_signing_bytes(&job);
+        let eb = env_claims_signing_bytes(&env);
+        assert_ne!(jb, eb);
+        // ドメインタグは先頭に長さ前置で入る。
+        assert!(eb.windows(17).any(|w| w == b"faas-env-token-v1"));
+        assert!(!eb.windows(17).any(|w| w == b"faas-job-token-v1"));
+    }
+
+    /// env-token の署名バイトはフィールド境界が曖昧にならない（長さ前置の効果）。
+    #[test]
+    fn env_claims_signing_bytes_are_unambiguous() {
+        let mk = |exec: &str, ten: &str| EnvClaims {
+            execution_id: exec.into(),
+            tenant_id: ten.into(),
+            version_id: "ver_1".into(),
+            component_id: "cmp_1".into(),
+            aud: ENV_TOKEN_AUDIENCE.into(),
+            kid: "k1".into(),
+            iat: 1,
+            exp: 2,
+        };
+        assert_ne!(
+            env_claims_signing_bytes(&mk("ab", "c")),
+            env_claims_signing_bytes(&mk("a", "bc"))
+        );
     }
 
     /// M6 (§15): `reply_to` / `origin` を載せた JobMessage が round-trip し、
@@ -1392,6 +1523,7 @@ mod tests {
             job_token: "payload.sig".into(),
             reply_to: Some("reply.inst_1.corr_9".into()),
             origin: Some("cron".into()),
+            env_token: None,
         };
         let json = serde_json::to_string(&job).unwrap();
         let back: JobMessage = serde_json::from_str(&json).unwrap();

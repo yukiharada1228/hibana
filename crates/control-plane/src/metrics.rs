@@ -98,6 +98,11 @@ pub struct Metrics {
     /// admission の 429・presign 失敗・publish backpressure・cron の冪等ヒットまで canary として
     /// 数えてしまい、`executions.routing_reason` 由来の `GET /traffic` の値と乖離する。
     pub canary_routed_total: IntCounterVec,
+
+    // ---- M7c: Secrets Manager ------------------------------------------------
+    /// `/internal/job-env` で worker へ発行した secret material の件数 (M7c, §4.6)。
+    /// labels: outcome（`ok` / 失敗時の安定 reason）。**secret 名も値もラベルにしない**。
+    pub secret_material_issued_total: IntCounterVec,
 }
 
 impl Metrics {
@@ -222,6 +227,18 @@ impl Metrics {
             .register(Box::new(canary_routed_total.clone()))
             .expect("register canary_routed_total");
 
+        let secret_material_issued_total = IntCounterVec::new(
+            Opts::new(
+                "faas_secret_material_issued_total",
+                "Secret material exchanges served on the internal job-env endpoint by outcome",
+            ),
+            &["outcome"],
+        )
+        .expect("metric: secret_material_issued_total");
+        registry
+            .register(Box::new(secret_material_issued_total.clone()))
+            .expect("register secret_material_issued_total");
+
         Arc::new(Self {
             registry,
             http_requests_total,
@@ -234,6 +251,7 @@ impl Metrics {
             reaper_tenants_last,
             dlq_finalized_total,
             canary_routed_total,
+            secret_material_issued_total,
         })
     }
 

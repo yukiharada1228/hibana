@@ -220,12 +220,28 @@ struct Settings {
     /// M4a (§3.8): /metrics + /readyz を返す最小 axum サーバの bind 先。既定 `0.0.0.0:9090`。
     /// 内部ネット越しのみで露出させる前提。ノード LB の readinessProbe ターゲットでもある。
     metrics_bind_addr: String,
+    /// M7c (§4.6): control-plane の**内部専用** listener の URL（`INTERNAL_BIND_ADDR` を指す）。
+    /// secret を持つ component の実行時に `POST {url}/internal/job-env` で引き換える。
+    control_plane_internal_url: String,
+    /// M7c: 引き換え HTTP のタイムアウト（ミリ秒）。超過は **fail-closed**（実行を failed で終端）。
+    job_env_fetch_timeout_ms: u64,
 }
 
 /// `WASM_CACHE_DIR` 未設定時の既定キャッシュ先。
 const DEFAULT_WASM_CACHE_DIR: &str = "./worker-cache";
 /// `METRICS_BIND_ADDR` 未設定時の既定。
 const DEFAULT_METRICS_BIND_ADDR: &str = "0.0.0.0:9090";
+/// `CONTROL_PLANE_INTERNAL_URL` 未設定時の既定（CP の `INTERNAL_BIND_ADDR` 既定に対応）。
+const DEFAULT_CONTROL_PLANE_INTERNAL_URL: &str = "http://127.0.0.1:8081";
+/// `JOB_ENV_FETCH_TIMEOUT_MS` 未設定時の既定。
+const DEFAULT_JOB_ENV_FETCH_TIMEOUT_MS: u64 = 2000;
+/// ゲスト stderr を封じ込めるときのバッファ上限（バイト）。
+///
+/// secret を注入する実行では `inherit_stderr()` を**使わない**。inherit すると、ゲストが
+/// うっかり（あるいは意図的に）env をダンプした内容が**全テナント共有のコンテナログ**へ
+/// 直結してしまう（§5.5）。内容はログにも `executions.error` にも載せず捨て、捨てたバイト数
+/// だけを観測する。
+const GUEST_STDERR_CAPTURE_BYTES: usize = 64 * 1024;
 
 impl Settings {
     fn from_env() -> anyhow::Result<Self> {
@@ -251,6 +267,13 @@ impl Settings {
             max_deliver,
             backoff_secs,
             metrics_bind_addr,
+            control_plane_internal_url: std::env::var("CONTROL_PLANE_INTERNAL_URL")
+                .map(|v| v.trim().to_string())
+                .unwrap_or_else(|_| DEFAULT_CONTROL_PLANE_INTERNAL_URL.to_string()),
+            job_env_fetch_timeout_ms: env_u64(
+                "JOB_ENV_FETCH_TIMEOUT_MS",
+                DEFAULT_JOB_ENV_FETCH_TIMEOUT_MS,
+            )?,
         })
     }
 }
@@ -480,6 +503,8 @@ async fn main() -> anyhow::Result<()> {
         wasm_cache_dir: settings.wasm_cache_dir,
         cache,
         metrics: worker_metrics,
+        control_plane_internal_url: settings.control_plane_internal_url.clone(),
+        job_env_fetch_timeout: Duration::from_millis(settings.job_env_fetch_timeout_ms),
     });
 
     let max_deliver = settings.max_deliver as i64;
@@ -771,6 +796,10 @@ struct Worker {
     cache: Mutex<LruCache<String, Arc<Component>>>,
     /// 観測メトリクス（M4a, §3.8）。LRU / cwasm のキャッシュヒット率、execute 時間、終端化件数。
     metrics: Arc<metrics::Metrics>,
+    /// M7c (§4.6): CP の内部専用エンドポイント URL（secret 引き換え先）。
+    control_plane_internal_url: String,
+    /// M7c: 引き換え HTTP のタイムアウト。超過は fail-closed。
+    job_env_fetch_timeout: Duration,
 }
 
 impl Worker {
@@ -958,14 +987,22 @@ impl Worker {
             .unwrap_or_default();
         let limits = resolved.limits;
 
+        // M7c (§4.6): secret を持つ component だけ CP の内部エンドポイントから引き換える。
+        // **worker は KEK を持たない**（keyless by design, §3.3）ので、平文は「CP のメモリ →
+        // TLS 上の HTTP レスポンス → worker のメモリ → WasiCtx」だけを通り、NATS にも DB にも
+        // S3 にも永続化されない。`env_token` が None（= secret 無し）なら往復ゼロ。
+        //
+        // **fail-closed**: 引き換えに失敗したら secret 欠損のまま実行してはならない。
+        // ExecError::Failed で終端させ、JetStream の backoff 再配送が自然にリトライになる。
+        let secrets = match job.env_token.as_deref() {
+            Some(token) => self.fetch_job_env(token).await?,
+            None => std::collections::BTreeMap::new(),
+        };
+
         // M7b (§4.4): 許可リストで畳んで注入する env を組み立てる。許可リストに無いキーは
-        // 値が DB に存在しても注入しない（admin 承認が権威）。
-        // secret（M7c）はここではまだ空。CP との引き換えで後段が埋める。
-        let built_env = env::build_env(
-            &resolved.config,
-            &std::collections::BTreeMap::new(),
-            &resolved.allowed_env,
-        );
+        // 値が DB に存在しても注入しない（admin 承認が権威。CP 側の引き換えでも同じ許可リストで
+        // 絞っており、この二重防御で片側の実装ミスが即漏洩にならないようにする）。
+        let built_env = env::build_env(&resolved.config, &secrets, &resolved.allowed_env);
         if built_env.dropped_unapproved > 0 {
             // 「設定したのに入っていない」の切り分けを可能にする（キー名は出さない）。
             tracing::debug!(
@@ -989,6 +1026,60 @@ impl Worker {
 
         self.run_component(component, input_bytes, limits, built_env)
             .await
+    }
+
+    /// M7c (§4.6): env-token と引き換えに復号済み secret を CP から受け取る。
+    ///
+    /// **fail-closed**: どの失敗（CP 不達 / タイムアウト / 401 / 403 / 500 / 応答が壊れている）でも
+    /// `ExecError::Failed` を返し、secret 欠損のまま実行させない。エラーメッセージには
+    /// **HTTP ステータスしか載せない**（応答 body には値が含まれうるため、ログにも
+    /// executions.error にも転記しない）。
+    ///
+    /// `env_token` は `ResultMessage` / `FailedMessage` / reply へ **echo しない** (MUST NOT)。
+    /// 本関数はトークンをリクエスト body にのみ載せ、返り値にも保持しない。
+    async fn fetch_job_env(
+        &self,
+        env_token: &str,
+    ) -> std::result::Result<
+        std::collections::BTreeMap<String, faas_shared::Redacted<String>>,
+        ExecError,
+    > {
+        let url = format!(
+            "{}/internal/job-env",
+            self.control_plane_internal_url.trim_end_matches('/')
+        );
+        let resp = self
+            .http
+            .post(&url)
+            .timeout(self.job_env_fetch_timeout)
+            .json(&serde_json::json!({ "env_token": env_token }))
+            .send()
+            .await
+            .map_err(|e| {
+                // reqwest のエラー表示には URL しか出ない（body は含まれない）。
+                ExecError::Failed(format!("secret material unavailable: {}", e.without_url()))
+            })?;
+
+        let status = resp.status();
+        if !status.is_success() {
+            return Err(ExecError::Failed(format!(
+                "secret material unavailable: control-plane returned {status}"
+            )));
+        }
+
+        #[derive(serde::Deserialize)]
+        struct JobEnvResponse {
+            env: std::collections::BTreeMap<String, String>,
+        }
+        let body: JobEnvResponse = resp.json().await.map_err(|_| {
+            ExecError::Failed("secret material unavailable: malformed response".into())
+        })?;
+
+        Ok(body
+            .env
+            .into_iter()
+            .map(|(k, v)| (k, faas_shared::Redacted::new(v)))
+            .collect())
     }
 
     /// 大入力を presigned GET URL（input_url）から取得する (§3.4)。
@@ -1180,7 +1271,20 @@ impl Worker {
         // ゲスト側は `wasi:cli/environment` を import する。これは capability baseline で承認済み
         // （`validation.rs` の `BASELINE_APPROVED_PREFIXES` に `wasi:cli/`）なので baseline の変更は不要。
         let mut wasi_builder = WasiCtxBuilder::new();
-        wasi_builder.inherit_stderr();
+        // M7c (§5.5): secret を 1 件でも注入する実行では `inherit_stderr()` を**使わない**。
+        // inherit はゲスト stderr を**全テナント共有のコンテナログ**へ直結させるため、ゲストが
+        // env をダンプすれば secret がそのままログに載る（`docker compose logs` で読める）。
+        // 代わりに上限付きのメモリパイプへ流し、内容はログにも executions.error にも載せず
+        // Drop で捨てる（捨てたバイト数だけをメトリクスで観測する）。
+        // 平文 config だけの実行は従来どおり inherit する（運用のデバッグ性を落とさない）。
+        let captured_stderr = if built_env.has_secret {
+            let pipe = wasmtime_wasi::pipe::MemoryOutputPipe::new(GUEST_STDERR_CAPTURE_BYTES);
+            wasi_builder.stderr(pipe.clone());
+            Some(pipe)
+        } else {
+            wasi_builder.inherit_stderr();
+            None
+        };
         for (k, v) in &built_env.pairs {
             wasi_builder.env(k, v);
         }
@@ -1279,6 +1383,19 @@ impl Worker {
         // ticker を停止する (正常終了でも timeout でも不要)。
         // OS スレッドは次の 50ms tick で stop を観測して終了する（detached, join しない）。
         stop.store(true, Ordering::Relaxed);
+
+        // M7c (§5.5): secret を注入した実行のゲスト stderr は**内容を一切見ずに捨てる**。
+        // ログにも executions.error にも載せない（載せた瞬間、共有ログ経由の漏洩になる）。
+        // 捨てたバイト数だけをメトリクスで観測し、「ゲストが何か書いている」ことは分かるが
+        // 「何を書いたか」は分からない状態にする。
+        if let Some(pipe) = captured_stderr {
+            let dropped = pipe.contents().len() as u64;
+            if dropped > 0 {
+                self.metrics
+                    .guest_stderr_dropped_bytes_total
+                    .inc_by(dropped);
+            }
+        }
 
         match timed {
             // tokio タイムアウト（max_execution_time 超過）。host+guest 総時間上限を超えた。

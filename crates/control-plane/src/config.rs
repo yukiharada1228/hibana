@@ -180,8 +180,6 @@ pub struct Config {
     /// 内部専用 listener の bind アドレス（`POST /internal/job-env` のみ）。**公開してはならない**。
     pub internal_bind_addr: String,
     /// `/internal/job-env` の per-IP 上限（req/分）。
-    /// M7c-3（内部 listener + 引き換えハンドラ）で consume する。
-    #[allow(dead_code)]
     pub job_env_exchange_rate_per_min: u64,
 
     // --- 観測 (M4a, §3.8) ---

@@ -408,3 +408,219 @@ pub async fn list_secret_keys(
 
     Ok(Json(json!({ "secrets": out })))
 }
+
+// ---------------------------------------------------------------------------
+// M7c: POST /internal/job-env — worker への secret 引き換え（§4.6）
+//
+// **このハンドラは内部専用 listener（INTERNAL_BIND_ADDR）にだけマウントする。**
+// 公開 listener（BIND_ADDR）に生やしてはならない (MUST NOT)。認証 middleware の外にあるため、
+// 認証は env-token の署名そのもの、テナント停止の遮断はこのハンドラ内で明示的に行う。
+//
+// ## 検証手順（順序も規約, §4.6.2）
+//  1. per-IP レート制限（無認証面なのでこれが最初）
+//  2. 署名検証（aud == "job-env" を要求。job_token を渡しても署名ドメインが違うので通らない）
+//  3. exp 検査
+//  4. tenants.status = 'active'（middleware 外なので明示。MUST）
+//  5. set_tenant_guc した tx を開始（以降すべて RLS 下）
+//  6. executions 行と claim の突き合わせ（tenant / version / component 一致、未終端であること）
+//  7. テナント名前空間のレート制限（invoke 予算を食わない独立名前空間）
+//  8. capabilities.env の許可リストを解決（パース不能なら deny-all）
+//  9. 許可リストで絞って secret のみ復号（**execution 基準の世代**）
+// 10. {"env": {...}} を返す
+// 11. 監査（値は載せない）
+// ---------------------------------------------------------------------------
+
+/// 引き換えリクエスト。**`Debug` を derive しない**（トークンをログに出さない）。
+#[derive(Deserialize)]
+pub struct JobEnvRequest {
+    pub env_token: String,
+}
+
+/// per-IP レート制限のキー名前空間（invoke の `rl:{tenant}` と衝突させない）。
+fn env_ip_rate_key(ip: &str) -> String {
+    format!("env-ip:{ip}")
+}
+
+/// テナント名前空間のレート制限キー（invoke 予算を食わない独立名前空間）。
+fn env_tenant_rate_key(tenant: &str) -> String {
+    format!("env:{tenant}")
+}
+
+/// 引き換え失敗を監査に残す（best-effort。理由は安定文字列のみ、値は載せない）。
+async fn audit_denied(state: &AppState, tenant: &str, target: Option<&str>, reason: &str) {
+    let mut tx = match state.pool().begin().await {
+        Ok(t) => t,
+        Err(_) => return,
+    };
+    if db::set_tenant_guc(&mut tx, tenant).await.is_err() {
+        return;
+    }
+    let _ = db::insert_audit_log(
+        &mut *tx,
+        tenant,
+        None,
+        "secret_material_denied",
+        target,
+        Some(&json!({ "reason": reason })),
+    )
+    .await;
+    let _ = tx.commit().await;
+}
+
+/// POST /internal/job-env — env-token と引き換えに復号済み env を返す。
+pub async fn job_env(
+    State(state): State<AppState>,
+    axum::extract::ConnectInfo(peer): axum::extract::ConnectInfo<std::net::SocketAddr>,
+    JsonBody(req): JsonBody<JobEnvRequest>,
+) -> Result<impl IntoResponse, AppError> {
+    // --- 1) per-IP レート制限（無認証面のグローバル保護。**最初に**行う） ---
+    let ip = peer.ip().to_string();
+    let now_ms = chrono::Utc::now().timestamp_millis().max(0) as u64;
+    let per_min = state.job_env_exchange_rate_per_min() as f64;
+    let ip_params = crate::store::RateLimitParams {
+        refill_per_sec: per_min / 60.0,
+        capacity: per_min,
+    };
+    // fail-open（ストア障害時は許可）は invoke と同じ方針。ここは無認証面の粗いガードであり、
+    // 実質的な認証は env-token の署名（手順 2）と行の突き合わせ（手順 6）が担う。
+    if let Ok(d) = state
+        .store()
+        .rate_limit(&env_ip_rate_key(&ip), ip_params, now_ms)
+        .await
+    {
+        if !d.allowed {
+            return Ok(crate::admission::RateLimited::rate(d.retry_after_secs).into_response());
+        }
+    }
+
+    // --- 2) 署名検証 + aud 検査 ---
+    // job_token を渡しても署名ドメインタグが違うので通らない。aud はさらにその二重確認。
+    let claims = state
+        .signer()
+        .verifier()
+        .verify_env(&req.env_token)
+        .map_err(|_| FaasError::Unauthorized)?;
+    if claims.aud != faas_shared::ENV_TOKEN_AUDIENCE {
+        return Err(FaasError::Unauthorized.into());
+    }
+
+    // --- 3) exp 検査 ---
+    let now = chrono::Utc::now().timestamp();
+    if claims.exp <= now {
+        return Err(FaasError::Unauthorized.into());
+    }
+
+    // --- 4) テナント停止の遮断（middleware 外なので明示。MUST, §4.6.1 (3)） ---
+    if !db::tenant_is_active(state.pool(), &claims.tenant_id).await? {
+        return Err(FaasError::Forbidden.into());
+    }
+
+    // --- 5) 以降すべて RLS 下 ---
+    let tenant = claims.tenant_id.clone();
+    let mut tx = state.pool().begin().await?;
+    db::set_tenant_guc(&mut tx, &tenant).await?;
+
+    // --- 6) executions 行と claim の突き合わせ ---
+    // subscriber が result 側で行っている claim ↔ 行の照合と同じ思想。
+    let Some(exec) = db::get_execution(&mut *tx, &tenant, &claims.execution_id).await? else {
+        drop(tx);
+        audit_denied(
+            &state,
+            &tenant,
+            Some(&claims.execution_id),
+            "execution_not_found",
+        )
+        .await;
+        return Err(FaasError::Unauthorized.into());
+    };
+    if exec.version_id != claims.version_id || exec.component_id != claims.component_id {
+        drop(tx);
+        audit_denied(
+            &state,
+            &tenant,
+            Some(&claims.execution_id),
+            "claim_row_mismatch",
+        )
+        .await;
+        return Err(FaasError::Unauthorized.into());
+    }
+    // 終端済みの execution へは発行しない（再配送の窓を過ぎた要求は拒否する）。
+    if !matches!(exec.status.as_str(), "pending" | "running") {
+        drop(tx);
+        audit_denied(
+            &state,
+            &tenant,
+            Some(&claims.execution_id),
+            "execution_terminal",
+        )
+        .await;
+        return Err(FaasError::Forbidden.into());
+    }
+
+    // --- 7) テナント名前空間のレート制限（invoke 予算とは独立） ---
+    // JetStream の再配送（max_deliver 既定 5）を許容するため single-use にはしない。
+    if let Ok(d) = state
+        .store()
+        .rate_limit(&env_tenant_rate_key(&tenant), ip_params, now_ms)
+        .await
+    {
+        if !d.allowed {
+            return Ok(crate::admission::RateLimited::rate(d.retry_after_secs).into_response());
+        }
+    }
+
+    // --- 8) 許可リスト（admin 承認）を解決。壊れた値は deny-all。 ---
+    let capabilities = db::version_capabilities(&mut *tx, &tenant, &claims.version_id)
+        .await?
+        .unwrap_or(serde_json::Value::Null);
+    let allowed = crate::validation::parse_capabilities(&capabilities).env;
+
+    // --- 9) 許可リストで絞って復号（**execution 基準の世代**, §4.7.1） ---
+    let resolved = secrets::resolve_for_injection(
+        &mut tx,
+        state.secret_keyring(),
+        &tenant,
+        &claims.component_id,
+        exec.created_at,
+        &allowed,
+    )
+    .await;
+
+    let resolved = match resolved {
+        Ok(r) => r,
+        Err(e) => {
+            let reason = e.reason();
+            drop(tx);
+            audit_denied(&state, &tenant, Some(&claims.execution_id), reason).await;
+            return Err(map_secret_error(e));
+        }
+    };
+
+    // --- 11) 監査（**値も件数以外の内訳も載せない**: 名前と件数まで） ---
+    let names: Vec<&str> = resolved.iter().map(|r| r.name.as_str()).collect();
+    db::insert_audit_log(
+        &mut *tx,
+        &tenant,
+        None,
+        "secret_material_issued",
+        Some(&claims.execution_id),
+        Some(&json!({ "names": names, "count": resolved.len() })),
+    )
+    .await?;
+    tx.commit().await?;
+
+    state
+        .metrics()
+        .secret_material_issued_total
+        .with_label_values(&["ok"])
+        .inc();
+
+    // --- 10) 応答。ここが平文の唯一の出口であり、TLS 上の HTTP レスポンスにしか現れない
+    //         （NATS にも DB にも S3 にも平文は書かない）。
+    let env: std::collections::BTreeMap<String, &str> = resolved
+        .iter()
+        .map(|r| (r.name.clone(), r.value.expose().as_str()))
+        .collect();
+
+    Ok(Json(json!({ "env": env })).into_response())
+}

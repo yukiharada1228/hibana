@@ -198,6 +198,7 @@ async fn main() -> anyhow::Result<()> {
         config.instance_id.clone(),
         config.sync_reply_timeout_ms,
         secret_keyring,
+        config.job_env_exchange_rate_per_min,
     );
 
     // --- result 購読タスク ---
@@ -252,6 +253,30 @@ async fn main() -> anyhow::Result<()> {
         scheduler::run(scheduler_state, cron_poll_interval).await;
     });
 
+    // --- 内部専用 listener (M7c, §4.6.1) ---
+    // `POST /internal/job-env` だけを載せた 2 本目の axum サーバを立てる。**公開 listener
+    // （BIND_ADDR）には生やさない**。認証 middleware の外にあるため、認証は env-token の署名
+    // そのものであり、テナント停止の遮断はハンドラ内で明示的に行う。
+    // 既定 bind は loopback（127.0.0.1:8081）。これをインターネット / 共有ネットワークへ
+    // 公開してはならない (MUST NOT)。
+    {
+        let internal_state = state.clone();
+        let internal_addr = config.internal_bind_addr.clone();
+        let internal_listener = tokio::net::TcpListener::bind(&internal_addr).await?;
+        tracing::info!(addr = %internal_addr, "listening (internal: job-env exchange only)");
+        tokio::spawn(async move {
+            let internal_app = build_internal_router(internal_state);
+            if let Err(e) = axum::serve(
+                internal_listener,
+                internal_app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+            )
+            .await
+            {
+                tracing::error!(error = %e, "internal listener terminated");
+            }
+        });
+    }
+
     // --- ルータ ---
     let app = build_router(state);
 
@@ -267,6 +292,24 @@ async fn main() -> anyhow::Result<()> {
     .await?;
 
     Ok(())
+}
+
+/// **内部専用**ルータ (M7c, §4.6.1)。`POST /internal/job-env` だけを載せる。
+///
+/// # MUST NOT
+///
+/// このルータを公開 listener（`BIND_ADDR`）へマウントしてはならない。`build_router` が被せる
+/// `auth::authenticate` / `require_scope` の外にあり、認証は **env-token の署名そのもの**である。
+/// 公開すると、署名鍵を持たない相手でも per-IP レート上限まで総当たりの試行ができる面が
+/// インターネットに露出する（署名検証は破れないが、無用な攻撃面を作らない）。
+///
+/// TraceLayer は付けない —— `TraceLayer::new_for_http()` は URI を span に載せるが、ここは
+/// body にトークンを載せる経路であり、リクエストの記録は監査ログ（値を載せない detail 構築点）に
+/// 一本化するほうが漏洩面が狭い。
+fn build_internal_router(state: AppState) -> Router {
+    Router::new()
+        .route("/internal/job-env", post(handlers_secrets::job_env))
+        .with_state(state)
 }
 
 /// ルータを組み立てる。

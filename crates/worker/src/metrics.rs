@@ -54,6 +54,12 @@ pub struct Metrics {
     /// (`published` = `.failed` への publish に成功 / `publish_failed` = publish 自体が失敗、
     /// reaper の stuck-execution sweeper に救済を委ねる)。
     pub dlq_published_total: IntCounterVec,
+    /// M7c (§5.5): secret を注入した実行で**捨てた**ゲスト stderr のバイト数の累計。
+    ///
+    /// secret 注入時はゲスト stderr を共有コンテナログへ流さない（inherit_stderr を使わない）。
+    /// 内容は一切見ずに捨てるが、「ゲストが何か書いている」ことだけは観測できるようにする
+    /// （デバッグの手掛かりを残しつつ、何を書いたかは分からない状態を保つ）。
+    pub guest_stderr_dropped_bytes_total: IntCounter,
 }
 
 impl Metrics {
@@ -127,6 +133,15 @@ impl Metrics {
             .register(Box::new(dlq_published_total.clone()))
             .expect("register dlq_published_total");
 
+        let guest_stderr_dropped_bytes_total = IntCounter::new(
+            "faas_guest_stderr_dropped_bytes_total",
+            "Guest stderr bytes discarded because the execution had secrets injected",
+        )
+        .expect("metric: guest_stderr_dropped_bytes_total");
+        registry
+            .register(Box::new(guest_stderr_dropped_bytes_total.clone()))
+            .expect("register guest_stderr_dropped_bytes_total");
+
         Arc::new(Self {
             registry,
             wasmtime_execution_duration_seconds,
@@ -135,6 +150,7 @@ impl Metrics {
             wasmtime_component_cache_misses_total,
             executions_total,
             dlq_published_total,
+            guest_stderr_dropped_bytes_total,
         })
     }
 

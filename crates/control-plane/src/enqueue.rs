@@ -235,6 +235,14 @@ pub async fn enqueue_execution(
         return Err(EnqueueError::Other(e.into()));
     }
 
+    // --- 1.5) M7c (§4.6): env-token の要否を判定する ---
+    // 「当該 component に生存する secret が 1 件以上あるか」だけを見る。**secret 名も件数も
+    // wire に載せない**（`env_token` が `Some` かどうかがそのままシグナルになる）。
+    // secret を 1 つも持たない component では worker の HTTP 往復がゼロになる（pay-per-use）。
+    // GUC 済み tx の中で引く必要があるので commit より前に行う。
+    let needs_env_token =
+        db::component_has_live_secrets(&mut *tx, req.tenant, req.component_id).await?;
+
     // --- 2) tx を確定してから署名・publish する（publish をトランザクション境界の外へ） ---
     tx.commit().await?;
 
@@ -248,6 +256,24 @@ pub async fn enqueue_execution(
         exp: req.exp,
     };
     let job_token = state.signer().sign(&claims);
+
+    // --- 3.5) M7c (§4.6): 必要なときだけ env-token を mint する ---
+    // **job_token を流用しない**。job_token は ResultMessage / FailedMessage にも verbatim に
+    // echo されるため、流用すると result / DLQ / reply の購読権しか持たない主体が引き換え
+    // トークンを得て secret を読めてしまう。専用 claim（別ドメインタグ + aud）にする。
+    let env_token = needs_env_token.then(|| {
+        state.signer().sign_env(&faas_shared::EnvClaims {
+            execution_id: req.execution_id.clone(),
+            tenant_id: req.tenant.to_string(),
+            version_id: req.version_id.to_string(),
+            component_id: req.component_id.to_string(),
+            aud: faas_shared::ENV_TOKEN_AUDIENCE.to_string(),
+            kid: state.signer().kid().to_string(),
+            iat: req.iat,
+            // job_token と同じ TTL 式（再配送を含む最悪滞留 + 実行上限 + 余裕）で有限。
+            exp: req.exp,
+        })
+    });
 
     // --- 4) JobMessage を invoke_subject へ publish（Nats-Msg-Id=execution_id, 冪等 layer 3） ---
     let job = JobMessage {
@@ -264,6 +290,8 @@ pub async fn enqueue_execution(
         reply_to: req.reply_to,
         // M6: 起動由来（http_invoke / cron / event / chain）。
         origin: Some(req.origin.to_string()),
+        // M7c: secret を持つ component のときだけ載る引き換えトークン。
+        env_token,
     };
     let payload = serde_json::to_vec(&job)?;
 
