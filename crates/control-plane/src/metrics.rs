@@ -35,8 +35,8 @@
 use std::sync::Arc;
 
 use prometheus::{
-    Encoder, Histogram, HistogramOpts, HistogramVec, IntCounter, IntCounterVec, IntGauge, Opts,
-    Registry, TextEncoder,
+    Encoder, Histogram, HistogramOpts, HistogramVec, IntCounter, IntCounterVec, IntGauge,
+    IntGaugeVec, Opts, Registry, TextEncoder,
 };
 
 /// メトリクスの 1 セット（プロセスで 1 個。`AppState` が `Arc` で持ち、ハンドラから参照する）。
@@ -103,6 +103,12 @@ pub struct Metrics {
     /// `/internal/job-env` で worker へ発行した secret material の件数 (M7c, §4.6)。
     /// labels: outcome（`ok` / 失敗時の安定 reason）。**secret 名も値もラベルにしない**。
     pub secret_material_issued_total: IntCounterVec,
+    /// kid 別の current 世代を持つ secret 件数 (M7c-4)。labels: kid。
+    ///
+    /// KEK ローテーションの進捗を見るための gauge。**背景ジョブが内部更新する専用**であり、
+    /// 全テナント横断の集計なので HTTP 応答には載せない（`POST /admin/secrets/rekey` は
+    /// 件数だけを返す）。旧 kid の gauge が 0 になったら `SECRETS_RETIRED_KEYS` を撤去してよい。
+    pub secret_versions_by_kid: IntGaugeVec,
 }
 
 impl Metrics {
@@ -239,6 +245,18 @@ impl Metrics {
             .register(Box::new(secret_material_issued_total.clone()))
             .expect("register secret_material_issued_total");
 
+        let secret_versions_by_kid = IntGaugeVec::new(
+            Opts::new(
+                "faas_secret_versions_by_kid",
+                "Live secrets whose current generation is wrapped by each KEK kid",
+            ),
+            &["kid"],
+        )
+        .expect("metric: secret_versions_by_kid");
+        registry
+            .register(Box::new(secret_versions_by_kid.clone()))
+            .expect("register secret_versions_by_kid");
+
         Arc::new(Self {
             registry,
             http_requests_total,
@@ -252,6 +270,7 @@ impl Metrics {
             dlq_finalized_total,
             canary_routed_total,
             secret_material_issued_total,
+            secret_versions_by_kid,
         })
     }
 

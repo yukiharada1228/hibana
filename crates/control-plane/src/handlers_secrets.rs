@@ -624,3 +624,106 @@ pub async fn job_env(
 
     Ok(Json(json!({ "env": env })).into_response())
 }
+
+// ---------------------------------------------------------------------------
+// M7c-4: KEK ローテーション（wrap-only rekey, §4.7.2）
+//
+// **これは侵害復旧ではない**（§4.7.2 / secrets.rs の doc）。DEK も ciphertext も不変なので、
+// 旧 KEK + 旧 DB ダンプを持つ攻撃者は再ラップ後も全平文を復元できる。
+// rekey は **KEK の計画的ローテーション専用**であり、侵害時の唯一の復旧経路は
+// 「値そのものを rotate する」ことである（README 露出ガード節に明記）。
+//
+// 手順:
+//   1. SECRETS_MASTER_KID を新 kid に切り替え、旧 kid を SECRETS_RETIRED_KEYS へ移す
+//      （この時点で新規書き込みは新 kid、既存は旧 kid で復号可能）。
+//   2. この API（または背景ジョブ）が対象を引き、reason='rekey' の新 version を INSERT して
+//      current_version を前進させる。
+//   3. すべて再ラップし終えてから SECRETS_RETIRED_KEYS を空にする。
+//      **早期撤去は復号不能 ＝ データ喪失**（signing の overlap と意味が違う: signing は TTL で
+//      有限時間に終わるが、secret の暗号文は DB に永続する）。
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Serialize)]
+pub struct RekeyResponse {
+    /// 再ラップした secret の件数。
+    ///
+    /// **kid 別の内訳は返さない**。本リポジトリの admin はテナント管理者であり、全テナント
+    /// 横断の集計を返すと他テナントの secret 総数が漏れる。kid 別の全体像は Prometheus gauge
+    /// （内部更新）でのみ観測する。
+    pub rewrapped: usize,
+}
+
+/// POST /admin/secrets/rekey — **当該テナントのみ**を現行 kid で再ラップする（admin）。
+pub async fn rekey_secrets(
+    State(state): State<AppState>,
+    principal: Principal,
+) -> Result<impl IntoResponse, AppError> {
+    require_admin_role(principal.role)?;
+    let tenant = &principal.tenant_id;
+    let keyring = state.secret_keyring();
+    let active_kid = keyring.active_kid().to_string();
+
+    // 対象の抽出は SECURITY DEFINER 関数（faas_app は FORCE RLS 下で巡回できない）。
+    // **テナント引数を取る版**を使う（`_all` は背景ジョブ専用で HTTP からは呼ばない）。
+    let targets = db::secrets_stale_kek(state.pool(), tenant, &active_kid).await?;
+
+    let mut rewrapped = 0usize;
+    for secret_id in targets {
+        // 各 secret を独立した tx で処理する（1 件の失敗が他を巻き込まない）。
+        let mut tx = state.pool().begin().await?;
+        db::set_tenant_guc(&mut tx, tenant).await?;
+
+        let Some(meta) = db::find_secret_meta_by_id(&mut *tx, tenant, &secret_id).await? else {
+            continue;
+        };
+        let Some(current) =
+            db::find_secret_version(&mut *tx, tenant, &secret_id, meta.current_version).await?
+        else {
+            continue;
+        };
+        if current.kek_kid == active_kid {
+            continue; // 既に現行 kid（並行実行での二重処理）。
+        }
+
+        let next_version = meta.current_version + 1;
+        // **値の平文をメモリに載せない**: DEK を旧 KEK で unwrap → 新 KEK で wrap するだけで、
+        // ciphertext / nonce / value_len はそのままコピーされる。
+        let rewrapped_env = secrets::rewrap(
+            keyring,
+            &current,
+            tenant,
+            &secret_id,
+            meta.current_version,
+            next_version,
+        )
+        .map_err(map_secret_error)?;
+
+        db::insert_secret_version(
+            &mut *tx,
+            tenant,
+            &secret_id,
+            next_version,
+            &rewrapped_env,
+            "rekey",
+            principal.user_id.as_deref(),
+        )
+        .await?;
+        db::bump_secret_current_version(&mut *tx, tenant, &secret_id, next_version).await?;
+
+        db::insert_audit_log(
+            &mut *tx,
+            tenant,
+            principal.user_id.as_deref(),
+            "secret_rekeyed",
+            Some(&secret_id),
+            Some(&secrets::audit_detail(&meta.name, next_version, "rekey")),
+        )
+        .await?;
+
+        tx.commit().await?;
+        rewrapped += 1;
+    }
+
+    tracing::info!(%active_kid, rewrapped, "secrets re-wrapped with the active KEK");
+    Ok(Json(RekeyResponse { rewrapped }))
+}

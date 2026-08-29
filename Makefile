@@ -89,7 +89,7 @@ ECHO_WASM := target/wasm32-wasip2/release/echo.wasm
 
 .DEFAULT_GOAL := help
 
-.PHONY: help setup up down migrate minio-bucket build-component run-cp run-worker bootstrap login deploy invoke logs psql clean rls-lint
+.PHONY: component-id traffic canary promote rollback approve-env set-secret secrets rekey help setup up down migrate minio-bucket build-component run-cp run-worker bootstrap login deploy invoke logs psql clean rls-lint
 
 help: ## 利用可能なターゲット一覧を表示
 	@echo "WASM FaaS Platform — M2 Makefile"
@@ -244,6 +244,79 @@ invoke: ## echo を end-to-end で実行（deploy → POST /invoke → GET /exec
 		echo "    [$$i] status=$$S"; \
 		case "$$S" in succeeded|failed|timeout) echo "$$R"; break;; esac; \
 	done
+
+# --- M7: デプロイ運用（canary / rollback / secret）------------------------
+# canary 運用と secret 管理には **admin スコープ**のトークンが要る（細粒度スコープは M7 非スコープ）。
+# COMPONENT_ID は `make component-id` で解決するか、明示的に渡す。
+
+component-id: ## echo の component_id を標準出力に出す（CID=$$(make -s component-id)）
+	@set -e; \
+	TOKEN=$$($(MAKE) -s login); \
+	curl -sS "$(BASE_URL)/components" -H "Authorization: Bearer $$TOKEN" \
+	  | sed -n 's/.*"component_id"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -1
+
+traffic: ## M7a: canary 配分を表示（GET /components/{id}/traffic）。CID=... で対象指定
+	@set -e; \
+	TOKEN=$$($(MAKE) -s login); \
+	CID=$${CID:-$$($(MAKE) -s component-id)}; \
+	curl -sS "$(BASE_URL)/components/$$CID/traffic" -H "Authorization: Bearer $$TOKEN"; echo
+
+canary: ## M7a: canary を設定（CANARY_VERSION=0.2.0 WEIGHT=10 [CID=...]）
+	@set -e; \
+	test -n "$(CANARY_VERSION)" || { echo "ERROR: CANARY_VERSION=... を指定してください（例: make canary CANARY_VERSION=0.2.0 WEIGHT=10）"; exit 1; }; \
+	TOKEN=$$($(MAKE) -s login); \
+	CID=$${CID:-$$($(MAKE) -s component-id)}; \
+	curl -sS -X PUT "$(BASE_URL)/components/$$CID/traffic" \
+	  -H "Authorization: Bearer $$TOKEN" -H "Content-Type: application/json" \
+	  -d "{\"canary_version\":\"$(CANARY_VERSION)\",\"weight\":$${WEIGHT:-10}}"; echo
+
+promote: ## M7a: canary を stable へ昇格（[CANARY_VERSION=0.2.0 で CAS] [CID=...]）
+	@set -e; \
+	TOKEN=$$($(MAKE) -s login); \
+	CID=$${CID:-$$($(MAKE) -s component-id)}; \
+	BODY=$${CANARY_VERSION:+{\"version\":\"$(CANARY_VERSION)\"}}; \
+	curl -sS -X POST "$(BASE_URL)/components/$$CID/promote" \
+	  -H "Authorization: Bearer $$TOKEN" -H "Content-Type: application/json" \
+	  -d "$${BODY:-{}}"; echo
+
+rollback: ## M7a: ワンクリック rollback（直前 stable へ戻し canary をクリア）[CID=...]
+	@set -e; \
+	TOKEN=$$($(MAKE) -s login); \
+	CID=$${CID:-$$($(MAKE) -s component-id)}; \
+	curl -sS -X POST "$(BASE_URL)/components/$$CID/rollback" \
+	  -H "Authorization: Bearer $$TOKEN" -H "Content-Type: application/json" -d '{}'; echo
+
+approve-env: ## M7b: 注入を許可する env 名を承認（ENV_NAMES=API_KEY,LOG_LEVEL VERSION=0.1.0 [CID=...]）
+	@set -e; \
+	test -n "$(ENV_NAMES)" || { echo "ERROR: ENV_NAMES=A,B を指定してください"; exit 1; }; \
+	TOKEN=$$($(MAKE) -s login); \
+	CID=$${CID:-$$($(MAKE) -s component-id)}; \
+	JSON=$$(printf '%s' "$(ENV_NAMES)" | awk -F, '{printf "["; for(i=1;i<=NF;i++){printf "%s\"%s\"", (i>1?",":""), $$i}; printf "]"}'); \
+	curl -sS -X PUT "$(BASE_URL)/components/$$CID/versions/$(VERSION)/capabilities" \
+	  -H "Authorization: Bearer $$TOKEN" -H "Content-Type: application/json" \
+	  -d "{\"env\":$$JSON}"; echo
+
+set-secret: ## M7c: secret を設定（NAME=API_KEY VALUE=... [CID=...]）。**値はエコーしない**
+	@set -e; \
+	test -n "$(NAME)" || { echo "ERROR: NAME=API_KEY を指定してください"; exit 1; }; \
+	test -n "$(VALUE)" || { echo "ERROR: VALUE=... を指定してください"; exit 1; }; \
+	TOKEN=$$($(MAKE) -s login); \
+	CID=$${CID:-$$($(MAKE) -s component-id)}; \
+	CODE=$$(curl -sS -o /dev/null -w '%{http_code}' -X PUT "$(BASE_URL)/components/$$CID/secrets/$(NAME)" \
+	  -H "Authorization: Bearer $$TOKEN" -H "Content-Type: application/json" \
+	  -d "{\"value\":\"$(VALUE)\"}"); \
+	echo "PUT /components/$$CID/secrets/$(NAME) -> $$CODE (値は出力しません)"
+
+secrets: ## M7c: secret のメタデータ一覧（値は返らない）[CID=...]
+	@set -e; \
+	TOKEN=$$($(MAKE) -s login); \
+	CID=$${CID:-$$($(MAKE) -s component-id)}; \
+	curl -sS "$(BASE_URL)/components/$$CID/secrets" -H "Authorization: Bearer $$TOKEN"; echo
+
+rekey: ## M7c: 当該テナントの secret を現行 KEK で再ラップ（**侵害復旧ではない**。README 露出ガード 4）
+	@set -e; \
+	TOKEN=$$($(MAKE) -s login); \
+	curl -sS -X POST "$(BASE_URL)/admin/secrets/rekey" -H "Authorization: Bearer $$TOKEN"; echo
 
 rls-lint: ## M3b: テナント分離の静的ガード（SET app.tenant_id ハザード / 生 pool 渡し検出）
 	@./scripts/rls-lint.sh

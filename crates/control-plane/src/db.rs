@@ -1302,6 +1302,68 @@ pub async fn component_has_live_secrets(
     row.try_get("present")
 }
 
+/// 現行 kid でない current 世代を持つ secret の id を引く（M7c-4: rekey 対象）。
+///
+/// `secrets_stale_kek(p_tenant, p_active_kid)` は SECURITY DEFINER（faas_app は FORCE RLS 下で
+/// 巡回できない）。**テナント引数を取る版**なので GUC 前でも呼べるが、返すのは
+/// `(tenant_id, secret_id)` だけで暗号文も名前も返さない（0004 の認証前参照 3 関数と同じ作法）。
+pub async fn secrets_stale_kek(
+    executor: impl sqlx::PgExecutor<'_>,
+    tenant_id: &str,
+    active_kid: &str,
+) -> Result<Vec<String>, sqlx::Error> {
+    let rows = sqlx::query("SELECT secret_id FROM secrets_stale_kek($1, $2)")
+        .bind(tenant_id)
+        .bind(active_kid)
+        .fetch_all(executor)
+        .await?;
+    rows.into_iter()
+        .map(|r| r.try_get::<String, _>("secret_id"))
+        .collect()
+}
+
+/// kid 別の current 世代件数（M7c-4: Prometheus gauge の内部更新専用）。
+///
+/// **HTTP 応答に載せてはならない** (MUST NOT)。全テナント横断の集計であり、テナント管理者へ
+/// 返すと他テナントの secret 総数が漏れる。
+pub async fn secrets_kek_kid_counts_all(
+    executor: impl sqlx::PgExecutor<'_>,
+) -> Result<Vec<(String, i64)>, sqlx::Error> {
+    let rows = sqlx::query("SELECT kek_kid, n FROM secrets_kek_kid_counts_all()")
+        .fetch_all(executor)
+        .await?;
+    rows.into_iter()
+        .map(|r| Ok((r.try_get("kek_kid")?, r.try_get("n")?)))
+        .collect()
+}
+
+/// secret メタ行を id で引く（rekey が current 世代を解決するのに使う）。
+pub async fn find_secret_meta_by_id(
+    executor: impl sqlx::PgExecutor<'_>,
+    tenant_id: &str,
+    secret_id: &str,
+) -> Result<Option<SecretMetaRow>, sqlx::Error> {
+    let row = sqlx::query(
+        "SELECT id, name, current_version, created_at, updated_at FROM function_secrets \
+          WHERE tenant_id = $1 AND id = $2 AND deleted_at IS NULL",
+    )
+    .bind(tenant_id)
+    .bind(secret_id)
+    .fetch_optional(executor)
+    .await?;
+
+    row.map(|r| {
+        Ok(SecretMetaRow {
+            id: r.try_get("id")?,
+            name: r.try_get("name")?,
+            current_version: r.try_get("current_version")?,
+            created_at: r.try_get("created_at")?,
+            updated_at: r.try_get("updated_at")?,
+        })
+    })
+    .transpose()
+}
+
 /// 指定 secret の指定版の封筒を引く。
 pub async fn find_secret_version(
     executor: impl sqlx::PgExecutor<'_>,

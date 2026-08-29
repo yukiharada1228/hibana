@@ -191,3 +191,46 @@ async fn reconcile_tenant(
         .map_err(|e: StoreError| anyhow::anyhow!("resync_inflight: {e}"))?;
     Ok(())
 }
+
+// ---------------------------------------------------------------------------
+// M7c-4: KEK ローテーションの進捗 gauge を更新する背景ジョブ (§4.7.2)
+// ---------------------------------------------------------------------------
+
+/// `faas_secret_versions_by_kid` を定期更新する（`scheduler::run` / `reaper::run` と同型のループ）。
+///
+/// 全テナント横断の集計なので **SECURITY DEFINER 関数の `_all` 版**を使い、結果は
+/// **Prometheus gauge にしか出さない**（HTTP 応答へ載せてはならない: テナント管理者へ返すと
+/// 他テナントの secret 総数が漏れる）。
+///
+/// 運用上の使い方: KEK を切り替えたあと `POST /admin/secrets/rekey` を回し、旧 kid の gauge が
+/// 0 になったら `SECRETS_RETIRED_KEYS` から旧鍵を撤去してよい（0 になる前の撤去は復号不能
+/// ＝ データ喪失）。
+pub async fn run_secret_kid_gauge(state: AppState, interval_secs: u64) {
+    let period = Duration::from_secs(interval_secs.max(1));
+    let mut ticker = tokio::time::interval(period);
+    tracing::info!(
+        interval_secs = period.as_secs(),
+        "secret KEK kid gauge updater started"
+    );
+
+    loop {
+        ticker.tick().await;
+        match crate::db::secrets_kek_kid_counts_all(state.pool()).await {
+            Ok(counts) => {
+                // 前周期の kid が消えても gauge が残らないよう、毎回リセットしてから set する。
+                state.metrics().secret_versions_by_kid.reset();
+                for (kid, n) in counts {
+                    state
+                        .metrics()
+                        .secret_versions_by_kid
+                        .with_label_values(&[kid.as_str()])
+                        .set(n);
+                }
+            }
+            Err(e) => {
+                // best-effort: 観測の失敗で本流を止めない（次周期で再試行）。
+                tracing::warn!(error = %e, "failed to refresh secret KEK kid gauge");
+            }
+        }
+    }
+}

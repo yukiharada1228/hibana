@@ -253,6 +253,14 @@ async fn main() -> anyhow::Result<()> {
         scheduler::run(scheduler_state, cron_poll_interval).await;
     });
 
+    // --- KEK ローテーション進捗の gauge 更新（M7c-4, §4.7.2）---
+    // reaper と同じ周期で回す（頻度を要さない観測なので専用 env は増やさない）。
+    let kid_gauge_state = state.clone();
+    let kid_gauge_interval = config.reaper_interval_secs;
+    tokio::spawn(async move {
+        reaper::run_secret_kid_gauge(kid_gauge_state, kid_gauge_interval).await;
+    });
+
     // --- 内部専用 listener (M7c, §4.6.1) ---
     // `POST /internal/job-env` だけを載せた 2 本目の axum サーバを立てる。**公開 listener
     // （BIND_ADDR）には生やさない**。認証 middleware の外にあるため、認証は env-token の署名
@@ -469,6 +477,12 @@ fn build_router(state: AppState) -> Router {
         .route(
             "/components/{component_id}/secrets/keys",
             get(handlers_secrets::list_secret_keys),
+        )
+        // POST /admin/secrets/rekey: **当該テナントのみ**を現行 KEK で再ラップする (M7c-4)。
+        // 応答は件数のみ（kid 別の内訳は他テナントの総数が漏れるので返さない）。
+        .route(
+            "/admin/secrets/rekey",
+            post(handlers_secrets::rekey_secrets),
         )
         .route_layer(axum::middleware::from_fn(require_scope(Scope::Admin)));
 

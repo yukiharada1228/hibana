@@ -56,8 +56,8 @@ const NONCE_LEN: usize = 24;
 ///
 /// HTTP へは一律 500（`FaasError::Internal`）に写像し、ボディには reason も値も出さない
 /// （`error.rs` の 5xx redaction と同じ思想）。`reason()` は**メトリクスラベル / 内部ログ専用**。
-// 一部の variant / 関数は注入経路（M7c-3）と rekey（M7c-4）が着地するまで
-// 本番コードから呼ばれない（現状はユニットテストのみが構築・呼び出しする）。
+// `KeyMissing` は現状のキーリング構築（active を必ず入れる）では到達しないが、
+// 将来 KEK の遅延解決を入れたときの分類として残す。
 #[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SecretError {
@@ -224,7 +224,6 @@ fn cipher(key: &[u8; 32]) -> XChaCha20Poly1305 {
     XChaCha20Poly1305::new(Key::from_slice(key))
 }
 
-#[allow(dead_code)] // 復号経路（M7c-3）で使う。
 fn to_nonce(bytes: &[u8]) -> Result<&XNonce, SecretError> {
     if bytes.len() != NONCE_LEN {
         return Err(SecretError::BadEnvelope);
@@ -286,7 +285,6 @@ pub fn encrypt(
 }
 
 /// 封筒を復号して平文を取り出す。返り値は `Zeroizing`（Drop でゼロ化）。
-#[allow(dead_code)] // job-env 引き換え（M7c-3）が唯一の呼び出し元になる。
 pub fn decrypt(
     keyring: &SecretKeyring,
     env: &Envelope,
@@ -338,7 +336,6 @@ pub fn decrypt(
 ///
 /// **これは侵害復旧ではない**: DEK も ciphertext も不変なので、旧 KEK + 旧 DB ダンプがあれば
 /// 再ラップ後も全平文を復元できる。侵害時の唯一の復旧経路は**値そのものの rotate**。
-#[allow(dead_code)] // KEK ローテーション（M7c-4 の POST /admin/secrets/rekey）で使う。
 pub fn rewrap(
     keyring: &SecretKeyring,
     env: &Envelope,

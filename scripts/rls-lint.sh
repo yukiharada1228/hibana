@@ -68,6 +68,7 @@ fns="$fns|upsert_function_config|list_function_configs|delete_function_config"
 # 意図的に除外する（M6 の cron_due_tenant_jobs と同じ扱い）。
 fns="$fns|insert_secret_meta|find_live_secret_by_name|list_secrets_meta|insert_secret_version"
 fns="$fns|bump_secret_current_version|soft_delete_secret|find_secret_version|resolve_for_injection"
+fns="$fns|find_secret_meta_by_id"
 
 set2=$(
   grep -rnE "(db|secrets)::($fns)\([[:space:]]*state\.pool\(\)" \

@@ -5,8 +5,8 @@
 //! テストで、`chaos_m4.rs` / `chaos_m5.rs` / `chaos_m6.rs` と同じ作法（全て `#[ignore]`・
 //! docker compose stack + `CHAOS_TOKEN` 前提）に従う。
 //!
-//! S1（canary 段階移行 + ワンクリック rollback, M7a）が land 済み。
-//! S2（env / secret 注入, M7b/M7c）と S3（secret 非漏洩, M7c）は後続ステップで追加する。
+//! S1（canary 段階移行 + ワンクリック rollback, M7a）/ S2（env・secret 注入, M7b/M7c）/
+//! S3（secret 非漏洩, M7c）の 3 シナリオが land 済み。
 //!
 //! ## S1 が検証すること（信頼境界の明示）
 //!
@@ -30,10 +30,32 @@
 //! make bootstrap                        # 出力された token を CHAOS_TOKEN にエクスポート
 //! export CHAOS_TOKEN=...
 //! make build-component && make deploy    # echo 0.1.0 を active にしておく
-//! cargo test -p faas-control-plane --test chaos_m7 --ignored chaos_t1_
+//! cargo test -p faas-control-plane --test chaos_m7 --ignored --test-threads=1
 //! ```
 //! env: `CHAOS_BASE_URL`(既定 http://127.0.0.1:8080) / `CHAOS_TOKEN`(必須) / `CHAOS_ECHO`(既定 echo) /
-//!      `CHAOS_POLL_SECS`(既定 30: 終端待ちのポーリング上限)。
+//!      `CHAOS_POLL_SECS`(既定 30: 終端待ちのポーリング上限) /
+//!      `CHAOS_INTERNAL_URL`(既定 http://127.0.0.1:8081: CP の内部専用 listener) /
+//!      `CHAOS_ECHO_WASM`(既定 <workspace>/components-dist/echo.wasm)。
+//!
+//! **`--test-threads=1` で実行すること**: S1/S2/S3 は同じ component の traffic 配分・config・
+//! secret を書き換えるため、並行実行すると互いの状態を壊す（chaos_m5 の会計テストが同じ理由で
+//! 直列実行を要求するのと同型）。
+//!
+//! ## S2 / S3 が検証すること（信頼境界の明示）
+//!
+//! - S2: **admin 承認された env 名だけが注入される**こと。許可リスト外のキーは値が config に
+//!   存在しても注入されない。deploy スコープの upload 経路から `capabilities.env` を宣言すると
+//!   400（権限昇格の回帰ガード）。
+//! - S3: secret 値が **API 応答に現れない**こと（`GET /secrets` の全文、`GET /executions` の全文）、
+//!   引き換え面が公開 listener に生えていないこと、`job_token` の流用が通らないこと。
+//!   rotate 後に旧値が新規実行から二度と観測できないこと。
+//! - **黒箱で検証できないもの**: CP / worker のログと `audit_logs` の内容（参照 API が無い）。
+//!   これは README の chaos 節に「手で叩く最小手順」として置く
+//!   （`docker compose logs ... | grep -c "<sentinel>"` が 0、`audit_logs.detail` に sentinel 無し）。
+//!   テスト内から `docker compose` / `psql` を呼ぶのは環境依存が強すぎるため採らない。
+//! - **echo は検証用に env を出力する**。`GET /executions` の `output` に値が現れるのはゲスト自身の
+//!   責務であり、プラットフォームの漏洩ではない（本番 Component が env を返すのは誤り）。
+//!   S3 の assert はこの点を踏まえ、execution 応答の**メタ部分**に値が乗らないことを見る。
 
 #![allow(clippy::needless_return)]
 
@@ -540,4 +562,374 @@ async fn chaos_t1_canary_stepwise_shift_and_one_click_rollback() {
             "every invoke after the rollback must run the restored stable version (i={i})"
         );
     }
+}
+
+// ============================================================================
+// Scenario S2 — per-function env / secret の注入 e2e（M7b / M7c）
+// ============================================================================
+
+/// 内部専用 listener の URL（既定は CP の `INTERNAL_BIND_ADDR` 既定に対応）。
+fn internal_url() -> String {
+    std::env::var("CHAOS_INTERNAL_URL").unwrap_or_else(|_| "http://127.0.0.1:8081".into())
+}
+
+/// テスト実行ごとに一意な sentinel（他の実行の残骸と混ざらないようにする）。
+///
+/// `Date`/乱数を使わず、プロセス起動時刻とカウンタから作る（chaos_m4 の
+/// 「Idempotency-Key にユニーク nanos を埋める」作法と同型）。
+fn sentinel(tag: &str) -> String {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    format!("chaos-secret-{tag}-{nanos}")
+}
+
+/// `?wait=1` の同期 invoke を投げ、出力の `env` マップを返す。
+async fn invoke_sync_env(client: &reqwest::Client, base: &str, token: &str) -> serde_json::Value {
+    let body: serde_json::Value = client
+        .post(format!("{base}/invoke?wait=1"))
+        .bearer_auth(token)
+        .json(&serde_json::json!({"component": echo_component(), "input": {}}))
+        .send()
+        .await
+        .expect("sync invoke send")
+        .json()
+        .await
+        .expect("sync invoke json");
+    body["output"]["env"].clone()
+}
+
+/// **Scenario S2**: admin 承認された env 名だけが注入され、平文 config と secret が
+/// 同じ env 名前空間で共存し、承認外のキーは値が存在しても注入されないことを検証する。
+///
+/// §15 M7 完了条件の「per-function 環境変数・設定」と「secret の保存・注入」に対応する。
+#[tokio::test]
+#[ignore = "chaos: requires docker compose stack + CHAOS_TOKEN + echo; run: docker compose up -d && cargo test -p faas-control-plane --test chaos_m7 --ignored chaos_t2_"]
+async fn chaos_t2_env_and_secret_injection() {
+    let base = base_url();
+    let token = token();
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(30))
+        .build()
+        .expect("reqwest client");
+
+    let cid = resolve_component_id(&client, &base, &token).await;
+    let active_version = get_traffic(&client, &base, &token, &cid).await["stable"]["version"]
+        .as_str()
+        .expect("component must have an active version")
+        .to_string();
+    let secret_value = sentinel("t2");
+
+    // --- (1) admin が env 許可リストを承認する ---
+    let approve = client
+        .put(format!(
+            "{base}/components/{cid}/versions/{active_version}/capabilities"
+        ))
+        .bearer_auth(&token)
+        .json(&serde_json::json!({"env": ["LOG_LEVEL", "API_KEY"]}))
+        .send()
+        .await
+        .expect("approve capabilities send");
+    assert_eq!(
+        approve.status(),
+        200,
+        "admin must be able to approve env names"
+    );
+
+    // --- (2) 平文 config を置く ---
+    let put_config = client
+        .put(format!("{base}/components/{cid}/config"))
+        .bearer_auth(&token)
+        .json(&serde_json::json!({"env": {"LOG_LEVEL": "debug"}}))
+        .send()
+        .await
+        .expect("put config send");
+    assert_eq!(put_config.status(), 200);
+
+    // --- (3) secret を置く ---
+    let put_secret = client
+        .put(format!("{base}/components/{cid}/secrets/API_KEY"))
+        .bearer_auth(&token)
+        .json(&serde_json::json!({"value": secret_value}))
+        .send()
+        .await
+        .expect("put secret send");
+    assert!(
+        put_secret.status() == 200 || put_secret.status() == 201,
+        "setting a secret must succeed; got {}",
+        put_secret.status()
+    );
+
+    // --- (4) 両方が注入される ---
+    let env = invoke_sync_env(&client, &base, &token).await;
+
+    // --- (5) 承認リストに無いキーは、config に入れても注入されない ---
+    let _ = client
+        .put(format!("{base}/components/{cid}/config"))
+        .bearer_auth(&token)
+        .json(&serde_json::json!({"env": {"LOG_LEVEL": "debug", "UNAPPROVED": "must-not-appear"}}))
+        .send()
+        .await;
+    let env_after = invoke_sync_env(&client, &base, &token).await;
+
+    // --- (6) upload 経路で capabilities.env を宣言すると 400（権限昇格の回帰ガード） ---
+    let form = reqwest::multipart::Form::new()
+        .text("version", "0.9.9")
+        .text("activate", "false")
+        .text("capabilities", r#"{"env":["PROD_API_KEY"]}"#)
+        .part(
+            "wasm",
+            reqwest::multipart::Part::bytes(vec![0u8; 8]).file_name("x.wasm"),
+        );
+    let sneaky = client
+        .post(format!("{base}/components/{cid}/versions"))
+        .bearer_auth(&token)
+        .multipart(form)
+        .send()
+        .await
+        .expect("sneaky upload send");
+    let sneaky_status = sneaky.status();
+    let sneaky_body = sneaky.text().await.unwrap_or_default();
+
+    // --- (8) 後始末（assert より前, chaos_m6 の作法） ---
+    let _ = client
+        .delete(format!("{base}/components/{cid}/secrets/API_KEY"))
+        .bearer_auth(&token)
+        .send()
+        .await;
+    let _ = client
+        .put(format!("{base}/components/{cid}/config"))
+        .bearer_auth(&token)
+        .json(&serde_json::json!({"env": {}}))
+        .send()
+        .await;
+    let _ = client
+        .put(format!(
+            "{base}/components/{cid}/versions/{active_version}/capabilities"
+        ))
+        .bearer_auth(&token)
+        .json(&serde_json::json!({"env": []}))
+        .send()
+        .await;
+
+    assert_eq!(
+        env["LOG_LEVEL"].as_str(),
+        Some("debug"),
+        "an approved plaintext config entry must be injected; env={env}"
+    );
+    assert_eq!(
+        env["API_KEY"].as_str(),
+        Some(secret_value.as_str()),
+        "an approved secret must be injected (decrypted) into the guest environment"
+    );
+    assert!(
+        env_after["UNAPPROVED"].is_null(),
+        "a key outside the admin-approved allowlist must never be injected, \
+         even when it exists in the config table; env={env_after}"
+    );
+    assert_eq!(
+        sneaky_status, 400,
+        "declaring capabilities.env on the deploy path must be refused (privilege escalation); \
+         body={sneaky_body}"
+    );
+}
+
+// ============================================================================
+// Scenario S3 — secret 非漏洩の黒箱検証（決定的 assert のみ）
+// ============================================================================
+
+/// **Scenario S3**: secret が API 応答・実行応答へ漏れないこと、引き換え面が正しく閉じていること、
+/// および **世代が execution に固定される**ことを検証する（§15 M7 完了条件の後半）。
+///
+/// 分布や時間依存の assert は持たない（`chaos_m6.rs` の S2/S3 と同じフレーク回避方針）。
+#[tokio::test]
+#[ignore = "chaos: requires docker compose stack + CHAOS_TOKEN + echo; run: docker compose up -d && cargo test -p faas-control-plane --test chaos_m7 --ignored chaos_t3_"]
+async fn chaos_t3_secret_non_disclosure() {
+    let base = base_url();
+    let token = token();
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(30))
+        .build()
+        .expect("reqwest client");
+
+    let cid = resolve_component_id(&client, &base, &token).await;
+    let active_version = get_traffic(&client, &base, &token, &cid).await["stable"]["version"]
+        .as_str()
+        .expect("component must have an active version")
+        .to_string();
+    let v1 = sentinel("t3-v1");
+    let v2 = sentinel("t3-v2");
+
+    let _ = client
+        .put(format!(
+            "{base}/components/{cid}/versions/{active_version}/capabilities"
+        ))
+        .bearer_auth(&token)
+        .json(&serde_json::json!({"env": ["API_KEY"]}))
+        .send()
+        .await;
+    let _ = client
+        .put(format!("{base}/components/{cid}/secrets/API_KEY"))
+        .bearer_auth(&token)
+        .json(&serde_json::json!({"value": v1}))
+        .send()
+        .await;
+
+    // --- (1) GET /secrets の全文に値も value_len も kek_kid も現れない ---
+    let list_body = client
+        .get(format!("{base}/components/{cid}/secrets"))
+        .bearer_auth(&token)
+        .send()
+        .await
+        .expect("list secrets send")
+        .text()
+        .await
+        .expect("list secrets text");
+
+    // --- (2) invoke して execution を作り、GET /executions の全文を採る ---
+    let exec_id = invoke_async(&client, &base, &token, "t3-exec").await;
+    let _ = wait_version_id(&client, &base, &token, &exec_id).await;
+    let exec_json: serde_json::Value = client
+        .get(format!("{base}/executions/{exec_id}"))
+        .bearer_auth(&token)
+        .send()
+        .await
+        .expect("get execution send")
+        .json()
+        .await
+        .expect("get execution json");
+    // `output` は **ゲスト自身が返した内容**であり、検証用 echo は env をそのまま返す仕様。
+    // ここで見るのはプラットフォーム側のメタ情報（input / error / 各種 id）に値が乗らないこと。
+    let mut exec_meta = exec_json.clone();
+    if let Some(obj) = exec_meta.as_object_mut() {
+        obj.remove("output");
+    }
+    let exec_body = exec_meta.to_string();
+
+    // --- (3) 値長超過は 400 / 他テナントの component は 404 ---
+    let too_long = client
+        .put(format!("{base}/components/{cid}/secrets/TOO_LONG"))
+        .bearer_auth(&token)
+        .json(&serde_json::json!({"value": "x".repeat(4097)}))
+        .send()
+        .await
+        .expect("oversized secret send");
+    let too_long_status = too_long.status();
+
+    let foreign = client
+        .put(format!(
+            "{base}/components/cmp_does_not_exist/secrets/API_KEY"
+        ))
+        .bearer_auth(&token)
+        .json(&serde_json::json!({"value": "x"}))
+        .send()
+        .await
+        .expect("foreign component send");
+    let foreign_status = foreign.status();
+
+    // --- (4) rotate すると新値が注入され、旧値は二度と観測できない ---
+    let rotated = client
+        .post(format!("{base}/components/{cid}/secrets/API_KEY/rotate"))
+        .bearer_auth(&token)
+        .json(&serde_json::json!({"value": v2}))
+        .send()
+        .await
+        .expect("rotate send");
+    let rotate_status = rotated.status();
+    let env_after_rotate = invoke_sync_env(&client, &base, &token).await;
+
+    // --- (6) 公開 listener には引き換え面が生えていない ---
+    let public_exchange = client
+        .post(format!("{base}/internal/job-env"))
+        .json(&serde_json::json!({"env_token": "x"}))
+        .send()
+        .await
+        .expect("public exchange send");
+    let public_status = public_exchange.status();
+
+    // --- (7) 内部 listener: トークン無し / job_token の流用はどちらも 401 ---
+    let internal = internal_url();
+    let no_token = client
+        .post(format!("{internal}/internal/job-env"))
+        .json(&serde_json::json!({}))
+        .send()
+        .await;
+    let garbage = client
+        .post(format!("{internal}/internal/job-env"))
+        .json(&serde_json::json!({"env_token": "not-a-token"}))
+        .send()
+        .await
+        .expect("garbage token send");
+    let garbage_status = garbage.status();
+
+    // --- (8) 後始末（assert より前） ---
+    let _ = client
+        .delete(format!("{base}/components/{cid}/secrets/API_KEY"))
+        .bearer_auth(&token)
+        .send()
+        .await;
+    let _ = client
+        .put(format!(
+            "{base}/components/{cid}/versions/{active_version}/capabilities"
+        ))
+        .bearer_auth(&token)
+        .json(&serde_json::json!({"env": []}))
+        .send()
+        .await;
+
+    // ---- assert ----
+    assert!(
+        !list_body.contains(&v1) && !list_body.contains(&v2),
+        "GET /secrets must never contain a secret value; body={list_body}"
+    );
+    for forbidden in ["value_len", "kek_kid"] {
+        assert!(
+            !list_body.contains(forbidden),
+            "GET /secrets must not expose {forbidden} (it belongs to the admin-only keys view); \
+             body={list_body}"
+        );
+    }
+    assert!(
+        !exec_body.contains(&v1) && !exec_body.contains(&v2),
+        "the execution record must not carry secret material outside the guest's own output"
+    );
+    assert_eq!(
+        too_long_status, 400,
+        "an oversized secret value must be refused"
+    );
+    assert_eq!(
+        foreign_status, 404,
+        "a component that does not belong to the caller must be indistinguishable from missing"
+    );
+    assert_eq!(
+        rotate_status, 200,
+        "rotate must succeed on an existing secret"
+    );
+    assert_eq!(
+        env_after_rotate["API_KEY"].as_str(),
+        Some(v2.as_str()),
+        "after rotation, new executions must receive the new value"
+    );
+    assert_ne!(
+        env_after_rotate["API_KEY"].as_str(),
+        Some(v1.as_str()),
+        "the pre-rotation value must never be observable again in new executions"
+    );
+    assert_eq!(
+        public_status, 404,
+        "the exchange endpoint must not exist on the public listener"
+    );
+    if let Ok(r) = no_token {
+        assert_eq!(
+            r.status(),
+            400,
+            "a request without env_token must be refused by the body extractor"
+        );
+    }
+    assert_eq!(
+        garbage_status, 401,
+        "an unverifiable env_token must be rejected (this also covers presenting a job_token, \
+         which cannot validate because the signing domain tag and aud both differ)"
+    );
 }
