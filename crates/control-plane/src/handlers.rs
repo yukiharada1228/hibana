@@ -256,6 +256,9 @@ pub async fn upload_version(
                 let parsed: Value = serde_json::from_str(&text).map_err(|e| {
                     FaasError::InvalidRequest(format!("capabilities is not valid JSON: {e}"))
                 })?;
+                // M7b (§4.4): env 許可リストは admin 承認の対象。deploy スコープのこの経路で
+                // 宣言されたら 400 で拒否する（黙って無視すると「設定したのに効かない」になる）。
+                validation::reject_env_in_declared_capabilities(&parsed)?;
                 capabilities = Some(parsed);
             }
             Some("resource_limits") => {
@@ -323,7 +326,16 @@ pub async fn upload_version(
         tracing::debug!(declared = ?caps, imports = ?validated.imports, "client-declared capabilities (not trusted; persisting resolved approved set)");
     }
     // §4.4 MUST: クライアント宣言値ではなく、承認集合と照合して解決した import を保存する。
-    let capabilities_json = json!(validated.approved_imports);
+    //
+    // M7b: `capabilities.env`（注入を許可する env 名の許可リスト）は **admin 承認**の対象であり、
+    // Deploy スコープのこの経路では**常に空**（deny-all）で保存する。deploy トークンが
+    // `env: ["PROD_API_KEY"]` を宣言できると、その wasm が `wasi:cli/environment`（baseline 承認済み）
+    // で読んだ値を invoke 出力へ返すだけで admin 専用の secret を平文で取得できる（権限昇格）。
+    let capabilities_json = validation::CapabilitySet {
+        imports: validated.approved_imports.clone(),
+        env: std::collections::BTreeSet::new(),
+    }
+    .to_json();
 
     // (5) 検証通過 → MinIO 保存 → INSERT(active) → active 化。
     let object_key = component_object_key(tenant, &component.name, &version);
@@ -3166,6 +3178,286 @@ pub async fn get_traffic_split(
             })
             .collect(),
     }))
+}
+
+// ---------------------------------------------------------------------------
+// M7b: capability の env 許可リスト承認（§4.4 / §15）
+//
+// §4.4 は「capability の付与（承認）は admin スコープを要する (MUST)」と規定する。
+// 版のアップロード（Deploy スコープ）から分離した**専用エンドポイント**にすることで、
+// deploy トークンが自分で env 許可リストを広げる権限昇格経路を構造的に消す。
+// secret 系（§4.5）と同じく admin スコープ + admin ロールの二重ガードを掛ける。
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Deserialize)]
+pub struct ApproveCapabilityEnvRequest {
+    /// 注入を許可する env 名の**全置換**リスト（空配列 = deny-all へ戻す）。
+    pub env: Vec<String>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ApproveCapabilityEnvResponse {
+    pub component_id: String,
+    pub version: String,
+    pub version_id: String,
+    pub env: Vec<String>,
+}
+
+/// PUT /components/{id}/versions/{version}/capabilities — env 許可リストを承認する（admin）。
+///
+/// `imports`（strict matching の結果）は受け付けない。あれは検証パイプラインが決める値であり、
+/// API から書き換えられてはならない。
+pub async fn approve_capability_env(
+    State(state): State<AppState>,
+    principal: Principal,
+    Path((component_id, version)): Path<(String, String)>,
+    JsonBody(req): JsonBody<ApproveCapabilityEnvRequest>,
+) -> Result<impl IntoResponse, AppError> {
+    // admin スコープ（ルータ）に加えて admin **ロール**も要求する（二重ガード, §3.7）。
+    require_admin_role(principal.role)?;
+    let tenant = &principal.tenant_id;
+
+    let approved = validation::validate_env_allowlist(&req.env)?;
+
+    let mut tx = state.pool().begin().await?;
+    db::set_tenant_guc(&mut tx, tenant).await?;
+
+    db::find_component_by_id(&mut *tx, tenant, &component_id)
+        .await?
+        .ok_or_else(|| FaasError::NotFound(format!("component '{component_id}'")))?;
+
+    let version_id = db::find_version_id(&mut *tx, tenant, &component_id, &version)
+        .await?
+        .ok_or_else(|| {
+            FaasError::NotFound(format!("version '{version}' of component '{component_id}'"))
+        })?;
+
+    // 既存の imports は保持し、env だけを差し替える。
+    let current = db::version_capabilities(&mut *tx, tenant, &version_id)
+        .await?
+        .unwrap_or(Value::Null);
+    let mut caps = validation::parse_capabilities(&current);
+    caps.env = approved.clone();
+
+    if !db::set_version_capabilities(&mut *tx, tenant, &version_id, &caps.to_json()).await? {
+        return Err(FaasError::NotFound(format!(
+            "version '{version}' of component '{component_id}'"
+        ))
+        .into());
+    }
+
+    // 監査には**承認された名前**だけを残す（値はここには存在しない）。
+    db::insert_audit_log(
+        &mut *tx,
+        tenant,
+        principal.user_id.as_deref(),
+        "capability_env_approved",
+        Some(&version_id),
+        Some(&json!({
+            "component_id": component_id,
+            "version": version,
+            "env": approved.iter().collect::<Vec<_>>(),
+        })),
+    )
+    .await?;
+
+    tx.commit().await?;
+
+    tracing::info!(
+        %component_id,
+        %version,
+        approved_env_count = approved.len(),
+        "capability env allowlist approved"
+    );
+
+    Ok(Json(ApproveCapabilityEnvResponse {
+        component_id,
+        version,
+        version_id,
+        env: approved.into_iter().collect(),
+    }))
+}
+
+// ---------------------------------------------------------------------------
+// M7b: per-function 環境変数（平文 config）の CRUD（§15 / §4.4）
+//
+// スコープは **deploy**（読み書きとも）。読み取りを read に置かない理由: config は平文であり、
+// 注入時に secret と同じ env 名前空間へ混ざる。運用者が資格情報を誤って config 側に入れる確率は
+// 現実的に高く、その瞬間 read スコープ（監視・ダッシュボード用途で最も広く配られる）が
+// 資格情報の読み取り権限になってしまう。1 段引き上げて被害面を縮める。
+// → README の露出ガード節に「config は平文であり deploy スコープで読める。資格情報は必ず
+//    secrets 側に置くこと」を明記する。
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Deserialize)]
+pub struct PutFunctionConfigRequest {
+    /// 環境変数の**全置換**マップ。空オブジェクトで全削除。
+    pub env: std::collections::BTreeMap<String, String>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct FunctionConfigResponse {
+    pub component_id: String,
+    pub env: std::collections::BTreeMap<String, String>,
+    pub updated_at: Option<chrono::DateTime<chrono::Utc>>,
+}
+
+/// config の入力（キー名・値長・件数・総バイト）を検証する純関数（DB / ストア非依存）。
+///
+/// 上限は `faas_shared` の定数を使う（CP の受付と worker の防御的 clamp で同じ値を参照する
+/// 二重防御）。超過は 400（`error.rs` は `InvalidRequest` を 400 にしか写像しない）。
+fn validate_env_map(env: &std::collections::BTreeMap<String, String>) -> Result<(), FaasError> {
+    if env.len() > faas_shared::MAX_FUNCTION_ENV_KEYS {
+        return Err(FaasError::InvalidRequest(format!(
+            "at most {} env entries are allowed per component",
+            faas_shared::MAX_FUNCTION_ENV_KEYS
+        )));
+    }
+    let mut total = 0usize;
+    for (k, v) in env {
+        if !faas_shared::is_valid_env_key(k) {
+            return Err(FaasError::InvalidRequest(format!(
+                "invalid env key '{k}': must match ^[A-Z_][A-Z0-9_]{{0,{}}}$",
+                faas_shared::MAX_ENV_KEY_LEN - 1
+            )));
+        }
+        if v.len() > faas_shared::MAX_ENV_VALUE_BYTES {
+            return Err(FaasError::InvalidRequest(format!(
+                "env value for '{k}' exceeds {} bytes",
+                faas_shared::MAX_ENV_VALUE_BYTES
+            )));
+        }
+        total += k.len() + v.len();
+    }
+    if total > faas_shared::MAX_FUNCTION_ENV_TOTAL_BYTES {
+        return Err(FaasError::InvalidRequest(format!(
+            "total env size exceeds {} bytes",
+            faas_shared::MAX_FUNCTION_ENV_TOTAL_BYTES
+        )));
+    }
+    Ok(())
+}
+
+/// GET /components/{id}/config — 平文 config を返す（deploy）。
+pub async fn get_function_config(
+    State(state): State<AppState>,
+    principal: Principal,
+    Path(component_id): Path<String>,
+) -> Result<impl IntoResponse, AppError> {
+    let tenant = &principal.tenant_id;
+
+    let mut tx = state.pool().begin().await?;
+    db::set_tenant_guc(&mut tx, tenant).await?;
+
+    db::find_component_by_id(&mut *tx, tenant, &component_id)
+        .await?
+        .ok_or_else(|| FaasError::NotFound(format!("component '{component_id}'")))?;
+
+    let rows = db::list_function_configs(&mut *tx, tenant, &component_id).await?;
+    tx.commit().await?;
+
+    let updated_at = rows.iter().map(|r| r.updated_at).max();
+    Ok(Json(FunctionConfigResponse {
+        component_id,
+        env: rows.into_iter().map(|r| (r.key, r.value)).collect(),
+        updated_at,
+    }))
+}
+
+/// PUT /components/{id}/config — 平文 config を全置換する（deploy）。
+///
+/// `PATCH` は既存 API の作法に無いので使わない（全置換のみ）。
+pub async fn put_function_config(
+    State(state): State<AppState>,
+    principal: Principal,
+    Path(component_id): Path<String>,
+    JsonBody(req): JsonBody<PutFunctionConfigRequest>,
+) -> Result<impl IntoResponse, AppError> {
+    let tenant = &principal.tenant_id;
+    validate_env_map(&req.env)?;
+
+    let mut tx = state.pool().begin().await?;
+    db::set_tenant_guc(&mut tx, tenant).await?;
+
+    db::find_component_by_id(&mut *tx, tenant, &component_id)
+        .await?
+        .ok_or_else(|| FaasError::NotFound(format!("component '{component_id}'")))?;
+
+    let entries: Vec<(String, String)> = req
+        .env
+        .iter()
+        .map(|(k, v)| (k.clone(), v.clone()))
+        .collect();
+    db::replace_function_configs(
+        &mut tx,
+        tenant,
+        &component_id,
+        &entries,
+        principal.user_id.as_deref(),
+    )
+    .await?;
+
+    // 監査には**キー名だけ**を残す（値は載せない: config は平文だが、誤って資格情報が
+    // 入れられていた場合に audit_logs へ二次的に残さないため）。
+    db::insert_audit_log(
+        &mut *tx,
+        tenant,
+        principal.user_id.as_deref(),
+        "function_config_updated",
+        Some(&component_id),
+        Some(&json!({ "keys": req.env.keys().collect::<Vec<_>>() })),
+    )
+    .await?;
+
+    let rows = db::list_function_configs(&mut *tx, tenant, &component_id).await?;
+    tx.commit().await?;
+
+    tracing::info!(%component_id, key_count = rows.len(), "function config replaced");
+
+    let updated_at = rows.iter().map(|r| r.updated_at).max();
+    Ok(Json(FunctionConfigResponse {
+        component_id,
+        env: rows.into_iter().map(|r| (r.key, r.value)).collect(),
+        updated_at,
+    }))
+}
+
+/// DELETE /components/{id}/config/{key} — 1 キー削除（deploy）。不在は 404。
+pub async fn delete_function_config(
+    State(state): State<AppState>,
+    principal: Principal,
+    Path((component_id, key)): Path<(String, String)>,
+) -> Result<impl IntoResponse, AppError> {
+    let tenant = &principal.tenant_id;
+
+    let mut tx = state.pool().begin().await?;
+    db::set_tenant_guc(&mut tx, tenant).await?;
+
+    db::find_component_by_id(&mut *tx, tenant, &component_id)
+        .await?
+        .ok_or_else(|| FaasError::NotFound(format!("component '{component_id}'")))?;
+
+    if !db::delete_function_config(&mut *tx, tenant, &component_id, &key).await? {
+        return Err(FaasError::NotFound(format!(
+            "config key '{key}' of component '{component_id}'"
+        ))
+        .into());
+    }
+
+    db::insert_audit_log(
+        &mut *tx,
+        tenant,
+        principal.user_id.as_deref(),
+        "function_config_deleted",
+        Some(&component_id),
+        Some(&json!({ "key": key })),
+    )
+    .await?;
+
+    tx.commit().await?;
+
+    tracing::info!(%component_id, %key, "function config key deleted");
+    Ok(StatusCode::NO_CONTENT)
 }
 
 fn map_unique_violation(e: sqlx::Error, msg: &str) -> AppError {

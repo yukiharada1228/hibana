@@ -61,6 +61,7 @@
 //! トラップ分類: epoch 中断 / 時間超過 → `timeout`、fuel 超過 → `failed`（§4.3）。
 
 mod bindings;
+mod env;
 mod metrics;
 
 use std::num::NonZeroUsize;
@@ -724,6 +725,38 @@ async fn ensure_consumer(
 // Worker 本体
 // ============================================================================
 
+/// version 解決の結果（M7b: limits に加え env 許可リストと平文 config を同じ tx で引く）。
+#[derive(Debug, Default)]
+struct ResolvedVersion {
+    limits: ResourceLimits,
+    /// `component_versions.capabilities.env`（admin 承認済みの注入可能 env 名）。
+    /// 行が引けない / 壊れている場合は空 ＝ **deny-all**（fail-closed）。
+    allowed_env: std::collections::BTreeSet<String>,
+    /// `function_configs` の平文キー・値。
+    config: std::collections::BTreeMap<String, String>,
+}
+
+/// `component_versions.capabilities` から env 許可リストを読む（M7b, §4.4）。
+///
+/// CP 側 `validation::parse_capabilities` と**同じ規則**（後方互換 + fail-closed）を worker 側にも
+/// 持つ。crate をまたぐので実装は複製になるが、どちらも「配列は旧形式で env 空 / 壊れた値は
+/// deny-all」という 1 行の規則であり、テストで両側に固定する。
+fn parse_allowed_env(capabilities: &serde_json::Value) -> std::collections::BTreeSet<String> {
+    capabilities
+        .as_object()
+        .and_then(|m| m.get("env"))
+        .and_then(|v| v.as_array())
+        .map(|a| {
+            a.iter()
+                .filter_map(|x| x.as_str())
+                .filter(|k| faas_shared::is_valid_env_key(k))
+                .map(str::to_string)
+                .collect()
+        })
+        // 旧形式（素の配列）/ null / 壊れた値 → deny-all。
+        .unwrap_or_default()
+}
+
 struct Worker {
     engine: Engine,
     pool: PgPool,
@@ -917,11 +950,29 @@ impl Worker {
         &self,
         job: &JobMessage,
     ) -> std::result::Result<(serde_json::Value, UsageMetrics), ExecError> {
-        // resource_limits を DB から解決する。失敗・未設定時は既定。
-        let limits = self
-            .resolve_limits(&job.tenant_id, &job.component, &job.version)
+        // resource_limits / env 許可リスト / 平文 config を DB から解決する（M7b）。
+        // 失敗・未設定時は既定（limits は既定値、env は **deny-all**）。
+        let resolved = self
+            .resolve_version(&job.tenant_id, &job.component, &job.version)
             .await
             .unwrap_or_default();
+        let limits = resolved.limits;
+
+        // M7b (§4.4): 許可リストで畳んで注入する env を組み立てる。許可リストに無いキーは
+        // 値が DB に存在しても注入しない（admin 承認が権威）。
+        // secret（M7c）はここではまだ空。CP との引き換えで後段が埋める。
+        let built_env = env::build_env(
+            &resolved.config,
+            &std::collections::BTreeMap::new(),
+            &resolved.allowed_env,
+        );
+        if built_env.dropped_unapproved > 0 {
+            // 「設定したのに入っていない」の切り分けを可能にする（キー名は出さない）。
+            tracing::debug!(
+                dropped = built_env.dropped_unapproved,
+                "dropped env entries not present in the approved allowlist"
+            );
+        }
 
         // §3.6 のキャッシュ階層で Component を解決する。
         let component = self.resolve_component(job).await?;
@@ -936,7 +987,8 @@ impl Worker {
                 .map_err(|e| ExecError::Failed(format!("failed to encode input: {e}")))?,
         };
 
-        self.run_component(component, input_bytes, limits).await
+        self.run_component(component, input_bytes, limits, built_env)
+            .await
     }
 
     /// 大入力を presigned GET URL（input_url）から取得する (§3.4)。
@@ -1106,6 +1158,7 @@ impl Worker {
         component: Arc<Component>,
         input: Vec<u8>,
         limits: ResourceLimits,
+        built_env: env::BuiltEnv,
     ) -> std::result::Result<(serde_json::Value, UsageMetrics), ExecError> {
         // StoreLimits: max_memory を適用する (§4.3)。
         let store_limits = StoreLimitsBuilder::new()
@@ -1120,7 +1173,18 @@ impl Worker {
             peak_memory_bytes: Arc::clone(&peak_memory),
         };
 
-        let wasi = WasiCtxBuilder::new().inherit_stderr().build();
+        // M7b (§3.5 / §4.4): per-function 環境変数を注入する唯一の場所。
+        //
+        // `Component` は sha256 キーで LRU 共有されるが `WasiCtx` は **実行ごとに構築される**ため、
+        // テナント混線は構造的に起きない（この不変条件は M7c で secret を載せる際の前提でもある）。
+        // ゲスト側は `wasi:cli/environment` を import する。これは capability baseline で承認済み
+        // （`validation.rs` の `BASELINE_APPROVED_PREFIXES` に `wasi:cli/`）なので baseline の変更は不要。
+        let mut wasi_builder = WasiCtxBuilder::new();
+        wasi_builder.inherit_stderr();
+        for (k, v) in &built_env.pairs {
+            wasi_builder.env(k, v);
+        }
+        let wasi = wasi_builder.build();
         let host = HostState {
             ctx: wasi,
             table: ResourceTable::new(),
@@ -1329,13 +1393,22 @@ impl Worker {
         Ok(())
     }
 
-    /// component_versions.resource_limits を解決する。見つからなければ None。
-    async fn resolve_limits(
+    /// component_versions の resource_limits / capabilities.env と function_configs を
+    /// **同一 tx** で解決する（M7b, §3.4）。
+    ///
+    /// 平文 config は worker が DB を直読みする（HTTP 往復ゼロ）。既に worker は
+    /// `assert_non_privileged_runtime_role` で `faas_app`（NOBYPASSRLS）であることを起動時に
+    /// アサートしており、読み取りは `set_tenant_guc` 済み tx + `WHERE tenant_id = $1` の
+    /// 二重防御下で行う（既存 `resolve_limits` と同じ作法）。
+    ///
+    /// **secret はここでは読まない**。secret は暗号化されており、worker は KEK を持たない
+    /// （keyless by design, §3.3）。secret の注入は CP の内部エンドポイントとの引き換えで行う。
+    async fn resolve_version(
         &self,
         tenant_id: &str,
         component: &str,
         version: &str,
-    ) -> anyhow::Result<ResourceLimits> {
+    ) -> anyhow::Result<ResolvedVersion> {
         use sqlx::Row as _;
 
         // M3c: tenant の権威は CP-signed claim。job.tenant_id はその claim と一致する。
@@ -1343,7 +1416,8 @@ impl Worker {
         let mut tx = self.pool.begin().await?;
         Self::set_tenant_guc(&mut tx, tenant_id).await?;
         let row = sqlx::query(
-            "SELECT cv.resource_limits AS resource_limits \
+            "SELECT c.id AS component_id, cv.resource_limits AS resource_limits, \
+                    cv.capabilities AS capabilities \
              FROM component_versions cv \
              JOIN components c ON c.id = cv.component_id \
              WHERE c.tenant_id = $1 AND c.name = $2 AND cv.version = $3 \
@@ -1354,16 +1428,42 @@ impl Worker {
         .bind(version)
         .fetch_optional(&mut *tx)
         .await?;
+
+        let Some(r) = row else {
+            tx.commit().await?;
+            // 行が引けない = 承認情報が無い。limits は既定、env は **deny-all**（fail-closed）。
+            return Ok(ResolvedVersion::default());
+        };
+
+        let component_id: String = r.try_get("component_id")?;
+        let limits: ResourceLimits =
+            serde_json::from_value(r.try_get("resource_limits")?).unwrap_or_default();
+        let allowed_env = parse_allowed_env(&r.try_get::<serde_json::Value, _>("capabilities")?);
+
+        // 平文 config を同じ tx（同じ GUC）で引く。
+        let config_rows = sqlx::query(
+            "SELECT key, value FROM function_configs \
+              WHERE tenant_id = $1 AND component_id = $2 ORDER BY key",
+        )
+        .bind(tenant_id)
+        .bind(&component_id)
+        .fetch_all(&mut *tx)
+        .await?;
         tx.commit().await?;
 
-        match row {
-            Some(r) => {
-                let value: serde_json::Value = r.try_get("resource_limits")?;
-                let limits: ResourceLimits = serde_json::from_value(value).unwrap_or_default();
-                Ok(limits)
-            }
-            None => Ok(ResourceLimits::default()),
+        let mut config = std::collections::BTreeMap::new();
+        for row in config_rows {
+            config.insert(
+                row.try_get::<String, _>("key")?,
+                row.try_get::<String, _>("value")?,
+            );
         }
+
+        Ok(ResolvedVersion {
+            limits,
+            allowed_env,
+            config,
+        })
     }
 
     // ------------------------------------------------------------------------

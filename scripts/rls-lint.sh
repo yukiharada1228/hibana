@@ -60,6 +60,9 @@ fns="$fns|insert_trigger|list_triggers|delete_trigger|list_enabled_triggers_by_t
 fns="$fns|resolve_component_routing|switch_active_version|promote_active_version"
 fns="$fns|rollback_active_version|set_traffic_split|clear_traffic_split"
 fns="$fns|traffic_split_for_component|version_stats_for_component"
+# M7b per-function config + capability env 承認（すべて set_tenant_guc 済み tx で呼ぶ）。
+fns="$fns|version_capabilities|set_version_capabilities"
+fns="$fns|upsert_function_config|list_function_configs|delete_function_config"
 
 set2=$(
   grep -rnE "db::($fns)\([[:space:]]*state\.pool\(\)" \

@@ -818,6 +818,41 @@ pub const MAX_WALL_TIME_MS_LIMIT: u64 = 30_000;
 /// max_execution_time: 60 000 ms。
 pub const MAX_EXECUTION_TIME_MS_LIMIT: u64 = 60_000;
 
+// ============================================================================
+// per-function 環境変数 / secret の上限 (M7b/M7c, §15 / §4.4)
+// ============================================================================
+//
+// **CP の受付バリデーションと worker の防御的 clamp の両方でこの定数を使う**（二重防御）。
+// CP 側だけで守ると、DB を直接書き換えられた場合や将来の別経路で worker が無制限の env を
+// 組み立ててしまう。
+
+/// env キー名の最大長。POSIX の env 名の慣行に合わせる。
+pub const MAX_ENV_KEY_LEN: usize = 64;
+/// 1 component あたりの env キー数上限（config + secret の合計）。
+/// `WasiCtx` 構築コストと運用可読性の両面から。
+pub const MAX_FUNCTION_ENV_KEYS: usize = 64;
+/// env 値のバイト長上限（config / secret 共通）。secret は資格情報であり、
+/// 数 KiB を超える用途（証明書チェーン等）は M7 の非スコープ。
+pub const MAX_ENV_VALUE_BYTES: usize = 4096;
+/// 1 実行に注入する env の総バイト数上限（キー + 値の合計）。
+pub const MAX_FUNCTION_ENV_TOTAL_BYTES: usize = 32_768;
+
+/// env キー名が `^[A-Z_][A-Z0-9_]{0,63}$` を満たすか（純関数）。
+///
+/// 小文字・`=`・NUL・空文字を拒む。`wasi:cli/environment` 経由でゲストへ渡す名前なので、
+/// POSIX env 名として不正な形を最初から入れさせない。
+pub fn is_valid_env_key(key: &str) -> bool {
+    if key.is_empty() || key.len() > MAX_ENV_KEY_LEN {
+        return false;
+    }
+    let mut bytes = key.bytes();
+    let first = bytes.next().expect("non-empty checked above");
+    if !(first.is_ascii_uppercase() || first == b'_') {
+        return false;
+    }
+    bytes.all(|b| b.is_ascii_uppercase() || b.is_ascii_digit() || b == b'_')
+}
+
 /// Component version ごとのリソース制限 (§4.3)。
 /// component_versions.resource_limits (JSONB) に格納される。
 ///

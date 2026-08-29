@@ -320,6 +320,22 @@ fn build_router(state: AppState) -> Router {
         .route("/cron-jobs", post(handlers::create_cron_job))
         // POST /triggers: トリガー登録 (M6c, §15。component ライフサイクル相当の Deploy スコープ)。
         .route("/triggers", post(handlers::create_trigger))
+        // --- M7b: per-function 環境変数（平文 config, §15 / §4.4）---
+        // 読み書きとも Deploy。GET を Read に置かないのは、config が平文で secret と同じ env
+        // 名前空間に混ざるため（資格情報を誤って config へ入れた瞬間、最も広く配られる read
+        // スコープが資格情報の読み取り権限になる）。
+        .route(
+            "/components/{component_id}/config",
+            get(handlers::get_function_config),
+        )
+        .route(
+            "/components/{component_id}/config",
+            put(handlers::put_function_config),
+        )
+        .route(
+            "/components/{component_id}/config/{key}",
+            delete(handlers::delete_function_config),
+        )
         .route_layer(axum::middleware::from_fn(require_scope(Scope::Deploy)));
 
     // --- Admin スコープ（全 DELETE・active-version 切替・user/token 管理） ---
@@ -366,6 +382,14 @@ fn build_router(state: AppState) -> Router {
         .route(
             "/components/{component_id}/rollback",
             post(handlers::rollback_version),
+        )
+        // --- M7b: capability の env 許可リスト承認 (§4.4 / §15) ---
+        // PUT /components/{id}/versions/{version}/capabilities:
+        // 注入を許可する env 名を承認する。§4.4 MUST「付与は admin スコープを要する」に従い
+        // アップロード（Deploy）から分離した専用経路にする（deploy トークンによる権限昇格の遮断）。
+        .route(
+            "/components/{component_id}/versions/{version}/capabilities",
+            put(handlers::approve_capability_env),
         )
         .route_layer(axum::middleware::from_fn(require_scope(Scope::Admin)));
 
@@ -634,6 +658,130 @@ mod migration_tests {
     // （0009/0010/0011）にするため、const も 1 ファイル 1 include_str! に分ける。統合ファイルに
     // すると m7a_creates_no_new_table（0009 は新表を作らない）が M7b/M7c の CREATE TABLE で必ず落ちる。
     const M7A_SQL: &str = include_str!("../../../migrations/0009_m7a_traffic_split.sql");
+    const M7B_SQL: &str = include_str!("../../../migrations/0010_m7b_function_configs.sql");
+
+    /// 連続空白を 1 個に潰す（DDL の桁揃えに依存しない部分文字列照合のため）。
+    fn squeeze_spaces(sql: &str) -> String {
+        let mut s = String::with_capacity(sql.len());
+        let mut prev_space = false;
+        for c in sql.chars() {
+            if c == ' ' || c == '\t' {
+                if !prev_space {
+                    s.push(' ');
+                }
+                prev_space = true;
+            } else {
+                s.push(c);
+                prev_space = false;
+            }
+        }
+        s
+    }
+
+    /// 新表が ENABLE + FORCE RLS されていること（0007/0008 と同型の DDL 不変条件）。
+    fn assert_force_rls(sql: &str, tables: &[&str]) {
+        let normalized = squeeze_spaces(sql);
+        for table in tables {
+            assert!(
+                normalized.contains(&format!("ALTER TABLE {table} FORCE ROW LEVEL SECURITY")),
+                "{table} must FORCE ROW LEVEL SECURITY"
+            );
+            assert!(
+                normalized.contains(&format!("ALTER TABLE {table} ENABLE ROW LEVEL SECURITY")),
+                "{table} must ENABLE ROW LEVEL SECURITY"
+            );
+        }
+    }
+
+    /// tenant_isolation が fail-closed（`current_setting('app.tenant_id')` の第 2 引数なし）。
+    fn assert_fail_closed_isolation(sql: &str, tables: &[&str]) {
+        assert!(
+            sql.contains("current_setting('app.tenant_id')"),
+            "tenant_isolation must gate on current_setting('app.tenant_id')"
+        );
+        assert!(
+            !sql.contains("current_setting('app.tenant_id', true)")
+                && !sql.contains("current_setting('app.tenant_id', TRUE)"),
+            "tenant_isolation must NOT use the second-arg fallback (must fail closed)"
+        );
+        for table in tables {
+            assert!(
+                sql.contains(&format!("CREATE POLICY tenant_isolation ON {table}")),
+                "{table} must have a tenant_isolation policy"
+            );
+        }
+    }
+
+    /// 新表に明示 GRANT / REVOKE があること。0004_rls.sql の GRANT はテーブル名の列挙なので
+    /// 新表を含まない。書き忘れると RLS 以前に権限エラーで faas_app から一切触れなくなる
+    /// （新表追加時の最頻の退行）ため CI で固定する。
+    fn assert_explicit_grants(sql: &str, tables: &[&str]) {
+        let normalized = squeeze_spaces(sql);
+        for table in tables {
+            assert!(
+                normalized.contains(&format!("REVOKE ALL ON {table} FROM PUBLIC")),
+                "{table} must REVOKE ALL FROM PUBLIC"
+            );
+            assert!(
+                normalized.contains(&format!("ON {table} TO faas_app")),
+                "{table} must GRANT explicitly to faas_app"
+            );
+        }
+    }
+
+    // ---- 0010_m7b_function_configs.sql の DB-free 文字列不変条件 --------------
+
+    #[test]
+    fn migrator_includes_version_10() {
+        let v10 = MIGRATOR
+            .iter()
+            .find(|m| m.version == 10)
+            .expect("migration version 10 (0010_m7b_function_configs) must be collected");
+        assert!(
+            v10.description.contains("m7b") || v10.description.contains("function"),
+            "unexpected 0010 description: {}",
+            v10.description
+        );
+    }
+
+    #[test]
+    fn version_10_is_not_baselined() {
+        assert!(
+            !super::BASELINE_VERSIONS.iter().any(|(v, _)| *v == 10),
+            "0010 must not be baselined; MIGRATOR.run applies it normally"
+        );
+    }
+
+    #[test]
+    fn m7b_tables_are_force_rls() {
+        assert_force_rls(M7B_SQL, &["function_configs"]);
+    }
+
+    #[test]
+    fn m7b_tenant_isolation_is_fail_closed() {
+        assert_fail_closed_isolation(M7B_SQL, &["function_configs"]);
+    }
+
+    #[test]
+    fn m7b_tables_have_explicit_grants() {
+        assert_explicit_grants(M7B_SQL, &["function_configs"]);
+    }
+
+    /// component 参照 FK は **2 列の複合 FK** であること。
+    ///
+    /// 単一列 FK（`components(id)`）はテナント一致を強制しない。RLS の WITH CHECK は
+    /// 「自分の tenant_id を書くこと」しか要求しないため、テナント A が
+    /// 「tenant_id=A, component_id=（B の cmp_*）」という行を作れてしまう。
+    #[test]
+    fn m7b_foreign_keys_are_composite() {
+        let normalized = squeeze_spaces(M7B_SQL);
+        assert!(
+            normalized.contains(
+                "FOREIGN KEY (tenant_id, component_id) REFERENCES components (tenant_id, id)"
+            ),
+            "the component reference must be a composite FK so the DB enforces tenant match"
+        );
+    }
 
     // MIGRATOR が 0007 を**コンパイル時収集**していること（sqlx::migrate! の埋め込み検証）。
     // live DB を要さない（iter() は埋め込み済みメタデータを走査するだけ）。
