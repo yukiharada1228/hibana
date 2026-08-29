@@ -85,6 +85,19 @@ pub struct Metrics {
     /// `dropped` = 検証失敗・行不在等で drop)。`executions_total{status="failed"}` の合算には
     /// この `finalized` 数も含まれる（subscriber と DLQ の双方で同名カウンタを inc するため）。
     pub dlq_finalized_total: IntCounterVec,
+
+    // ---- M7a: canary ルーティング -------------------------------------------
+    /// canary ルーティングの選択結果のうち、**実際に JetStream へ publish された**もの (M7a, §15)。
+    /// labels: reason (stable / canary)。
+    ///
+    /// version / tenant はラベルにしない（カーディナリティ）。既存 `faas_executions_total` にも
+    /// version ラベルは足さない（既存ダッシュボードを壊さない）。
+    ///
+    /// **inc の位置**: `enqueue::enqueue_execution` が `Enqueued` を返す直前（publish ack 成功後）
+    /// の 1 箇所のみ。解決時点（`resolve_version_for_enqueue`）で数えると、その後段にある
+    /// admission の 429・presign 失敗・publish backpressure・cron の冪等ヒットまで canary として
+    /// 数えてしまい、`executions.routing_reason` 由来の `GET /traffic` の値と乖離する。
+    pub canary_routed_total: IntCounterVec,
 }
 
 impl Metrics {
@@ -197,6 +210,18 @@ impl Metrics {
             .register(Box::new(dlq_finalized_total.clone()))
             .expect("register dlq_finalized_total");
 
+        let canary_routed_total = IntCounterVec::new(
+            Opts::new(
+                "faas_canary_routed_total",
+                "Enqueued jobs by version routing decision (stable/canary)",
+            ),
+            &["reason"],
+        )
+        .expect("metric: canary_routed_total");
+        registry
+            .register(Box::new(canary_routed_total.clone()))
+            .expect("register canary_routed_total");
+
         Arc::new(Self {
             registry,
             http_requests_total,
@@ -208,6 +233,7 @@ impl Metrics {
             reaper_swept_total,
             reaper_tenants_last,
             dlq_finalized_total,
+            canary_routed_total,
         })
     }
 

@@ -9,3 +9,5 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 uuid = { workspace = true }
 thiserror = { workspace = true }
+# M7-0 (§5.1): Redacted<T> の Drop 時ゼロ化。
+zeroize = { workspace = true }

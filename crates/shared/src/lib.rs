@@ -21,6 +21,72 @@ use uuid::Uuid;
 pub const DEFAULT_TENANT: &str = "default";
 
 // ============================================================================
+// 露出ガード (M7-0, §7 / §10)
+// ============================================================================
+
+/// 秘密値のラッパ。`Debug` / `Display` は常に `"<redacted>"` を出す。
+///
+/// **`Serialize` を実装しない**のが設計の中心である。うっかり API 応答型のフィールドに入れると
+/// **コンパイルエラーになる**（実行時に漏れてから気付くのではなく、型で塞ぐ）。一度だけ返す
+/// 正当なケース（login / token 発行）は `#[serde(serialize_with = "faas_shared::expose_once")]` を
+/// フィールドに明示する —— この属性は grep 可能であり、「意図的に平文を返している箇所」の
+/// 全一覧がレビューできる。
+///
+/// 平文の取り出しは [`Redacted::expose`] の 1 経路だけ（`scripts/rls-lint.sh` の検査 (4) が
+/// 呼び出しファイルを allowlist に限定する）。
+///
+/// 境界を**構造体宣言側**に書いているのは Rust の制約による: `Drop` の実装には構造体宣言と
+/// 同一の境界が要求されるため、`pub struct Redacted<T>(T);` + `impl<T: Zeroize> Drop` は
+/// E0367 でコンパイルできない。`String` / `Vec<u8>` / `[u8; 32]` は `Zeroize` 実装済み。
+///
+/// `Drop` を実装すると値のムーブアウトができなくなるため `into_inner()` は提供しない
+/// （`expose(&self) -> &T` のみ）。これは意図した制約であり、平文の取り出し口を 1 本に保つ。
+#[derive(Clone)]
+pub struct Redacted<T: zeroize::Zeroize>(T);
+
+impl<T: zeroize::Zeroize> Redacted<T> {
+    pub fn new(v: T) -> Self {
+        Self(v)
+    }
+
+    /// 平文を取り出す。**呼び出しは allowlist ファイルのみ**（rls-lint の検査 (4)）。
+    pub fn expose(&self) -> &T {
+        &self.0
+    }
+}
+
+impl<T: zeroize::Zeroize> std::fmt::Debug for Redacted<T> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("<redacted>")
+    }
+}
+
+impl<T: zeroize::Zeroize> std::fmt::Display for Redacted<T> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("<redacted>")
+    }
+}
+
+impl<T: zeroize::Zeroize> Drop for Redacted<T> {
+    fn drop(&mut self) {
+        self.0.zeroize();
+    }
+}
+
+/// 「一度だけ平文で返す」フィールド用の serializer（`#[serde(serialize_with = "...")]`）。
+///
+/// `Redacted<T>` にうっかり `Serialize` を実装する代わりに、**明示的にこの属性を書いた
+/// フィールドだけ**が平文で出る。属性名で grep すれば「意図的に秘密を返す API」の全一覧になる。
+/// 対象は発行直後に一度だけ返すもの（ログイン token / API トークン secret）に限ること。
+pub fn expose_once<S, T>(v: &Redacted<T>, s: S) -> std::result::Result<S::Ok, S::Error>
+where
+    S: serde::Serializer,
+    T: zeroize::Zeroize + Serialize,
+{
+    v.expose().serialize(s)
+}
+
+// ============================================================================
 // ID 採番ヘルパ（uuid 由来の不透明文字列）
 // ============================================================================
 

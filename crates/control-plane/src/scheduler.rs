@@ -98,8 +98,16 @@ async fn fire_due_job(state: &AppState, tenant: &str, job_id: &str) -> anyhow::R
                 job.component_id
             )
         })?;
-    let active = crate::db::active_version_storage(&mut *tx, tenant, &component.name).await?;
-    let Some(active) = active else {
+    // 今回 fire のスロット（分境界 unix 秒）と安定冪等キー。
+    // M7a: `idem_key` を canary のルーティングキーに使うため、version 解決より**前**に算出する。
+    // これにより同一 slot の再発火（複数 CP の競合・再試行）が常に同じ版へ落ちる。
+    let slot = scheduled_slot_unix(job.next_fire_at);
+    let idem_key = faas_shared::cron_idempotency_key(&job.id, slot);
+
+    // M7a: cron 起点も HTTP と同じ唯一の解決点を通す（canary をバイパスさせない）。
+    let routed =
+        enqueue::resolve_version_for_enqueue(&mut tx, tenant, &component.name, &idem_key).await?;
+    let Some(routed) = routed else {
         // active version が無いジョブは起動できない。掴んでいるロック tx をそのまま渡して前進だけ
         // させ、次回 due で再試行する（毎 poll で同じジョブを掴み続ける tight-loop を避ける）。
         advance_only(tx, tenant, &job).await?;
@@ -111,10 +119,7 @@ async fn fire_due_job(state: &AppState, tenant: &str, job_id: &str) -> anyhow::R
         );
         return Ok(false);
     };
-
-    // 今回 fire のスロット（分境界 unix 秒）と安定冪等キー。
-    let slot = scheduled_slot_unix(job.next_fire_at);
-    let idem_key = faas_shared::cron_idempotency_key(&job.id, slot);
+    let active = &routed.selected;
 
     // 次回 occurrence を計算し、next_fire_at を前進させてからコミットする（掴んでいる間に重複 due を
     // 消す）。cron 式は登録時に検証済みだが、防御的に再パースして次回を求める。
@@ -144,7 +149,7 @@ async fn fire_due_job(state: &AppState, tenant: &str, job_id: &str) -> anyhow::R
         EnqueueRequest {
             tenant,
             component_name: &component.name,
-            component_id: &component.id,
+            component_id: &routed.component_id,
             version_id: &active.version_id,
             version: &active.version,
             wasm_sha256: &active.wasm_sha256,
@@ -160,6 +165,7 @@ async fn fire_due_job(state: &AppState, tenant: &str, job_id: &str) -> anyhow::R
             reply_to: None,
             origin: "cron",
             chain_depth: 0,
+            routing_reason: routed.reason,
         },
     )
     .await;

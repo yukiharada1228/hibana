@@ -38,6 +38,9 @@ argon2 = { workspace = true }
 rand = { workspace = true }
 async-trait = { workspace = true }
 
+# M7-0 / M7c (§5.1 / §4): 秘密素材（KEK / DEK / 復号済み平文）を Drop でゼロ化する。
+zeroize = { workspace = true }
+
 # DB（query! マクロは使わずランタイム API のみ）
 sqlx = { workspace = true }
 

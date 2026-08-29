@@ -48,7 +48,7 @@ fi
 
 # --- (2) tenant-scoped db:: call passed the raw pool -----------------------
 fns="create_component|insert_version|set_active_version|insert_pending_execution|get_execution"
-fns="$fns|find_component_by_id|find_component_by_name|active_version_storage|list_components|list_versions"
+fns="$fns|find_component_by_id|find_component_by_name|resolve_component_routing|list_components|list_versions"
 fns="$fns|soft_delete_component|soft_delete_version|find_version_id"
 fns="$fns|has_active_executions_for_component|has_active_executions_for_version|finalize_execution"
 fns="$fns|create_user|find_user_role|create_token|revoke_token|token_exists|bootstrap_tenant"
@@ -56,6 +56,10 @@ fns="$fns|create_user|find_user_role|create_token|revoke_token|token_exists|boot
 fns="$fns|insert_cron_job|list_cron_jobs|delete_cron_job|lock_due_cron_job|advance_cron_next_fire"
 # M6c トリガー CRUD + 配送台帳 + chain/event 解決（すべて set_tenant_guc 済み tx で呼ぶ）。
 fns="$fns|insert_trigger|list_triggers|delete_trigger|list_enabled_triggers_by_type|record_trigger_delivery"
+# M7a canary ルーティング / 段階移行（すべて set_tenant_guc 済み tx で呼ぶ）。
+fns="$fns|resolve_component_routing|switch_active_version|promote_active_version"
+fns="$fns|rollback_active_version|set_traffic_split|clear_traffic_split"
+fns="$fns|traffic_split_for_component|version_stats_for_component"
 
 set2=$(
   grep -rnE "db::($fns)\([[:space:]]*state\.pool\(\)" \

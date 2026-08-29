@@ -44,6 +44,8 @@ sqlx = { version = "0.8", features = [
 argon2 = "0.5"
 # opaque トークン secret と argon2 salt の生成。
 rand = "0.8"
+# M7-0 (§5.1): 秘密値ラッパ Redacted<T> の Drop 時ゼロ化。Cargo.lock に既存（推移依存）。
+zeroize = "1"
 # LoginThrottle trait の async メソッド用（M3a は no-op スタブ、実装は M3d）。
 async-trait = "0.1"
 

@@ -23,6 +23,7 @@ mod handlers;
 mod login;
 mod metrics;
 mod reaper;
+mod routing;
 mod scheduler;
 mod signing;
 mod state;
@@ -286,6 +287,12 @@ fn build_router(state: AppState) -> Router {
         .route("/cron-jobs", get(handlers::list_cron_jobs))
         // GET /triggers: テナントのトリガー一覧 (M6c, §15)。
         .route("/triggers", get(handlers::list_triggers))
+        // GET /components/{id}/traffic: 現在の canary 配分 + version 別の直近成績 (M7a, §6.7 / §15)。
+        // canary の go/no-go 判断の一次情報（executions 生表の直近 60 分を直読み）。
+        .route(
+            "/components/{component_id}/traffic",
+            get(handlers::get_traffic_split),
+        )
         .route_layer(axum::middleware::from_fn(require_scope(Scope::Read)));
 
     // --- Invoke スコープ ---
@@ -336,6 +343,30 @@ fn build_router(state: AppState) -> Router {
         .route("/cron-jobs/{id}", delete(handlers::delete_cron_job))
         // DELETE /triggers/{id}: トリガー削除 (M6c, §15。他 DELETE と整合の Admin スコープ)。
         .route("/triggers/{id}", delete(handlers::delete_trigger))
+        // --- M7a: 段階移行と即時 rollback (§6.7 / §15) ---
+        // 版の切替権限を 1 スコープ（Admin）に集約する。既存 PUT /active-version が Admin であり、
+        // 分けると「Deploy で stable を動かせるが Admin でないと戻せない」非対称が生まれる。
+        //
+        // PUT /components/{id}/traffic: canary の版と重みを設定（絶対値・冪等）。
+        .route(
+            "/components/{component_id}/traffic",
+            put(handlers::set_traffic_split),
+        )
+        // DELETE /components/{id}/traffic: canary を解除（weight=0 + ポインタ NULL）。
+        .route(
+            "/components/{component_id}/traffic",
+            delete(handlers::clear_traffic_split),
+        )
+        // POST /components/{id}/promote: canary を stable へ昇格（CAS つき単一 UPDATE）。
+        .route(
+            "/components/{component_id}/promote",
+            post(handlers::promote_version),
+        )
+        // POST /components/{id}/rollback: ワンクリック rollback（canary 破棄 + 直前 stable へ復帰）。
+        .route(
+            "/components/{component_id}/rollback",
+            post(handlers::rollback_version),
+        )
         .route_layer(axum::middleware::from_fn(require_scope(Scope::Admin)));
 
     // 認証必須ルート（スコープ別ルータを統合し、authenticate で principal を確立）。
@@ -599,6 +630,11 @@ mod migration_tests {
     // 0008_m6.sql のソースも同様にコンパイル時埋め込み（DB-free 文字列不変条件検査用）。
     const M6_SQL: &str = include_str!("../../../migrations/0008_m6.sql");
 
+    // 0009_m7a_traffic_split.sql も同様。M7 の migration は**サブマイルストンごとに別ファイル**
+    // （0009/0010/0011）にするため、const も 1 ファイル 1 include_str! に分ける。統合ファイルに
+    // すると m7a_creates_no_new_table（0009 は新表を作らない）が M7b/M7c の CREATE TABLE で必ず落ちる。
+    const M7A_SQL: &str = include_str!("../../../migrations/0009_m7a_traffic_split.sql");
+
     // MIGRATOR が 0007 を**コンパイル時収集**していること（sqlx::migrate! の埋め込み検証）。
     // live DB を要さない（iter() は埋め込み済みメタデータを走査するだけ）。
     #[test]
@@ -810,6 +846,122 @@ mod migration_tests {
             M6_SQL.contains("GRANT  EXECUTE ON FUNCTION cron_due_tenant_jobs() TO   faas_app;")
                 || M6_SQL.contains("GRANT EXECUTE ON FUNCTION cron_due_tenant_jobs() TO faas_app;"),
             "cron_due_tenant_jobs() EXECUTE must be granted to faas_app"
+        );
+    }
+
+    // ---- 0009_m7a_traffic_split.sql の DB-free 文字列不変条件 -----------------
+
+    // MIGRATOR が 0009 を**コンパイル時収集**していること（sqlx::migrate! の埋め込み検証）。
+    #[test]
+    fn migrator_includes_version_9() {
+        let v9 = MIGRATOR
+            .iter()
+            .find(|m| m.version == 9)
+            .expect("migration version 9 (0009_m7a_traffic_split) must be collected by MIGRATOR");
+        assert!(
+            v9.description.contains("m7a") || v9.description.contains("traffic"),
+            "unexpected 0009 description: {}",
+            v9.description
+        );
+    }
+
+    // 0009 を BASELINE_VERSIONS に入れていないこと（= MIGRATOR.run が通常適用する）。
+    #[test]
+    fn version_9_is_not_baselined() {
+        assert!(
+            !super::BASELINE_VERSIONS.iter().any(|(v, _)| *v == 9),
+            "0009 must not be baselined; MIGRATOR.run applies it normally"
+        );
+    }
+
+    // M7a は**新規テーブルを 1 つも作らない**（GRANT 漏れ / RLS ポリシー漏れという最大の退行リスクを
+    // 設計段階で消したことの回帰ガード）。新表を足したくなったら 0010 以降で作り、RLS + GRANT を
+    // 明示すること。
+    #[test]
+    fn m7a_creates_no_new_table() {
+        assert!(
+            !M7A_SQL.contains("CREATE TABLE"),
+            "0009 must not create any table (canary state lives on components; \
+             new tables belong in 0010+ with explicit RLS and GRANT)"
+        );
+    }
+
+    // 同じ理由で、権限 / ポリシー DDL も 0009 には現れない（既存 components / executions の
+    // FORCE RLS + tenant_isolation + GRANT をそのまま継承する）。
+    #[test]
+    fn m7a_grants_nothing_new() {
+        for forbidden in ["GRANT", "REVOKE", "CREATE POLICY", "ROW LEVEL SECURITY"] {
+            assert!(
+                !M7A_SQL
+                    .lines()
+                    .filter(|l| !l.trim_start().starts_with("--"))
+                    .any(|l| l.contains(forbidden)),
+                "0009 must not contain {forbidden} outside comments \
+                 (it adds columns to already-protected tables)"
+            );
+        }
+    }
+
+    // canary 4 列が additive（IF NOT EXISTS・nullable か NOT NULL DEFAULT）で足されること。
+    #[test]
+    fn m7a_columns_are_additive() {
+        for col in [
+            "canary_version_id",
+            "canary_weight",
+            "previous_active_version_id",
+            "canary_updated_at",
+        ] {
+            assert!(
+                M7A_SQL.contains(&format!("ADD COLUMN IF NOT EXISTS {col}")),
+                "components.{col} must be added with ADD COLUMN IF NOT EXISTS"
+            );
+        }
+        // canary_weight だけは NOT NULL。既定 0 ＝ M6 までと同一の解決（全量 stable）。
+        assert!(
+            M7A_SQL.contains("ADD COLUMN IF NOT EXISTS canary_weight SMALLINT NOT NULL DEFAULT 0"),
+            "canary_weight must default to 0 so that an un-configured component routes 100% stable"
+        );
+        // M7b/M7c の複合 FK の被参照側。
+        assert!(
+            M7A_SQL.contains("components_tenant_id_id_key UNIQUE (tenant_id, id)"),
+            "components must expose UNIQUE (tenant_id, id) for the composite FKs in 0010/0011"
+        );
+    }
+
+    // 「配分先の無い重み」と値域外を DB で不可能にする 2 本の CHECK。
+    #[test]
+    fn m7a_canary_weight_is_range_checked() {
+        assert!(
+            M7A_SQL.contains("CHECK (canary_weight >= 0 AND canary_weight <= 100)"),
+            "canary_weight must be range-checked in the DB (0..=100)"
+        );
+        assert!(
+            M7A_SQL.contains("CHECK (canary_weight = 0 OR canary_version_id IS NOT NULL)"),
+            "a non-zero weight must be impossible without a canary target"
+        );
+    }
+
+    // executions は最大テーブル。ADD COLUMN のインライン CHECK（既存全行の検証走査を誘発する）を
+    // 書かず、値域は NOT VALID 制約で前方だけ守る（ロック窓の最小化。VALIDATE は保守窓で手動）。
+    #[test]
+    fn m7a_executions_check_is_not_valid() {
+        assert!(
+            M7A_SQL
+                .contains("ADD COLUMN IF NOT EXISTS routing_reason TEXT NOT NULL DEFAULT 'stable'"),
+            "executions.routing_reason must be additive with DEFAULT 'stable'"
+        );
+        assert!(
+            M7A_SQL.contains("CHECK (routing_reason IN ('stable', 'canary')) NOT VALID"),
+            "the routing_reason CHECK must be added NOT VALID (no full-table verification scan)"
+        );
+        // インライン CHECK（ADD COLUMN ... CHECK ...）になっていないこと。
+        let add_column_line = M7A_SQL
+            .lines()
+            .find(|l| l.contains("ADD COLUMN IF NOT EXISTS routing_reason"))
+            .expect("routing_reason ADD COLUMN line must exist");
+        assert!(
+            !add_column_line.contains("CHECK"),
+            "routing_reason must not carry an inline CHECK (it would scan every existing row)"
         );
     }
 }
