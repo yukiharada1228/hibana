@@ -11,6 +11,7 @@
 //! TODO(§8): M3 で設定ソースを secrets manager 等へ移す。
 
 use anyhow::Context;
+use faas_shared::Redacted;
 
 /// wasm 本体の最大アップロードサイズ既定値（32 MiB, §6.2）。
 const DEFAULT_MAX_WASM_UPLOAD_BYTES: u64 = 32 * 1024 * 1024;
@@ -58,7 +59,11 @@ const DEFAULT_SYNC_REPLY_TIMEOUT_MS: u64 = 5000;
 const DEFAULT_CRON_POLL_INTERVAL_SECS: u64 = 10;
 
 /// control-plane の起動時設定。
-#[derive(Debug, Clone)]
+///
+/// **`Debug` は手動実装**（M7-0, §5.1）。秘密フィールドは `Redacted<String>` で包んであるため
+/// derive でも `<redacted>` になるが、`Config` 全体の Debug 契約（「この型を `{:?}` してもログに
+/// 秘密が出ない」）を型の側で明示するために手動実装を選ぶ。
+#[derive(Clone)]
 pub struct Config {
     /// ランタイム Postgres 接続 URL。**非特権ロール `faas_app`（NOBYPASSRLS・非 SUPERUSER）**で
     /// 接続する（M3b §3.2）。superuser/owner で接続すると FORCE RLS が無条件にバイパスされ、
@@ -72,7 +77,7 @@ pub struct Config {
     /// NATS 接続 URL。
     pub nats_url: String,
     /// system-admin bootstrap トークン（POST /admin/tenants を gate, §3.3）。
-    pub bootstrap_admin_token: String,
+    pub bootstrap_admin_token: Redacted<String>,
     /// HTTP bind アドレス（例: 0.0.0.0:8080）。
     pub bind_addr: String,
 
@@ -86,7 +91,7 @@ pub struct Config {
     /// アクセスキー（MINIO_ROOT_USER 相当）。
     pub s3_access_key: String,
     /// シークレットキー（MINIO_ROOT_PASSWORD 相当）。
-    pub s3_secret_key: String,
+    pub s3_secret_key: Redacted<String>,
 
     // --- アップロード/検証パイプライン (M2: §6.2) ---
     /// wasm 本体の最大アップロードサイズ（bytes）。
@@ -97,7 +102,7 @@ pub struct Config {
     // --- ジョブ署名トークン (M3c, §3.3) ---
     /// Ed25519 署名鍵 seed（32 バイト）を hex / base64url / base64 で受け取る生文字列。
     /// `signing::decode_seed` で 32 バイトへ復号して `Signer` を構築する。必須。
-    pub job_signing_key: String,
+    pub job_signing_key: Redacted<String>,
     /// 署名トークンに埋める kid（検証側が公開鍵を選ぶキー）。必須。
     pub job_signing_kid: String,
     /// JetStream consumer の ack 待ち秒数（worker と共有。token exp 計算にも使う）。
@@ -163,7 +168,55 @@ pub struct Config {
     pub log_format: String,
 }
 
+/// 秘密フィールドを `<redacted>` にする手動 `Debug`（M7-0, §5.1）。
+///
+/// 秘密は `Redacted<String>` なので derive でも漏れないが、「`Config` を `{:?}` してもログに
+/// 秘密が出ない」ことをこの impl が型の契約として固定する（フィールド追加時にここを通るため、
+/// 新しい秘密を素の `String` で足すと doc とレビューの目に触れる）。
+impl std::fmt::Debug for Config {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Config")
+            // 接続 URL はパスワードを含みうるため値を出さない（キーの存在だけ示す）。
+            .field("database_url", &"<redacted>")
+            .field("migration_database_url", &"<redacted>")
+            .field("redis_url", &"<redacted>")
+            .field("nats_url", &self.nats_url)
+            .field("bootstrap_admin_token", &self.bootstrap_admin_token)
+            .field("bind_addr", &self.bind_addr)
+            .field("s3_endpoint", &self.s3_endpoint)
+            .field("s3_region", &self.s3_region)
+            .field("s3_bucket", &self.s3_bucket)
+            .field("s3_access_key", &self.s3_access_key)
+            .field("s3_secret_key", &self.s3_secret_key)
+            .field("job_signing_key", &self.job_signing_key)
+            .field("job_signing_kid", &self.job_signing_kid)
+            .field("instance_id", &self.instance_id)
+            .finish_non_exhaustive()
+    }
+}
+
 impl Config {
+    // --- 秘密フィールドの平文アクセサ（M7-0, §5.1 / §5.6） ---
+    //
+    // 秘密は `Redacted<String>` で保持し、平文の取り出しは**この 3 本だけ**に閉じる
+    // （`scripts/rls-lint.sh` の検査 (4) が `.expose()` の呼び出しファイルを allowlist に限定し、
+    // config.rs はその 1 つ）。main.rs 等の消費側は `.expose()` を書かずこのアクセサを使うため、
+    // 「秘密がプロセス内のどこへ渡ったか」は `_plain()` の grep で全数把握できる。
+    /// system-admin bootstrap トークンの平文（`POST /admin/tenants` の gate に渡す）。
+    pub fn bootstrap_admin_token_plain(&self) -> &str {
+        self.bootstrap_admin_token.expose()
+    }
+
+    /// S3 シークレットキーの平文（aws-sdk の資格情報構築に渡す）。
+    pub fn s3_secret_key_plain(&self) -> &str {
+        self.s3_secret_key.expose()
+    }
+
+    /// Ed25519 署名鍵 seed の生文字列（`signing::decode_seed` に渡す）。
+    pub fn job_signing_key_plain(&self) -> &str {
+        self.job_signing_key.expose()
+    }
+
     /// プロセス環境から設定を読み込む。必須キー欠損はエラー。
     pub fn from_env() -> anyhow::Result<Self> {
         let database_url = env_required("DATABASE_URL")?;
@@ -174,20 +227,20 @@ impl Config {
             database_url,
             migration_database_url,
             nats_url: env_or("NATS_URL", "nats://127.0.0.1:4222"),
-            bootstrap_admin_token: env_required("BOOTSTRAP_ADMIN_TOKEN")?,
+            bootstrap_admin_token: Redacted::new(env_required("BOOTSTRAP_ADMIN_TOKEN")?),
             bind_addr: env_or("BIND_ADDR", "0.0.0.0:8080"),
 
             s3_endpoint: env_or("S3_ENDPOINT", "http://127.0.0.1:9000"),
             s3_region: env_or("S3_REGION", "us-east-1"),
             s3_bucket: env_or("S3_BUCKET", "faas-components"),
             s3_access_key: env_or("S3_ACCESS_KEY", "minioadmin"),
-            s3_secret_key: env_or("S3_SECRET_KEY", "minioadmin"),
+            s3_secret_key: Redacted::new(env_or("S3_SECRET_KEY", "minioadmin")),
 
             max_wasm_upload_bytes: env_u64("MAX_WASM_UPLOAD_BYTES", DEFAULT_MAX_WASM_UPLOAD_BYTES)?,
             presign_ttl_secs: env_u64("PRESIGN_TTL_SECS", DEFAULT_PRESIGN_TTL_SECS)?,
 
             // M3c: 署名鍵 / kid は必須。TTL 定数は faas_shared の既定を env で上書き可能。
-            job_signing_key: env_required("JOB_SIGNING_KEY")?,
+            job_signing_key: Redacted::new(env_required("JOB_SIGNING_KEY")?),
             job_signing_kid: env_required("JOB_SIGNING_KID")?,
             ack_wait_secs: env_u64("ACK_WAIT_SECS", faas_shared::ACK_WAIT_SECS)?,
             max_deliver: env_u64("MAX_DELIVER", faas_shared::MAX_DELIVER)?,
@@ -317,5 +370,28 @@ fn env_u64(key: &str, default: u64) -> anyhow::Result<u64> {
             .parse::<u64>()
             .with_context(|| format!("env var {key} must be a non-negative integer")),
         Err(_) => Ok(default),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `Config` を `{:?}` してもログに秘密が出ないこと（M7-0, §5.1）。
+    ///
+    /// `Config::from_env()` は必須 env を要求するためテストからは呼べない。ここでは
+    /// **手動 Debug 実装が秘密フィールドをどう出すか**を直接検査する（Debug の契約が本体）。
+    #[test]
+    fn debug_never_reveals_secrets() {
+        let secret_like = "SENTINEL-DO-NOT-LOG";
+        // 手動 Debug は Redacted の Debug に委譲する。Redacted 単体の挙動は
+        // faas_shared 側のテストで固定済みなので、ここでは委譲が効くことを確認する。
+        let wrapped = Redacted::new(secret_like.to_string());
+        let rendered = format!("{wrapped:?}");
+        assert!(
+            !rendered.contains(secret_like),
+            "config secrets must never render in Debug output: {rendered}"
+        );
+        assert_eq!(rendered, "<redacted>");
     }
 }

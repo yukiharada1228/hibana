@@ -104,7 +104,7 @@ async fn main() -> anyhow::Result<()> {
         &config.s3_region,
         &config.s3_bucket,
         &config.s3_access_key,
-        &config.s3_secret_key,
+        config.s3_secret_key_plain(),
     );
     tracing::info!(endpoint = %config.s3_endpoint, bucket = %config.s3_bucket, "configured object storage");
 
@@ -115,7 +115,7 @@ async fn main() -> anyhow::Result<()> {
     // --- ジョブ署名鍵 (M3c, §3.3) ---
     // Ed25519 seed を env から復号し、Signer（kid -> 公開鍵マップ付き）を構築する。
     // 鍵は control-plane だけが持つ。worker は鍵なし（不透明トークンを echo するのみ）。
-    let seed = signing::decode_seed(&config.job_signing_key)?;
+    let seed = signing::decode_seed(config.job_signing_key_plain())?;
     let signer = std::sync::Arc::new(signing::Signer::from_seed(
         seed,
         config.job_signing_kid.clone(),
@@ -180,7 +180,7 @@ async fn main() -> anyhow::Result<()> {
         config.max_wasm_upload_bytes,
         config.presign_ttl_secs,
         config.upload_presign_ttl_secs,
-        config.bootstrap_admin_token.clone(),
+        config.bootstrap_admin_token_plain().to_string(),
         dummy_password_hash,
         signer,
         token_exp_offset_secs,

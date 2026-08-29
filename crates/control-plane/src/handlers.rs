@@ -1791,7 +1791,11 @@ pub struct CreateTokenRequest {
 #[derive(Debug, Serialize)]
 pub struct CreateTokenResponse {
     /// 平文 opaque secret。**一度だけ**返す。
-    pub token: String,
+    ///
+    /// M7-0 (§5.1): `Redacted` は `Serialize` を実装しないので、平文で返すには `expose_once` を
+    /// 明示する必要がある（この属性の grep が「意図的に秘密を返す API」の全一覧になる）。
+    #[serde(serialize_with = "faas_shared::expose_once")]
+    pub token: faas_shared::Redacted<String>,
     pub token_id: String,
     pub scopes: Vec<Scope>,
     pub expires_at: String,
@@ -1871,7 +1875,7 @@ pub async fn create_token(
     Ok((
         StatusCode::CREATED,
         Json(CreateTokenResponse {
-            token: secret,
+            token: faas_shared::Redacted::new(secret),
             token_id,
             scopes,
             expires_at: expires_at.to_rfc3339(),
