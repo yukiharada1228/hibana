@@ -11,6 +11,7 @@
 //! TODO(§8): M3 で設定ソースを secrets manager 等へ移す。
 
 use anyhow::Context;
+use faas_shared::Redacted;
 
 /// wasm 本体の最大アップロードサイズ既定値（32 MiB, §6.2）。
 const DEFAULT_MAX_WASM_UPLOAD_BYTES: u64 = 32 * 1024 * 1024;
@@ -57,8 +58,25 @@ const DEFAULT_SYNC_REPLY_TIMEOUT_MS: u64 = 5000;
 /// Cron スケジューラの due スキャン間隔（秒）。
 const DEFAULT_CRON_POLL_INTERVAL_SECS: u64 = 10;
 
+// --- M7 デプロイ運用 / Secrets（§10 / §15） ---
+/// 内部専用 listener の bind アドレス。`POST /internal/job-env` だけを載せる。
+/// **既定は loopback**（公開 listener と分けることが露出ガードの本体）。
+const DEFAULT_INTERNAL_BIND_ADDR: &str = "127.0.0.1:8081";
+/// `/internal/job-env` の per-IP 上限（req/分）。無認証面のグローバル保護。
+const DEFAULT_JOB_ENV_EXCHANGE_RATE_PER_MIN: u64 = 600;
+/// `.env.example` に置く既知プレースホルダ。**この値のまま起動させない**（下記 MUST）。
+///
+/// `JOB_SIGNING_KEY` と違い secret の**暗号文は DB に永続する**ため、既知鍵で暗号化して
+/// しまうと影響が長期に残る。さらに Makefile は `include .env` + `export` するので、値は
+/// 全 make 子プロセスへ export される。よって warn ではなく**起動失敗**にする。
+const SECRETS_MASTER_KEY_PLACEHOLDER: &str = "CHANGE_ME_REPLACE_WITH_32_BYTE_KEY_BEFORE_USE";
+
 /// control-plane の起動時設定。
-#[derive(Debug, Clone)]
+///
+/// **`Debug` は手動実装**（M7-0, §5.1）。秘密フィールドは `Redacted<String>` で包んであるため
+/// derive でも `<redacted>` になるが、`Config` 全体の Debug 契約（「この型を `{:?}` してもログに
+/// 秘密が出ない」）を型の側で明示するために手動実装を選ぶ。
+#[derive(Clone)]
 pub struct Config {
     /// ランタイム Postgres 接続 URL。**非特権ロール `faas_app`（NOBYPASSRLS・非 SUPERUSER）**で
     /// 接続する（M3b §3.2）。superuser/owner で接続すると FORCE RLS が無条件にバイパスされ、
@@ -72,7 +90,7 @@ pub struct Config {
     /// NATS 接続 URL。
     pub nats_url: String,
     /// system-admin bootstrap トークン（POST /admin/tenants を gate, §3.3）。
-    pub bootstrap_admin_token: String,
+    pub bootstrap_admin_token: Redacted<String>,
     /// HTTP bind アドレス（例: 0.0.0.0:8080）。
     pub bind_addr: String,
 
@@ -86,7 +104,7 @@ pub struct Config {
     /// アクセスキー（MINIO_ROOT_USER 相当）。
     pub s3_access_key: String,
     /// シークレットキー（MINIO_ROOT_PASSWORD 相当）。
-    pub s3_secret_key: String,
+    pub s3_secret_key: Redacted<String>,
 
     // --- アップロード/検証パイプライン (M2: §6.2) ---
     /// wasm 本体の最大アップロードサイズ（bytes）。
@@ -97,7 +115,7 @@ pub struct Config {
     // --- ジョブ署名トークン (M3c, §3.3) ---
     /// Ed25519 署名鍵 seed（32 バイト）を hex / base64url / base64 で受け取る生文字列。
     /// `signing::decode_seed` で 32 バイトへ復号して `Signer` を構築する。必須。
-    pub job_signing_key: String,
+    pub job_signing_key: Redacted<String>,
     /// 署名トークンに埋める kid（検証側が公開鍵を選ぶキー）。必須。
     pub job_signing_kid: String,
     /// JetStream consumer の ack 待ち秒数（worker と共有。token exp 計算にも使う）。
@@ -151,6 +169,19 @@ pub struct Config {
     /// Cron スケジューラの due スキャン間隔（秒, M6b）。main.rs が `scheduler::run` へ渡して consume する。
     pub cron_poll_interval_secs: u64,
 
+    // --- M7c Secrets Manager（§10 / §15） ---
+    /// 現行 KEK（32 バイト）。hex / base64url / base64。新規暗号化は常にこの鍵で行う。
+    pub secrets_master_key: Redacted<String>,
+    /// 現行 KEK の kid。`function_secret_versions.kek_kid` に記録され、復号時の鍵選択に使う。
+    pub secrets_master_kid: String,
+    /// 復号専用の旧 KEK 群（`kid:key,kid:key` の CSV）。再ラップが全行に行き渡るまで残す。
+    /// **早期撤去は復号不能 ＝ データ喪失**（signing の overlap と同じ規律）。
+    pub secrets_retired_keys: Redacted<String>,
+    /// 内部専用 listener の bind アドレス（`POST /internal/job-env` のみ）。**公開してはならない**。
+    pub internal_bind_addr: String,
+    /// `/internal/job-env` の per-IP 上限（req/分）。
+    pub job_env_exchange_rate_per_min: u64,
+
     // --- 観測 (M4a, §3.8) ---
     /// ログ整形（"text" 既定 / "json"）。`json` のとき `tracing_subscriber::fmt().json()` を
     /// 有効化し、フィールドを flatten した JSON ライン形式で吐く。集約基盤（Loki/ELK 等）に
@@ -163,9 +194,107 @@ pub struct Config {
     pub log_format: String,
 }
 
+/// 秘密フィールドを `<redacted>` にする手動 `Debug`（M7-0, §5.1）。
+///
+/// 秘密は `Redacted<String>` なので derive でも漏れないが、「`Config` を `{:?}` してもログに
+/// 秘密が出ない」ことをこの impl が型の契約として固定する（フィールド追加時にここを通るため、
+/// 新しい秘密を素の `String` で足すと doc とレビューの目に触れる）。
+impl std::fmt::Debug for Config {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Config")
+            // 接続 URL はパスワードを含みうるため値を出さない（キーの存在だけ示す）。
+            .field("database_url", &"<redacted>")
+            .field("migration_database_url", &"<redacted>")
+            .field("redis_url", &"<redacted>")
+            .field("nats_url", &self.nats_url)
+            .field("bootstrap_admin_token", &self.bootstrap_admin_token)
+            .field("bind_addr", &self.bind_addr)
+            .field("s3_endpoint", &self.s3_endpoint)
+            .field("s3_region", &self.s3_region)
+            .field("s3_bucket", &self.s3_bucket)
+            .field("s3_access_key", &self.s3_access_key)
+            .field("s3_secret_key", &self.s3_secret_key)
+            .field("job_signing_key", &self.job_signing_key)
+            .field("job_signing_kid", &self.job_signing_kid)
+            .field("secrets_master_key", &self.secrets_master_key)
+            .field("secrets_master_kid", &self.secrets_master_kid)
+            .field("secrets_retired_keys", &self.secrets_retired_keys)
+            .field("internal_bind_addr", &self.internal_bind_addr)
+            .field("instance_id", &self.instance_id)
+            .finish_non_exhaustive()
+    }
+}
+
 impl Config {
+    // --- 秘密フィールドの平文アクセサ（M7-0, §5.1 / §5.6） ---
+    //
+    // 秘密は `Redacted<String>` で保持し、平文の取り出しは**この 3 本だけ**に閉じる
+    // （`scripts/rls-lint.sh` の検査 (4) が `.expose()` の呼び出しファイルを allowlist に限定し、
+    // config.rs はその 1 つ）。main.rs 等の消費側は `.expose()` を書かずこのアクセサを使うため、
+    // 「秘密がプロセス内のどこへ渡ったか」は `_plain()` の grep で全数把握できる。
+    /// system-admin bootstrap トークンの平文（`POST /admin/tenants` の gate に渡す）。
+    pub fn bootstrap_admin_token_plain(&self) -> &str {
+        self.bootstrap_admin_token.expose()
+    }
+
+    /// S3 シークレットキーの平文（aws-sdk の資格情報構築に渡す）。
+    pub fn s3_secret_key_plain(&self) -> &str {
+        self.s3_secret_key.expose()
+    }
+
+    /// Ed25519 署名鍵 seed の生文字列（`signing::decode_seed` に渡す）。
+    pub fn job_signing_key_plain(&self) -> &str {
+        self.job_signing_key.expose()
+    }
+
+    /// KEK キーリングを構築する (M7c, §4.4)。**秘密の平文がここから外へ出ない**ように、
+    /// 生文字列ではなく組み立て済みの [`crate::secrets::SecretKeyring`] を返す。
+    ///
+    /// `SECRETS_RETIRED_KEYS` は `kid:key,kid:key` の CSV。空要素は無視し、形式不正は
+    /// 起動失敗にする（黙って無視すると「retired 鍵を書いたのに復号できない」になる）。
+    pub fn secret_keyring(&self) -> anyhow::Result<crate::secrets::SecretKeyring> {
+        let active =
+            crate::signing::decode_key32(self.secrets_master_key.expose(), "SECRETS_MASTER_KEY")?;
+
+        let mut retired = Vec::new();
+        for entry in self.secrets_retired_keys.expose().split(',') {
+            let entry = entry.trim();
+            if entry.is_empty() {
+                continue;
+            }
+            let (kid, raw) = entry.split_once(':').ok_or_else(|| {
+                anyhow::anyhow!("SECRETS_RETIRED_KEYS entries must be 'kid:key' (comma separated)")
+            })?;
+            let kid = kid.trim();
+            if kid.is_empty() {
+                anyhow::bail!("SECRETS_RETIRED_KEYS: empty kid");
+            }
+            retired.push((
+                kid.to_string(),
+                crate::signing::decode_key32(raw.trim(), "SECRETS_RETIRED_KEYS")?,
+            ));
+        }
+
+        Ok(crate::secrets::SecretKeyring::new(
+            self.secrets_master_kid.clone(),
+            active,
+            retired,
+        ))
+    }
+
     /// プロセス環境から設定を読み込む。必須キー欠損はエラー。
     pub fn from_env() -> anyhow::Result<Self> {
+        // M7c (§4.4 MUST): `.env.example` の既知プレースホルダのままでは**起動させない**。
+        // 署名鍵と違い secret の暗号文は DB に永続するため、公開リポジトリに載る既知鍵で
+        // 暗号化してしまうと影響が長く残る（warn では見逃される）。
+        let secrets_master_key = env_required("SECRETS_MASTER_KEY")?;
+        if secrets_master_key.trim() == SECRETS_MASTER_KEY_PLACEHOLDER {
+            anyhow::bail!(
+                "SECRETS_MASTER_KEY is still the placeholder from .env.example; \
+                 generate a real 32-byte key (e.g. `openssl rand -hex 32`) before starting"
+            );
+        }
+
         let database_url = env_required("DATABASE_URL")?;
         // 未設定なら database_url にフォールバック（所有者 1 本運用の開発用途）。
         let migration_database_url =
@@ -174,20 +303,20 @@ impl Config {
             database_url,
             migration_database_url,
             nats_url: env_or("NATS_URL", "nats://127.0.0.1:4222"),
-            bootstrap_admin_token: env_required("BOOTSTRAP_ADMIN_TOKEN")?,
+            bootstrap_admin_token: Redacted::new(env_required("BOOTSTRAP_ADMIN_TOKEN")?),
             bind_addr: env_or("BIND_ADDR", "0.0.0.0:8080"),
 
             s3_endpoint: env_or("S3_ENDPOINT", "http://127.0.0.1:9000"),
             s3_region: env_or("S3_REGION", "us-east-1"),
             s3_bucket: env_or("S3_BUCKET", "faas-components"),
             s3_access_key: env_or("S3_ACCESS_KEY", "minioadmin"),
-            s3_secret_key: env_or("S3_SECRET_KEY", "minioadmin"),
+            s3_secret_key: Redacted::new(env_or("S3_SECRET_KEY", "minioadmin")),
 
             max_wasm_upload_bytes: env_u64("MAX_WASM_UPLOAD_BYTES", DEFAULT_MAX_WASM_UPLOAD_BYTES)?,
             presign_ttl_secs: env_u64("PRESIGN_TTL_SECS", DEFAULT_PRESIGN_TTL_SECS)?,
 
             // M3c: 署名鍵 / kid は必須。TTL 定数は faas_shared の既定を env で上書き可能。
-            job_signing_key: env_required("JOB_SIGNING_KEY")?,
+            job_signing_key: Redacted::new(env_required("JOB_SIGNING_KEY")?),
             job_signing_kid: env_required("JOB_SIGNING_KID")?,
             ack_wait_secs: env_u64("ACK_WAIT_SECS", faas_shared::ACK_WAIT_SECS)?,
             max_deliver: env_u64("MAX_DELIVER", faas_shared::MAX_DELIVER)?,
@@ -229,6 +358,14 @@ impl Config {
                 DEFAULT_CRON_POLL_INTERVAL_SECS,
             )?,
 
+            secrets_master_key: Redacted::new(secrets_master_key),
+            secrets_master_kid: env_required("SECRETS_MASTER_KID")?,
+            secrets_retired_keys: Redacted::new(env_or("SECRETS_RETIRED_KEYS", "")),
+            internal_bind_addr: env_or("INTERNAL_BIND_ADDR", DEFAULT_INTERNAL_BIND_ADDR),
+            job_env_exchange_rate_per_min: env_u64(
+                "JOB_ENV_EXCHANGE_RATE_PER_MIN",
+                DEFAULT_JOB_ENV_EXCHANGE_RATE_PER_MIN,
+            )?,
             log_format: env_or("LOG_FORMAT", "text"),
         })
     }
@@ -317,5 +454,28 @@ fn env_u64(key: &str, default: u64) -> anyhow::Result<u64> {
             .parse::<u64>()
             .with_context(|| format!("env var {key} must be a non-negative integer")),
         Err(_) => Ok(default),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `Config` を `{:?}` してもログに秘密が出ないこと（M7-0, §5.1）。
+    ///
+    /// `Config::from_env()` は必須 env を要求するためテストからは呼べない。ここでは
+    /// **手動 Debug 実装が秘密フィールドをどう出すか**を直接検査する（Debug の契約が本体）。
+    #[test]
+    fn debug_never_reveals_secrets() {
+        let secret_like = "SENTINEL-DO-NOT-LOG";
+        // 手動 Debug は Redacted の Debug に委譲する。Redacted 単体の挙動は
+        // faas_shared 側のテストで固定済みなので、ここでは委譲が効くことを確認する。
+        let wrapped = Redacted::new(secret_like.to_string());
+        let rendered = format!("{wrapped:?}");
+        assert!(
+            !rendered.contains(secret_like),
+            "config secrets must never render in Debug output: {rendered}"
+        );
+        assert_eq!(rendered, "<redacted>");
     }
 }

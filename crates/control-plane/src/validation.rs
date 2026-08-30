@@ -246,6 +246,116 @@ fn hex_lower(bytes: &[u8]) -> String {
     s
 }
 
+// ---------------------------------------------------------------------------
+// M7b (§4.4 / §15): capabilities JSONB の 2 キー構造
+// ---------------------------------------------------------------------------
+
+/// `component_versions.capabilities` の論理形（M7b）。
+///
+/// 保存形は `{"imports": [...], "env": [...]}`。M6 までは **承認済み import 名の素の配列**
+/// だったため、読み取り時に吸収する（backfill しない ＝ 0008 の additive 精神と同じ）:
+///  - 配列 → `imports` とみなし `env` は空。
+///  - オブジェクト → 各キーを読む（欠損は空）。
+///  - それ以外 / パース不能 → **deny-all**（両方空）。
+///
+/// `env` は「この version の wasm へ注入してよい env 名の許可リスト」であり、**admin 承認**の
+/// 対象である（§4.4: 付与は admin スコープを要する MUST）。`upload_version`（Deploy スコープ）は
+/// これを書けない —— 書けると deploy トークンが `env: ["PROD_API_KEY"]` を宣言した version を上げ、
+/// `wasi:cli/environment`（baseline 承認済み）で読んだ値を invoke 出力へ返すだけで admin 専用の
+/// secret を平文で取得できてしまう（`wasi:sockets/` が非承認でも**出力経路で足りる**）＝権限昇格。
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct CapabilitySet {
+    /// strict matching を通過した承認済み import 名。
+    pub imports: Vec<String>,
+    /// 注入を許可された env 名（admin 承認）。空 = deny-all。
+    pub env: BTreeSet<String>,
+}
+
+impl CapabilitySet {
+    /// 保存形（JSONB）へ変換する。
+    pub fn to_json(&self) -> serde_json::Value {
+        serde_json::json!({
+            "imports": self.imports,
+            "env": self.env.iter().collect::<Vec<_>>(),
+        })
+    }
+}
+
+/// `capabilities` JSONB を読む（後方互換つき・**壊れた値は deny-all**）。純関数。
+pub fn parse_capabilities(value: &serde_json::Value) -> CapabilitySet {
+    fn string_list(v: Option<&serde_json::Value>) -> Vec<String> {
+        v.and_then(|v| v.as_array())
+            .map(|a| {
+                a.iter()
+                    .filter_map(|x| x.as_str().map(str::to_string))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    match value {
+        // 旧形式（M6 まで）: 承認済み import 名の素の配列。env は空 = deny-all。
+        serde_json::Value::Array(_) => CapabilitySet {
+            imports: string_list(Some(value)),
+            env: BTreeSet::new(),
+        },
+        serde_json::Value::Object(map) => CapabilitySet {
+            imports: string_list(map.get("imports")),
+            // 許可リストは env 名として妥当なものだけを採る（DB が壊れていても不正名は入れない）。
+            env: string_list(map.get("env"))
+                .into_iter()
+                .filter(|k| faas_shared::is_valid_env_key(k))
+                .collect(),
+        },
+        // null / 数値 / 文字列 / パース不能 → deny-all（fail-closed）。
+        _ => CapabilitySet::default(),
+    }
+}
+
+/// `upload_version` の multipart `capabilities` に `env` キーが含まれていないことを検査する。
+///
+/// `Err` は 400 に写像する。**この関数が「deploy スコープで env 許可リストを書けない」ことの
+/// 実装上の唯一の門番**であり、`validation.rs` のテストで「upload 経路で `env` が非空になる
+/// 入力が存在しない」ことを固定する。
+pub fn reject_env_in_declared_capabilities(declared: &serde_json::Value) -> Result<(), FaasError> {
+    let has_env = match declared {
+        serde_json::Value::Object(map) => map.contains_key("env"),
+        _ => false,
+    };
+    if has_env {
+        return Err(FaasError::InvalidRequest(
+            "capabilities.env is admin-approved; use \
+             PUT /components/{component_id}/versions/{version}/capabilities"
+                .into(),
+        ));
+    }
+    Ok(())
+}
+
+/// admin が承認する env 名リストを検証する（`PUT .../capabilities`）。純関数。
+///
+/// 重複は集合化で吸収する。名前の形式・件数の上限は `faas_shared` の定数を使う
+/// （CP と worker で同じ定数を参照する二重防御）。
+pub fn validate_env_allowlist(names: &[String]) -> Result<BTreeSet<String>, FaasError> {
+    if names.len() > faas_shared::MAX_FUNCTION_ENV_KEYS {
+        return Err(FaasError::InvalidRequest(format!(
+            "at most {} env names may be approved per version",
+            faas_shared::MAX_FUNCTION_ENV_KEYS
+        )));
+    }
+    let mut out = BTreeSet::new();
+    for name in names {
+        if !faas_shared::is_valid_env_key(name) {
+            return Err(FaasError::InvalidRequest(format!(
+                "invalid env name '{name}': must match ^[A-Z_][A-Z0-9_]{{0,{}}}$",
+                faas_shared::MAX_ENV_KEY_LEN - 1
+            )));
+        }
+        out.insert(name.clone());
+    }
+    Ok(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -393,5 +503,115 @@ mod tests {
             match_capabilities(&imports, &approved).expect("type-only must not be rejected");
         // 型のみは承認結果に含めない。capability import のみが解決される。
         assert_eq!(resolved, vec!["faas:component/types@1.0.0".to_string()]);
+    }
+
+    // ---- M7b: capabilities の 2 キー構造（§4.4 / §15） ----------------------
+
+    /// 旧形式（承認済み import 名の素の配列）は `imports` として読め、`env` は空 = deny-all。
+    /// backfill せず読み取り時に吸収する（0008 の additive 精神と同じ）。
+    #[test]
+    fn capabilities_legacy_array_is_read_as_imports_with_no_env() {
+        let legacy = serde_json::json!(["wasi:cli/environment@0.2.0", "wasi:io/streams@0.2.6"]);
+        let caps = parse_capabilities(&legacy);
+        assert_eq!(caps.imports.len(), 2);
+        assert!(
+            caps.env.is_empty(),
+            "legacy rows must never grant env injection"
+        );
+    }
+
+    /// 新形式はそのまま読める。
+    #[test]
+    fn capabilities_object_form_roundtrips() {
+        let v = serde_json::json!({"imports": ["wasi:cli/environment@0.2.0"], "env": ["API_KEY"]});
+        let caps = parse_capabilities(&v);
+        assert_eq!(caps.imports, vec!["wasi:cli/environment@0.2.0".to_string()]);
+        assert!(caps.env.contains("API_KEY"));
+        // to_json → parse で往復する。
+        assert_eq!(parse_capabilities(&caps.to_json()), caps);
+    }
+
+    /// 壊れた値は **deny-all** に倒れる（fail-closed）。
+    #[test]
+    fn capabilities_broken_value_is_deny_all() {
+        for v in [
+            serde_json::Value::Null,
+            serde_json::json!(42),
+            serde_json::json!("nope"),
+            serde_json::json!({"imports": "not-a-list", "env": 7}),
+        ] {
+            let caps = parse_capabilities(&v);
+            assert!(caps.imports.is_empty(), "broken value must deny imports");
+            assert!(caps.env.is_empty(), "broken value must deny env");
+        }
+    }
+
+    /// DB 側が壊れて不正な env 名が入っていても、読み取りで落とす。
+    #[test]
+    fn capabilities_drops_malformed_env_names() {
+        let v = serde_json::json!({"imports": [], "env": ["OK_NAME", "bad-name", "", "9LEAD"]});
+        let caps = parse_capabilities(&v);
+        assert_eq!(caps.env.len(), 1);
+        assert!(caps.env.contains("OK_NAME"));
+    }
+
+    /// **権限昇格の回帰ガード**: upload 経路（Deploy スコープ）で `capabilities.env` が
+    /// 非空になる入力は存在しない。`env` キーを含む宣言は 400 で弾かれ、含まない宣言からは
+    /// 空の許可リストしか生まれない。
+    #[test]
+    fn upload_path_can_never_produce_a_non_empty_env_allowlist() {
+        // (a) env を含む宣言は拒否される。
+        for declared in [
+            serde_json::json!({"env": ["PROD_API_KEY"]}),
+            serde_json::json!({"imports": ["wasi:cli/environment@0.2.0"], "env": []}),
+        ] {
+            assert!(
+                reject_env_in_declared_capabilities(&declared).is_err(),
+                "declaring capabilities.env on the deploy path must be refused: {declared}"
+            );
+        }
+        // (b) env を含まない宣言は通り、保存形の env は必ず空になる。
+        for declared in [
+            serde_json::json!({}),
+            serde_json::json!({"imports": ["wasi:cli/environment@0.2.0"]}),
+            serde_json::json!(["wasi:cli/environment@0.2.0"]),
+            serde_json::Value::Null,
+        ] {
+            assert!(reject_env_in_declared_capabilities(&declared).is_ok());
+            // upload_version が保存するのは approved_imports のみ（env は常に空）。
+            let stored = CapabilitySet {
+                imports: vec!["wasi:cli/environment@0.2.0".to_string()],
+                env: BTreeSet::new(),
+            };
+            assert!(
+                parse_capabilities(&stored.to_json()).env.is_empty(),
+                "the deploy path must always persist an empty env allowlist"
+            );
+        }
+    }
+
+    /// admin 承認リストのバリデーション（形式・件数の境界）。
+    #[test]
+    fn env_allowlist_validation() {
+        let ok = validate_env_allowlist(&["API_KEY".into(), "LOG_LEVEL".into(), "API_KEY".into()])
+            .expect("valid names");
+        assert_eq!(ok.len(), 2, "duplicates collapse");
+
+        for bad in ["lower", "with-dash", "1LEADING", "HAS=EQ", "", "A\u{0}B"] {
+            assert!(
+                validate_env_allowlist(&[bad.to_string()]).is_err(),
+                "must reject {bad:?}"
+            );
+        }
+        // 境界: 64 文字は可、65 文字は不可。
+        let max = "A".repeat(faas_shared::MAX_ENV_KEY_LEN);
+        assert!(validate_env_allowlist(&[max]).is_ok());
+        let over = "A".repeat(faas_shared::MAX_ENV_KEY_LEN + 1);
+        assert!(validate_env_allowlist(&[over]).is_err());
+        // 件数上限。
+        let many: Vec<String> = (0..=faas_shared::MAX_FUNCTION_ENV_KEYS)
+            .map(|i| format!("K{i}"))
+            .collect();
+        assert!(validate_env_allowlist(&many).is_err());
     }
 }

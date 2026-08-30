@@ -84,12 +84,17 @@ BASE_URL ?= http://localhost:$(lastword $(subst :, ,$(BIND_ADDR)))
 # deploy するバージョン（semver）。
 VERSION ?= 0.1.0
 
+# M4 chaos_d 用 slow component のリソース上限。ゲストが tight loop で回り続けるため、
+# epoch interruption（max_wall_time）と tokio timeout（max_execution_time）の両方が
+# 短時間で発火する値にする（既定の 1s / 5s だとテストの待ち窓に収まらないことがある）。
+SLOW_LIMITS ?= {"max_wall_time_ms":1000,"max_execution_time_ms":2000}
+
 # echo component の wasm32-wasip2 ビルド成果物パス（アップロード対象のローカル成果物）。
 ECHO_WASM := target/wasm32-wasip2/release/echo.wasm
 
 .DEFAULT_GOAL := help
 
-.PHONY: help setup up down migrate minio-bucket build-component run-cp run-worker bootstrap login deploy invoke logs psql clean rls-lint
+.PHONY: deploy-chaos-components component-id traffic canary promote rollback approve-env set-secret secrets rekey help setup up down migrate minio-bucket build-component run-cp run-worker bootstrap login deploy invoke logs psql clean rls-lint
 
 help: ## 利用可能なターゲット一覧を表示
 	@echo "WASM FaaS Platform — M2 Makefile"
@@ -244,6 +249,107 @@ invoke: ## echo を end-to-end で実行（deploy → POST /invoke → GET /exec
 		echo "    [$$i] status=$$S"; \
 		case "$$S" in succeeded|failed|timeout) echo "$$R"; break;; esac; \
 	done
+
+# --- M7: デプロイ運用（canary / rollback / secret）------------------------
+# canary 運用と secret 管理には **admin スコープ**のトークンが要る（細粒度スコープは M7 非スコープ）。
+# COMPONENT_ID は `make component-id` で解決するか、明示的に渡す。
+
+component-id: ## echo の component_id を標準出力に出す（CID=$$(make -s component-id)）
+	@set -e; \
+	TOKEN=$$($(MAKE) -s login); \
+	curl -sS "$(BASE_URL)/components" -H "Authorization: Bearer $$TOKEN" \
+	  | sed -n 's/.*"component_id"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -1
+
+traffic: ## M7a: canary 配分を表示（GET /components/{id}/traffic）。CID=... で対象指定
+	@set -e; \
+	TOKEN=$$($(MAKE) -s login); \
+	CID=$${CID:-$$($(MAKE) -s component-id)}; \
+	curl -sS "$(BASE_URL)/components/$$CID/traffic" -H "Authorization: Bearer $$TOKEN"; echo
+
+canary: ## M7a: canary を設定（CANARY_VERSION=0.2.0 WEIGHT=10 [CID=...]）
+	@set -e; \
+	test -n "$(CANARY_VERSION)" || { echo "ERROR: CANARY_VERSION=... を指定してください（例: make canary CANARY_VERSION=0.2.0 WEIGHT=10）"; exit 1; }; \
+	TOKEN=$$($(MAKE) -s login); \
+	CID=$${CID:-$$($(MAKE) -s component-id)}; \
+	curl -sS -X PUT "$(BASE_URL)/components/$$CID/traffic" \
+	  -H "Authorization: Bearer $$TOKEN" -H "Content-Type: application/json" \
+	  -d "{\"canary_version\":\"$(CANARY_VERSION)\",\"weight\":$${WEIGHT:-10}}"; echo
+
+promote: ## M7a: canary を stable へ昇格（[CANARY_VERSION=0.2.0 で CAS] [CID=...]）
+	@set -e; \
+	TOKEN=$$($(MAKE) -s login); \
+	CID=$${CID:-$$($(MAKE) -s component-id)}; \
+	BODY=$${CANARY_VERSION:+{\"version\":\"$(CANARY_VERSION)\"}}; \
+	curl -sS -X POST "$(BASE_URL)/components/$$CID/promote" \
+	  -H "Authorization: Bearer $$TOKEN" -H "Content-Type: application/json" \
+	  -d "$${BODY:-{}}"; echo
+
+rollback: ## M7a: ワンクリック rollback（直前 stable へ戻し canary をクリア）[CID=...]
+	@set -e; \
+	TOKEN=$$($(MAKE) -s login); \
+	CID=$${CID:-$$($(MAKE) -s component-id)}; \
+	curl -sS -X POST "$(BASE_URL)/components/$$CID/rollback" \
+	  -H "Authorization: Bearer $$TOKEN" -H "Content-Type: application/json" -d '{}'; echo
+
+approve-env: ## M7b: 注入を許可する env 名を承認（ENV_NAMES=API_KEY,LOG_LEVEL VERSION=0.1.0 [CID=...]）
+	@set -e; \
+	test -n "$(ENV_NAMES)" || { echo "ERROR: ENV_NAMES=A,B を指定してください"; exit 1; }; \
+	TOKEN=$$($(MAKE) -s login); \
+	CID=$${CID:-$$($(MAKE) -s component-id)}; \
+	JSON=$$(printf '%s' "$(ENV_NAMES)" | awk -F, '{printf "["; for(i=1;i<=NF;i++){printf "%s\"%s\"", (i>1?",":""), $$i}; printf "]"}'); \
+	curl -sS -X PUT "$(BASE_URL)/components/$$CID/versions/$(VERSION)/capabilities" \
+	  -H "Authorization: Bearer $$TOKEN" -H "Content-Type: application/json" \
+	  -d "{\"env\":$$JSON}"; echo
+
+set-secret: ## M7c: secret を設定（NAME=API_KEY VALUE=... [CID=...]）。**値はエコーしない**
+	@set -e; \
+	test -n "$(NAME)" || { echo "ERROR: NAME=API_KEY を指定してください"; exit 1; }; \
+	test -n "$(VALUE)" || { echo "ERROR: VALUE=... を指定してください"; exit 1; }; \
+	TOKEN=$$($(MAKE) -s login); \
+	CID=$${CID:-$$($(MAKE) -s component-id)}; \
+	CODE=$$(curl -sS -o /dev/null -w '%{http_code}' -X PUT "$(BASE_URL)/components/$$CID/secrets/$(NAME)" \
+	  -H "Authorization: Bearer $$TOKEN" -H "Content-Type: application/json" \
+	  -d "{\"value\":\"$(VALUE)\"}"); \
+	echo "PUT /components/$$CID/secrets/$(NAME) -> $$CODE (値は出力しません)"
+
+secrets: ## M7c: secret のメタデータ一覧（値は返らない）[CID=...]
+	@set -e; \
+	TOKEN=$$($(MAKE) -s login); \
+	CID=$${CID:-$$($(MAKE) -s component-id)}; \
+	curl -sS "$(BASE_URL)/components/$$CID/secrets" -H "Authorization: Bearer $$TOKEN"; echo
+
+rekey: ## M7c: 当該テナントの secret を現行 KEK で再ラップ（**侵害復旧ではない**。README 露出ガード 4）
+	@set -e; \
+	TOKEN=$$($(MAKE) -s login); \
+	curl -sS -X POST "$(BASE_URL)/admin/secrets/rekey" -H "Authorization: Bearer $$TOKEN"; echo
+
+deploy-chaos-components: ## M4 chaos_c/d 用: always-trap / slow をビルドしてアップロード（冪等）
+	@set -e; \
+	echo "==> always-trap / slow を wasm32-wasip2 でビルド..."; \
+	cargo build -p always-trap -p slow --target wasm32-wasip2 --release; \
+	TOKEN=$$($(MAKE) -s login); \
+	resolve_cid() { \
+		curl -sS -o /dev/null -X POST "$(BASE_URL)/components" \
+			-H "Authorization: Bearer $$TOKEN" -H "Content-Type: application/json" \
+			-d "{\"name\":\"$$1\"}"; \
+		curl -sS "$(BASE_URL)/components" -H "Authorization: Bearer $$TOKEN" \
+			| tr '}' '\n' | grep "\"name\":\"$$1\"" \
+			| sed -n 's/.*"component_id"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -1; \
+	}; \
+	echo "==> always-trap"; \
+	TRAP_CID=$$(resolve_cid always-trap); \
+	test -n "$$TRAP_CID" || { echo "ERROR: always-trap の component_id を解決できませんでした"; exit 1; }; \
+	curl -sS -X POST "$(BASE_URL)/components/$$TRAP_CID/versions" \
+		-H "Authorization: Bearer $$TOKEN" -F "version=$(VERSION)" \
+		-F "wasm=@target/wasm32-wasip2/release/always_trap.wasm"; echo; \
+	echo "==> slow (resource_limits は SLOW_LIMITS 変数を参照)"; \
+	SLOW_CID=$$(resolve_cid slow); \
+	test -n "$$SLOW_CID" || { echo "ERROR: slow の component_id を解決できませんでした"; exit 1; }; \
+	curl -sS -X POST "$(BASE_URL)/components/$$SLOW_CID/versions" \
+		-H "Authorization: Bearer $$TOKEN" -F "version=$(VERSION)" \
+		-F 'resource_limits=$(SLOW_LIMITS)' \
+		-F "wasm=@target/wasm32-wasip2/release/slow.wasm"; echo; \
+	echo "OK: chaos 用 component をデプロイしました（CHAOS_ALWAYS_TRAP=always-trap CHAOS_SLOW=slow）。"
 
 rls-lint: ## M3b: テナント分離の静的ガード（SET app.tenant_id ハザード / 生 pool 渡し検出）
 	@./scripts/rls-lint.sh

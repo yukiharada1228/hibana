@@ -1,21 +1,21 @@
-# WASM FaaS Platform — M6 (Invoke 経路の拡充: 同期 Invoke + 外部イベント/Cron トリガー)
+# WASM FaaS Platform — M7 (デプロイ運用とコンフィグ: canary / rollback / per-function env / Secrets)
 
 [![CI](https://github.com/yukiharada1228/wasm-fass/actions/workflows/ci.yml/badge.svg?branch=develop)](https://github.com/yukiharada1228/wasm-fass/actions/workflows/ci.yml)
 
 WebAssembly Component をアップロードして invoke すると、Wasmtime Worker が実行して
-結果を返す FaaS プラットフォームです。本リポジトリの現状は **仕様書.md §15 の M6
-（Invoke 経路の拡充）範囲**であり、M1 の invoke 経路・M2 のアップロード/検証/デプロイ・M3 の
+結果を返す FaaS プラットフォームです。本リポジトリの現状は **仕様書.md §15 の M7
+（デプロイ運用とコンフィグ）範囲**であり、M1 の invoke 経路・M2 のアップロード/検証/デプロイ・M3 の
 マルチテナント / 認証 / RLS / 結果出所認証 / Capability 強制 / 共有 admission ストア /
 大容量 I/O 退避・M4 の Prometheus メトリクス + `/readyz`・構造化ログ・`.failed` (DLQ) subscriber と
 OS スレッドベースの epoch ticker による完全なリトライ/タイムアウト処理・全リソース制限・
 テナント別クォータ・M5 の per-execution 利用量計量（CPU fuel / wall time / peak memory /
 出力バイト）と冪等な期間集計（`usage_rollups`）/ 利用量参照 API（`GET /usage`）の上に、
-**非同期 invoke 一択から商用で要求される起動形態を揃える**経路拡充を追加します。具体的には
-(1) Core NATS の reply subject + correlation で結果まで待つ**同期 Invoke**（`POST /invoke?wait=1`、
-ステートレス×N を CP instance id で解く）、(2) Object Storage イベント・Component チェーン・
-スケジュール（Cron）からの**外部イベントトリガー**（トリガー登録モデル + 設定 API +
-イベントペイロード → Component input マッピング）を、いずれも **non-HTTP 起点でも冪等性・
-テナント分離・計量（M5）が破れない**ように既存の終端 finalize 経路へ合流させます。
+M6 の Invoke 経路拡充（同期 Invoke / Cron / 外部イベントトリガー）の上に、
+**本番運用に耐えるリリース安全性**を追加します。具体的には
+(1) **バージョン traffic splitting / canary**（10%→50%→100% の段階移行）と**ワンクリック rollback**、
+(2) **per-function 環境変数**（注入できる env 名そのものを admin 承認の対象にする）、
+(3) **Secrets Manager**（封筒暗号での保存・execution 基準の世代固定注入・KEK ローテーション）を、
+いずれも **既存の冪等性・テナント分離・計量（M5）を壊さず**に積み上げます。
 
 ```
                         ┌─ POST /components/{id}/versions (multipart) ─┐
@@ -63,6 +63,114 @@ Client ──HTTP──▶ control-plane ──put──▶ MinIO (Object Storag
 
 ---
 
+## M7 スコープ（と非スコープ）
+
+仕様書.md §15 M7 に準拠。**本番運用に耐えるリリース安全性**を与える。
+
+### 含む（M7a: バージョン traffic splitting / canary + 即時 rollback, §6.7）
+
+- canary の配分は **`components` への additive 4 列**（`canary_version_id` / `canary_weight` /
+  `previous_active_version_id` / `canary_updated_at`, `migrations/0009`）。**新規テーブルを作らない**
+  ことで「新表の GRANT / RLS ポリシー漏れ」という最大の退行リスクを構造的に消している
+  （`migration_tests::m7a_creates_no_new_table` が CI で固定）。
+- 版の選択は**乱数を使わない**。ルーティングキーの SHA-256 からバケット（0..=99）を決定的に導出し、
+  規則は `bucket < canary_weight` の**単一不等式のみ**（端点に分岐を書かない）。これにより
+  (a) 同一 `Idempotency-Key` の再送・cron の同一 slot 再発火・chain の再配送が常に同じ版へ落ち、
+  (b) 分配比率の正しさを DB 非依存の全列挙ユニットテストで**証明**できる。
+- sticky ルーティング用に `X-Faas-Routing-Key` ヘッダを受ける（未指定なら `Idempotency-Key` →
+  `execution_id` の順にフォールバックするので既存クライアントは無変更）。
+- 解決点は `enqueue::resolve_version_for_enqueue` の**1 箇所だけ**。HTTP invoke / Cron / event /
+  chain の全入口がここを通るので、**どの入口も canary をバイパスできない**。
+- stable ポインタを動かす 3 操作（`PUT /active-version` / `POST /promote` / `POST /rollback`）は
+  **単一 UPDATE で完結**し、**必ず canary をクリア**し、no-op 再 activate では `previous` を
+  CASE ガードで保全する（潰すと直後の rollback が「200 を返すのに何も戻らない」最悪の failure mode）。
+- `POST /components/{id}/versions` に `activate=false`（既定 true ＝ 従来挙動）。段階移行の出発点。
+- `executions.routing_reason` に決定理由を記録し、`GET /components/{id}/traffic` が直近 60 分の
+  version 別成績（成功/失敗/timeout・canary_routed・p50/p95）を返す。
+
+### 含む（M7b: per-function 環境変数, §4.4）
+
+- `function_configs`（`migrations/0010`）に**行 = 1 キー**で平文の環境変数を持つ。JSONB 1 列に
+  しないのは、`serde_json::Value` 経由で API 応答や `audit_logs.detail` へ丸ごと横流れする経路を
+  作らないため。
+- **注入面そのものを admin 承認の対象にする**。`component_versions.capabilities` を
+  `{"imports": [...], "env": [...]}` の 2 キー構造へ拡張し、`env`（注入を許可する名前のリスト）は
+  **admin 専用の `PUT /components/{id}/versions/{version}/capabilities`** でしか書けない。
+  `POST /versions`（Deploy スコープ）は常に空で保存し、`capabilities` に `env` が混ざっていたら 400。
+- 注入は worker が `set_tenant_guc` 済み tx で DB を直読み（HTTP 往復ゼロ）。
+  許可リストに無いキーは**値が DB に存在しても注入しない**。
+
+### 含む（M7c: Secrets Manager, §10）
+
+- **XChaCha20-Poly1305 の封筒暗号**（KEK → 行ごとの DEK → 値）。AAD に
+  `(tenant_id, component_id, name)` と `(tenant_id, secret_id, version, kek_kid)` を束縛し、
+  DB 書き込み権限を得た攻撃者による**行の貼り替え**と **version の巻き戻し**を遮断する。
+- 版台帳（`function_secret_versions`）は**追記専用**（`faas_app` に UPDATE/DELETE を GRANT しない）。
+  値の変更も KEK 再ラップも「新しい version 行の INSERT」で表現するので、追記専用のまま rotation が成立する。
+- API は **write-only**。`GET /secrets` はメタのみで、`value_len` / `kek_kid` は admin 専用の
+  `GET /secrets/keys` へ分離した（`value_len` は**平文長のオラクル**になるため）。
+- 注入は **worker が CP の内部専用エンドポイントから引き換える**。worker は KEK を持たない
+  （keyless by design, §3.3）ので、平文は「CP のメモリ → HTTP レスポンス → worker のメモリ →
+  `WasiCtx`」だけを通り、**NATS にも DB にも S3 にも永続化されない**。
+- 引き換えトークン（`env_token`）は `job_token` の**流用ではない**。`job_token` は
+  `ResultMessage` / `FailedMessage` にも echo されるため、流用すると result / DLQ / reply の
+  購読権しか持たない主体が secret を読めてしまう。別ドメインタグ + `aud="job-env"` の専用トークンにした。
+- **世代は execution に固定する**。引き換えは `current_version` ではなく
+  `executions.created_at` 以前の最大 version を解決する。そうしないと worker 再配送の間に rotate が
+  走ったとき、同一 execution の 1 回目と 2 回目で別の資格情報が外部 API へ到達しうる。
+- 引き換え失敗はすべて **fail-closed**（`secret material unavailable` で実行を failed 終端）。
+  secret 欠損のまま実行しない。
+
+### 含まない（M8 以降の follow-up）
+
+- **version 別の恒久的な課金集計**。`usage_rollups` の PK に version 次元が無く、粒度も日次なので
+  canary 判断には使えない。M7 は `executions` 生表の直近ウィンドウ集計に留める。
+- **自動 canary 判定 / 自動 promote / 自動 rollback**（エラー率 SLO によるゲート）。M7 は
+  「人間が `GET /traffic` を見て次の重みを PUT する」半自動まで。
+- **細粒度スコープ**（`rollout:write` / `secrets:write` 等）の新設。Scope は
+  read / invoke / deploy / admin の 4 値固定。→ **canary 運用と secret 管理には admin スコープの
+  トークンが要る**（CI/CD の設計に影響するので注意）。
+- **`net.allow_outbound` の実効的なネットワーク強制**。`wasi:sockets/` は baseline 非承認のまま。
+  M7 の「Capability の outbound 認証情報管理」は**資格情報を secret として保管し、承認された env 名で
+  注入するところまで**で、実際に外へ出る経路は存在しない（egress allowlist の実効強制は M9）。
+- **KEK 侵害からの復旧としての deep re-encryption**（DEK 再生成 + 平文再暗号化）。M7 は
+  wrap-only の rekey のみ（下記「露出ガード」参照）。
+- **in-flight ジョブの即時停止 / drain API**。rollback は新規 enqueue のルーティングだけを変える。
+- host interface 方式の secret 注入（`faas:secrets/store` 等）。ゲストは baseline 承認済みの
+  `wasi:cli/environment` を使う。
+
+### 露出ガード（M7 で新たに増える運用上の MUST）
+
+1. **`SECRETS_MASTER_KEY` を `.env.example` のプレースホルダのまま起動しない**。
+   その値のままだと control-plane は**起動に失敗する**（warn ではない）。署名鍵と違い
+   **secret の暗号文は DB に永続する**ため、公開リポジトリに載る既知鍵で暗号化すると影響が長く残る。
+   実鍵の生成例: `openssl rand -hex 32`。
+2. **`INTERNAL_BIND_ADDR`（既定 `127.0.0.1:8081`）を公開しない**。`POST /internal/job-env` だけを
+   載せた内部専用 listener であり、認証 middleware の外にある（認証は env-token の署名そのもの）。
+3. **`SECRETS_RETIRED_KEYS` を早期に撤去しない**。signing 鍵の overlap は TTL で有限時間に終わるが、
+   **secret の暗号文は DB に永続する**。`faas_secret_versions_by_kid{kid="<旧 kid>"}` が 0 になってから
+   撤去すること（早期撤去は復号不能 ＝ データ喪失）。
+4. **`POST /admin/secrets/rekey` は侵害復旧ではない**。wrap-only の再ラップなので DEK も ciphertext も
+   不変であり、旧 KEK + 旧 DB ダンプがあれば再ラップ後も全平文を復元できる。rekey は
+   **KEK の計画的ローテーション専用**。侵害時の唯一の復旧経路は**値そのものを rotate すること**。
+5. **`GET /components/{id}/config` は平文を返し、deploy スコープで読める**。資格情報は必ず
+   secrets 側に置くこと（config 側に入れた瞬間、deploy トークン保持者が読める）。
+6. **canary 運用・secret 管理には admin スコープのトークンが必要**（細粒度スコープは非スコープ）。
+7. **rollback は新規 enqueue のみに効く**。publish 済みの canary ジョブは最大
+   `ACK_WAIT_SECS × MAX_DELIVER`（`BACKOFF_SECS` 併用時はその総和）のあいだ canary 版で完走・再試行する。
+8. **`components/echo` は検証用に env を出力する**。本番の Component が注入された env を
+   そのまま出力へ返すのは誤り（invoke 応答から secret が読めてしまう）。
+9. **低頻度 cron / chain の版混在**: cron の標本数が少ないと canary の統計が意味を持たない。また
+   canary 中に rollback すると 1 チェーン内で上流 canary / 下流 stable が混ざる（起動時点解決の帰結）。
+
+> **完了条件（仕様書 §15 M7）**: 「active-version を 10%→100% へ段階移行でき、ワンクリック rollback が
+> 効き、secret はログ・監査・他テナントへ漏れない（露出ガード §7 / §15）」。
+> `crates/control-plane/tests/chaos_m7.rs` の S1（段階移行 + ワンクリック rollback）/
+> S2（env・secret 注入）/ S3（secret 非漏洩）で end-to-end 検証する（chaos_m4/m5/m6 と同じ作法・
+> 全て `#[ignore]`・docker compose stack + `CHAOS_TOKEN` 前提）。
+
+---
+
 ## M6 スコープ（と非スコープ）
 
 仕様書.md §15 M6 に準拠。非同期 invoke 一択から、商用で要求される起動形態を揃える。M6 は
@@ -101,10 +209,11 @@ Client ──HTTP──▶ control-plane ──put──▶ MinIO (Object Storag
   A→B→A の循環を止められない。各 execution に `chain_depth`（migration 0008、root=0・chain 下流のみ +1）を
   持たせ、上流深さ+1 が `MAX_CHAIN_DEPTH`（既定 8）を超える起動を拒否する（循環チェーンを深さで有界化）
 
-含まない（M7 以降の follow-up）:
+含まない（M8 以降の follow-up）:
 - 同期 Invoke の `.result` JetStream 化（現状 reply は Core NATS、CP 再起動で in-flight reply ドロップ）
 - Workflow Engine（多段 chain のオーケストレーション / 分岐・合流）・Cron の秒精度 / タイムゾーン指定
-- per-function 環境変数・Secrets Manager（M7, §10）、トリガーの admin API 越しの一括管理
+- トリガーの admin API 越しの一括管理
+（per-function 環境変数・Secrets Manager は **M7 で実装済み**。下の M7 スコープ節を参照）
 
 > **完了条件（仕様書 §15 M6）**: 「HTTP 同期呼び出しが上限レイテンシ内で結果を返し、Cron 登録で定時
 > 起動し、トリガー経路でも冪等性・テナント分離・計量（M5）が non-HTTP 起点で破れない」。
@@ -382,6 +491,15 @@ cp .env.example .env
 > （ブートを単一障害点にしない。縮退中は分散共有でなくなるため警告を出します）。本番は HA 構成に
 > してください（§9）。`redis` crate は pure-Rust（`tokio-comp`）で C 依存（cc/aws-lc）を引き込みません。
 
+> **M7 の新規 env（§10 / §15）**:
+> `SECRETS_MASTER_KEY`（**必須**・32 バイト KEK。`.env.example` のプレースホルダのままだと**起動失敗**）/
+> `SECRETS_MASTER_KID`（**必須**・新規暗号化に使う kid）/ `SECRETS_RETIRED_KEYS`（`kid:key,...` の CSV。
+> 復号専用の旧 KEK。再ラップ完了まで残す）/ `INTERNAL_BIND_ADDR`（既定 `127.0.0.1:8081`。
+> `POST /internal/job-env` だけを載せる内部専用 listener。**公開しないこと**）/
+> `JOB_ENV_EXCHANGE_RATE_PER_MIN`（既定 600）は **control-plane** が読みます。
+> `CONTROL_PLANE_INTERNAL_URL`（既定 `http://127.0.0.1:8081`）/ `JOB_ENV_FETCH_TIMEOUT_MS`（既定 2000）は
+> **worker** が読みます（引き換え先とタイムアウト。超過は fail-closed で実行を failed 終端）。
+
 > **M3c 結合の注意**: `JOB_SIGNING_KEY` / `JOB_SIGNING_KID` は **control-plane のみ**が読みます
 > （worker は鍵を持たず、不透明トークンを echo するだけ）。`ACK_WAIT_SECS` / `MAX_DELIVER` は
 > control-plane（token exp）と worker（consumer 設定）の **両方**が読むため、値をずらすと
@@ -633,29 +751,35 @@ CHAOS_ECHO=echo cargo test -p faas-control-plane --test chaos_m4 \
   -- --ignored chaos_b_idempotency_key_dedups --nocapture
 
 # Scenario A — Worker crash mid-execution → stuck-execution sweeper が failed で finalize
-# CP を短い deadline で起動し、worker を止めた状態で invoke
-pkill -f 'target.*control-plane'
+# テストは「オペレータが手で worker を落とす」前提で書かれているが、**worker を落とした状態で
+# 開始すれば自動化できる**（ジョブは JetStream に滞留し、pending 行を sweeper が終端化する）。
+pkill -f 'target/debug/faas-worker'     # 先に worker を落としておく
+pkill -f 'target/debug/control-plane'
 set -a; source .env; set +a
-STUCK_EXECUTION_DEADLINE_SECS=15 REAPER_INTERVAL_SECS=5 \
-  cargo run -p faas-control-plane --release > /tmp/cp.log 2>&1 &
-pkill -f 'target.*faas-worker'   # worker を落とす
+STUCK_EXECUTION_DEADLINE_SECS=20 REAPER_INTERVAL_SECS=5 \
+  ./target/debug/control-plane > /tmp/cp.log 2>&1 &
+sleep 15
 export CHAOS_TOKEN=$(make -s login | tail -1)
-CHAOS_STUCK_DEADLINE_SECS=15 CHAOS_WAIT_SECS=35 \
+CHAOS_WAIT_SECS=45 \
   cargo test -p faas-control-plane --test chaos_m4 \
-  -- --ignored chaos_a_worker_crash_finalizes_to_failed --nocapture
+  -- --ignored chaos_a_ --nocapture
+# 終わったら通常設定（既定 deadline 900s）で CP と worker を起動し直すこと。
 
 # Scenario C, D — 専用 component (always-trap / slow) を deploy してから実行
-cargo build --release -p always-trap -p slow --target wasm32-wasip2
-cp target/wasm32-wasip2/release/always_trap.wasm components-dist/always-trap.wasm
-cp target/wasm32-wasip2/release/slow.wasm components-dist/slow.wasm
-# always-trap と slow を POST /components → /components/{id}/versions で個別アップロード
-# （詳細手順は scripts/ に追加予定; 現状は手動 curl）
+# `make deploy-chaos-components` がビルド + component 作成 + アップロードまでを冪等に行う。
+# slow は SLOW_LIMITS（既定 max_wall_time_ms=1000 / max_execution_time_ms=2000）で上げる ——
+# 既定の 1s / 5s のままだと tokio timeout がテストの待ち窓（既定 10 秒）に収まらないことがある。
+make deploy-chaos-components
 make run-worker > /tmp/worker.log 2>&1 &
 CHAOS_ALWAYS_TRAP=always-trap CHAOS_SLOW=slow \
   cargo test -p faas-control-plane --test chaos_m4 \
-  -- --ignored chaos_c_dlq_finalizes_after_max_deliver \
-            chaos_d_tokio_timeout_finalizes_to_timeout --nocapture
+  -- --ignored chaos_c_ chaos_d_ --test-threads=1 --nocapture
 ```
+
+> **`make -n` で syntax check しないこと**: `deploy-chaos-components` を含む一部のターゲットは
+> レシピ内で `$(MAKE) -s login` を呼ぶ。make は `$(MAKE)` を含む行を「再帰 make」とみなし
+> **`-n` 指定でも実際に実行する**（POSIX）。しかも `-n` が子 make へ伝播してトークンが取れず失敗する。
+> 動作確認は実行して行うこと。
 
 期待される最終 status:
 - chaos_a: `status=failed`（sweeper, error.message に sweeper 由来文言）
@@ -726,6 +850,89 @@ curl -s -X POST http://localhost:8080/triggers \
 
 ---
 
+### Chaos / M7 デプロイ運用テスト（M7 完了条件の検証）
+
+仕様書 §15 M7 完了条件「active-version を 10%→100% へ段階移行でき、ワンクリック rollback が効き、
+secret はログ・監査・他テナントへ漏れない」を `crates/control-plane/tests/chaos_m7.rs` の 3 シナリオ
+（S1: canary 段階移行 + rollback / S2: env・secret 注入 / S3: secret 非漏洩）で end-to-end 検証します。
+
+> **`--test-threads=1` で実行すること**: 3 シナリオは同じ component の traffic 配分・config・secret を
+> 書き換えるため、並行実行すると互いの状態を壊します（chaos_m5 の会計テストが直列を要求するのと同型）。
+> S1 は約 700 回の invoke を終端まで待つため 10 分前後かかります。
+
+```bash
+# 共通: docker stack + bootstrap + token + echo + worker（M6 と同じ前提）
+make up && make migrate && make bootstrap
+export CHAOS_TOKEN=$(make -s login | tail -1)
+make build-component && make deploy
+make run-worker > /tmp/worker.log 2>&1 &   # ← worker は 1 つだけ（pgrep -fl faas-worker で確認）
+
+# 3 シナリオを直列実行
+cargo test -p faas-control-plane --test chaos_m7 -- --ignored --test-threads=1 --nocapture
+
+# S1 だけ（canary の端点・単調性・sticky・削除保護・rollback の保証境界・ワンクリック復帰）
+cargo test -p faas-control-plane --test chaos_m7 \
+  -- --ignored chaos_t1_ --nocapture
+```
+
+**黒箱で検証できない部分は手で確認する**（CP / worker のログと `audit_logs` には参照 API が無いため。
+テスト内から `docker compose` / `psql` を呼ぶのは環境依存が強すぎるので採らない）:
+
+```bash
+# 1) sentinel 値を持つ secret を置いて invoke する
+SENTINEL="sentinel-$(date +%s)-DO-NOT-LEAK"
+CID=$(curl -s http://localhost:8080/components -H "Authorization: Bearer $TOKEN" \
+      | python3 -c 'import json,sys;print(json.load(sys.stdin)[0]["component_id"])')
+VER=$(curl -s "http://localhost:8080/components/$CID/traffic" -H "Authorization: Bearer $TOKEN" \
+      | python3 -c 'import json,sys;print(json.load(sys.stdin)["stable"]["version"])')
+curl -s -X PUT "http://localhost:8080/components/$CID/secrets/API_KEY" \
+  -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
+  -d "{\"value\":\"$SENTINEL\"}"
+curl -s -X PUT "http://localhost:8080/components/$CID/versions/$VER/capabilities" \
+  -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' -d '{"env":["API_KEY"]}'
+curl -s -X POST "http://localhost:8080/invoke?wait=1" \
+  -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
+  -d '{"component":"echo","input":{}}' > /dev/null
+
+# 2) ログに sentinel が出ていないこと（CP / worker とも 0 であること）
+grep -c "$SENTINEL" /tmp/worker.log          # => 0
+docker compose logs control-plane worker 2>/dev/null | grep -c "$SENTINEL"   # => 0
+
+# 3) 監査ログに値が入っていないこと（names と count だけが残る）
+docker compose exec -T postgres psql -U faas -d faas -c \
+  "SELECT set_config('app.tenant_id','<tenant_id>',false);" -tAc \
+  "SELECT count(*) FROM audit_logs WHERE detail::text LIKE '%$SENTINEL%'"    # => 0
+```
+
+> **`executions.output` には sentinel が現れる**（`components/echo` が**検証用に**注入された env を
+> 出力へ返す仕様のため）。これはゲスト自身の責務であり、プラットフォームの漏洩ではない。
+> **本番の Component が注入された env をそのまま返すのは誤り**である。
+
+**KEK ローテーションの手順**（露出ガード 3 / 4 を必ず併読すること）:
+
+```bash
+# 1) 新 KEK を生成し、旧 KEK を retired へ移して CP を再起動する
+#    （この時点で新規書き込みは新 kid、既存は旧 kid で復号可能）
+openssl rand -hex 32                       # => 新 KEK
+#    .env: SECRETS_MASTER_KEY=<新 KEK> / SECRETS_MASTER_KID=k2 / SECRETS_RETIRED_KEYS=k1:<旧 KEK>
+
+# 2) 当該テナントの secret を現行 KEK で再ラップする
+curl -s -X POST http://localhost:8080/admin/secrets/rekey -H "Authorization: Bearer $TOKEN"
+# => {"rewrapped": N}
+
+# 3) 旧 kid の gauge が 0 になったことを確認してから retired を撤去する
+curl -s http://localhost:8080/metrics | grep faas_secret_versions_by_kid
+# => faas_secret_versions_by_kid{kid="k2"} N   （k1 が消えていれば撤去してよい）
+#    .env: SECRETS_RETIRED_KEYS=  にして CP 再起動
+```
+
+> **早期撤去は復号不能 ＝ データ喪失**。signing 鍵の overlap は TTL で有限時間に終わるが、
+> **secret の暗号文は DB に永続する**（§4.7.2）。
+> また **rekey は侵害復旧ではない**（wrap-only なので DEK も ciphertext も不変）。
+> KEK が漏れたときの唯一の復旧経路は **値そのものを rotate すること**。
+
+---
+
 ## エンドポイント一覧
 
 | メソッド / パス | 認証 | 説明 |
@@ -757,6 +964,22 @@ curl -s -X POST http://localhost:8080/triggers \
 | `GET /triggers` | read | **M6c**: 自テナントのトリガー登録一覧（§11） |
 | `DELETE /triggers/{id}` | admin | **M6c**: トリガー登録の削除（自テナント限定。他テナントは 404）。他 DELETE と整合の **admin** スコープ（§11） |
 | `POST /events/object-storage` | invoke | **M6c**: Object Storage イベント受領。テナントは object キーの `tenants/{tenant}/...` から導出し principal と一致を要求（anti-spoof）。同一 `{bucket}/{key}/{etag}` 再送は `enqueued=0`（冪等, §6.6 / §11） |
+| `PUT /components/{id}/traffic` | admin | **M7a**: canary の版と重みを設定（絶対値・冪等）。`{"canary_version":"0.2.0","weight":10}`。weight 範囲外 400 / 未知 version 404 / stable と同一 400（§6.7） |
+| `DELETE /components/{id}/traffic` | admin | **M7a**: canary を解除（`weight=0` + ポインタ NULL）。既に未設定でも 204（冪等, §6.7） |
+| `GET /components/{id}/traffic` | read | **M7a**: 現在の配分 + 直近 60 分の version 別成績（成功/失敗/timeout・`canary_routed`・p50/p95）。canary の go/no-go 判断の一次情報（§6.7） |
+| `POST /components/{id}/promote` | admin | **M7a**: canary を stable へ昇格（単一 UPDATE + CAS）。canary 未設定 400 / CAS 不一致 409（§6.7） |
+| `POST /components/{id}/rollback` | admin | **M7a**: ワンクリック rollback。body `{}` で直前 stable へ戻し canary をクリア。previous 不在 409 / 戻り先が削除済み 409（§6.7） |
+| `PUT /components/{id}/versions/{ver}/capabilities` | admin | **M7b**: 注入を許可する env 名を承認（全置換）。**deploy 経路からは書けない**（§4.4 の「付与は admin スコープを要する」MUST） |
+| `GET /components/{id}/config` | **deploy** | **M7b**: per-function の平文環境変数を返す。read に置かないのは、config が平文で secret と同じ env 名前空間に混ざるため（§15） |
+| `PUT /components/{id}/config` | deploy | **M7b**: 平文環境変数の全置換。キー名 `^[A-Z_][A-Z0-9_]{0,63}$` / 値 4096 バイト / 64 キー / 総 32 KiB を超えると 400（§15） |
+| `DELETE /components/{id}/config/{key}` | deploy | **M7b**: 1 キー削除。不在は 404（§15） |
+| `GET /components/{id}/secrets` | read | **M7c**: secret の**メタデータのみ**（`name` / `version` / `has_value` / `updated_at`）。値も `value_len` も `kek_kid` も返さない（§10） |
+| `GET /components/{id}/secrets/keys` | admin | **M7c**: 運用向け。`kek_kid` / `value_len` は**ここだけ**（`value_len` は平文長のオラクルなので read から分離, §10） |
+| `PUT /components/{id}/secrets/{name}` | admin | **M7c**: 値を設定（新規 201 + version=1 / 既存 200 + 新 version）。config と同名なら 409（§10） |
+| `POST /components/{id}/secrets/{name}/rotate` | admin | **M7c**: 値を差し替え（監査 action を `secret_rotated` に分ける）。不在は 404（§10） |
+| `DELETE /components/{id}/secrets/{name}` | admin | **M7c**: soft delete（204）。版台帳は追記専用なので残る。**同名で作り直せる**（部分 UNIQUE index, §10） |
+| `POST /admin/secrets/rekey` | admin | **M7c**: 当該テナントの secret を現行 KEK で再ラップ（`{"rewrapped": n}`）。**侵害復旧ではない**（露出ガード 4 を参照, §10） |
+| `POST /internal/job-env` | 内部専用 | **M7c**: worker が `env_token` と引き換えに復号済み env を受け取る。**`INTERNAL_BIND_ADDR` にしか生えない**（公開 listener では 404）。認証は env-token の署名そのもの（§4.6） |
 
 > **`GET /usage` の集計セマンティクス（課金解釈の明示, M5）**: `invocation_count` と
 > `succeeded_count`/`failed_count`/`timeout_count` は **全終端実行**で +1 される（worker 落下を
@@ -788,6 +1011,14 @@ curl -s -X POST http://localhost:8080/triggers \
 | 2 回目の invoke でも coldstart が短縮されない | `WASM_CACHE_DIR` に書き込めていない可能性。worker のログで `cwasm hit` / `cwasm 書き込み` を確認し、ディレクトリの権限と空き容量を見る。`make clean` 相当で cache を消すには `WASM_CACHE_DIR` を手動削除。 |
 | `status: timeout` | `max_wall_time`（既定 1000ms）超過。アップロード時の `resource_limits` を見直す。 |
 | ビルド時に DB / MinIO を要求される | 本実装は `sqlx` のランタイム API を使うため不要。`query!` マクロ起因のエラーが出る場合は実装が契約違反。 |
+| control-plane が `SECRETS_MASTER_KEY is still the placeholder` で起動しない | **M7c の意図した fail-fast**。`.env.example` の既知プレースホルダのままでは起動させない（secret の暗号文は DB に永続するため、公開リポジトリの既知鍵で暗号化させない）。`openssl rand -hex 32` で実鍵を生成して `.env` に置く。 |
+| invoke が `secret material unavailable` で `failed` になる | **M7c の fail-closed**（secret 欠損のまま実行しない）。worker から `CONTROL_PLANE_INTERNAL_URL`（既定 `http://127.0.0.1:8081`）へ到達できるか、CP が `INTERNAL_BIND_ADDR` で listen しているか（起動ログの `listening (internal: job-env exchange only)`）を確認。JetStream の backoff 再配送が自動リトライになる。 |
+| secret を設定したのに env に現れない | `capabilities.env`（**admin 承認の許可リスト**）に名前が無い。`PUT /components/{id}/versions/{version}/capabilities` で承認する。**承認は version 単位**なので、新しい version を上げたら再承認が要る。 |
+| 復号が失敗して invoke が落ちる（KEK ローテーション後） | `SECRETS_RETIRED_KEYS` から旧 KEK を**早期に撤去**した可能性。`faas_secret_versions_by_kid{kid="<旧 kid>"}` が 0 になるまで（＝ `POST /admin/secrets/rekey` が全行を再ラップし終えるまで）旧鍵を残すこと。撤去済みなら旧鍵を戻して再ラップをやり直す。 |
+| canary を設定したのに全部 stable に落ちる | canary 版が soft delete 済み / ポインタ不整合の可能性（解決 SQL の LEFT JOIN が外れると **fail-safe に全量 stable**）。`GET /components/{id}/traffic` の `canary` が `null` でないか確認。 |
+| `PUT /components/{id}/traffic` が 403 | canary 運用には **admin スコープ**のトークンが要る（細粒度スコープは M7 非スコープ）。 |
+| 0009 の適用でローリング更新が詰まる | `executions` は最大テーブルであり、`CREATE INDEX idx_executions_component_finished` が索引構築のあいだ ACCESS EXCLUSIVE を取る（sqlx は各 migration を 1 tx で走らせるため `CONCURRENTLY` を書けない）。本番は保守窓に `cargo run -p faas-control-plane -- --migrate-only`（= `make migrate`）で**単独適用**してからローリング更新すること。 |
+| `executions_routing_reason_chk` が `NOT VALID` のまま | 意図した状態（既存行のフルスキャン検証を避けるため）。完全化したい場合は保守窓で `ALTER TABLE executions VALIDATE CONSTRAINT executions_routing_reason_chk;` を手で流す。 |
 
 ---
 
@@ -808,6 +1039,9 @@ migrations/0005_provenance.sql  # M3c: 署名鍵 kid / idempotency_key UNIQUE / 
 migrations/0006_large_io.sql    # M3d: input_ref / output_ref 列、tenants.quotas、大容量 I/O 用
 migrations/0007_usage_metering.sql  # M5: executions 計量5列 + usage_rollups（FORCE RLS / DELETE 不可）
 migrations/0008_m6.sql     # M6: cron_jobs / triggers / trigger_deliveries（FORCE RLS、冪等配送台帳）
+migrations/0009_m7a_traffic_split.sql   # M7a: components へ canary 4 列 + executions.routing_reason（新表なし）
+migrations/0010_m7b_function_configs.sql # M7b: function_configs（平文 env・行=1キー・複合 FK・FORCE RLS）
+migrations/0011_m7c_secrets.sql          # M7c: function_secrets / function_secret_versions（追記専用の版台帳）
 crates/shared/             # faas-shared: 型・NATS subject・メッセージ・エラー（共有契約の唯一の真実）
                            #   FailedMessage / failed_subject 等の M4c DLQ 型 + M6 reply subject / instance id を含む
 crates/control-plane/      # faas-control-plane (bin): axum + storage(MinIO) + validation(wasmparser)
@@ -816,6 +1050,12 @@ crates/control-plane/      # faas-control-plane (bin): axum + storage(MinIO) + v
 crates/control-plane/tests/chaos_m4.rs  # M4 障害注入の end-to-end テスト（#[ignore]）
 crates/control-plane/tests/chaos_m5.rs  # M5 冪等会計の end-to-end テスト（E1: 重複は+1 / E2: N件は+N, #[ignore]）
 crates/control-plane/tests/chaos_m6.rs  # M6 起動形態の end-to-end テスト（S1: 同期 / S2: Cron / S3: トリガー, #[ignore]）
+crates/control-plane/tests/chaos_m7.rs  # M7 デプロイ運用の end-to-end テスト（S1: canary/rollback / S2: env・secret 注入 / S3: 非漏洩, #[ignore]）
+crates/control-plane/src/routing.rs     # M7a: canary の決定的バケット選択（DB/時刻/乱数に非依存の純関数）
+crates/control-plane/src/secrets.rs     # M7c: 封筒暗号（XChaCha20-Poly1305）+ KEK キーリング + execution 基準の世代解決
+crates/control-plane/src/handlers_secrets.rs # M7c: secret の write-only API と POST /internal/job-env
+crates/shared/src/redacted.rs           # M7-0: Redacted<T>（Serialize を実装しない秘密値ラッパ）
+crates/worker/src/env.rs                # M7b/M7c: 許可リストで畳む env 組み立て（expose() の allowlist 対象）
 crates/control-plane/src/metrics.rs     # M4a: Prometheus Registry とメトリクス定義
 crates/worker/             # faas-worker (bin): wasmtime + async-nats + reqwest + cwasm キャッシュ
                            #   epoch ticker は OS スレッド (chaos_d 対策。M4b 設計メモ参照)
@@ -830,12 +1070,12 @@ components/slow/           # M4 chaos_d 用: handle が tight loop（epoch inter
 
 ## 次のマイルストーン（仕様書 §15）
 
-M6 完了済み（本リポジトリの現状）。次は M7 以降の将来⬜:
+M7 完了済み（本リポジトリの現状）。次は M8 以降の将来⬜:
 
-- **M7 以降（商用マルチテナント SaaS 化, §15）**: 商用クラウド SaaS として成立させる段階実装。
+- **M8 以降（商用マルチテナント SaaS 化, §15）**: 商用クラウド SaaS として成立させる段階実装。
   基本線は **M5 課金・メータリング → M6 Invoke 拡充（同期 Invoke + 外部イベント/Cron トリガー）
-  → M7 デプロイ運用（canary / rollback / Secrets）→ M8 弾力スケール + テナント間アイソレーション
-  → M9 サンドボックス強化・サプライチェーン**（M5/M6 は完了済み）。分散トレーシング（OpenTelemetry）は
+  → M7 デプロイ運用（canary / rollback / per-function env / Secrets）→ M8 弾力スケール +
+  テナント間アイソレーション → M9 サンドボックス強化・サプライチェーン**（M5/M6/M7 は完了済み）。分散トレーシング（OpenTelemetry）は
   高レバレッジで前倒し推奨。Workflow Engine / Result Ingestor 分離 / Multi Region は固定順序を
   持たない**需要発火型**。AI/LLM はプラットフォーム機能ではなく Capability 経由の外部呼び出し
   （§4.4 / §13）で充足するため、ロードマップ項目から除外。

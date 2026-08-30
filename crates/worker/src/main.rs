@@ -61,6 +61,7 @@
 //! トラップ分類: epoch 中断 / 時間超過 → `timeout`、fuel 超過 → `failed`（§4.3）。
 
 mod bindings;
+mod env;
 mod metrics;
 
 use std::num::NonZeroUsize;
@@ -219,12 +220,28 @@ struct Settings {
     /// M4a (§3.8): /metrics + /readyz を返す最小 axum サーバの bind 先。既定 `0.0.0.0:9090`。
     /// 内部ネット越しのみで露出させる前提。ノード LB の readinessProbe ターゲットでもある。
     metrics_bind_addr: String,
+    /// M7c (§4.6): control-plane の**内部専用** listener の URL（`INTERNAL_BIND_ADDR` を指す）。
+    /// secret を持つ component の実行時に `POST {url}/internal/job-env` で引き換える。
+    control_plane_internal_url: String,
+    /// M7c: 引き換え HTTP のタイムアウト（ミリ秒）。超過は **fail-closed**（実行を failed で終端）。
+    job_env_fetch_timeout_ms: u64,
 }
 
 /// `WASM_CACHE_DIR` 未設定時の既定キャッシュ先。
 const DEFAULT_WASM_CACHE_DIR: &str = "./worker-cache";
 /// `METRICS_BIND_ADDR` 未設定時の既定。
 const DEFAULT_METRICS_BIND_ADDR: &str = "0.0.0.0:9090";
+/// `CONTROL_PLANE_INTERNAL_URL` 未設定時の既定（CP の `INTERNAL_BIND_ADDR` 既定に対応）。
+const DEFAULT_CONTROL_PLANE_INTERNAL_URL: &str = "http://127.0.0.1:8081";
+/// `JOB_ENV_FETCH_TIMEOUT_MS` 未設定時の既定。
+const DEFAULT_JOB_ENV_FETCH_TIMEOUT_MS: u64 = 2000;
+/// ゲスト stderr を封じ込めるときのバッファ上限（バイト）。
+///
+/// secret を注入する実行では `inherit_stderr()` を**使わない**。inherit すると、ゲストが
+/// うっかり（あるいは意図的に）env をダンプした内容が**全テナント共有のコンテナログ**へ
+/// 直結してしまう（§5.5）。内容はログにも `executions.error` にも載せず捨て、捨てたバイト数
+/// だけを観測する。
+const GUEST_STDERR_CAPTURE_BYTES: usize = 64 * 1024;
 
 impl Settings {
     fn from_env() -> anyhow::Result<Self> {
@@ -250,6 +267,13 @@ impl Settings {
             max_deliver,
             backoff_secs,
             metrics_bind_addr,
+            control_plane_internal_url: std::env::var("CONTROL_PLANE_INTERNAL_URL")
+                .map(|v| v.trim().to_string())
+                .unwrap_or_else(|_| DEFAULT_CONTROL_PLANE_INTERNAL_URL.to_string()),
+            job_env_fetch_timeout_ms: env_u64(
+                "JOB_ENV_FETCH_TIMEOUT_MS",
+                DEFAULT_JOB_ENV_FETCH_TIMEOUT_MS,
+            )?,
         })
     }
 }
@@ -479,6 +503,8 @@ async fn main() -> anyhow::Result<()> {
         wasm_cache_dir: settings.wasm_cache_dir,
         cache,
         metrics: worker_metrics,
+        control_plane_internal_url: settings.control_plane_internal_url.clone(),
+        job_env_fetch_timeout: Duration::from_millis(settings.job_env_fetch_timeout_ms),
     });
 
     let max_deliver = settings.max_deliver as i64;
@@ -724,6 +750,38 @@ async fn ensure_consumer(
 // Worker 本体
 // ============================================================================
 
+/// version 解決の結果（M7b: limits に加え env 許可リストと平文 config を同じ tx で引く）。
+#[derive(Debug, Default)]
+struct ResolvedVersion {
+    limits: ResourceLimits,
+    /// `component_versions.capabilities.env`（admin 承認済みの注入可能 env 名）。
+    /// 行が引けない / 壊れている場合は空 ＝ **deny-all**（fail-closed）。
+    allowed_env: std::collections::BTreeSet<String>,
+    /// `function_configs` の平文キー・値。
+    config: std::collections::BTreeMap<String, String>,
+}
+
+/// `component_versions.capabilities` から env 許可リストを読む（M7b, §4.4）。
+///
+/// CP 側 `validation::parse_capabilities` と**同じ規則**（後方互換 + fail-closed）を worker 側にも
+/// 持つ。crate をまたぐので実装は複製になるが、どちらも「配列は旧形式で env 空 / 壊れた値は
+/// deny-all」という 1 行の規則であり、テストで両側に固定する。
+fn parse_allowed_env(capabilities: &serde_json::Value) -> std::collections::BTreeSet<String> {
+    capabilities
+        .as_object()
+        .and_then(|m| m.get("env"))
+        .and_then(|v| v.as_array())
+        .map(|a| {
+            a.iter()
+                .filter_map(|x| x.as_str())
+                .filter(|k| faas_shared::is_valid_env_key(k))
+                .map(str::to_string)
+                .collect()
+        })
+        // 旧形式（素の配列）/ null / 壊れた値 → deny-all。
+        .unwrap_or_default()
+}
+
 struct Worker {
     engine: Engine,
     pool: PgPool,
@@ -738,6 +796,10 @@ struct Worker {
     cache: Mutex<LruCache<String, Arc<Component>>>,
     /// 観測メトリクス（M4a, §3.8）。LRU / cwasm のキャッシュヒット率、execute 時間、終端化件数。
     metrics: Arc<metrics::Metrics>,
+    /// M7c (§4.6): CP の内部専用エンドポイント URL（secret 引き換え先）。
+    control_plane_internal_url: String,
+    /// M7c: 引き換え HTTP のタイムアウト。超過は fail-closed。
+    job_env_fetch_timeout: Duration,
 }
 
 impl Worker {
@@ -917,11 +979,37 @@ impl Worker {
         &self,
         job: &JobMessage,
     ) -> std::result::Result<(serde_json::Value, UsageMetrics), ExecError> {
-        // resource_limits を DB から解決する。失敗・未設定時は既定。
-        let limits = self
-            .resolve_limits(&job.tenant_id, &job.component, &job.version)
+        // resource_limits / env 許可リスト / 平文 config を DB から解決する（M7b）。
+        // 失敗・未設定時は既定（limits は既定値、env は **deny-all**）。
+        let resolved = self
+            .resolve_version(&job.tenant_id, &job.component, &job.version)
             .await
             .unwrap_or_default();
+        let limits = resolved.limits;
+
+        // M7c (§4.6): secret を持つ component だけ CP の内部エンドポイントから引き換える。
+        // **worker は KEK を持たない**（keyless by design, §3.3）ので、平文は「CP のメモリ →
+        // TLS 上の HTTP レスポンス → worker のメモリ → WasiCtx」だけを通り、NATS にも DB にも
+        // S3 にも永続化されない。`env_token` が None（= secret 無し）なら往復ゼロ。
+        //
+        // **fail-closed**: 引き換えに失敗したら secret 欠損のまま実行してはならない。
+        // ExecError::Failed で終端させ、JetStream の backoff 再配送が自然にリトライになる。
+        let secrets = match job.env_token.as_deref() {
+            Some(token) => self.fetch_job_env(token).await?,
+            None => std::collections::BTreeMap::new(),
+        };
+
+        // M7b (§4.4): 許可リストで畳んで注入する env を組み立てる。許可リストに無いキーは
+        // 値が DB に存在しても注入しない（admin 承認が権威。CP 側の引き換えでも同じ許可リストで
+        // 絞っており、この二重防御で片側の実装ミスが即漏洩にならないようにする）。
+        let built_env = env::build_env(&resolved.config, &secrets, &resolved.allowed_env);
+        if built_env.dropped_unapproved > 0 {
+            // 「設定したのに入っていない」の切り分けを可能にする（キー名は出さない）。
+            tracing::debug!(
+                dropped = built_env.dropped_unapproved,
+                "dropped env entries not present in the approved allowlist"
+            );
+        }
 
         // §3.6 のキャッシュ階層で Component を解決する。
         let component = self.resolve_component(job).await?;
@@ -936,7 +1024,62 @@ impl Worker {
                 .map_err(|e| ExecError::Failed(format!("failed to encode input: {e}")))?,
         };
 
-        self.run_component(component, input_bytes, limits).await
+        self.run_component(component, input_bytes, limits, built_env)
+            .await
+    }
+
+    /// M7c (§4.6): env-token と引き換えに復号済み secret を CP から受け取る。
+    ///
+    /// **fail-closed**: どの失敗（CP 不達 / タイムアウト / 401 / 403 / 500 / 応答が壊れている）でも
+    /// `ExecError::Failed` を返し、secret 欠損のまま実行させない。エラーメッセージには
+    /// **HTTP ステータスしか載せない**（応答 body には値が含まれうるため、ログにも
+    /// executions.error にも転記しない）。
+    ///
+    /// `env_token` は `ResultMessage` / `FailedMessage` / reply へ **echo しない** (MUST NOT)。
+    /// 本関数はトークンをリクエスト body にのみ載せ、返り値にも保持しない。
+    async fn fetch_job_env(
+        &self,
+        env_token: &str,
+    ) -> std::result::Result<
+        std::collections::BTreeMap<String, faas_shared::Redacted<String>>,
+        ExecError,
+    > {
+        let url = format!(
+            "{}/internal/job-env",
+            self.control_plane_internal_url.trim_end_matches('/')
+        );
+        let resp = self
+            .http
+            .post(&url)
+            .timeout(self.job_env_fetch_timeout)
+            .json(&serde_json::json!({ "env_token": env_token }))
+            .send()
+            .await
+            .map_err(|e| {
+                // reqwest のエラー表示には URL しか出ない（body は含まれない）。
+                ExecError::Failed(format!("secret material unavailable: {}", e.without_url()))
+            })?;
+
+        let status = resp.status();
+        if !status.is_success() {
+            return Err(ExecError::Failed(format!(
+                "secret material unavailable: control-plane returned {status}"
+            )));
+        }
+
+        #[derive(serde::Deserialize)]
+        struct JobEnvResponse {
+            env: std::collections::BTreeMap<String, String>,
+        }
+        let body: JobEnvResponse = resp.json().await.map_err(|_| {
+            ExecError::Failed("secret material unavailable: malformed response".into())
+        })?;
+
+        Ok(body
+            .env
+            .into_iter()
+            .map(|(k, v)| (k, faas_shared::Redacted::new(v)))
+            .collect())
     }
 
     /// 大入力を presigned GET URL（input_url）から取得する (§3.4)。
@@ -1106,6 +1249,7 @@ impl Worker {
         component: Arc<Component>,
         input: Vec<u8>,
         limits: ResourceLimits,
+        built_env: env::BuiltEnv,
     ) -> std::result::Result<(serde_json::Value, UsageMetrics), ExecError> {
         // StoreLimits: max_memory を適用する (§4.3)。
         let store_limits = StoreLimitsBuilder::new()
@@ -1120,7 +1264,31 @@ impl Worker {
             peak_memory_bytes: Arc::clone(&peak_memory),
         };
 
-        let wasi = WasiCtxBuilder::new().inherit_stderr().build();
+        // M7b (§3.5 / §4.4): per-function 環境変数を注入する唯一の場所。
+        //
+        // `Component` は sha256 キーで LRU 共有されるが `WasiCtx` は **実行ごとに構築される**ため、
+        // テナント混線は構造的に起きない（この不変条件は M7c で secret を載せる際の前提でもある）。
+        // ゲスト側は `wasi:cli/environment` を import する。これは capability baseline で承認済み
+        // （`validation.rs` の `BASELINE_APPROVED_PREFIXES` に `wasi:cli/`）なので baseline の変更は不要。
+        let mut wasi_builder = WasiCtxBuilder::new();
+        // M7c (§5.5): secret を 1 件でも注入する実行では `inherit_stderr()` を**使わない**。
+        // inherit はゲスト stderr を**全テナント共有のコンテナログ**へ直結させるため、ゲストが
+        // env をダンプすれば secret がそのままログに載る（`docker compose logs` で読める）。
+        // 代わりに上限付きのメモリパイプへ流し、内容はログにも executions.error にも載せず
+        // Drop で捨てる（捨てたバイト数だけをメトリクスで観測する）。
+        // 平文 config だけの実行は従来どおり inherit する（運用のデバッグ性を落とさない）。
+        let captured_stderr = if built_env.has_secret {
+            let pipe = wasmtime_wasi::pipe::MemoryOutputPipe::new(GUEST_STDERR_CAPTURE_BYTES);
+            wasi_builder.stderr(pipe.clone());
+            Some(pipe)
+        } else {
+            wasi_builder.inherit_stderr();
+            None
+        };
+        for (k, v) in &built_env.pairs {
+            wasi_builder.env(k, v);
+        }
+        let wasi = wasi_builder.build();
         let host = HostState {
             ctx: wasi,
             table: ResourceTable::new(),
@@ -1215,6 +1383,19 @@ impl Worker {
         // ticker を停止する (正常終了でも timeout でも不要)。
         // OS スレッドは次の 50ms tick で stop を観測して終了する（detached, join しない）。
         stop.store(true, Ordering::Relaxed);
+
+        // M7c (§5.5): secret を注入した実行のゲスト stderr は**内容を一切見ずに捨てる**。
+        // ログにも executions.error にも載せない（載せた瞬間、共有ログ経由の漏洩になる）。
+        // 捨てたバイト数だけをメトリクスで観測し、「ゲストが何か書いている」ことは分かるが
+        // 「何を書いたか」は分からない状態にする。
+        if let Some(pipe) = captured_stderr {
+            let dropped = pipe.contents().len() as u64;
+            if dropped > 0 {
+                self.metrics
+                    .guest_stderr_dropped_bytes_total
+                    .inc_by(dropped);
+            }
+        }
 
         match timed {
             // tokio タイムアウト（max_execution_time 超過）。host+guest 総時間上限を超えた。
@@ -1329,13 +1510,22 @@ impl Worker {
         Ok(())
     }
 
-    /// component_versions.resource_limits を解決する。見つからなければ None。
-    async fn resolve_limits(
+    /// component_versions の resource_limits / capabilities.env と function_configs を
+    /// **同一 tx** で解決する（M7b, §3.4）。
+    ///
+    /// 平文 config は worker が DB を直読みする（HTTP 往復ゼロ）。既に worker は
+    /// `assert_non_privileged_runtime_role` で `faas_app`（NOBYPASSRLS）であることを起動時に
+    /// アサートしており、読み取りは `set_tenant_guc` 済み tx + `WHERE tenant_id = $1` の
+    /// 二重防御下で行う（既存 `resolve_limits` と同じ作法）。
+    ///
+    /// **secret はここでは読まない**。secret は暗号化されており、worker は KEK を持たない
+    /// （keyless by design, §3.3）。secret の注入は CP の内部エンドポイントとの引き換えで行う。
+    async fn resolve_version(
         &self,
         tenant_id: &str,
         component: &str,
         version: &str,
-    ) -> anyhow::Result<ResourceLimits> {
+    ) -> anyhow::Result<ResolvedVersion> {
         use sqlx::Row as _;
 
         // M3c: tenant の権威は CP-signed claim。job.tenant_id はその claim と一致する。
@@ -1343,7 +1533,8 @@ impl Worker {
         let mut tx = self.pool.begin().await?;
         Self::set_tenant_guc(&mut tx, tenant_id).await?;
         let row = sqlx::query(
-            "SELECT cv.resource_limits AS resource_limits \
+            "SELECT c.id AS component_id, cv.resource_limits AS resource_limits, \
+                    cv.capabilities AS capabilities \
              FROM component_versions cv \
              JOIN components c ON c.id = cv.component_id \
              WHERE c.tenant_id = $1 AND c.name = $2 AND cv.version = $3 \
@@ -1354,16 +1545,42 @@ impl Worker {
         .bind(version)
         .fetch_optional(&mut *tx)
         .await?;
+
+        let Some(r) = row else {
+            tx.commit().await?;
+            // 行が引けない = 承認情報が無い。limits は既定、env は **deny-all**（fail-closed）。
+            return Ok(ResolvedVersion::default());
+        };
+
+        let component_id: String = r.try_get("component_id")?;
+        let limits: ResourceLimits =
+            serde_json::from_value(r.try_get("resource_limits")?).unwrap_or_default();
+        let allowed_env = parse_allowed_env(&r.try_get::<serde_json::Value, _>("capabilities")?);
+
+        // 平文 config を同じ tx（同じ GUC）で引く。
+        let config_rows = sqlx::query(
+            "SELECT key, value FROM function_configs \
+              WHERE tenant_id = $1 AND component_id = $2 ORDER BY key",
+        )
+        .bind(tenant_id)
+        .bind(&component_id)
+        .fetch_all(&mut *tx)
+        .await?;
         tx.commit().await?;
 
-        match row {
-            Some(r) => {
-                let value: serde_json::Value = r.try_get("resource_limits")?;
-                let limits: ResourceLimits = serde_json::from_value(value).unwrap_or_default();
-                Ok(limits)
-            }
-            None => Ok(ResourceLimits::default()),
+        let mut config = std::collections::BTreeMap::new();
+        for row in config_rows {
+            config.insert(
+                row.try_get::<String, _>("key")?,
+                row.try_get::<String, _>("value")?,
+            );
         }
+
+        Ok(ResolvedVersion {
+            limits,
+            allowed_env,
+            config,
+        })
     }
 
     // ------------------------------------------------------------------------

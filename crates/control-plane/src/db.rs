@@ -43,6 +43,10 @@ pub struct ComponentRow {
     pub id: String,
     pub name: String,
     pub active_version_id: Option<String>,
+    /// M7a: canary 側のポインタ（migration 0009）。`delete_version` の 3 ポインタ保護に使う。
+    pub canary_version_id: Option<String>,
+    /// M7a: 直前の stable（引数なし rollback の戻り先）。同じく削除保護の対象。
+    pub previous_active_version_id: Option<String>,
 }
 
 /// `executions` の 1 行 (GET /executions/{id} 応答)。
@@ -114,7 +118,8 @@ pub async fn find_component_by_id(
     component_id: &str,
 ) -> Result<Option<ComponentRow>, sqlx::Error> {
     let row = sqlx::query(
-        "SELECT id, name, active_version_id FROM components \
+        "SELECT id, name, active_version_id, canary_version_id, previous_active_version_id \
+         FROM components \
          WHERE tenant_id = $1 AND id = $2 AND deleted_at IS NULL",
     )
     .bind(tenant_id)
@@ -127,6 +132,8 @@ pub async fn find_component_by_id(
             id: r.try_get("id")?,
             name: r.try_get("name")?,
             active_version_id: r.try_get("active_version_id")?,
+            canary_version_id: r.try_get("canary_version_id")?,
+            previous_active_version_id: r.try_get("previous_active_version_id")?,
         })
     })
     .transpose()
@@ -175,23 +182,296 @@ pub async fn insert_version(
     Ok(())
 }
 
-/// component の active_version_id を設定する (§6.7: latest=active)。
-pub async fn set_active_version(
+// ---------------------------------------------------------------------------
+// M7a: stable ポインタを動かす 3 操作（switch / promote / rollback）と canary 配分。
+//
+// **3 関数共通の不変条件**:
+//  (a) 必ず**単一 UPDATE 文**で完結する（「重みだけ 0 になって active は新版のまま」といった
+//      中間状態が観測されない）。
+//  (b) 必ず canary をクリアする（`canary_version_id = NULL`, `canary_weight = 0`）。
+//      これにより「新しい stable を入れたのに古い canary 配分が残って混線する」が構造的に起きない。
+//      canary 未使用時のクリアは no-op なので既存 API の挙動は不変。
+//  (c) `previous_active_version_id` は **CASE ガード**付きで更新する。同じ版を再 activate
+//      （宣言的 CI/CD が毎回同じ version を PUT する運用）したときに previous を自分自身で
+//      潰さない。潰すと直後の rollback が「200 を返すのに何も戻らない」最悪の failure mode になる。
+// ---------------------------------------------------------------------------
+
+/// stable ポインタを切り替える (§6.7)。M7a: 直前 stable を退避し、canary 配分を必ずクリアする。
+///
+/// 戻り値は更新が起きたか。既存の呼び出し 2 箇所（`upload_version` / `set_active_version` ハンドラ）は
+/// 同一 tx 内で先に `find_component_by_id` で 404 判定済みなので `false` は到達しない防御。
+/// bool を返すのは promote / rollback が事前 SELECT 無しの単一 UPDATE で 0 行を 404/409/400 へ
+/// 写像する必要があり、3 関数の形を揃えるため。
+pub async fn switch_active_version(
     executor: impl sqlx::PgExecutor<'_>,
     tenant_id: &str,
     component_id: &str,
     version_id: &str,
-) -> Result<(), sqlx::Error> {
-    sqlx::query(
-        "UPDATE components SET active_version_id = $3 \
-         WHERE tenant_id = $1 AND id = $2 AND deleted_at IS NULL",
+) -> Result<bool, sqlx::Error> {
+    let r = sqlx::query(SWITCH_ACTIVE_VERSION_SQL)
+        .bind(tenant_id)
+        .bind(component_id)
+        .bind(version_id)
+        .execute(executor)
+        .await?;
+    Ok(r.rows_affected() > 0)
+}
+
+const SWITCH_ACTIVE_VERSION_SQL: &str = "UPDATE components \
+        SET previous_active_version_id = CASE \
+                WHEN active_version_id IS DISTINCT FROM $3 THEN active_version_id \
+                ELSE previous_active_version_id END, \
+            active_version_id = $3, \
+            canary_version_id = NULL, \
+            canary_weight = 0, \
+            canary_updated_at = now() \
+      WHERE tenant_id = $1 AND id = $2 AND deleted_at IS NULL";
+
+/// canary を stable へ昇格する (M7a)。**単一 UPDATE + CAS**（read-then-write のレースを作らない）。
+///
+/// `$3`(target) が NULL なら現 `canary_version_id` を昇格。非 NULL なら「オペレータが見た canary と
+/// 昇格対象が一致すること」を CAS 条件にする（別 CP の `PUT /traffic` が割り込んで別の版を 100%
+/// 出す事故を防ぐ）。0 行 = component 不在 / canary 未設定 / CAS 不一致。
+const PROMOTE_ACTIVE_VERSION_SQL: &str = "UPDATE components \
+        SET previous_active_version_id = CASE \
+                WHEN active_version_id IS DISTINCT FROM COALESCE($3, canary_version_id) \
+                THEN active_version_id ELSE previous_active_version_id END, \
+            active_version_id = COALESCE($3, canary_version_id), \
+            canary_version_id = NULL, \
+            canary_weight = 0, \
+            canary_updated_at = now() \
+      WHERE tenant_id = $1 AND id = $2 AND deleted_at IS NULL \
+        AND canary_version_id IS NOT NULL \
+        AND ($3 IS NULL OR canary_version_id = $3) \
+  RETURNING active_version_id, previous_active_version_id";
+
+/// canary を stable へ昇格する。成功時は `(新 active_version_id, 旧 active_version_id)` を返す。
+///
+/// 0 行（`None`）の理由確定（component 不在 / canary 未設定 / CAS 不一致）は呼び出し側が
+/// **0 行のときだけ**再 SELECT して行う。成功パスは 1 文のままなのでレースは起きない。
+pub async fn promote_active_version(
+    executor: impl sqlx::PgExecutor<'_>,
+    tenant_id: &str,
+    component_id: &str,
+    target_version_id: Option<&str>,
+) -> Result<Option<(String, Option<String>)>, sqlx::Error> {
+    let row = sqlx::query(PROMOTE_ACTIVE_VERSION_SQL)
+        .bind(tenant_id)
+        .bind(component_id)
+        .bind(target_version_id)
+        .fetch_optional(executor)
+        .await?;
+    row.map(|r| {
+        Ok((
+            r.try_get("active_version_id")?,
+            r.try_get("previous_active_version_id")?,
+        ))
+    })
+    .transpose()
+}
+
+/// ワンクリック rollback: canary を破棄し、指定版（NULL なら `previous_active_version_id`）へ戻す。
+///
+/// **戻り先は必ず「未削除の version」として解決する**。単なる COALESCE UPDATE にすると previous が
+/// soft delete 済みのとき tombstone を黙って active にしてしまう（解決 SQL の stable 側は
+/// `deleted_at` を見ないので、`GET /components/{id}/versions` に出てこない版が 100% を受ける幽霊状態に
+/// なる）。FROM 句の JOIN で `cv.deleted_at IS NULL` を要求し、満たさなければ 0 行 → 409 に倒す。
+const ROLLBACK_ACTIVE_VERSION_SQL: &str = "UPDATE components c \
+        SET previous_active_version_id = CASE \
+                WHEN c.active_version_id IS DISTINCT FROM cv.id \
+                THEN c.active_version_id ELSE c.previous_active_version_id END, \
+            active_version_id = cv.id, \
+            canary_version_id = NULL, \
+            canary_weight = 0, \
+            canary_updated_at = now() \
+       FROM component_versions cv \
+      WHERE c.tenant_id = $1 AND c.id = $2 AND c.deleted_at IS NULL \
+        AND cv.id = COALESCE($3, c.previous_active_version_id) \
+        AND cv.tenant_id = c.tenant_id AND cv.component_id = c.id \
+        AND cv.deleted_at IS NULL \
+  RETURNING c.active_version_id, c.previous_active_version_id";
+
+/// ワンクリック rollback。成功時は `(新 active_version_id, 旧 active_version_id)` を返す。
+///
+/// 0 行（`None`）は component 不在 / previous が NULL / 戻り先が soft delete 済み。理由確定は
+/// 呼び出し側が 0 行のときだけ再 SELECT する。
+pub async fn rollback_active_version(
+    executor: impl sqlx::PgExecutor<'_>,
+    tenant_id: &str,
+    component_id: &str,
+    target_version_id: Option<&str>,
+) -> Result<Option<(String, Option<String>)>, sqlx::Error> {
+    let row = sqlx::query(ROLLBACK_ACTIVE_VERSION_SQL)
+        .bind(tenant_id)
+        .bind(component_id)
+        .bind(target_version_id)
+        .fetch_optional(executor)
+        .await?;
+    row.map(|r| {
+        Ok((
+            r.try_get("active_version_id")?,
+            r.try_get("previous_active_version_id")?,
+        ))
+    })
+    .transpose()
+}
+
+/// canary の版と重みを設定する（絶対値の PUT。冪等）。戻り値は更新が起きたか。
+///
+/// `version_id` の存在検証（当該 component の未削除 version であること）は
+/// **アプリ側（`find_version_id`）が唯一の参照整合**である（`canary_version_id` に FK は張らない）。
+/// 万一壊れたポインタが入っても解決 SQL の LEFT JOIN が外れて全量 stable に倒れる（fail-safe）。
+pub async fn set_traffic_split(
+    executor: impl sqlx::PgExecutor<'_>,
+    tenant_id: &str,
+    component_id: &str,
+    version_id: &str,
+    weight: i16,
+) -> Result<bool, sqlx::Error> {
+    let r = sqlx::query(
+        "UPDATE components \
+            SET canary_version_id = $3, canary_weight = $4, canary_updated_at = now() \
+          WHERE tenant_id = $1 AND id = $2 AND deleted_at IS NULL",
     )
     .bind(tenant_id)
     .bind(component_id)
     .bind(version_id)
+    .bind(weight)
     .execute(executor)
     .await?;
-    Ok(())
+    Ok(r.rows_affected() > 0)
+}
+
+/// `GET /components/{id}/traffic` が返す現在の配分（版は semver も解決済み）。
+#[derive(Debug, Clone)]
+pub struct TrafficSplitRow {
+    pub component_id: String,
+    pub stable_version_id: Option<String>,
+    pub stable_version: Option<String>,
+    pub canary_version_id: Option<String>,
+    pub canary_version: Option<String>,
+    pub weight: i16,
+    pub updated_at: Option<chrono::DateTime<chrono::Utc>>,
+}
+
+/// component id から現在の traffic 配分を引く（`GET /components/{id}/traffic`）。
+///
+/// 解決 SQL（`RESOLVE_ROUTING_SQL`）と違い **active version が無くても行を返す**（未デプロイの
+/// component でも 200 で「stable=null / weight=0」を返したい）。canary 側は解決 SQL と同じ 4 条件で
+/// LEFT JOIN するため、soft delete 済み / 不整合ポインタは `canary_version = null` として見える
+/// （＝ 実際のルーティングと同じものが観測できる）。
+pub async fn traffic_split_for_component(
+    executor: impl sqlx::PgExecutor<'_>,
+    tenant_id: &str,
+    component_id: &str,
+) -> Result<Option<TrafficSplitRow>, sqlx::Error> {
+    let row = sqlx::query(
+        "SELECT c.id AS component_id, c.canary_weight, c.canary_updated_at, \
+                sv.id AS stable_version_id, sv.version AS stable_version, \
+                cvv.id AS canary_version_id, cvv.version AS canary_version \
+           FROM components c \
+           LEFT JOIN component_versions sv \
+             ON sv.id = c.active_version_id AND sv.tenant_id = c.tenant_id \
+            AND sv.component_id = c.id \
+           LEFT JOIN component_versions cvv \
+             ON cvv.id = c.canary_version_id AND cvv.tenant_id = c.tenant_id \
+            AND cvv.component_id = c.id AND cvv.deleted_at IS NULL \
+          WHERE c.tenant_id = $1 AND c.id = $2 AND c.deleted_at IS NULL",
+    )
+    .bind(tenant_id)
+    .bind(component_id)
+    .fetch_optional(executor)
+    .await?;
+
+    row.map(|r| {
+        Ok(TrafficSplitRow {
+            component_id: r.try_get("component_id")?,
+            stable_version_id: r.try_get("stable_version_id")?,
+            stable_version: r.try_get("stable_version")?,
+            canary_version_id: r.try_get("canary_version_id")?,
+            canary_version: r.try_get("canary_version")?,
+            weight: r.try_get("canary_weight")?,
+            updated_at: r.try_get("canary_updated_at")?,
+        })
+    })
+    .transpose()
+}
+
+/// version 別の直近ウィンドウ成績（canary の go/no-go 判断の一次情報）。
+#[derive(Debug, Clone)]
+pub struct VersionStatsRow {
+    pub version_id: String,
+    pub succeeded: i64,
+    pub failed: i64,
+    pub timeout: i64,
+    pub canary_routed: i64,
+    /// `wall_time_ms` が全 NULL の版（DLQ / timeout のみ）では percentile が NULL になる。
+    pub p50_wall_time_ms: Option<i64>,
+    pub p95_wall_time_ms: Option<i64>,
+}
+
+/// 直近 `window_minutes` 分の終端実行を version 別に集計する (M7a の観測)。
+///
+/// `usage_rollups`（M5）は PK に version 次元が無く、粒度も日次なので canary 判断には使えない。
+/// M5 の集計は 1 行も変えず、`executions` 生表を直近ウィンドウで直読みする（0009 で追加した
+/// 部分 index `idx_executions_component_finished` がこの走査に対応する）。
+pub async fn version_stats_for_component(
+    executor: impl sqlx::PgExecutor<'_>,
+    tenant_id: &str,
+    component_id: &str,
+    window_minutes: i32,
+) -> Result<Vec<VersionStatsRow>, sqlx::Error> {
+    let rows = sqlx::query(VERSION_STATS_SQL)
+        .bind(tenant_id)
+        .bind(component_id)
+        .bind(window_minutes)
+        .fetch_all(executor)
+        .await?;
+
+    rows.into_iter()
+        .map(|r| {
+            Ok(VersionStatsRow {
+                version_id: r.try_get("version_id")?,
+                succeeded: r.try_get("succeeded")?,
+                failed: r.try_get("failed")?,
+                timeout: r.try_get("timeout")?,
+                canary_routed: r.try_get("canary_routed")?,
+                p50_wall_time_ms: r.try_get("p50_wall_time_ms")?,
+                p95_wall_time_ms: r.try_get("p95_wall_time_ms")?,
+            })
+        })
+        .collect()
+}
+
+const VERSION_STATS_SQL: &str = "SELECT version_id, \
+       COUNT(*) FILTER (WHERE status = 'succeeded')::bigint AS succeeded, \
+       COUNT(*) FILTER (WHERE status = 'failed')::bigint    AS failed, \
+       COUNT(*) FILTER (WHERE status = 'timeout')::bigint   AS timeout, \
+       COUNT(*) FILTER (WHERE routing_reason = 'canary')::bigint AS canary_routed, \
+       percentile_cont(0.5)  WITHIN GROUP (ORDER BY wall_time_ms)::bigint AS p50_wall_time_ms, \
+       percentile_cont(0.95) WITHIN GROUP (ORDER BY wall_time_ms)::bigint AS p95_wall_time_ms \
+  FROM executions \
+ WHERE tenant_id = $1 AND component_id = $2 \
+   AND status IN ('succeeded', 'failed', 'timeout') \
+   AND finished_at >= now() - ($3::int * interval '1 minute') \
+ GROUP BY version_id";
+
+/// canary を解除する（`canary_version_id = NULL`, `canary_weight = 0`）。既に未設定でも成功（冪等）。
+pub async fn clear_traffic_split(
+    executor: impl sqlx::PgExecutor<'_>,
+    tenant_id: &str,
+    component_id: &str,
+) -> Result<bool, sqlx::Error> {
+    let r = sqlx::query(
+        "UPDATE components \
+            SET canary_version_id = NULL, canary_weight = 0, canary_updated_at = now() \
+          WHERE tenant_id = $1 AND id = $2 AND deleted_at IS NULL",
+    )
+    .bind(tenant_id)
+    .bind(component_id)
+    .execute(executor)
+    .await?;
+    Ok(r.rows_affected() > 0)
 }
 
 /// invoke 用に解決した active version の保存先情報。
@@ -206,43 +486,95 @@ pub struct ActiveVersion {
     pub max_wall_time_ms: u64,
 }
 
-/// component 名から active かつ未削除の version を解決する (invoke 用, §6.3)。
+/// 解決 SQL (M7a)。stable / canary の両側で「id 一致 + tenant 一致 + component 一致」を JOIN 条件にする。
 ///
-/// active_version_id が NULL のとき（version 未投入）は `None`。
-pub async fn active_version_storage(
+/// **`component_id = c.id` を両側に入れる理由**: ポインタが同一テナント内の別 component の version を
+/// 指してしまった場合（運用の手 UPDATE / バックアップ復元 / component 削除→再作成）、これが無いと
+/// `JobMessage` が `component=A` / `version=<B の semver>` になり、worker の `resolve_limits` が
+/// `(tenant, component 名, version)` で行を引けず `ResourceLimits::default()` へ**無言でフォールバック**
+/// する（＝承認外のリソース上限で実行される）。さらに `executions.component_id` と `version_id` が
+/// 食い違って M5 の課金帰属も壊れる。**別 component の wasm を実行するより、起動しないほうが安全**。
+/// 一貫したデータでは結果が変わらない厳密な絞り込みであり、壊れたポインタのときだけ
+/// 「行なし → 既存の 400 `has no active version`」へ倒れる。
+const RESOLVE_ROUTING_SQL: &str = "SELECT c.id AS component_id, c.canary_weight, \
+        sv.id  AS stable_version_id, sv.version AS stable_version, \
+        sv.storage_uri AS stable_storage_uri, sv.wasm_sha256 AS stable_wasm_sha256, \
+        sv.resource_limits AS stable_resource_limits, \
+        cvv.id AS canary_version_id, cvv.version AS canary_version, \
+        cvv.storage_uri AS canary_storage_uri, cvv.wasm_sha256 AS canary_wasm_sha256, \
+        cvv.resource_limits AS canary_resource_limits \
+     FROM components c \
+     JOIN component_versions sv \
+       ON sv.id = c.active_version_id AND sv.tenant_id = c.tenant_id \
+      AND sv.component_id = c.id \
+     LEFT JOIN component_versions cvv \
+       ON cvv.id = c.canary_version_id AND cvv.tenant_id = c.tenant_id \
+      AND cvv.component_id = c.id \
+      AND cvv.deleted_at IS NULL \
+     WHERE c.tenant_id = $1 AND c.name = $2 AND c.deleted_at IS NULL \
+       AND c.active_version_id IS NOT NULL";
+
+/// `resource_limits`(JSONB) から壁時計上限を解決する。欠損 / 不正は既定にフォールバック。
+fn max_wall_time_from_limits(limits_json: Value) -> u64 {
+    serde_json::from_value::<faas_shared::ResourceLimits>(limits_json)
+        .unwrap_or_default()
+        .max_wall_time_ms
+}
+
+/// component 名から stable / canary の両ポインタを 1 本の SQL で解決する (M7a, §6.7 / §15)。
+///
+/// `active_version_id` が NULL のとき（version 未投入）や、stable ポインタが壊れているときは `None`
+/// ＝ 呼び出し側は従来どおり 400 `has no active version` / cron の advance-only skip に倒れる。
+///
+/// canary 側は LEFT JOIN の 4 条件（id / tenant / component / 未削除）が揃ったときだけ `Some` になる。
+/// どれか 1 つでも外れれば `None` ＝ **重みに関わらず全量 stable**（fail-safe）。
+///
+/// 呼び出しは必ず `db::set_tenant_guc` 済みの tx から行う（RLS の二重防御: GUC + `WHERE tenant_id = $1`）。
+pub async fn resolve_component_routing(
     executor: impl sqlx::PgExecutor<'_>,
     tenant_id: &str,
     component_name: &str,
-) -> Result<Option<ActiveVersion>, sqlx::Error> {
-    let row = sqlx::query(
-        "SELECT cv.id AS version_id, cv.version, cv.storage_uri, cv.wasm_sha256, \
-                cv.resource_limits \
-         FROM components c \
-         JOIN component_versions cv \
-           ON cv.id = c.active_version_id AND cv.tenant_id = c.tenant_id \
-         WHERE c.tenant_id = $1 AND c.name = $2 AND c.deleted_at IS NULL \
-           AND c.active_version_id IS NOT NULL",
-    )
-    .bind(tenant_id)
-    .bind(component_name)
-    .fetch_optional(executor)
-    .await?;
+) -> Result<Option<crate::routing::ComponentRouting>, sqlx::Error> {
+    let Some(r) = sqlx::query(RESOLVE_ROUTING_SQL)
+        .bind(tenant_id)
+        .bind(component_name)
+        .fetch_optional(executor)
+        .await?
+    else {
+        return Ok(None);
+    };
 
-    row.map(|r| {
-        // resource_limits(JSONB) から壁時計上限を解決する。欠損/不正は既定にフォールバック。
-        let limits_json: Value = r.try_get("resource_limits")?;
-        let max_wall_time_ms = serde_json::from_value::<faas_shared::ResourceLimits>(limits_json)
-            .unwrap_or_default()
-            .max_wall_time_ms;
-        Ok(ActiveVersion {
-            version_id: r.try_get("version_id")?,
-            version: r.try_get("version")?,
-            storage_uri: r.try_get("storage_uri")?,
-            wasm_sha256: r.try_get("wasm_sha256")?,
-            max_wall_time_ms,
-        })
-    })
-    .transpose()
+    let stable = ActiveVersion {
+        version_id: r.try_get("stable_version_id")?,
+        version: r.try_get("stable_version")?,
+        storage_uri: r.try_get("stable_storage_uri")?,
+        wasm_sha256: r.try_get("stable_wasm_sha256")?,
+        max_wall_time_ms: max_wall_time_from_limits(r.try_get("stable_resource_limits")?),
+    };
+
+    // LEFT JOIN が外れた場合は canary_version_id が NULL で返る（= fail-safe に全量 stable）。
+    let canary_version_id: Option<String> = r.try_get("canary_version_id")?;
+    let canary = match canary_version_id {
+        Some(version_id) => Some(ActiveVersion {
+            version_id,
+            version: r.try_get("canary_version")?,
+            storage_uri: r.try_get("canary_storage_uri")?,
+            wasm_sha256: r.try_get("canary_wasm_sha256")?,
+            max_wall_time_ms: max_wall_time_from_limits(r.try_get("canary_resource_limits")?),
+        }),
+        None => None,
+    };
+
+    // DB の CHECK（migration 0009）で 0..=100 は保証されるが、防御的に clamp して読む。
+    let weight: i16 = r.try_get("canary_weight")?;
+    let canary_weight = weight.clamp(0, 100) as u8;
+
+    Ok(Some(crate::routing::ComponentRouting {
+        component_id: r.try_get("component_id")?,
+        stable,
+        canary,
+        canary_weight,
+    }))
 }
 
 /// テナント内で name から component を解決する (soft-delete 済みは除外)。
@@ -252,7 +584,8 @@ pub async fn find_component_by_name(
     name: &str,
 ) -> Result<Option<ComponentRow>, sqlx::Error> {
     let row = sqlx::query(
-        "SELECT id, name, active_version_id FROM components \
+        "SELECT id, name, active_version_id, canary_version_id, previous_active_version_id \
+         FROM components \
          WHERE tenant_id = $1 AND name = $2 AND deleted_at IS NULL",
     )
     .bind(tenant_id)
@@ -265,6 +598,8 @@ pub async fn find_component_by_name(
             id: r.try_get("id")?,
             name: r.try_get("name")?,
             active_version_id: r.try_get("active_version_id")?,
+            canary_version_id: r.try_get("canary_version_id")?,
+            previous_active_version_id: r.try_get("previous_active_version_id")?,
         })
     })
     .transpose()
@@ -296,6 +631,9 @@ pub async fn insert_pending_execution(
         None,
         None,
         0,
+        // M7a: この簡易版は canary 解決を通らない（テスト / 将来の非 invoke 経路）ため
+        // 定義上 stable 相当。executions_routing_reason_chk の値域に合わせる。
+        crate::routing::RoutingReason::Stable.as_str(),
     )
     .await
 }
@@ -309,6 +647,9 @@ pub async fn insert_pending_execution(
 /// `tenants/{tenant}/io/{execution_id}/input` に完全一致したものだけが呼び出し側で渡される）。
 /// 冪等列は migrations/0005_provenance.sql、input_ref は migrations/0006_large_io.sql の
 /// nullable 列に対応する。
+/// `routing_reason` は M7a の version 決定理由（`"stable"` | `"canary"`, migration 0009）。
+/// `components` は可変なので version_id だけでは昇格後に stable/canary の区別が失われる。
+/// 実行時点のスナップショットとしてここで固定する（`routing::RoutingReason::as_str()` を渡す）。
 ///
 /// 部分 UNIQUE (tenant_id, idempotency_key) WHERE idempotency_key IS NOT NULL に違反すると
 /// 23505 を返す。並行同一 key の二重 INSERT 競合では呼び出し側がこれを捕捉し、再 SELECT して
@@ -326,12 +667,14 @@ pub async fn insert_pending_execution_with_provenance(
     job_token_kid: Option<&str>,
     input_ref: Option<&str>,
     chain_depth: i32,
+    routing_reason: &str,
 ) -> Result<(), sqlx::Error> {
     sqlx::query(
         "INSERT INTO executions \
          (id, tenant_id, component_id, version_id, status, input, \
-          idempotency_key, idempotency_request_hash, job_token_kid, input_ref, chain_depth) \
-         VALUES ($1, $2, $3, $4, 'pending', $5, $6, $7, $8, $9, $10)",
+          idempotency_key, idempotency_request_hash, job_token_kid, input_ref, chain_depth, \
+          routing_reason) \
+         VALUES ($1, $2, $3, $4, 'pending', $5, $6, $7, $8, $9, $10, $11)",
     )
     .bind(execution_id)
     .bind(tenant_id)
@@ -343,6 +686,7 @@ pub async fn insert_pending_execution_with_provenance(
     .bind(job_token_kid)
     .bind(input_ref)
     .bind(chain_depth)
+    .bind(routing_reason)
     .execute(executor)
     .await?;
     Ok(())
@@ -595,6 +939,460 @@ pub async fn find_version_id(
     .await?;
 
     row.map(|r| r.try_get::<String, _>("id")).transpose()
+}
+
+/// version の `capabilities` JSONB を引く（M7b: env 許可リストの解決）。
+pub async fn version_capabilities(
+    executor: impl sqlx::PgExecutor<'_>,
+    tenant_id: &str,
+    version_id: &str,
+) -> Result<Option<Value>, sqlx::Error> {
+    let row = sqlx::query(
+        "SELECT capabilities FROM component_versions \
+         WHERE tenant_id = $1 AND id = $2 AND deleted_at IS NULL",
+    )
+    .bind(tenant_id)
+    .bind(version_id)
+    .fetch_optional(executor)
+    .await?;
+
+    row.map(|r| r.try_get::<Value, _>("capabilities"))
+        .transpose()
+}
+
+/// version の `capabilities.env`（注入を許可する env 名）を全置換する (M7b, §4.4)。
+///
+/// **admin 承認の唯一の書き込み点**。`imports` 側（strict matching の結果）は保持したまま
+/// `env` キーだけを差し替える（jsonb_set 相当をアプリ側で組み立てて渡す）。
+/// 戻り値は更新が起きたか（0 行 = version 不在 / soft delete 済み → 呼び出し側が 404）。
+pub async fn set_version_capabilities(
+    executor: impl sqlx::PgExecutor<'_>,
+    tenant_id: &str,
+    version_id: &str,
+    capabilities: &Value,
+) -> Result<bool, sqlx::Error> {
+    let r = sqlx::query(
+        "UPDATE component_versions SET capabilities = $3 \
+          WHERE tenant_id = $1 AND id = $2 AND deleted_at IS NULL",
+    )
+    .bind(tenant_id)
+    .bind(version_id)
+    .bind(capabilities)
+    .execute(executor)
+    .await?;
+    Ok(r.rows_affected() > 0)
+}
+
+// ---------------------------------------------------------------------------
+// M7b: per-function の平文環境変数（function_configs, migration 0010）
+//
+// **平文である**ことが型と権限の両方で分かるようにする（secret は function_secrets 側で
+// 暗号化して持ち、読み出し API を持たない）。すべて set_tenant_guc 済み tx で呼ぶこと。
+// ---------------------------------------------------------------------------
+
+/// `function_configs` の 1 行（平文なので値も返す）。
+#[derive(Debug, Clone)]
+pub struct FunctionConfigRow {
+    pub key: String,
+    pub value: String,
+    pub updated_at: chrono::DateTime<chrono::Utc>,
+}
+
+/// per-function config を 1 キー upsert する。
+pub async fn upsert_function_config(
+    executor: impl sqlx::PgExecutor<'_>,
+    tenant_id: &str,
+    component_id: &str,
+    key: &str,
+    value: &str,
+    updated_by: Option<&str>,
+) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        "INSERT INTO function_configs (tenant_id, component_id, key, value, updated_by) \
+         VALUES ($1, $2, $3, $4, $5) \
+         ON CONFLICT (tenant_id, component_id, key) \
+         DO UPDATE SET value = EXCLUDED.value, updated_at = now(), updated_by = EXCLUDED.updated_by",
+    )
+    .bind(tenant_id)
+    .bind(component_id)
+    .bind(key)
+    .bind(value)
+    .bind(updated_by)
+    .execute(executor)
+    .await?;
+    Ok(())
+}
+
+/// component の config を全件引く（キー名昇順 ＝ 応答と注入の決定性）。
+pub async fn list_function_configs(
+    executor: impl sqlx::PgExecutor<'_>,
+    tenant_id: &str,
+    component_id: &str,
+) -> Result<Vec<FunctionConfigRow>, sqlx::Error> {
+    let rows = sqlx::query(
+        "SELECT key, value, updated_at FROM function_configs \
+          WHERE tenant_id = $1 AND component_id = $2 ORDER BY key",
+    )
+    .bind(tenant_id)
+    .bind(component_id)
+    .fetch_all(executor)
+    .await?;
+
+    rows.into_iter()
+        .map(|r| {
+            Ok(FunctionConfigRow {
+                key: r.try_get("key")?,
+                value: r.try_get("value")?,
+                updated_at: r.try_get("updated_at")?,
+            })
+        })
+        .collect()
+}
+
+/// config を 1 キー削除する。戻り値は削除が起きたか（0 行 → 404）。
+pub async fn delete_function_config(
+    executor: impl sqlx::PgExecutor<'_>,
+    tenant_id: &str,
+    component_id: &str,
+    key: &str,
+) -> Result<bool, sqlx::Error> {
+    let r = sqlx::query(
+        "DELETE FROM function_configs WHERE tenant_id = $1 AND component_id = $2 AND key = $3",
+    )
+    .bind(tenant_id)
+    .bind(component_id)
+    .bind(key)
+    .execute(executor)
+    .await?;
+    Ok(r.rows_affected() > 0)
+}
+
+/// component の config を全置換する（`PUT /config` のトランザクション内で使う）。
+///
+/// 「全置換」を DELETE + INSERT で表現する。同一 tx 内なので中間状態は観測されない。
+pub async fn replace_function_configs(
+    tx: &mut sqlx::PgConnection,
+    tenant_id: &str,
+    component_id: &str,
+    entries: &[(String, String)],
+    updated_by: Option<&str>,
+) -> Result<(), sqlx::Error> {
+    sqlx::query("DELETE FROM function_configs WHERE tenant_id = $1 AND component_id = $2")
+        .bind(tenant_id)
+        .bind(component_id)
+        .execute(&mut *tx)
+        .await?;
+    for (key, value) in entries {
+        upsert_function_config(&mut *tx, tenant_id, component_id, key, value, updated_by).await?;
+    }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// M7c: Secrets Manager（function_secrets / function_secret_versions, migration 0011）
+//
+// **平文も暗号文もこの層より上へ素で流さない**。値は `secrets.rs` の封筒 [`crate::secrets::Envelope`]
+// としてのみ受け渡す。版台帳は追記専用（faas_app に UPDATE/DELETE が無い）なので、値の更新
+// （rotate）も KEK 再ラップ（rekey）も「新しい version 行の INSERT」で表現する。
+// すべて set_tenant_guc 済み tx で呼ぶこと。
+// ---------------------------------------------------------------------------
+
+/// `function_secrets` のメタデータ 1 行（**値は含まない**）。
+#[derive(Debug, Clone)]
+pub struct SecretMetaRow {
+    pub id: String,
+    pub name: String,
+    pub current_version: i32,
+    /// 作成時刻。M7c-3 の execution 基準の世代解決（§4.7）で参照する。
+    #[allow(dead_code)]
+    pub created_at: chrono::DateTime<chrono::Utc>,
+    pub updated_at: chrono::DateTime<chrono::Utc>,
+}
+
+/// secret メタ行を作成する（版行は別途 `insert_secret_version` で INSERT する）。
+///
+/// 生存行の同名重複は部分 UNIQUE index 違反（23505）。呼び出し側が捕捉して
+/// 「既存 → rotate」へ倒す。
+pub async fn insert_secret_meta(
+    executor: impl sqlx::PgExecutor<'_>,
+    tenant_id: &str,
+    secret_id: &str,
+    component_id: &str,
+    name: &str,
+    current_version: i32,
+) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        "INSERT INTO function_secrets \
+         (id, tenant_id, component_id, name, current_version) \
+         VALUES ($1, $2, $3, $4, $5)",
+    )
+    .bind(secret_id)
+    .bind(tenant_id)
+    .bind(component_id)
+    .bind(name)
+    .bind(current_version)
+    .execute(executor)
+    .await?;
+    Ok(())
+}
+
+/// 生存している secret を名前で引く（**メタのみ**）。
+pub async fn find_live_secret_by_name(
+    executor: impl sqlx::PgExecutor<'_>,
+    tenant_id: &str,
+    component_id: &str,
+    name: &str,
+) -> Result<Option<SecretMetaRow>, sqlx::Error> {
+    let row = sqlx::query(
+        "SELECT id, name, current_version, created_at, updated_at FROM function_secrets \
+          WHERE tenant_id = $1 AND component_id = $2 AND name = $3 AND deleted_at IS NULL",
+    )
+    .bind(tenant_id)
+    .bind(component_id)
+    .bind(name)
+    .fetch_optional(executor)
+    .await?;
+
+    row.map(|r| {
+        Ok(SecretMetaRow {
+            id: r.try_get("id")?,
+            name: r.try_get("name")?,
+            current_version: r.try_get("current_version")?,
+            created_at: r.try_get("created_at")?,
+            updated_at: r.try_get("updated_at")?,
+        })
+    })
+    .transpose()
+}
+
+/// component の生存 secret を全件引く（**メタのみ**。値も value_len も kek_kid も返さない）。
+pub async fn list_secrets_meta(
+    executor: impl sqlx::PgExecutor<'_>,
+    tenant_id: &str,
+    component_id: &str,
+) -> Result<Vec<SecretMetaRow>, sqlx::Error> {
+    let rows = sqlx::query(
+        "SELECT id, name, current_version, created_at, updated_at FROM function_secrets \
+          WHERE tenant_id = $1 AND component_id = $2 AND deleted_at IS NULL ORDER BY name",
+    )
+    .bind(tenant_id)
+    .bind(component_id)
+    .fetch_all(executor)
+    .await?;
+
+    rows.into_iter()
+        .map(|r| {
+            Ok(SecretMetaRow {
+                id: r.try_get("id")?,
+                name: r.try_get("name")?,
+                current_version: r.try_get("current_version")?,
+                created_at: r.try_get("created_at")?,
+                updated_at: r.try_get("updated_at")?,
+            })
+        })
+        .collect()
+}
+
+/// 版台帳へ 1 行 INSERT する（追記専用）。`reason` は `'create' | 'rotate' | 'rekey'`。
+pub async fn insert_secret_version(
+    executor: impl sqlx::PgExecutor<'_>,
+    tenant_id: &str,
+    secret_id: &str,
+    version: i32,
+    env: &crate::secrets::Envelope,
+    reason: &str,
+    created_by: Option<&str>,
+) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        "INSERT INTO function_secret_versions \
+         (tenant_id, secret_id, version, kek_kid, wrapped_dek, dek_nonce, nonce, ciphertext, \
+          value_len, reason, created_by) \
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)",
+    )
+    .bind(tenant_id)
+    .bind(secret_id)
+    .bind(version)
+    .bind(&env.kek_kid)
+    .bind(&env.wrapped_dek)
+    .bind(&env.dek_nonce)
+    .bind(&env.nonce)
+    .bind(&env.ciphertext)
+    .bind(env.value_len)
+    .bind(reason)
+    .bind(created_by)
+    .execute(executor)
+    .await?;
+    Ok(())
+}
+
+/// `current_version` を前進させる（rotate / rekey 後の切替）。
+pub async fn bump_secret_current_version(
+    executor: impl sqlx::PgExecutor<'_>,
+    tenant_id: &str,
+    secret_id: &str,
+    version: i32,
+) -> Result<bool, sqlx::Error> {
+    let r = sqlx::query(
+        "UPDATE function_secrets SET current_version = $3, updated_at = now() \
+          WHERE tenant_id = $1 AND id = $2 AND deleted_at IS NULL",
+    )
+    .bind(tenant_id)
+    .bind(secret_id)
+    .bind(version)
+    .execute(executor)
+    .await?;
+    Ok(r.rows_affected() > 0)
+}
+
+/// secret を soft delete する。版台帳は残る（追記専用なので消せない ＝ 監査上も残す）。
+///
+/// 生存行の部分 UNIQUE index から外れるため、**同名で作り直せる**（インシデント対応の基本操作）。
+pub async fn soft_delete_secret(
+    executor: impl sqlx::PgExecutor<'_>,
+    tenant_id: &str,
+    secret_id: &str,
+) -> Result<bool, sqlx::Error> {
+    let r = sqlx::query(
+        "UPDATE function_secrets SET deleted_at = now(), updated_at = now() \
+          WHERE tenant_id = $1 AND id = $2 AND deleted_at IS NULL",
+    )
+    .bind(tenant_id)
+    .bind(secret_id)
+    .execute(executor)
+    .await?;
+    Ok(r.rows_affected() > 0)
+}
+
+/// テナントが `active` かどうか (M7c: `/internal/job-env` は認証 middleware 外なので個別確認する)。
+///
+/// `auth::authenticate` が middleware で行っている停止テナント遮断と同じ判定を、middleware の
+/// 外にある内部エンドポイントで**明示的に**行うためのもの（§4.6.1 (3) の MUST）。
+/// RLS 下の GUC を必要としない参照なので、SECURITY DEFINER 関数と同じく GUC 前に呼べる。
+pub async fn tenant_is_active(
+    executor: impl sqlx::PgExecutor<'_>,
+    tenant_id: &str,
+) -> Result<bool, sqlx::Error> {
+    let row = sqlx::query(
+        "SELECT EXISTS (SELECT 1 FROM tenants WHERE id = $1 AND status = 'active') AS ok",
+    )
+    .bind(tenant_id)
+    .fetch_one(executor)
+    .await?;
+    row.try_get("ok")
+}
+
+/// component に**生存する secret が 1 件以上あるか**（M7c: enqueue 時の env-token 要否判定）。
+///
+/// 件数も名前も返さない（wire に載せる情報を「有無」だけに絞るため）。
+pub async fn component_has_live_secrets(
+    executor: impl sqlx::PgExecutor<'_>,
+    tenant_id: &str,
+    component_id: &str,
+) -> Result<bool, sqlx::Error> {
+    let row = sqlx::query(
+        "SELECT EXISTS ( \
+             SELECT 1 FROM function_secrets \
+              WHERE tenant_id = $1 AND component_id = $2 AND deleted_at IS NULL \
+         ) AS present",
+    )
+    .bind(tenant_id)
+    .bind(component_id)
+    .fetch_one(executor)
+    .await?;
+    row.try_get("present")
+}
+
+/// 現行 kid でない current 世代を持つ secret の id を引く（M7c-4: rekey 対象）。
+///
+/// `secrets_stale_kek(p_tenant, p_active_kid)` は SECURITY DEFINER（faas_app は FORCE RLS 下で
+/// 巡回できない）。**テナント引数を取る版**なので GUC 前でも呼べるが、返すのは
+/// `(tenant_id, secret_id)` だけで暗号文も名前も返さない（0004 の認証前参照 3 関数と同じ作法）。
+pub async fn secrets_stale_kek(
+    executor: impl sqlx::PgExecutor<'_>,
+    tenant_id: &str,
+    active_kid: &str,
+) -> Result<Vec<String>, sqlx::Error> {
+    let rows = sqlx::query("SELECT secret_id FROM secrets_stale_kek($1, $2)")
+        .bind(tenant_id)
+        .bind(active_kid)
+        .fetch_all(executor)
+        .await?;
+    rows.into_iter()
+        .map(|r| r.try_get::<String, _>("secret_id"))
+        .collect()
+}
+
+/// kid 別の current 世代件数（M7c-4: Prometheus gauge の内部更新専用）。
+///
+/// **HTTP 応答に載せてはならない** (MUST NOT)。全テナント横断の集計であり、テナント管理者へ
+/// 返すと他テナントの secret 総数が漏れる。
+pub async fn secrets_kek_kid_counts_all(
+    executor: impl sqlx::PgExecutor<'_>,
+) -> Result<Vec<(String, i64)>, sqlx::Error> {
+    let rows = sqlx::query("SELECT kek_kid, n FROM secrets_kek_kid_counts_all()")
+        .fetch_all(executor)
+        .await?;
+    rows.into_iter()
+        .map(|r| Ok((r.try_get("kek_kid")?, r.try_get("n")?)))
+        .collect()
+}
+
+/// secret メタ行を id で引く（rekey が current 世代を解決するのに使う）。
+pub async fn find_secret_meta_by_id(
+    executor: impl sqlx::PgExecutor<'_>,
+    tenant_id: &str,
+    secret_id: &str,
+) -> Result<Option<SecretMetaRow>, sqlx::Error> {
+    let row = sqlx::query(
+        "SELECT id, name, current_version, created_at, updated_at FROM function_secrets \
+          WHERE tenant_id = $1 AND id = $2 AND deleted_at IS NULL",
+    )
+    .bind(tenant_id)
+    .bind(secret_id)
+    .fetch_optional(executor)
+    .await?;
+
+    row.map(|r| {
+        Ok(SecretMetaRow {
+            id: r.try_get("id")?,
+            name: r.try_get("name")?,
+            current_version: r.try_get("current_version")?,
+            created_at: r.try_get("created_at")?,
+            updated_at: r.try_get("updated_at")?,
+        })
+    })
+    .transpose()
+}
+
+/// 指定 secret の指定版の封筒を引く。
+pub async fn find_secret_version(
+    executor: impl sqlx::PgExecutor<'_>,
+    tenant_id: &str,
+    secret_id: &str,
+    version: i32,
+) -> Result<Option<crate::secrets::Envelope>, sqlx::Error> {
+    let row = sqlx::query(
+        "SELECT kek_kid, wrapped_dek, dek_nonce, nonce, ciphertext, value_len \
+           FROM function_secret_versions \
+          WHERE tenant_id = $1 AND secret_id = $2 AND version = $3",
+    )
+    .bind(tenant_id)
+    .bind(secret_id)
+    .bind(version)
+    .fetch_optional(executor)
+    .await?;
+
+    row.map(|r| {
+        Ok(crate::secrets::Envelope {
+            kek_kid: r.try_get("kek_kid")?,
+            wrapped_dek: r.try_get("wrapped_dek")?,
+            dek_nonce: r.try_get("dek_nonce")?,
+            nonce: r.try_get("nonce")?,
+            ciphertext: r.try_get("ciphertext")?,
+            value_len: r.try_get("value_len")?,
+        })
+    })
+    .transpose()
 }
 
 /// version を soft delete する (deleted_at=now(), §6.7)。
@@ -1727,8 +2525,9 @@ pub async fn record_trigger_delivery(
 #[cfg(test)]
 mod tests {
     use super::{
-        saturating_i64, TenantQuotaOverrides, FINALIZE_EXECUTION_SQL, SET_TENANT_GUC_SQL,
-        STUCK_EXECUTION_SWEEP_SQL, UPSERT_USAGE_ROLLUP_SQL,
+        saturating_i64, TenantQuotaOverrides, FINALIZE_EXECUTION_SQL, PROMOTE_ACTIVE_VERSION_SQL,
+        RESOLVE_ROUTING_SQL, ROLLBACK_ACTIVE_VERSION_SQL, SET_TENANT_GUC_SQL,
+        STUCK_EXECUTION_SWEEP_SQL, SWITCH_ACTIVE_VERSION_SQL, UPSERT_USAGE_ROLLUP_SQL,
     };
 
     // ---- M4d クォータ上書き JSONB のパース不変条件（DB 非依存）-----------------
@@ -2016,5 +2815,134 @@ mod tests {
         let upper = sql.to_ascii_uppercase();
         assert!(upper.starts_with("INSERT INTO AUDIT_LOGS"));
         assert!(!upper.contains("UPDATE") && !upper.contains("DELETE"));
+    }
+
+    // ---- M7a: 解決 SQL の不変条件（DB-free 文字列検査） ----------------------
+
+    /// 解決 SQL は必ずテナントで絞り、値を文字列結合しない（RLS の二重防御の片側）。
+    #[test]
+    fn resolve_routing_sql_is_tenant_scoped() {
+        assert!(
+            RESOLVE_ROUTING_SQL.contains("c.tenant_id = $1"),
+            "resolution must be tenant-scoped in the predicate as well as under RLS"
+        );
+        assert!(
+            RESOLVE_ROUTING_SQL.contains("c.name = $2"),
+            "component name must be bound, never concatenated"
+        );
+        assert!(
+            !RESOLVE_ROUTING_SQL.contains("format!") && !RESOLVE_ROUTING_SQL.contains("{}"),
+            "resolution SQL must not interpolate values"
+        );
+    }
+
+    /// canary 側 LEFT JOIN の 4 条件（id / tenant / component / 未削除）が揃っていること。
+    /// どれか 1 つでも欠けると「壊れたポインタは fail-safe に stable へ倒れる」という
+    /// 設計の中心主張が成立しなくなる。
+    #[test]
+    fn resolve_routing_sql_fails_safe_on_bad_canary() {
+        for cond in [
+            "cvv.id = c.canary_version_id",
+            "cvv.tenant_id = c.tenant_id",
+            "cvv.component_id = c.id",
+            "cvv.deleted_at IS NULL",
+        ] {
+            assert!(
+                RESOLVE_ROUTING_SQL.contains(cond),
+                "canary LEFT JOIN must constrain `{cond}` (fail-safe to stable otherwise)"
+            );
+        }
+    }
+
+    /// stable 側の述語は M6 までの `active_version_storage` と**同値**であること
+    /// （alias は `cv` → `sv` に改名しているので文字単位では一致しない。凍結リテラルで照合する）。
+    /// `sv.component_id = c.id` は一貫データでは no-op の narrowing で、壊れたポインタのときだけ
+    /// 「行なし → 既存の 400 has no active version」へ倒す（別 component の wasm を実行しない）。
+    #[test]
+    fn resolve_routing_sql_preserves_stable_predicates() {
+        for cond in [
+            "sv.id = c.active_version_id",
+            "sv.tenant_id = c.tenant_id",
+            "sv.component_id = c.id",
+            "c.deleted_at IS NULL",
+            "c.active_version_id IS NOT NULL",
+        ] {
+            assert!(
+                RESOLVE_ROUTING_SQL.contains(cond),
+                "stable-side predicate `{cond}` must be preserved"
+            );
+        }
+    }
+
+    // ---- M7a: stable ポインタを動かす 3 操作の不変条件 -----------------------
+
+    /// stable を動かす操作は必ず canary をクリアする（新 stable と古い配分の混線を構造的に防ぐ）。
+    #[test]
+    fn switch_active_version_clears_canary() {
+        for sql in [
+            SWITCH_ACTIVE_VERSION_SQL,
+            PROMOTE_ACTIVE_VERSION_SQL,
+            ROLLBACK_ACTIVE_VERSION_SQL,
+        ] {
+            assert!(
+                sql.contains("canary_version_id = NULL") && sql.contains("canary_weight = 0"),
+                "moving the stable pointer must always clear the canary split"
+            );
+        }
+    }
+
+    /// 同じ版を再 activate しても `previous_active_version_id` を自分自身で潰さない。
+    /// 潰すと直後の rollback が「200 を返すのに何も戻らない」最悪の failure mode になる。
+    #[test]
+    fn switch_active_version_preserves_previous_on_noop() {
+        for sql in [
+            SWITCH_ACTIVE_VERSION_SQL,
+            PROMOTE_ACTIVE_VERSION_SQL,
+            ROLLBACK_ACTIVE_VERSION_SQL,
+        ] {
+            assert!(
+                sql.contains("CASE") && sql.contains("IS DISTINCT FROM"),
+                "previous_active_version_id must be guarded by a no-op CASE"
+            );
+        }
+    }
+
+    /// promote は事前 SELECT 無しの単一 UPDATE + CAS（read-then-write のレースを作らない）。
+    #[test]
+    fn promote_sql_is_single_statement_cas() {
+        assert!(
+            PROMOTE_ACTIVE_VERSION_SQL.contains("canary_version_id IS NOT NULL"),
+            "promote must refuse when no canary is configured"
+        );
+        assert!(
+            PROMOTE_ACTIVE_VERSION_SQL.contains("($3 IS NULL OR canary_version_id = $3)"),
+            "an explicit target must be a CAS condition, not a read-then-write"
+        );
+        assert!(
+            PROMOTE_ACTIVE_VERSION_SQL.contains("RETURNING"),
+            "promote must report the resulting pointers from the same statement"
+        );
+        assert!(
+            !PROMOTE_ACTIVE_VERSION_SQL.contains("SELECT"),
+            "the success path must stay a single UPDATE"
+        );
+    }
+
+    /// rollback の戻り先は必ず**未削除の**version として解決する（tombstone を active にしない）。
+    #[test]
+    fn rollback_sql_requires_live_version() {
+        assert!(
+            ROLLBACK_ACTIVE_VERSION_SQL.contains("cv.deleted_at IS NULL"),
+            "rollback must not resurrect a soft-deleted version"
+        );
+        assert!(
+            ROLLBACK_ACTIVE_VERSION_SQL.contains("cv.component_id = c.id")
+                && ROLLBACK_ACTIVE_VERSION_SQL.contains("cv.tenant_id = c.tenant_id"),
+            "rollback target must belong to the same component and tenant"
+        );
+        assert!(
+            ROLLBACK_ACTIVE_VERSION_SQL.contains("COALESCE($3, c.previous_active_version_id)"),
+            "an empty body must roll back to the recorded previous stable"
+        );
     }
 }

@@ -44,8 +44,21 @@ impl Guest for Component {
             },
         };
 
-        // {"echo": <input value>} に包んで JSON エンコードして返す。
-        let output = json!({ "echo": value });
+        // M7b (§3.6): 注入された環境変数を出力に含める（chaos S2/S3 の前提）。
+        //
+        // **これは検証用の component であり、本番の Component が env をそのまま出力へ返すのは
+        // 誤りである**（secret が invoke 応答から読めてしまう）。README の露出ガード節にも明記する。
+        // `wasi:cli/environment` は capability baseline で承認済みなので追加の承認は要らない。
+        // キー名でソートして決定的な出力にする。
+        let mut env: Vec<(String, String)> = std::env::vars().collect();
+        env.sort();
+        let env_map: serde_json::Map<String, Value> = env
+            .into_iter()
+            .map(|(k, v)| (k, Value::String(v)))
+            .collect();
+
+        // {"echo": <input value>, "env": {...}} に包んで JSON エンコードして返す。
+        let output = json!({ "echo": value, "env": env_map });
         serde_json::to_vec(&output).map_err(|e| HandlerError {
             kind: ErrorKind::Runtime,
             message: format!("failed to serialize output: {e}"),

@@ -68,6 +68,52 @@ pub struct EnqueueRequest<'a> {
     /// M6c: Component チェーンのホップ深さ。root 起動（HTTP/Cron/Object Storage）は 0、chain 下流のみ
     /// 上流深さ+1。`MAX_CHAIN_DEPTH` 超過の起動は呼び出し側（chain フック）で拒否する（循環暴走防止）。
     pub chain_depth: i32,
+    /// M7a: version 決定理由（`"stable"` | `"canary"`）。`executions.routing_reason` へ保存し、
+    /// **publish ack 成功後**の `faas_canary_routed_total` にも使う。
+    /// 値は `resolve_version_for_enqueue` が返した `RoutedVersion::reason` をそのまま渡すこと
+    /// （呼び出し側で組み立てない ＝ 解決と記録の食い違いを構造的に防ぐ）。
+    pub routing_reason: &'static str,
+}
+
+/// 選ばれた版と、その選択理由 (M7a)。
+pub struct RoutedVersion {
+    /// 解決された component の id（executions.component_id / routing バケットのドメイン）。
+    pub component_id: String,
+    /// 実際に起動する版（stable か canary のどちらか）。
+    pub selected: db::ActiveVersion,
+    /// `routing::RoutingReason::as_str()`（`"stable"` | `"canary"`）。
+    pub reason: &'static str,
+}
+
+/// 全入口（HTTP invoke / Cron / event / chain）が通る**唯一のバージョン解決点** (M7a, §6.7 / §15)。
+///
+/// `enqueue.rs` に置くのは意図的である。本モジュールは M6-0 で「全入口が合流する唯一の正規パス」
+/// として作られており、解決をここに閉じれば **どの入口も canary をバイパスできない**。
+///
+/// `tx` は `set_tenant_guc` 済み（FORCE RLS 下）。active version が無い / stable ポインタが壊れて
+/// いるときは `None`（呼び出し側が従来どおり 400 / cron の advance-only skip / delivery-only skip
+/// に倒す）。
+///
+/// **メトリクスはここで inc しない**。解決しても enqueue されない経路が複数あるため
+/// （HTTP は admission reserve の 429・presign 失敗・publish backpressure がこの後に来る。cron は
+/// 冪等ヒットで skip する）。計上は `enqueue_execution` が `Enqueued` を返す直前に行う（§2.9）。
+pub async fn resolve_version_for_enqueue(
+    tx: &mut sqlx::PgConnection,
+    tenant: &str,
+    component_name: &str,
+    routing_key: &str,
+) -> Result<Option<RoutedVersion>, sqlx::Error> {
+    let Some(routing) = db::resolve_component_routing(&mut *tx, tenant, component_name).await?
+    else {
+        return Ok(None);
+    };
+    let bucket = crate::routing::routing_bucket(&routing.component_id, routing_key);
+    let (selected, reason) = crate::routing::select_version(&routing, bucket);
+    Ok(Some(RoutedVersion {
+        component_id: routing.component_id.clone(),
+        selected: selected.clone(),
+        reason: reason.as_str(),
+    }))
 }
 
 /// enqueue 失敗の分類 (M6-0)。
@@ -152,6 +198,7 @@ pub async fn enqueue_execution(
             Some(state.signer().kid()),
             req.input_ref,
             req.chain_depth,
+            req.routing_reason,
         )
         .await;
         match r {
@@ -188,6 +235,14 @@ pub async fn enqueue_execution(
         return Err(EnqueueError::Other(e.into()));
     }
 
+    // --- 1.5) M7c (§4.6): env-token の要否を判定する ---
+    // 「当該 component に生存する secret が 1 件以上あるか」だけを見る。**secret 名も件数も
+    // wire に載せない**（`env_token` が `Some` かどうかがそのままシグナルになる）。
+    // secret を 1 つも持たない component では worker の HTTP 往復がゼロになる（pay-per-use）。
+    // GUC 済み tx の中で引く必要があるので commit より前に行う。
+    let needs_env_token =
+        db::component_has_live_secrets(&mut *tx, req.tenant, req.component_id).await?;
+
     // --- 2) tx を確定してから署名・publish する（publish をトランザクション境界の外へ） ---
     tx.commit().await?;
 
@@ -201,6 +256,24 @@ pub async fn enqueue_execution(
         exp: req.exp,
     };
     let job_token = state.signer().sign(&claims);
+
+    // --- 3.5) M7c (§4.6): 必要なときだけ env-token を mint する ---
+    // **job_token を流用しない**。job_token は ResultMessage / FailedMessage にも verbatim に
+    // echo されるため、流用すると result / DLQ / reply の購読権しか持たない主体が引き換え
+    // トークンを得て secret を読めてしまう。専用 claim（別ドメインタグ + aud）にする。
+    let env_token = needs_env_token.then(|| {
+        state.signer().sign_env(&faas_shared::EnvClaims {
+            execution_id: req.execution_id.clone(),
+            tenant_id: req.tenant.to_string(),
+            version_id: req.version_id.to_string(),
+            component_id: req.component_id.to_string(),
+            aud: faas_shared::ENV_TOKEN_AUDIENCE.to_string(),
+            kid: state.signer().kid().to_string(),
+            iat: req.iat,
+            // job_token と同じ TTL 式（再配送を含む最悪滞留 + 実行上限 + 余裕）で有限。
+            exp: req.exp,
+        })
+    });
 
     // --- 4) JobMessage を invoke_subject へ publish（Nats-Msg-Id=execution_id, 冪等 layer 3） ---
     let job = JobMessage {
@@ -217,6 +290,8 @@ pub async fn enqueue_execution(
         reply_to: req.reply_to,
         // M6: 起動由来（http_invoke / cron / event / chain）。
         origin: Some(req.origin.to_string()),
+        // M7c: secret を持つ component のときだけ載る引き換えトークン。
+        env_token,
     };
     let payload = serde_json::to_vec(&job)?;
 
@@ -250,6 +325,15 @@ pub async fn enqueue_execution(
         );
         return Err(EnqueueError::PublishBackpressure);
     }
+
+    // M7a (§2.9): canary の計上は **publish ack 成功後のここ 1 箇所だけ**で行う。全入口
+    // （HTTP / cron / event / chain）がこの関数を通るため、3 起点が自動的に、かつ「実際に起動した
+    // 数」だけが計上される（解決時点で数えると 429 / presign 失敗 / 冪等ヒットまで混ざる）。
+    state
+        .metrics()
+        .canary_routed_total
+        .with_label_values(&[req.routing_reason])
+        .inc();
 
     Ok(EnqueueOutcome::Enqueued {
         execution_id: req.execution_id,

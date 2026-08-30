@@ -20,10 +20,13 @@ mod enqueue;
 mod error;
 mod extract;
 mod handlers;
+mod handlers_secrets;
 mod login;
 mod metrics;
 mod reaper;
+mod routing;
 mod scheduler;
+mod secrets;
 mod signing;
 mod state;
 mod storage;
@@ -103,7 +106,7 @@ async fn main() -> anyhow::Result<()> {
         &config.s3_region,
         &config.s3_bucket,
         &config.s3_access_key,
-        &config.s3_secret_key,
+        config.s3_secret_key_plain(),
     );
     tracing::info!(endpoint = %config.s3_endpoint, bucket = %config.s3_bucket, "configured object storage");
 
@@ -114,7 +117,7 @@ async fn main() -> anyhow::Result<()> {
     // --- ジョブ署名鍵 (M3c, §3.3) ---
     // Ed25519 seed を env から復号し、Signer（kid -> 公開鍵マップ付き）を構築する。
     // 鍵は control-plane だけが持つ。worker は鍵なし（不透明トークンを echo するのみ）。
-    let seed = signing::decode_seed(&config.job_signing_key)?;
+    let seed = signing::decode_seed(config.job_signing_key_plain())?;
     let signer = std::sync::Arc::new(signing::Signer::from_seed(
         seed,
         config.job_signing_kid.clone(),
@@ -172,6 +175,12 @@ async fn main() -> anyhow::Result<()> {
     // 観測メトリクス（M4a, §3.8）。プロセスで 1 つ。AppState 経由でハンドラ・タスクから参照する。
     let metrics = metrics::Metrics::init();
 
+    // --- secret の KEK キーリング (M7c, §10) ---
+    // active KEK（新規暗号化）と retired KEK（復号専用）を env から構築する。
+    // control-plane だけがこれを持つ（worker は keyless by design, §3.3）。
+    let secret_keyring = std::sync::Arc::new(config.secret_keyring()?);
+    tracing::info!(kid = %secret_keyring.active_kid(), "loaded secrets KEK keyring");
+
     let state = AppState::new(
         pool,
         nats,
@@ -179,7 +188,7 @@ async fn main() -> anyhow::Result<()> {
         config.max_wasm_upload_bytes,
         config.presign_ttl_secs,
         config.upload_presign_ttl_secs,
-        config.bootstrap_admin_token.clone(),
+        config.bootstrap_admin_token_plain().to_string(),
         dummy_password_hash,
         signer,
         token_exp_offset_secs,
@@ -188,6 +197,8 @@ async fn main() -> anyhow::Result<()> {
         metrics,
         config.instance_id.clone(),
         config.sync_reply_timeout_ms,
+        secret_keyring,
+        config.job_env_exchange_rate_per_min,
     );
 
     // --- result 購読タスク ---
@@ -242,6 +253,38 @@ async fn main() -> anyhow::Result<()> {
         scheduler::run(scheduler_state, cron_poll_interval).await;
     });
 
+    // --- KEK ローテーション進捗の gauge 更新（M7c-4, §4.7.2）---
+    // reaper と同じ周期で回す（頻度を要さない観測なので専用 env は増やさない）。
+    let kid_gauge_state = state.clone();
+    let kid_gauge_interval = config.reaper_interval_secs;
+    tokio::spawn(async move {
+        reaper::run_secret_kid_gauge(kid_gauge_state, kid_gauge_interval).await;
+    });
+
+    // --- 内部専用 listener (M7c, §4.6.1) ---
+    // `POST /internal/job-env` だけを載せた 2 本目の axum サーバを立てる。**公開 listener
+    // （BIND_ADDR）には生やさない**。認証 middleware の外にあるため、認証は env-token の署名
+    // そのものであり、テナント停止の遮断はハンドラ内で明示的に行う。
+    // 既定 bind は loopback（127.0.0.1:8081）。これをインターネット / 共有ネットワークへ
+    // 公開してはならない (MUST NOT)。
+    {
+        let internal_state = state.clone();
+        let internal_addr = config.internal_bind_addr.clone();
+        let internal_listener = tokio::net::TcpListener::bind(&internal_addr).await?;
+        tracing::info!(addr = %internal_addr, "listening (internal: job-env exchange only)");
+        tokio::spawn(async move {
+            let internal_app = build_internal_router(internal_state);
+            if let Err(e) = axum::serve(
+                internal_listener,
+                internal_app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+            )
+            .await
+            {
+                tracing::error!(error = %e, "internal listener terminated");
+            }
+        });
+    }
+
     // --- ルータ ---
     let app = build_router(state);
 
@@ -257,6 +300,24 @@ async fn main() -> anyhow::Result<()> {
     .await?;
 
     Ok(())
+}
+
+/// **内部専用**ルータ (M7c, §4.6.1)。`POST /internal/job-env` だけを載せる。
+///
+/// # MUST NOT
+///
+/// このルータを公開 listener（`BIND_ADDR`）へマウントしてはならない。`build_router` が被せる
+/// `auth::authenticate` / `require_scope` の外にあり、認証は **env-token の署名そのもの**である。
+/// 公開すると、署名鍵を持たない相手でも per-IP レート上限まで総当たりの試行ができる面が
+/// インターネットに露出する（署名検証は破れないが、無用な攻撃面を作らない）。
+///
+/// TraceLayer は付けない —— `TraceLayer::new_for_http()` は URI を span に載せるが、ここは
+/// body にトークンを載せる経路であり、リクエストの記録は監査ログ（値を載せない detail 構築点）に
+/// 一本化するほうが漏洩面が狭い。
+fn build_internal_router(state: AppState) -> Router {
+    Router::new()
+        .route("/internal/job-env", post(handlers_secrets::job_env))
+        .with_state(state)
 }
 
 /// ルータを組み立てる。
@@ -286,6 +347,19 @@ fn build_router(state: AppState) -> Router {
         .route("/cron-jobs", get(handlers::list_cron_jobs))
         // GET /triggers: テナントのトリガー一覧 (M6c, §15)。
         .route("/triggers", get(handlers::list_triggers))
+        // GET /components/{id}/traffic: 現在の canary 配分 + version 別の直近成績 (M7a, §6.7 / §15)。
+        // canary の go/no-go 判断の一次情報（executions 生表の直近 60 分を直読み）。
+        .route(
+            "/components/{component_id}/traffic",
+            get(handlers::get_traffic_split),
+        )
+        // GET /components/{id}/secrets: secret の**メタデータのみ** (M7c, §10)。
+        // 値を返す経路はコードに存在しない。value_len / kek_kid も返さない
+        // （value_len は平文長のオラクルになるので admin 専用の /secrets/keys へ分離）。
+        .route(
+            "/components/{component_id}/secrets",
+            get(handlers_secrets::list_secrets),
+        )
         .route_layer(axum::middleware::from_fn(require_scope(Scope::Read)));
 
     // --- Invoke スコープ ---
@@ -313,6 +387,22 @@ fn build_router(state: AppState) -> Router {
         .route("/cron-jobs", post(handlers::create_cron_job))
         // POST /triggers: トリガー登録 (M6c, §15。component ライフサイクル相当の Deploy スコープ)。
         .route("/triggers", post(handlers::create_trigger))
+        // --- M7b: per-function 環境変数（平文 config, §15 / §4.4）---
+        // 読み書きとも Deploy。GET を Read に置かないのは、config が平文で secret と同じ env
+        // 名前空間に混ざるため（資格情報を誤って config へ入れた瞬間、最も広く配られる read
+        // スコープが資格情報の読み取り権限になる）。
+        .route(
+            "/components/{component_id}/config",
+            get(handlers::get_function_config),
+        )
+        .route(
+            "/components/{component_id}/config",
+            put(handlers::put_function_config),
+        )
+        .route(
+            "/components/{component_id}/config/{key}",
+            delete(handlers::delete_function_config),
+        )
         .route_layer(axum::middleware::from_fn(require_scope(Scope::Deploy)));
 
     // --- Admin スコープ（全 DELETE・active-version 切替・user/token 管理） ---
@@ -336,6 +426,64 @@ fn build_router(state: AppState) -> Router {
         .route("/cron-jobs/{id}", delete(handlers::delete_cron_job))
         // DELETE /triggers/{id}: トリガー削除 (M6c, §15。他 DELETE と整合の Admin スコープ)。
         .route("/triggers/{id}", delete(handlers::delete_trigger))
+        // --- M7a: 段階移行と即時 rollback (§6.7 / §15) ---
+        // 版の切替権限を 1 スコープ（Admin）に集約する。既存 PUT /active-version が Admin であり、
+        // 分けると「Deploy で stable を動かせるが Admin でないと戻せない」非対称が生まれる。
+        //
+        // PUT /components/{id}/traffic: canary の版と重みを設定（絶対値・冪等）。
+        .route(
+            "/components/{component_id}/traffic",
+            put(handlers::set_traffic_split),
+        )
+        // DELETE /components/{id}/traffic: canary を解除（weight=0 + ポインタ NULL）。
+        .route(
+            "/components/{component_id}/traffic",
+            delete(handlers::clear_traffic_split),
+        )
+        // POST /components/{id}/promote: canary を stable へ昇格（CAS つき単一 UPDATE）。
+        .route(
+            "/components/{component_id}/promote",
+            post(handlers::promote_version),
+        )
+        // POST /components/{id}/rollback: ワンクリック rollback（canary 破棄 + 直前 stable へ復帰）。
+        .route(
+            "/components/{component_id}/rollback",
+            post(handlers::rollback_version),
+        )
+        // --- M7b: capability の env 許可リスト承認 (§4.4 / §15) ---
+        // PUT /components/{id}/versions/{version}/capabilities:
+        // 注入を許可する env 名を承認する。§4.4 MUST「付与は admin スコープを要する」に従い
+        // アップロード（Deploy）から分離した専用経路にする（deploy トークンによる権限昇格の遮断）。
+        .route(
+            "/components/{component_id}/versions/{version}/capabilities",
+            put(handlers::approve_capability_env),
+        )
+        // --- M7c: Secrets Manager (§10 / §15) ---
+        // 書き込み系はすべて admin スコープ + require_admin_role の二重ガード
+        // （§4.4「付与（承認）は admin スコープを要する (MUST)」に従う）。
+        .route(
+            "/components/{component_id}/secrets/{name}",
+            put(handlers_secrets::put_secret),
+        )
+        .route(
+            "/components/{component_id}/secrets/{name}/rotate",
+            post(handlers_secrets::rotate_secret),
+        )
+        .route(
+            "/components/{component_id}/secrets/{name}",
+            delete(handlers_secrets::delete_secret),
+        )
+        // GET /secrets/keys: 運用向け（kek_kid / value_len はここだけ）。
+        .route(
+            "/components/{component_id}/secrets/keys",
+            get(handlers_secrets::list_secret_keys),
+        )
+        // POST /admin/secrets/rekey: **当該テナントのみ**を現行 KEK で再ラップする (M7c-4)。
+        // 応答は件数のみ（kid 別の内訳は他テナントの総数が漏れるので返さない）。
+        .route(
+            "/admin/secrets/rekey",
+            post(handlers_secrets::rekey_secrets),
+        )
         .route_layer(axum::middleware::from_fn(require_scope(Scope::Admin)));
 
     // 認証必須ルート（スコープ別ルータを統合し、authenticate で principal を確立）。
@@ -599,6 +747,299 @@ mod migration_tests {
     // 0008_m6.sql のソースも同様にコンパイル時埋め込み（DB-free 文字列不変条件検査用）。
     const M6_SQL: &str = include_str!("../../../migrations/0008_m6.sql");
 
+    // 0009_m7a_traffic_split.sql も同様。M7 の migration は**サブマイルストンごとに別ファイル**
+    // （0009/0010/0011）にするため、const も 1 ファイル 1 include_str! に分ける。統合ファイルに
+    // すると m7a_creates_no_new_table（0009 は新表を作らない）が M7b/M7c の CREATE TABLE で必ず落ちる。
+    const M7A_SQL: &str = include_str!("../../../migrations/0009_m7a_traffic_split.sql");
+    const M7B_SQL: &str = include_str!("../../../migrations/0010_m7b_function_configs.sql");
+    const M7C_SQL: &str = include_str!("../../../migrations/0011_m7c_secrets.sql");
+
+    /// 連続空白を 1 個に潰す（DDL の桁揃えに依存しない部分文字列照合のため）。
+    fn squeeze_spaces(sql: &str) -> String {
+        let mut s = String::with_capacity(sql.len());
+        let mut prev_space = false;
+        for c in sql.chars() {
+            if c == ' ' || c == '\t' {
+                if !prev_space {
+                    s.push(' ');
+                }
+                prev_space = true;
+            } else {
+                s.push(c);
+                prev_space = false;
+            }
+        }
+        s
+    }
+
+    /// 新表が ENABLE + FORCE RLS されていること（0007/0008 と同型の DDL 不変条件）。
+    fn assert_force_rls(sql: &str, tables: &[&str]) {
+        let normalized = squeeze_spaces(sql);
+        for table in tables {
+            assert!(
+                normalized.contains(&format!("ALTER TABLE {table} FORCE ROW LEVEL SECURITY")),
+                "{table} must FORCE ROW LEVEL SECURITY"
+            );
+            assert!(
+                normalized.contains(&format!("ALTER TABLE {table} ENABLE ROW LEVEL SECURITY")),
+                "{table} must ENABLE ROW LEVEL SECURITY"
+            );
+        }
+    }
+
+    /// tenant_isolation が fail-closed（`current_setting('app.tenant_id')` の第 2 引数なし）。
+    fn assert_fail_closed_isolation(sql: &str, tables: &[&str]) {
+        assert!(
+            sql.contains("current_setting('app.tenant_id')"),
+            "tenant_isolation must gate on current_setting('app.tenant_id')"
+        );
+        assert!(
+            !sql.contains("current_setting('app.tenant_id', true)")
+                && !sql.contains("current_setting('app.tenant_id', TRUE)"),
+            "tenant_isolation must NOT use the second-arg fallback (must fail closed)"
+        );
+        for table in tables {
+            assert!(
+                sql.contains(&format!("CREATE POLICY tenant_isolation ON {table}")),
+                "{table} must have a tenant_isolation policy"
+            );
+        }
+    }
+
+    /// 新表に明示 GRANT / REVOKE があること。0004_rls.sql の GRANT はテーブル名の列挙なので
+    /// 新表を含まない。書き忘れると RLS 以前に権限エラーで faas_app から一切触れなくなる
+    /// （新表追加時の最頻の退行）ため CI で固定する。
+    fn assert_explicit_grants(sql: &str, tables: &[&str]) {
+        let normalized = squeeze_spaces(sql);
+        for table in tables {
+            assert!(
+                normalized.contains(&format!("REVOKE ALL ON {table} FROM PUBLIC")),
+                "{table} must REVOKE ALL FROM PUBLIC"
+            );
+            assert!(
+                normalized.contains(&format!("ON {table} TO faas_app")),
+                "{table} must GRANT explicitly to faas_app"
+            );
+        }
+    }
+
+    // ---- 0010_m7b_function_configs.sql の DB-free 文字列不変条件 --------------
+
+    #[test]
+    fn migrator_includes_version_10() {
+        let v10 = MIGRATOR
+            .iter()
+            .find(|m| m.version == 10)
+            .expect("migration version 10 (0010_m7b_function_configs) must be collected");
+        assert!(
+            v10.description.contains("m7b") || v10.description.contains("function"),
+            "unexpected 0010 description: {}",
+            v10.description
+        );
+    }
+
+    #[test]
+    fn version_10_is_not_baselined() {
+        assert!(
+            !super::BASELINE_VERSIONS.iter().any(|(v, _)| *v == 10),
+            "0010 must not be baselined; MIGRATOR.run applies it normally"
+        );
+    }
+
+    #[test]
+    fn m7b_tables_are_force_rls() {
+        assert_force_rls(M7B_SQL, &["function_configs"]);
+    }
+
+    #[test]
+    fn m7b_tenant_isolation_is_fail_closed() {
+        assert_fail_closed_isolation(M7B_SQL, &["function_configs"]);
+    }
+
+    #[test]
+    fn m7b_tables_have_explicit_grants() {
+        assert_explicit_grants(M7B_SQL, &["function_configs"]);
+    }
+
+    /// component 参照 FK は **2 列の複合 FK** であること。
+    ///
+    /// 単一列 FK（`components(id)`）はテナント一致を強制しない。RLS の WITH CHECK は
+    /// 「自分の tenant_id を書くこと」しか要求しないため、テナント A が
+    /// 「tenant_id=A, component_id=（B の cmp_*）」という行を作れてしまう。
+    #[test]
+    fn m7b_foreign_keys_are_composite() {
+        let normalized = squeeze_spaces(M7B_SQL);
+        assert!(
+            normalized.contains(
+                "FOREIGN KEY (tenant_id, component_id) REFERENCES components (tenant_id, id)"
+            ),
+            "the component reference must be a composite FK so the DB enforces tenant match"
+        );
+    }
+
+    // ---- 0011_m7c_secrets.sql の DB-free 文字列不変条件 ----------------------
+
+    #[test]
+    fn migrator_includes_version_11() {
+        let v11 = MIGRATOR
+            .iter()
+            .find(|m| m.version == 11)
+            .expect("migration version 11 (0011_m7c_secrets) must be collected");
+        assert!(
+            v11.description.contains("m7c") || v11.description.contains("secrets"),
+            "unexpected 0011 description: {}",
+            v11.description
+        );
+    }
+
+    #[test]
+    fn version_11_is_not_baselined() {
+        assert!(
+            !super::BASELINE_VERSIONS.iter().any(|(v, _)| *v == 11),
+            "0011 must not be baselined; MIGRATOR.run applies it normally"
+        );
+    }
+
+    #[test]
+    fn m7c_tables_are_force_rls() {
+        assert_force_rls(M7C_SQL, &["function_secrets", "function_secret_versions"]);
+    }
+
+    #[test]
+    fn m7c_tenant_isolation_is_fail_closed() {
+        assert_fail_closed_isolation(M7C_SQL, &["function_secrets", "function_secret_versions"]);
+    }
+
+    #[test]
+    fn m7c_tables_have_explicit_grants() {
+        assert_explicit_grants(M7C_SQL, &["function_secrets", "function_secret_versions"]);
+    }
+
+    /// 版台帳は **追記専用**（暗号文の改竄・消去を faas_app から不可能にする）。
+    /// `audit_logs` / `trigger_deliveries` と同型の不変条件。
+    #[test]
+    fn m7c_secret_versions_is_append_only_for_faas_app() {
+        let normalized = squeeze_spaces(M7C_SQL);
+        assert!(
+            normalized.contains("GRANT SELECT, INSERT ON function_secret_versions TO faas_app"),
+            "the version ledger must be granted only SELECT/INSERT"
+        );
+        assert!(
+            normalized.contains("REVOKE UPDATE, DELETE ON function_secret_versions FROM faas_app"),
+            "UPDATE/DELETE must be revoked from faas_app on the version ledger"
+        );
+        for forbidden in [
+            "GRANT SELECT, INSERT, UPDATE ON function_secret_versions",
+            "GRANT SELECT, INSERT, UPDATE, DELETE ON function_secret_versions",
+            "GRANT ALL ON function_secret_versions",
+        ] {
+            assert!(
+                !normalized.contains(forbidden),
+                "the version ledger must never be granted {forbidden}"
+            );
+        }
+    }
+
+    /// name の一意性は **生存行のみ**（部分 UNIQUE index）。
+    ///
+    /// テーブル制約にすると soft delete 後に同名で作り直せず 23505 になる。
+    /// 「侵害された資格情報を削除して同名で入れ直す」はインシデント対応の最も基本の操作であり、
+    /// これを不可能にしてはならない。
+    #[test]
+    fn m7c_secret_name_uniqueness_is_soft_delete_aware() {
+        let normalized = squeeze_spaces(M7C_SQL);
+        assert!(
+            normalized.contains(
+                "CREATE UNIQUE INDEX IF NOT EXISTS uq_function_secrets_live_name \
+                 ON function_secrets (tenant_id, component_id, name) WHERE deleted_at IS NULL"
+            ) || (normalized.contains("uq_function_secrets_live_name")
+                && normalized.contains("WHERE deleted_at IS NULL")),
+            "secret name uniqueness must be a partial index over live rows only"
+        );
+        // コメント行を除いて判定する（本ファイルの設計メモが「テーブル制約にしない理由」を
+        // 説明するために同じ字面を含むため）。
+        let code_only: String = M7C_SQL
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("--"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            !squeeze_spaces(&code_only).contains("UNIQUE (tenant_id, component_id, name)"),
+            "a table-level UNIQUE would make same-name re-creation after deletion impossible"
+        );
+    }
+
+    /// HTTP から呼ぶ SECURITY DEFINER 関数は **必ずテナント引数を取る**。
+    ///
+    /// 本リポジトリの admin は**テナント管理者**であってプラットフォーム管理者ではない。
+    /// 全テナント版は `_all` 接尾辞のものだけ（背景ジョブ専用）。
+    #[test]
+    fn m7c_definer_functions_are_tenant_scoped() {
+        assert!(
+            M7C_SQL.contains("CREATE FUNCTION secrets_stale_kek(p_tenant text, p_active_kid text)"),
+            "the HTTP-facing rekey helper must take a tenant argument"
+        );
+        assert!(
+            M7C_SQL.contains("s.tenant_id = p_tenant"),
+            "secrets_stale_kek must filter by the supplied tenant"
+        );
+        // 全テナント版は _all 接尾辞のものだけ。
+        for f in ["secrets_stale_kek_all", "secrets_kek_kid_counts_all"] {
+            assert!(
+                M7C_SQL.contains(&format!("CREATE FUNCTION {f}(")),
+                "{f} must exist as the explicitly-named cross-tenant variant"
+            );
+        }
+        // SECURITY DEFINER 関数はすべて PUBLIC から EXECUTE を剥奪する。
+        for f in [
+            "secrets_stale_kek(text, text)",
+            "secrets_stale_kek_all(text)",
+            "secrets_kek_kid_counts_all()",
+        ] {
+            assert!(
+                M7C_SQL.contains(&format!("REVOKE EXECUTE ON FUNCTION {f} FROM PUBLIC")),
+                "{f} EXECUTE must be revoked from PUBLIC"
+            );
+        }
+        assert!(
+            M7C_SQL.contains("SECURITY DEFINER"),
+            "the cross-tenant helpers must be SECURITY DEFINER (faas_app is under FORCE RLS)"
+        );
+    }
+
+    /// secret 側の FK も 2 列の複合 FK であること（0010 と同じ理由）。
+    #[test]
+    fn m7c_foreign_keys_are_composite() {
+        let normalized = squeeze_spaces(M7C_SQL);
+        assert!(
+            normalized.contains(
+                "FOREIGN KEY (tenant_id, component_id) REFERENCES components (tenant_id, id)"
+            ),
+            "function_secrets must reference components with a composite FK"
+        );
+        assert!(
+            normalized.contains(
+                "FOREIGN KEY (tenant_id, secret_id) REFERENCES function_secrets (tenant_id, id)"
+            ),
+            "the version ledger must reference function_secrets with a composite FK"
+        );
+    }
+
+    /// BIGSERIAL を使わない（0004 の ALL SEQUENCES GRANT が新シーケンスに効かないため、
+    /// GRANT 漏れという退行を構造的に避ける）。
+    #[test]
+    fn m7c_uses_no_sequences() {
+        for forbidden in ["BIGSERIAL", "SERIAL", "GENERATED"] {
+            assert!(
+                !M7C_SQL
+                    .lines()
+                    .filter(|l| !l.trim_start().starts_with("--"))
+                    .any(|l| l.to_ascii_uppercase().contains(forbidden)),
+                "0011 must not introduce a sequence ({forbidden}); composite PKs avoid GRANT drift"
+            );
+        }
+    }
+
     // MIGRATOR が 0007 を**コンパイル時収集**していること（sqlx::migrate! の埋め込み検証）。
     // live DB を要さない（iter() は埋め込み済みメタデータを走査するだけ）。
     #[test]
@@ -810,6 +1251,122 @@ mod migration_tests {
             M6_SQL.contains("GRANT  EXECUTE ON FUNCTION cron_due_tenant_jobs() TO   faas_app;")
                 || M6_SQL.contains("GRANT EXECUTE ON FUNCTION cron_due_tenant_jobs() TO faas_app;"),
             "cron_due_tenant_jobs() EXECUTE must be granted to faas_app"
+        );
+    }
+
+    // ---- 0009_m7a_traffic_split.sql の DB-free 文字列不変条件 -----------------
+
+    // MIGRATOR が 0009 を**コンパイル時収集**していること（sqlx::migrate! の埋め込み検証）。
+    #[test]
+    fn migrator_includes_version_9() {
+        let v9 = MIGRATOR
+            .iter()
+            .find(|m| m.version == 9)
+            .expect("migration version 9 (0009_m7a_traffic_split) must be collected by MIGRATOR");
+        assert!(
+            v9.description.contains("m7a") || v9.description.contains("traffic"),
+            "unexpected 0009 description: {}",
+            v9.description
+        );
+    }
+
+    // 0009 を BASELINE_VERSIONS に入れていないこと（= MIGRATOR.run が通常適用する）。
+    #[test]
+    fn version_9_is_not_baselined() {
+        assert!(
+            !super::BASELINE_VERSIONS.iter().any(|(v, _)| *v == 9),
+            "0009 must not be baselined; MIGRATOR.run applies it normally"
+        );
+    }
+
+    // M7a は**新規テーブルを 1 つも作らない**（GRANT 漏れ / RLS ポリシー漏れという最大の退行リスクを
+    // 設計段階で消したことの回帰ガード）。新表を足したくなったら 0010 以降で作り、RLS + GRANT を
+    // 明示すること。
+    #[test]
+    fn m7a_creates_no_new_table() {
+        assert!(
+            !M7A_SQL.contains("CREATE TABLE"),
+            "0009 must not create any table (canary state lives on components; \
+             new tables belong in 0010+ with explicit RLS and GRANT)"
+        );
+    }
+
+    // 同じ理由で、権限 / ポリシー DDL も 0009 には現れない（既存 components / executions の
+    // FORCE RLS + tenant_isolation + GRANT をそのまま継承する）。
+    #[test]
+    fn m7a_grants_nothing_new() {
+        for forbidden in ["GRANT", "REVOKE", "CREATE POLICY", "ROW LEVEL SECURITY"] {
+            assert!(
+                !M7A_SQL
+                    .lines()
+                    .filter(|l| !l.trim_start().starts_with("--"))
+                    .any(|l| l.contains(forbidden)),
+                "0009 must not contain {forbidden} outside comments \
+                 (it adds columns to already-protected tables)"
+            );
+        }
+    }
+
+    // canary 4 列が additive（IF NOT EXISTS・nullable か NOT NULL DEFAULT）で足されること。
+    #[test]
+    fn m7a_columns_are_additive() {
+        for col in [
+            "canary_version_id",
+            "canary_weight",
+            "previous_active_version_id",
+            "canary_updated_at",
+        ] {
+            assert!(
+                M7A_SQL.contains(&format!("ADD COLUMN IF NOT EXISTS {col}")),
+                "components.{col} must be added with ADD COLUMN IF NOT EXISTS"
+            );
+        }
+        // canary_weight だけは NOT NULL。既定 0 ＝ M6 までと同一の解決（全量 stable）。
+        assert!(
+            M7A_SQL.contains("ADD COLUMN IF NOT EXISTS canary_weight SMALLINT NOT NULL DEFAULT 0"),
+            "canary_weight must default to 0 so that an un-configured component routes 100% stable"
+        );
+        // M7b/M7c の複合 FK の被参照側。
+        assert!(
+            M7A_SQL.contains("components_tenant_id_id_key UNIQUE (tenant_id, id)"),
+            "components must expose UNIQUE (tenant_id, id) for the composite FKs in 0010/0011"
+        );
+    }
+
+    // 「配分先の無い重み」と値域外を DB で不可能にする 2 本の CHECK。
+    #[test]
+    fn m7a_canary_weight_is_range_checked() {
+        assert!(
+            M7A_SQL.contains("CHECK (canary_weight >= 0 AND canary_weight <= 100)"),
+            "canary_weight must be range-checked in the DB (0..=100)"
+        );
+        assert!(
+            M7A_SQL.contains("CHECK (canary_weight = 0 OR canary_version_id IS NOT NULL)"),
+            "a non-zero weight must be impossible without a canary target"
+        );
+    }
+
+    // executions は最大テーブル。ADD COLUMN のインライン CHECK（既存全行の検証走査を誘発する）を
+    // 書かず、値域は NOT VALID 制約で前方だけ守る（ロック窓の最小化。VALIDATE は保守窓で手動）。
+    #[test]
+    fn m7a_executions_check_is_not_valid() {
+        assert!(
+            M7A_SQL
+                .contains("ADD COLUMN IF NOT EXISTS routing_reason TEXT NOT NULL DEFAULT 'stable'"),
+            "executions.routing_reason must be additive with DEFAULT 'stable'"
+        );
+        assert!(
+            M7A_SQL.contains("CHECK (routing_reason IN ('stable', 'canary')) NOT VALID"),
+            "the routing_reason CHECK must be added NOT VALID (no full-table verification scan)"
+        );
+        // インライン CHECK（ADD COLUMN ... CHECK ...）になっていないこと。
+        let add_column_line = M7A_SQL
+            .lines()
+            .find(|l| l.contains("ADD COLUMN IF NOT EXISTS routing_reason"))
+            .expect("routing_reason ADD COLUMN line must exist");
+        assert!(
+            !add_column_line.contains("CHECK"),
+            "routing_reason must not carry an inline CHECK (it would scan every existing row)"
         );
     }
 }

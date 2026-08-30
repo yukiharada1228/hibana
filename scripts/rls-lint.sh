@@ -48,7 +48,7 @@ fi
 
 # --- (2) tenant-scoped db:: call passed the raw pool -----------------------
 fns="create_component|insert_version|set_active_version|insert_pending_execution|get_execution"
-fns="$fns|find_component_by_id|find_component_by_name|active_version_storage|list_components|list_versions"
+fns="$fns|find_component_by_id|find_component_by_name|list_components|list_versions"
 fns="$fns|soft_delete_component|soft_delete_version|find_version_id"
 fns="$fns|has_active_executions_for_component|has_active_executions_for_version|finalize_execution"
 fns="$fns|create_user|find_user_role|create_token|revoke_token|token_exists|bootstrap_tenant"
@@ -56,9 +56,22 @@ fns="$fns|create_user|find_user_role|create_token|revoke_token|token_exists|boot
 fns="$fns|insert_cron_job|list_cron_jobs|delete_cron_job|lock_due_cron_job|advance_cron_next_fire"
 # M6c トリガー CRUD + 配送台帳 + chain/event 解決（すべて set_tenant_guc 済み tx で呼ぶ）。
 fns="$fns|insert_trigger|list_triggers|delete_trigger|list_enabled_triggers_by_type|record_trigger_delivery"
+# M7a canary ルーティング / 段階移行（すべて set_tenant_guc 済み tx で呼ぶ）。
+fns="$fns|resolve_component_routing|switch_active_version|promote_active_version"
+fns="$fns|rollback_active_version|set_traffic_split|clear_traffic_split"
+fns="$fns|traffic_split_for_component|version_stats_for_component"
+# M7b per-function config + capability env 承認（すべて set_tenant_guc 済み tx で呼ぶ）。
+fns="$fns|version_capabilities|set_version_capabilities"
+fns="$fns|upsert_function_config|list_function_configs|delete_function_config"
+# M7c Secrets Manager（すべて set_tenant_guc 済み tx で呼ぶ）。
+# secrets_stale_kek / _all / secrets_kek_kid_counts_all は SECURITY DEFINER で GUC 不要のため
+# 意図的に除外する（M6 の cron_due_tenant_jobs と同じ扱い）。
+fns="$fns|insert_secret_meta|find_live_secret_by_name|list_secrets_meta|insert_secret_version"
+fns="$fns|bump_secret_current_version|soft_delete_secret|find_secret_version|resolve_for_injection"
+fns="$fns|find_secret_meta_by_id"
 
 set2=$(
-  grep -rnE "db::($fns)\([[:space:]]*state\.pool\(\)" \
+  grep -rnE "(db|secrets)::($fns)\([[:space:]]*state\.pool\(\)" \
     --include=*.rs crates/ 2>/dev/null \
   || true
 )
@@ -90,9 +103,37 @@ if [ -n "$dburl" ]; then
   fail=1
 fi
 
+# --- (4) Redacted::expose() の allowlist（M7-0, §5.1 / §5.6）-----------------
+# 秘密値は faas_shared::Redacted<T> に包み、平文の取り出しは expose() の 1 経路に閉じる。
+# 呼び出せるファイルを allowlist に限定することで「秘密がプロセス内のどこへ渡ったか」を
+# grep で全数把握できる状態を維持する。
+#
+# allowlist の考え方:
+#  - config.rs        : env から秘密が入ってくる唯一の入口（*_plain() アクセサ 3 本に閉じている）
+#  - secrets.rs       : 封筒暗号の実装本体（M7c）
+#  - handlers_secrets.rs : secret の write-only API と job-env 引き換え（M7c）
+#  - crates/worker/src/env.rs : worker 側の env 組み立て（M7b/M7c）
+# worker/main.rs のような巨大ファイルを allowlist に入れるとガードが実質無効になるため、
+# env 組み立ては専用モジュールへ切り出すこと（設計 §5.6）。
+expose_allow='crates/shared/src/redacted.rs|crates/control-plane/src/config.rs|crates/control-plane/src/secrets.rs|crates/control-plane/src/handlers_secrets.rs|crates/worker/src/env.rs'
+set4=$(
+  grep -rnE "\.expose\(\)" --include=*.rs crates/ 2>/dev/null \
+    | sed -E 's#(//).*$##' \
+    | grep -E "\.expose\(\)" \
+    | grep -vE "^($expose_allow):" \
+  || true
+)
+if [ -n "$set4" ]; then
+  echo "ERROR(rls-lint 4): Redacted::expose() called outside the allowlist."
+  echo "  Secret plaintext may only be unwrapped in: $expose_allow"
+  echo "  (Pass the Redacted<T> itself, or add a narrow accessor in config.rs.)"
+  echo "$set4"
+  fail=1
+fi
+
 if [ "$fail" -ne 0 ]; then
   echo "rls-lint: FAILED"
   exit 1
 fi
 
-echo "rls-lint: OK (no SET-without-LOCAL hazard; no raw-pool tenant db:: calls; runtime DATABASE_URL is faas_app)"
+echo "rls-lint: OK (no SET-without-LOCAL hazard; no raw-pool tenant db:: calls; runtime DATABASE_URL is faas_app; Redacted::expose() is allowlisted)"

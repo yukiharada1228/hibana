@@ -20,6 +20,9 @@ use uuid::Uuid;
 /// TODO(§3.2 / §6.0): M3 で認証コンテキストから解決する。
 pub const DEFAULT_TENANT: &str = "default";
 
+mod redacted;
+pub use redacted::{expose_once, Redacted};
+
 // ============================================================================
 // ID 採番ヘルパ（uuid 由来の不透明文字列）
 // ============================================================================
@@ -60,6 +63,11 @@ pub fn new_user_id() -> String {
 /// `tok_*` API Token ID を生成する (§3.3)。
 pub fn new_token_id() -> String {
     new_prefixed_id("tok")
+}
+
+/// `sec_*`（M7c: per-function secret のメタ行 id）。
+pub fn new_secret_id() -> String {
+    new_prefixed_id("sec")
 }
 
 /// `inst_*` CP インスタンス ID を生成する (M6a, §15)。
@@ -517,6 +525,23 @@ pub struct JobMessage {
     /// 旧 CP のメッセージとの互換のため serde default、`None` は wire に出さない。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub origin: Option<String>,
+    /// M7c (§4.6): secret 引き換え専用の短命トークン（[`EnvClaims`] を署名したもの）。
+    ///
+    /// CP は enqueue 時、当該 component に**生存する secret が 1 件以上あるときだけ** `Some` を載せる
+    /// （secret 名も件数も wire に載せない。`Some` かどうかがそのままシグナルになる）。worker はこれを
+    /// CP の内部エンドポイント `POST /internal/job-env` に提示して復号済み env を受け取る。
+    ///
+    /// **MUST NOT**: worker はこの値を `ResultMessage` / `FailedMessage` / reply subject へ
+    /// echo してはならない。echo すると result / DLQ / reply の購読権しか持たない主体が
+    /// 引き換えトークンを得て secret を読めるようになり、この方式の優位性が消える
+    /// （`reply_to` の「揮発フィールドで DB に永続化しない」と同型の宣言）。
+    ///
+    /// **MUST NOT**: `JobMessage` に平文 secret / KEK / DEK を載せてはならない。wire に出る
+    /// secret 由来の情報はこのトークンだけである。
+    ///
+    /// 旧 CP のメッセージとの互換のため serde default、`None` は wire に出さない。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub env_token: Option<String>,
 }
 
 /// worker が 1 実行ごとに計測したリソース利用量 (M5, §15)。
@@ -713,6 +738,68 @@ pub fn job_claims_signing_bytes(c: &JobClaims) -> Vec<u8> {
     out
 }
 
+/// job-env 引き換えトークンの claim (M7c, §4.6)。
+///
+/// **`JobClaims` を流用しない理由**: `job_token` は `JobMessage` だけでなく `ResultMessage` /
+/// `FailedMessage` にも verbatim に echo される。流用すると、result / DLQ / reply の購読権しか
+/// 持たない主体が引き換えトークンを手に入れて secret を読めてしまい、「worker が CP から
+/// 引き換える方式は、平文を JobMessage に載せる方式より厳密に優位」という論証が崩れる。
+/// 専用 claim にし、ドメインタグと `aud` の両方で job_token と相互に使い回せなくする。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct EnvClaims {
+    /// `exec_*`。引き換え時に executions 行と突き合わせる。
+    pub execution_id: String,
+    /// `ten_*`（権威的テナント）。
+    pub tenant_id: String,
+    /// `ver_*`。この版の `capabilities.env` が注入可能な名前を決める。
+    pub version_id: String,
+    /// `cmp_*`。secret の所属 component。
+    pub component_id: String,
+    /// 用途識別子。**常に `"job-env"`**。不一致は 401（job_token との取り違え防止）。
+    pub aud: String,
+    /// 検証側の公開鍵を選ぶ key id。
+    pub kid: String,
+    /// 発行時刻（unix 秒）。
+    pub iat: i64,
+    /// 有効期限（unix 秒）。job_token と同じ TTL 式で有限。
+    pub exp: i64,
+}
+
+/// env-token の `aud`。
+pub const ENV_TOKEN_AUDIENCE: &str = "job-env";
+
+/// env-token の署名バイトのドメインタグ。`JOB_TOKEN_DOMAIN` と**別**であることが本質
+/// （同じ鍵を使っても job_token と env_token を相互に使い回せない）。
+const ENV_TOKEN_DOMAIN: &[u8] = b"faas-env-token-v1";
+
+/// env-token の claim から **正準** 署名バイト列を組み立てる (M7c, §4.6)。
+///
+/// `job_claims_signing_bytes` と同じ作法（ドメインタグ + 4 バイト BE 長さ前置 + 固定順）。
+/// serde_json を使わない理由も同じ（map/key 順序が非正準でドリフトすると検証が黙って壊れる）。
+pub fn env_claims_signing_bytes(c: &EnvClaims) -> Vec<u8> {
+    let mut out = Vec::with_capacity(
+        4 + ENV_TOKEN_DOMAIN.len()
+            + 5 * 4
+            + c.execution_id.len()
+            + c.tenant_id.len()
+            + c.version_id.len()
+            + c.component_id.len()
+            + c.aud.len()
+            + c.kid.len()
+            + 16,
+    );
+    write_len_prefixed(&mut out, ENV_TOKEN_DOMAIN);
+    write_len_prefixed(&mut out, c.execution_id.as_bytes());
+    write_len_prefixed(&mut out, c.tenant_id.as_bytes());
+    write_len_prefixed(&mut out, c.version_id.as_bytes());
+    write_len_prefixed(&mut out, c.component_id.as_bytes());
+    write_len_prefixed(&mut out, c.aud.as_bytes());
+    write_len_prefixed(&mut out, c.kid.as_bytes());
+    out.extend_from_slice(&c.iat.to_be_bytes());
+    out.extend_from_slice(&c.exp.to_be_bytes());
+    out
+}
+
 /// 4 バイト BE 長さ前置 + バイト列を書き込む。
 fn write_len_prefixed(out: &mut Vec<u8>, bytes: &[u8]) {
     // id 類は短いので u32 で十分。サーバ採番のため上限超過は想定しない。
@@ -731,15 +818,17 @@ const B64URL_ALPHABET: &[u8; 64] =
 /// 任意バイト列を base64url（パディングなし）に符号化する。
 pub fn b64url_encode(input: &[u8]) -> String {
     let mut out = String::with_capacity(input.len().div_ceil(3) * 4);
-    let mut chunks = input.chunks_exact(3);
-    for chunk in &mut chunks {
+    // 3 バイト固定長で切り出す。`as_chunks::<3>()` は配列参照 `&[u8; 3]` を返すので、
+    // 添字アクセスの境界チェックがコンパイル時に消える（`chunks_exact` はスライスを返すため
+    // 残らざるを得ない）。第 2 要素が端数。
+    let (chunks, rem) = input.as_chunks::<3>();
+    for chunk in chunks {
         let n = (u32::from(chunk[0]) << 16) | (u32::from(chunk[1]) << 8) | u32::from(chunk[2]);
         out.push(B64URL_ALPHABET[((n >> 18) & 0x3f) as usize] as char);
         out.push(B64URL_ALPHABET[((n >> 12) & 0x3f) as usize] as char);
         out.push(B64URL_ALPHABET[((n >> 6) & 0x3f) as usize] as char);
         out.push(B64URL_ALPHABET[(n & 0x3f) as usize] as char);
     }
-    let rem = chunks.remainder();
     match rem.len() {
         1 => {
             let n = u32::from(rem[0]) << 16;
@@ -814,6 +903,41 @@ pub const MAX_MEMORY_BYTES_LIMIT: u64 = 1024 * 1024 * 1024;
 pub const MAX_WALL_TIME_MS_LIMIT: u64 = 30_000;
 /// max_execution_time: 60 000 ms。
 pub const MAX_EXECUTION_TIME_MS_LIMIT: u64 = 60_000;
+
+// ============================================================================
+// per-function 環境変数 / secret の上限 (M7b/M7c, §15 / §4.4)
+// ============================================================================
+//
+// **CP の受付バリデーションと worker の防御的 clamp の両方でこの定数を使う**（二重防御）。
+// CP 側だけで守ると、DB を直接書き換えられた場合や将来の別経路で worker が無制限の env を
+// 組み立ててしまう。
+
+/// env キー名の最大長。POSIX の env 名の慣行に合わせる。
+pub const MAX_ENV_KEY_LEN: usize = 64;
+/// 1 component あたりの env キー数上限（config + secret の合計）。
+/// `WasiCtx` 構築コストと運用可読性の両面から。
+pub const MAX_FUNCTION_ENV_KEYS: usize = 64;
+/// env 値のバイト長上限（config / secret 共通）。secret は資格情報であり、
+/// 数 KiB を超える用途（証明書チェーン等）は M7 の非スコープ。
+pub const MAX_ENV_VALUE_BYTES: usize = 4096;
+/// 1 実行に注入する env の総バイト数上限（キー + 値の合計）。
+pub const MAX_FUNCTION_ENV_TOTAL_BYTES: usize = 32_768;
+
+/// env キー名が `^[A-Z_][A-Z0-9_]{0,63}$` を満たすか（純関数）。
+///
+/// 小文字・`=`・NUL・空文字を拒む。`wasi:cli/environment` 経由でゲストへ渡す名前なので、
+/// POSIX env 名として不正な形を最初から入れさせない。
+pub fn is_valid_env_key(key: &str) -> bool {
+    if key.is_empty() || key.len() > MAX_ENV_KEY_LEN {
+        return false;
+    }
+    let mut bytes = key.bytes();
+    let first = bytes.next().expect("non-empty checked above");
+    if !(first.is_ascii_uppercase() || first == b'_') {
+        return false;
+    }
+    bytes.all(|b| b.is_ascii_uppercase() || b.is_ascii_digit() || b == b'_')
+}
 
 /// Component version ごとのリソース制限 (§4.3)。
 /// component_versions.resource_limits (JSONB) に格納される。
@@ -1322,6 +1446,7 @@ mod tests {
             job_token: "payload.sig".into(),
             reply_to: None,
             origin: None,
+            env_token: None,
         };
         let json = serde_json::to_string(&job).unwrap();
         let back: JobMessage = serde_json::from_str(&json).unwrap();
@@ -1331,6 +1456,57 @@ mod tests {
         // M6: reply_to / origin は None のとき wire に現れない（skip_serializing_if）。
         assert!(!json.contains("reply_to"));
         assert!(!json.contains("origin"));
+        // M7c: env_token も同様（secret を持たない component では wire に一切現れない）。
+        assert!(!json.contains("env_token"));
+    }
+
+    /// M7c (§4.6): env-token の署名バイトが job_token と**別のドメインタグ**を持ち、
+    /// 同じフィールド値でも衝突しないこと（両者を相互に使い回せないことの根拠）。
+    #[test]
+    fn env_token_signing_bytes_are_domain_separated_from_job_token() {
+        let job = JobClaims {
+            execution_id: "exec_1".into(),
+            tenant_id: "ten_a".into(),
+            version_id: "ver_1".into(),
+            kid: "k1".into(),
+            iat: 1,
+            exp: 2,
+        };
+        let env = EnvClaims {
+            execution_id: "exec_1".into(),
+            tenant_id: "ten_a".into(),
+            version_id: "ver_1".into(),
+            component_id: "cmp_1".into(),
+            aud: ENV_TOKEN_AUDIENCE.into(),
+            kid: "k1".into(),
+            iat: 1,
+            exp: 2,
+        };
+        let jb = job_claims_signing_bytes(&job);
+        let eb = env_claims_signing_bytes(&env);
+        assert_ne!(jb, eb);
+        // ドメインタグは先頭に長さ前置で入る。
+        assert!(eb.windows(17).any(|w| w == b"faas-env-token-v1"));
+        assert!(!eb.windows(17).any(|w| w == b"faas-job-token-v1"));
+    }
+
+    /// env-token の署名バイトはフィールド境界が曖昧にならない（長さ前置の効果）。
+    #[test]
+    fn env_claims_signing_bytes_are_unambiguous() {
+        let mk = |exec: &str, ten: &str| EnvClaims {
+            execution_id: exec.into(),
+            tenant_id: ten.into(),
+            version_id: "ver_1".into(),
+            component_id: "cmp_1".into(),
+            aud: ENV_TOKEN_AUDIENCE.into(),
+            kid: "k1".into(),
+            iat: 1,
+            exp: 2,
+        };
+        assert_ne!(
+            env_claims_signing_bytes(&mk("ab", "c")),
+            env_claims_signing_bytes(&mk("a", "bc"))
+        );
     }
 
     /// M6 (§15): `reply_to` / `origin` を載せた JobMessage が round-trip し、
@@ -1349,6 +1525,7 @@ mod tests {
             job_token: "payload.sig".into(),
             reply_to: Some("reply.inst_1.corr_9".into()),
             origin: Some("cron".into()),
+            env_token: None,
         };
         let json = serde_json::to_string(&job).unwrap();
         let back: JobMessage = serde_json::from_str(&json).unwrap();

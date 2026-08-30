@@ -35,8 +35,8 @@
 use std::sync::Arc;
 
 use prometheus::{
-    Encoder, Histogram, HistogramOpts, HistogramVec, IntCounter, IntCounterVec, IntGauge, Opts,
-    Registry, TextEncoder,
+    Encoder, Histogram, HistogramOpts, HistogramVec, IntCounter, IntCounterVec, IntGauge,
+    IntGaugeVec, Opts, Registry, TextEncoder,
 };
 
 /// メトリクスの 1 セット（プロセスで 1 個。`AppState` が `Arc` で持ち、ハンドラから参照する）。
@@ -85,6 +85,30 @@ pub struct Metrics {
     /// `dropped` = 検証失敗・行不在等で drop)。`executions_total{status="failed"}` の合算には
     /// この `finalized` 数も含まれる（subscriber と DLQ の双方で同名カウンタを inc するため）。
     pub dlq_finalized_total: IntCounterVec,
+
+    // ---- M7a: canary ルーティング -------------------------------------------
+    /// canary ルーティングの選択結果のうち、**実際に JetStream へ publish された**もの (M7a, §15)。
+    /// labels: reason (stable / canary)。
+    ///
+    /// version / tenant はラベルにしない（カーディナリティ）。既存 `faas_executions_total` にも
+    /// version ラベルは足さない（既存ダッシュボードを壊さない）。
+    ///
+    /// **inc の位置**: `enqueue::enqueue_execution` が `Enqueued` を返す直前（publish ack 成功後）
+    /// の 1 箇所のみ。解決時点（`resolve_version_for_enqueue`）で数えると、その後段にある
+    /// admission の 429・presign 失敗・publish backpressure・cron の冪等ヒットまで canary として
+    /// 数えてしまい、`executions.routing_reason` 由来の `GET /traffic` の値と乖離する。
+    pub canary_routed_total: IntCounterVec,
+
+    // ---- M7c: Secrets Manager ------------------------------------------------
+    /// `/internal/job-env` で worker へ発行した secret material の件数 (M7c, §4.6)。
+    /// labels: outcome（`ok` / 失敗時の安定 reason）。**secret 名も値もラベルにしない**。
+    pub secret_material_issued_total: IntCounterVec,
+    /// kid 別の current 世代を持つ secret 件数 (M7c-4)。labels: kid。
+    ///
+    /// KEK ローテーションの進捗を見るための gauge。**背景ジョブが内部更新する専用**であり、
+    /// 全テナント横断の集計なので HTTP 応答には載せない（`POST /admin/secrets/rekey` は
+    /// 件数だけを返す）。旧 kid の gauge が 0 になったら `SECRETS_RETIRED_KEYS` を撤去してよい。
+    pub secret_versions_by_kid: IntGaugeVec,
 }
 
 impl Metrics {
@@ -197,6 +221,42 @@ impl Metrics {
             .register(Box::new(dlq_finalized_total.clone()))
             .expect("register dlq_finalized_total");
 
+        let canary_routed_total = IntCounterVec::new(
+            Opts::new(
+                "faas_canary_routed_total",
+                "Enqueued jobs by version routing decision (stable/canary)",
+            ),
+            &["reason"],
+        )
+        .expect("metric: canary_routed_total");
+        registry
+            .register(Box::new(canary_routed_total.clone()))
+            .expect("register canary_routed_total");
+
+        let secret_material_issued_total = IntCounterVec::new(
+            Opts::new(
+                "faas_secret_material_issued_total",
+                "Secret material exchanges served on the internal job-env endpoint by outcome",
+            ),
+            &["outcome"],
+        )
+        .expect("metric: secret_material_issued_total");
+        registry
+            .register(Box::new(secret_material_issued_total.clone()))
+            .expect("register secret_material_issued_total");
+
+        let secret_versions_by_kid = IntGaugeVec::new(
+            Opts::new(
+                "faas_secret_versions_by_kid",
+                "Live secrets whose current generation is wrapped by each KEK kid",
+            ),
+            &["kid"],
+        )
+        .expect("metric: secret_versions_by_kid");
+        registry
+            .register(Box::new(secret_versions_by_kid.clone()))
+            .expect("register secret_versions_by_kid");
+
         Arc::new(Self {
             registry,
             http_requests_total,
@@ -208,6 +268,9 @@ impl Metrics {
             reaper_swept_total,
             reaper_tenants_last,
             dlq_finalized_total,
+            canary_routed_total,
+            secret_material_issued_total,
+            secret_versions_by_kid,
         })
     }
 

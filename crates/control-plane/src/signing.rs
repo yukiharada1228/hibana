@@ -18,7 +18,10 @@ use std::collections::HashMap;
 
 use ed25519_dalek::{Signature, Signer as _, SigningKey, VerifyingKey};
 
-use faas_shared::{b64url_decode, b64url_encode, job_claims_signing_bytes, JobClaims};
+use faas_shared::{
+    b64url_decode, b64url_encode, env_claims_signing_bytes, job_claims_signing_bytes, EnvClaims,
+    JobClaims,
+};
 
 /// 署名 / 検証の失敗理由（audit detail の `reason` に載せる安定文字列）。
 ///
@@ -106,6 +109,22 @@ impl Signer {
         )
     }
 
+    /// env-token（secret 引き換え専用）を署名する (M7c, §4.6)。
+    ///
+    /// 鍵は job_token と同じ Ed25519 鍵を流用するが、署名バイトの**ドメインタグが異なる**ため
+    /// （`faas-env-token-v1` vs `faas-job-token-v1`）、両者を相互に使い回すことはできない。
+    /// 用途の取り違えは `aud` の検査でも二重に防ぐ。
+    pub fn sign_env(&self, claims: &EnvClaims) -> String {
+        let signing_bytes = env_claims_signing_bytes(claims);
+        let sig: Signature = self.key.sign(&signing_bytes);
+        let payload = serde_json::to_vec(claims).expect("EnvClaims serialize never fails");
+        format!(
+            "{}.{}",
+            b64url_encode(&payload),
+            b64url_encode(&sig.to_bytes())
+        )
+    }
+
     /// 検証器への参照（subscriber が `state.verifier()` 経由で使う）。
     pub fn verifier(&self) -> &Verifier {
         &self.verifier
@@ -157,6 +176,40 @@ impl Verifier {
 
         Ok(claims)
     }
+
+    /// env-token を検証し、成功時に正準パース済みの [`EnvClaims`] を返す (M7c, §4.6)。
+    ///
+    /// `verify` と同じ手順（b64url 2 セグメント → JSON → **正準バイト再導出** → kid で鍵選択 →
+    /// `verify_strict`）だが、署名バイトのドメインタグが異なるため job_token を渡しても通らない。
+    /// `aud` の検査は呼び出し側（引き換えハンドラ）が行う（claim 内容の検査は署名検証の後、
+    /// という `verify` の分業と揃える）。
+    pub fn verify_env(&self, token: &str) -> Result<EnvClaims, VerifyError> {
+        let mut parts = token.split('.');
+        let seg0 = parts.next().ok_or(VerifyError::MalformedToken)?;
+        let seg1 = parts.next().ok_or(VerifyError::MalformedToken)?;
+        if parts.next().is_some() {
+            return Err(VerifyError::MalformedToken);
+        }
+
+        let payload = b64url_decode(seg0).ok_or(VerifyError::PayloadDecode)?;
+        let claims: EnvClaims =
+            serde_json::from_slice(&payload).map_err(|_| VerifyError::PayloadJson)?;
+
+        let sig_bytes = b64url_decode(seg1).ok_or(VerifyError::SignatureDecode)?;
+        let sig_arr: [u8; 64] = sig_bytes
+            .as_slice()
+            .try_into()
+            .map_err(|_| VerifyError::SignatureDecode)?;
+        let signature = Signature::from_bytes(&sig_arr);
+
+        let key = self.keys.get(&claims.kid).ok_or(VerifyError::UnknownKid)?;
+
+        let signing_bytes = env_claims_signing_bytes(&claims);
+        key.verify_strict(&signing_bytes, &signature)
+            .map_err(|_| VerifyError::BadSignature)?;
+
+        Ok(claims)
+    }
 }
 
 /// `JOB_SIGNING_KEY` env 値（base64url / base64 / hex のいずれか）を 32 バイト
@@ -169,9 +222,18 @@ impl Verifier {
 ///
 /// いずれも 32 バイトちょうどでなければエラー。
 pub fn decode_seed(raw: &str) -> anyhow::Result<[u8; 32]> {
+    decode_key32(raw, "JOB_SIGNING_KEY")
+}
+
+/// 32 バイト鍵素材を hex / base64url / base64 のいずれかから復号する（M7c で一般化）。
+///
+/// `env_name` はエラーメッセージに埋める env 変数名。`decode_seed` は
+/// `decode_key32(raw, "JOB_SIGNING_KEY")` の薄いラッパであり、M7c の `SECRETS_MASTER_KEY` /
+/// `SECRETS_RETIRED_KEYS` も同じ復号規則を共有する（鍵素材の受理形式を 1 箇所に保つ）。
+pub fn decode_key32(raw: &str, env_name: &str) -> anyhow::Result<[u8; 32]> {
     let raw = raw.trim();
     if raw.is_empty() {
-        anyhow::bail!("JOB_SIGNING_KEY is empty");
+        anyhow::bail!("{env_name} is empty");
     }
 
     // 1. hex（64 文字）。
@@ -182,7 +244,7 @@ pub fn decode_seed(raw: &str) -> anyhow::Result<[u8; 32]> {
             let lo = hex_val(raw.as_bytes()[i * 2 + 1]);
             match (hi, lo) {
                 (Some(h), Some(l)) => *byte = (h << 4) | l,
-                _ => anyhow::bail!("JOB_SIGNING_KEY: invalid hex"),
+                _ => anyhow::bail!("{env_name}: invalid hex"),
             }
         }
         return Ok(out);
@@ -190,22 +252,22 @@ pub fn decode_seed(raw: &str) -> anyhow::Result<[u8; 32]> {
 
     // 2. base64url（no-pad）。
     if let Some(bytes) = b64url_decode(raw) {
-        return to_seed32(bytes);
+        return to_seed32(bytes, env_name);
     }
 
     // 3. 標準 base64（'+'/'/' と '=' パディング）。手実装（外部 base64 依存を避ける）。
     if let Some(bytes) = std_base64_decode(raw) {
-        return to_seed32(bytes);
+        return to_seed32(bytes, env_name);
     }
 
-    anyhow::bail!("JOB_SIGNING_KEY: not valid hex / base64url / base64 of a 32-byte seed")
+    anyhow::bail!("{env_name}: not valid hex / base64url / base64 of a 32-byte seed")
 }
 
-fn to_seed32(bytes: Vec<u8>) -> anyhow::Result<[u8; 32]> {
+fn to_seed32(bytes: Vec<u8>, env_name: &str) -> anyhow::Result<[u8; 32]> {
     let arr: [u8; 32] = bytes
         .as_slice()
         .try_into()
-        .map_err(|_| anyhow::anyhow!("JOB_SIGNING_KEY must decode to exactly 32 bytes"))?;
+        .map_err(|_| anyhow::anyhow!("{env_name} must decode to exactly 32 bytes"))?;
     Ok(arr)
 }
 

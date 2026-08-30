@@ -38,6 +38,11 @@ argon2 = { workspace = true }
 rand = { workspace = true }
 async-trait = { workspace = true }
 
+# M7-0 / M7c (§5.1 / §4): 秘密素材（KEK / DEK / 復号済み平文）を Drop でゼロ化する。
+zeroize = { workspace = true }
+# M7c (§4.1): secret の封筒暗号（XChaCha20-Poly1305）。
+chacha20poly1305 = { workspace = true }
+
 # DB（query! マクロは使わずランタイム API のみ）
 sqlx = { workspace = true }
 
@@ -71,8 +76,13 @@ prometheus = { workspace = true }
 [dev-dependencies]
 # M4 chaos tests（tests/chaos_m4.rs）の HTTP クライアント。プロダクションコードでは使わない。
 # worker と同じ rustls-tls バックエンドで OpenSSL/aws-lc-sys を回避。`json` feature は
-# テスト中のリクエスト/レスポンスの serde 統合のため必要。
-reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
+# テスト中のリクエスト/レスポンスの serde 統合のため必要。`multipart` は M7 chaos が
+# canary 用 version を activate=false でアップロードするため（POST /components/{id}/versions）。
+reqwest = { version = "0.12", default-features = false, features = [
+    "rustls-tls",
+    "json",
+    "multipart",
+] }
 # chaos_b の Idempotency-Key 生成にユニーク nanos を埋める用途。
 chrono = { workspace = true }
 # chaos テストの async ランタイム（既存の workspace tokio を re-import するだけ）。

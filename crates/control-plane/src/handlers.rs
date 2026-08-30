@@ -32,6 +32,7 @@ use crate::db;
 use crate::enqueue;
 use crate::error::AppError;
 use crate::extract::JsonBody;
+use crate::routing;
 use crate::state::AppState;
 use crate::validation;
 
@@ -229,6 +230,10 @@ pub async fn upload_version(
     let mut wasm_bytes: Option<Vec<u8>> = None;
     let mut capabilities: Option<Value> = None;
     let mut resource_limits: ResourceLimits = ResourceLimits::default();
+    // M7a: アップロード直後に stable を差し替えるか。**既定 true**（M6 までと同一挙動）。
+    // canary の段階移行は「新版を activate=false で上げてから PUT /traffic で 10% 流す」という
+    // 手順を取るため、これが無いと新版が保存と同時に無条件 100% になり段階移行が形骸化する。
+    let mut activate = true;
 
     let max_bytes = state.max_wasm_upload_bytes();
 
@@ -251,6 +256,9 @@ pub async fn upload_version(
                 let parsed: Value = serde_json::from_str(&text).map_err(|e| {
                     FaasError::InvalidRequest(format!("capabilities is not valid JSON: {e}"))
                 })?;
+                // M7b (§4.4): env 許可リストは admin 承認の対象。deploy スコープのこの経路で
+                // 宣言されたら 400 で拒否する（黙って無視すると「設定したのに効かない」になる）。
+                validation::reject_env_in_declared_capabilities(&parsed)?;
                 capabilities = Some(parsed);
             }
             Some("resource_limits") => {
@@ -282,6 +290,13 @@ pub async fn upload_version(
                 }
                 wasm_bytes = Some(buf);
             }
+            Some("activate") => {
+                let text = field.text().await.map_err(|e| {
+                    FaasError::InvalidRequest(format!("invalid activate field: {e}"))
+                })?;
+                // `"false"` だけを false と解釈する（未知値は既定 true ＝ 従来挙動へ倒す）。
+                activate = !text.trim().eq_ignore_ascii_case("false");
+            }
             // 未知フィールドは無視（前方互換）。
             _ => {
                 let _ = field.bytes().await;
@@ -311,7 +326,16 @@ pub async fn upload_version(
         tracing::debug!(declared = ?caps, imports = ?validated.imports, "client-declared capabilities (not trusted; persisting resolved approved set)");
     }
     // §4.4 MUST: クライアント宣言値ではなく、承認集合と照合して解決した import を保存する。
-    let capabilities_json = json!(validated.approved_imports);
+    //
+    // M7b: `capabilities.env`（注入を許可する env 名の許可リスト）は **admin 承認**の対象であり、
+    // Deploy スコープのこの経路では**常に空**（deny-all）で保存する。deploy トークンが
+    // `env: ["PROD_API_KEY"]` を宣言できると、その wasm が `wasi:cli/environment`（baseline 承認済み）
+    // で読んだ値を invoke 出力へ返すだけで admin 専用の secret を平文で取得できる（権限昇格）。
+    let capabilities_json = validation::CapabilitySet {
+        imports: validated.approved_imports.clone(),
+        env: std::collections::BTreeSet::new(),
+    }
+    .to_json();
 
     // (5) 検証通過 → MinIO 保存 → INSERT(active) → active 化。
     let object_key = component_object_key(tenant, &component.name, &version);
@@ -340,7 +364,12 @@ pub async fn upload_version(
     // 同一 (component_id, version) 上書きは禁止 (§6.7 MUST NOT) → 409/422。
     .map_err(|e| map_unique_violation(e, "version already exists for this component"))?;
 
-    db::set_active_version(&mut *tx, tenant, &component.id, &version_id).await?;
+    // M7a: activate=false なら stable を動かさない（canary 段階移行の出発点）。
+    // `component_versions.status` は従来どおり 'active'（= 「利用可能」の意味）。ルーティングの
+    // 権威は components の 2 ポインタ（active_version_id / canary_version_id）であって status ではない。
+    if activate {
+        db::switch_active_version(&mut *tx, tenant, &component.id, &version_id).await?;
+    }
 
     tx.commit().await?;
 
@@ -349,7 +378,8 @@ pub async fn upload_version(
         %version,
         sha256 = %validated.sha256,
         size_bytes = validated.size_bytes,
-        "version uploaded and activated"
+        activate,
+        "version uploaded"
     );
 
     Ok((
@@ -583,19 +613,49 @@ pub async fn invoke(
         }
     }
 
-    // active component を解決し、active version の保存先・sha256 を引く (§6.3)。
-    let component = db::find_component_by_name(&mut *tx, tenant, &req.component)
+    // component の存在確認 (§6.3)。不在は 404、在るが active version が無いのは後段で 400 と、
+    // 区別を維持するためここで先に引く（id 自体は解決 SQL が返すものを権威とする: M7a）。
+    db::find_component_by_name(&mut *tx, tenant, &req.component)
         .await?
         .ok_or_else(|| FaasError::NotFound(format!("component '{}'", req.component)))?;
 
-    let active = db::active_version_storage(&mut *tx, tenant, &req.component)
-        .await?
-        .ok_or_else(|| {
-            FaasError::InvalidRequest(format!(
-                "component '{}' has no active version",
-                req.component
-            ))
-        })?;
+    // --- M7a (§6.7 / §15): canary ルーティングキーを決める ---
+    // 優先順は ① X-Faas-Routing-Key（任意。呼び出し側が user_id / session_id を入れれば同一ユーザは
+    // 常に同じ版＝sticky）→ ② Idempotency-Key（再送が同じ版へ落ちる）→ ③ execution_id（一様相当）。
+    // ヘッダ未指定なら従来クライアントは無変更で ③ になる。
+    //
+    // クエリではなく**ヘッダ**で受けるのは、`TraceLayer::new_for_http()` が URI（クエリ込み）を
+    // span に載せるため。識別子をクエリに置くと全ログ行に伝播してしまう。
+    let routing_key: String = match headers.get("X-Faas-Routing-Key").map(|v| v.to_str()) {
+        Some(Ok(v)) => {
+            if !routing::validate_routing_key(v) {
+                return Err(FaasError::InvalidRequest(format!(
+                    "X-Faas-Routing-Key must be 1..={} printable ASCII bytes",
+                    routing::MAX_ROUTING_KEY_LEN
+                ))
+                .into());
+            }
+            v.to_string()
+        }
+        Some(Err(_)) => {
+            return Err(
+                FaasError::InvalidRequest("X-Faas-Routing-Key must be ASCII".into()).into(),
+            );
+        }
+        None => idem_key.clone().unwrap_or_else(|| execution_id.clone()),
+    };
+
+    // active version を解決する（M7a 以降は stable / canary の重み付き選択を通る唯一の入口）。
+    let routed =
+        enqueue::resolve_version_for_enqueue(&mut tx, tenant, &req.component, &routing_key)
+            .await?
+            .ok_or_else(|| {
+                FaasError::InvalidRequest(format!(
+                    "component '{}' has no active version",
+                    req.component
+                ))
+            })?;
+    let active = &routed.selected;
 
     // --- admission ゲート 2: in-flight 同時実行 reserve (§8) ---
     // 冪等 fast-path miss を確認し、本当に新規 enqueue する確度が高まった所で原子予約する
@@ -693,7 +753,7 @@ pub async fn invoke(
         enqueue::EnqueueRequest {
             tenant,
             component_name: &req.component,
-            component_id: &component.id,
+            component_id: &routed.component_id,
             version_id: &active.version_id,
             version: &active.version,
             wasm_sha256: &active.wasm_sha256,
@@ -709,6 +769,7 @@ pub async fn invoke(
             reply_to: reply_to.clone(),
             origin: "http_invoke",
             chain_depth: 0,
+            routing_reason: routed.reason,
         },
     )
     .await;
@@ -1413,6 +1474,24 @@ pub async fn delete_version(
         .into());
     }
 
+    // M7a: canary 対象も削除不可。削除しても解決 SQL は fail-safe に stable へ倒れるが、
+    // 「配分を設定したつもりの版が黙って無視される」状態を作らないため明示的に拒否する。
+    if component.canary_version_id.as_deref() == Some(target_version_id.as_str()) {
+        return Err(FaasError::Conflict(format!(
+            "version '{version}' is the canary target; clear the traffic split first"
+        ))
+        .into());
+    }
+
+    // M7a: rollback の戻り先も削除不可。消すと「ワンクリック rollback が 409 で失敗する」状態に
+    // なるため、削除より先に active-version の切替 / rollback を済ませてもらう。
+    if component.previous_active_version_id.as_deref() == Some(target_version_id.as_str()) {
+        return Err(FaasError::Conflict(format!(
+            "version '{version}' is the rollback target; switch active-version or roll back first"
+        ))
+        .into());
+    }
+
     // 参照中の実行があれば保護（§6.7）。
     if db::has_active_executions_for_version(&mut *tx, tenant, &target_version_id).await? {
         return Err(FaasError::Conflict(format!(
@@ -1479,7 +1558,25 @@ pub async fn set_active_version(
             ))
         })?;
 
-    db::set_active_version(&mut *tx, tenant, &component_id, &target_version_id).await?;
+    // M7a: 直前 stable の退避 + canary 配分のクリアを伴う単一 UPDATE に差し替える。
+    // 事前に 404 判定済みなので false は到達しない（防御的に 404 へ写像する）。
+    if !db::switch_active_version(&mut *tx, tenant, &component_id, &target_version_id).await? {
+        return Err(FaasError::NotFound(format!("component '{component_id}'")).into());
+    }
+
+    // M7a: 版の切替は監査に残す（現行は tracing のみで audit_logs に痕跡が無かった）。
+    db::insert_audit_log(
+        &mut *tx,
+        tenant,
+        principal.user_id.as_deref(),
+        "active_version_switched",
+        Some(&component_id),
+        Some(&json!({
+            "active_version_id": target_version_id,
+            "version": req.version,
+        })),
+    )
+    .await?;
 
     tx.commit().await?;
 
@@ -1706,7 +1803,11 @@ pub struct CreateTokenRequest {
 #[derive(Debug, Serialize)]
 pub struct CreateTokenResponse {
     /// 平文 opaque secret。**一度だけ**返す。
-    pub token: String,
+    ///
+    /// M7-0 (§5.1): `Redacted` は `Serialize` を実装しないので、平文で返すには `expose_once` を
+    /// 明示する必要がある（この属性の grep が「意図的に秘密を返す API」の全一覧になる）。
+    #[serde(serialize_with = "faas_shared::expose_once")]
+    pub token: faas_shared::Redacted<String>,
     pub token_id: String,
     pub scopes: Vec<Scope>,
     pub expires_at: String,
@@ -1786,7 +1887,7 @@ pub async fn create_token(
     Ok((
         StatusCode::CREATED,
         Json(CreateTokenResponse {
-            token: secret,
+            token: faas_shared::Redacted::new(secret),
             token_id,
             scopes,
             expires_at: expires_at.to_rfc3339(),
@@ -2441,7 +2542,13 @@ async fn enqueue_via_trigger(
         );
         return Ok(None);
     };
-    let Some(active) = db::active_version_storage(&mut *tx, tenant, &component.name).await? else {
+    // M7a: event / chain 起点も HTTP と同じ唯一の解決点を通す（canary をバイパスさせない）。
+    // ルーティングキーは既に採番済みの execution_id（一様相当。配送台帳が二重起動を防ぐので
+    // 「同じイベントが 2 度別の版へ落ちる」ことは構造的に起きない）。
+    let Some(routed) =
+        enqueue::resolve_version_for_enqueue(&mut tx, tenant, &component.name, &execution_id)
+            .await?
+    else {
         // active version 無し → 起動不能。配送は記録済みなので再送は skip される（取りこぼし防止は将来課題）。
         tx.commit().await?;
         tracing::warn!(
@@ -2452,6 +2559,7 @@ async fn enqueue_via_trigger(
         );
         return Ok(None);
     };
+    let active = &routed.selected;
 
     let wasm_url = state
         .storage()
@@ -2468,7 +2576,7 @@ async fn enqueue_via_trigger(
         enqueue::EnqueueRequest {
             tenant,
             component_name: &component.name,
-            component_id: &component.id,
+            component_id: &routed.component_id,
             version_id: &active.version_id,
             version: &active.version,
             wasm_sha256: &active.wasm_sha256,
@@ -2484,6 +2592,7 @@ async fn enqueue_via_trigger(
             reply_to: None,
             origin: "event",
             chain_depth,
+            routing_reason: routed.reason,
         },
     )
     .await;
@@ -2643,6 +2752,712 @@ pub(crate) async fn enqueue_chain_downstreams(
             }
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// M7a: バージョン traffic splitting / canary + 即時 rollback（§6.7 / §15）
+//
+// スコープは制御 4 本が Admin、参照のみ Read。既存の `PUT /active-version` が Admin なので、
+// 版の切替権限を 1 スコープに集約しないと「Deploy トークンで stable を動かせるが Admin でないと
+// 戻せない」という非対称が生まれる。`require_admin_role` は付けない（既存の rollback 導線と
+// 対称にする意図的な判断。secret 系の二重ガードとは扱いが違う）。
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Deserialize)]
+pub struct SetTrafficSplitRequest {
+    /// canary 側に置く既存 version (semver)。
+    pub canary_version: String,
+    /// canary へ流す割合（%）。0..=100。
+    pub weight: i32,
+}
+
+#[derive(Debug, Serialize)]
+pub struct SetTrafficSplitResponse {
+    pub component_id: String,
+    pub stable_version_id: Option<String>,
+    pub stable_version: Option<String>,
+    pub canary_version_id: String,
+    pub canary_version: String,
+    pub weight: i32,
+}
+
+/// PUT /components/{id}/traffic — canary の版と重みを設定する（絶対値・冪等）。
+///
+/// `weight = 0` + `canary_version` 指定は許可する（配分 0 で待機 ＝ 段階移行の開始前状態）。
+/// 完全解除は `DELETE /components/{id}/traffic`。
+pub async fn set_traffic_split(
+    State(state): State<AppState>,
+    principal: Principal,
+    Path(component_id): Path<String>,
+    JsonBody(req): JsonBody<SetTrafficSplitRequest>,
+) -> Result<impl IntoResponse, AppError> {
+    let tenant = &principal.tenant_id;
+
+    if !(0..=100).contains(&req.weight) {
+        return Err(FaasError::InvalidRequest("weight must be between 0 and 100".into()).into());
+    }
+    if req.canary_version.trim().is_empty() {
+        return Err(FaasError::InvalidRequest("canary_version must not be empty".into()).into());
+    }
+
+    let mut tx = state.pool().begin().await?;
+    db::set_tenant_guc(&mut tx, tenant).await?;
+
+    let component = db::find_component_by_id(&mut *tx, tenant, &component_id)
+        .await?
+        .ok_or_else(|| FaasError::NotFound(format!("component '{component_id}'")))?;
+
+    // canary_version_id に FK は張らないため、**ここが唯一の参照整合**（§1.3 の設計判断）。
+    let canary_version_id =
+        db::find_version_id(&mut *tx, tenant, &component_id, &req.canary_version)
+            .await?
+            .ok_or_else(|| {
+                FaasError::NotFound(format!(
+                    "version '{}' of component '{component_id}'",
+                    req.canary_version
+                ))
+            })?;
+
+    // stable と同じ版へ配分しても意味が無く、「canary を出したつもり」の誤解を生むので拒否する。
+    if component.active_version_id.as_deref() == Some(canary_version_id.as_str()) {
+        return Err(FaasError::InvalidRequest(
+            "canary version must differ from the active version".into(),
+        )
+        .into());
+    }
+
+    if !db::set_traffic_split(
+        &mut *tx,
+        tenant,
+        &component_id,
+        &canary_version_id,
+        req.weight as i16,
+    )
+    .await?
+    {
+        return Err(FaasError::NotFound(format!("component '{component_id}'")).into());
+    }
+
+    db::insert_audit_log(
+        &mut *tx,
+        tenant,
+        principal.user_id.as_deref(),
+        "traffic_split_updated",
+        Some(&component_id),
+        Some(&json!({
+            "stable_version_id": component.active_version_id,
+            "canary_version_id": canary_version_id,
+            "weight": req.weight,
+        })),
+    )
+    .await?;
+
+    // stable 側の semver は応答のために引き直す（配分確定後の権威な状態を返す）。
+    let split = db::traffic_split_for_component(&mut *tx, tenant, &component_id).await?;
+
+    tx.commit().await?;
+
+    tracing::info!(
+        %component_id,
+        canary_version = %req.canary_version,
+        weight = req.weight,
+        "traffic split updated"
+    );
+
+    Ok(Json(SetTrafficSplitResponse {
+        component_id,
+        stable_version_id: split.as_ref().and_then(|s| s.stable_version_id.clone()),
+        stable_version: split.as_ref().and_then(|s| s.stable_version.clone()),
+        canary_version_id,
+        canary_version: req.canary_version,
+        weight: req.weight,
+    }))
+}
+
+/// DELETE /components/{id}/traffic — canary を解除する（冪等・204）。
+pub async fn clear_traffic_split(
+    State(state): State<AppState>,
+    principal: Principal,
+    Path(component_id): Path<String>,
+) -> Result<impl IntoResponse, AppError> {
+    let tenant = &principal.tenant_id;
+
+    let mut tx = state.pool().begin().await?;
+    db::set_tenant_guc(&mut tx, tenant).await?;
+
+    db::find_component_by_id(&mut *tx, tenant, &component_id)
+        .await?
+        .ok_or_else(|| FaasError::NotFound(format!("component '{component_id}'")))?;
+
+    // 既に未設定でも 204（冪等）。
+    db::clear_traffic_split(&mut *tx, tenant, &component_id).await?;
+
+    db::insert_audit_log(
+        &mut *tx,
+        tenant,
+        principal.user_id.as_deref(),
+        "traffic_split_cleared",
+        Some(&component_id),
+        None,
+    )
+    .await?;
+
+    tx.commit().await?;
+
+    tracing::info!(%component_id, "traffic split cleared");
+    Ok(StatusCode::NO_CONTENT)
+}
+
+#[derive(Debug, Deserialize)]
+pub struct PromoteVersionRequest {
+    /// 昇格対象 (semver)。省略時は現 canary をそのまま昇格する。
+    /// 指定した場合は「オペレータが見た canary と一致すること」を CAS 条件にする。
+    #[serde(default)]
+    pub version: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct PromoteVersionResponse {
+    pub component_id: String,
+    pub active_version_id: String,
+    pub previous_active_version_id: Option<String>,
+    pub canary_cleared: bool,
+}
+
+/// POST /components/{id}/promote — canary を stable へ昇格する（単一 UPDATE + CAS）。
+pub async fn promote_version(
+    State(state): State<AppState>,
+    principal: Principal,
+    Path(component_id): Path<String>,
+    JsonBody(req): JsonBody<PromoteVersionRequest>,
+) -> Result<impl IntoResponse, AppError> {
+    let tenant = &principal.tenant_id;
+
+    let mut tx = state.pool().begin().await?;
+    db::set_tenant_guc(&mut tx, tenant).await?;
+
+    // 明示指定があれば version_id へ解決してから CAS に載せる（semver → id）。
+    let target_version_id: Option<String> = match req.version.as_deref().map(str::trim) {
+        Some(v) if !v.is_empty() => Some(
+            db::find_version_id(&mut *tx, tenant, &component_id, v)
+                .await?
+                .ok_or_else(|| {
+                    FaasError::NotFound(format!("version '{v}' of component '{component_id}'"))
+                })?,
+        ),
+        _ => None,
+    };
+
+    let promoted = db::promote_active_version(
+        &mut *tx,
+        tenant,
+        &component_id,
+        target_version_id.as_deref(),
+    )
+    .await?;
+
+    // 0 行のときだけ理由を確定する（成功パスは 1 文のままなのでレースは起きない）。
+    let Some((active_version_id, previous_active_version_id)) = promoted else {
+        let component = db::find_component_by_id(&mut *tx, tenant, &component_id)
+            .await?
+            .ok_or_else(|| FaasError::NotFound(format!("component '{component_id}'")))?;
+        return match component.canary_version_id {
+            None => Err(FaasError::InvalidRequest("no canary configured".into()).into()),
+            Some(_) => Err(FaasError::Conflict(
+                "canary version changed; re-read GET /components/{id}/traffic".into(),
+            )
+            .into()),
+        };
+    };
+
+    db::insert_audit_log(
+        &mut *tx,
+        tenant,
+        principal.user_id.as_deref(),
+        "version_promoted",
+        Some(&component_id),
+        Some(&json!({
+            "active_version_id": active_version_id,
+            "previous_active_version_id": previous_active_version_id,
+        })),
+    )
+    .await?;
+
+    tx.commit().await?;
+
+    tracing::info!(%component_id, %active_version_id, "canary promoted to stable");
+
+    Ok(Json(PromoteVersionResponse {
+        component_id,
+        active_version_id,
+        previous_active_version_id,
+        canary_cleared: true,
+    }))
+}
+
+#[derive(Debug, Deserialize)]
+pub struct RollbackVersionRequest {
+    /// 戻り先 (semver)。省略時は `previous_active_version_id`（＝ ワンクリック）。
+    #[serde(default)]
+    pub version: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct RollbackVersionResponse {
+    pub component_id: String,
+    pub active_version_id: String,
+    /// 直前まで stable だった版（今回の rollback で置き換えられた側）。
+    pub rolled_back_from: Option<String>,
+    pub canary_cleared: bool,
+}
+
+/// POST /components/{id}/rollback — ワンクリック rollback（canary 破棄 + 直前 stable へ復帰）。
+///
+/// **保証の境界**: 版は enqueue 時点で JobMessage と job_token claim に焼き込まれるため、
+/// rollback が効くのは **commit 直後の次の enqueue から**である。publish 済みの canary ジョブは
+/// 最大 `ACK_WAIT_SECS × MAX_DELIVER`（`BACKOFF_SECS` 併用時はその総和）のあいだ canary 版で
+/// 完走・再試行する。in-flight の即時停止は M7 非スコープ。
+pub async fn rollback_version(
+    State(state): State<AppState>,
+    principal: Principal,
+    Path(component_id): Path<String>,
+    JsonBody(req): JsonBody<RollbackVersionRequest>,
+) -> Result<impl IntoResponse, AppError> {
+    let tenant = &principal.tenant_id;
+
+    let mut tx = state.pool().begin().await?;
+    db::set_tenant_guc(&mut tx, tenant).await?;
+
+    let target_version_id: Option<String> = match req.version.as_deref().map(str::trim) {
+        Some(v) if !v.is_empty() => Some(
+            db::find_version_id(&mut *tx, tenant, &component_id, v)
+                .await?
+                .ok_or_else(|| {
+                    FaasError::NotFound(format!("version '{v}' of component '{component_id}'"))
+                })?,
+        ),
+        _ => None,
+    };
+
+    let rolled = db::rollback_active_version(
+        &mut *tx,
+        tenant,
+        &component_id,
+        target_version_id.as_deref(),
+    )
+    .await?;
+
+    // 0 行のときだけ理由を確定する。
+    let Some((active_version_id, rolled_back_from)) = rolled else {
+        let component = db::find_component_by_id(&mut *tx, tenant, &component_id)
+            .await?
+            .ok_or_else(|| FaasError::NotFound(format!("component '{component_id}'")))?;
+        return match (target_version_id, component.previous_active_version_id) {
+            // 戻り先を指定していないのに previous が無い（まだ一度も切り替えていない）。
+            (None, None) => Err(FaasError::Conflict(
+                "no previous version to roll back to; specify a version".into(),
+            )
+            .into()),
+            // previous はあるが解決できない ＝ soft delete 済み（tombstone を active にしない）。
+            _ => Err(FaasError::Conflict(
+                "rollback target was deleted; specify a live version explicitly".into(),
+            )
+            .into()),
+        };
+    };
+
+    db::insert_audit_log(
+        &mut *tx,
+        tenant,
+        principal.user_id.as_deref(),
+        "version_rollback",
+        Some(&component_id),
+        Some(&json!({
+            "active_version_id": active_version_id,
+            "rolled_back_from": rolled_back_from,
+        })),
+    )
+    .await?;
+
+    tx.commit().await?;
+
+    tracing::info!(%component_id, %active_version_id, "rolled back");
+
+    Ok(Json(RollbackVersionResponse {
+        component_id,
+        active_version_id,
+        rolled_back_from,
+        canary_cleared: true,
+    }))
+}
+
+/// `GET /components/{id}/traffic` の version 別成績（直近ウィンドウ）。
+#[derive(Debug, Serialize)]
+pub struct VersionStats {
+    pub version_id: String,
+    pub succeeded: i64,
+    pub failed: i64,
+    pub timeout: i64,
+    pub canary_routed: i64,
+    pub p50_wall_time_ms: Option<i64>,
+    pub p95_wall_time_ms: Option<i64>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct VersionRef {
+    pub version_id: String,
+    pub version: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct GetTrafficSplitResponse {
+    pub component_id: String,
+    pub stable: Option<VersionRef>,
+    pub canary: Option<VersionRef>,
+    pub weight: i32,
+    pub updated_at: Option<chrono::DateTime<chrono::Utc>>,
+    /// 集計窓（分）。**固定 60**（可変窓は M8 以降の follow-up）。
+    pub window_minutes: i32,
+    pub version_stats: Vec<VersionStats>,
+}
+
+/// canary 判断に使う集計窓（分）。固定値。
+const TRAFFIC_STATS_WINDOW_MINUTES: i32 = 60;
+
+/// GET /components/{id}/traffic — 現在の配分と version 別の直近成績（canary 判断の一次情報）。
+pub async fn get_traffic_split(
+    State(state): State<AppState>,
+    principal: Principal,
+    Path(component_id): Path<String>,
+) -> Result<impl IntoResponse, AppError> {
+    let tenant = &principal.tenant_id;
+
+    let mut tx = state.pool().begin().await?;
+    db::set_tenant_guc(&mut tx, tenant).await?;
+
+    let split = db::traffic_split_for_component(&mut *tx, tenant, &component_id)
+        .await?
+        .ok_or_else(|| FaasError::NotFound(format!("component '{component_id}'")))?;
+
+    let stats = db::version_stats_for_component(
+        &mut *tx,
+        tenant,
+        &component_id,
+        TRAFFIC_STATS_WINDOW_MINUTES,
+    )
+    .await?;
+
+    tx.commit().await?;
+
+    // version_id と semver が揃っているときだけ参照を返す（片方だけの中途半端な形にしない）。
+    let pair = |id: Option<String>, v: Option<String>| match (id, v) {
+        (Some(version_id), Some(version)) => Some(VersionRef {
+            version_id,
+            version,
+        }),
+        _ => None,
+    };
+
+    Ok(Json(GetTrafficSplitResponse {
+        component_id: split.component_id,
+        stable: pair(split.stable_version_id, split.stable_version),
+        canary: pair(split.canary_version_id, split.canary_version),
+        weight: split.weight as i32,
+        updated_at: split.updated_at,
+        window_minutes: TRAFFIC_STATS_WINDOW_MINUTES,
+        version_stats: stats
+            .into_iter()
+            .map(|s| VersionStats {
+                version_id: s.version_id,
+                succeeded: s.succeeded,
+                failed: s.failed,
+                timeout: s.timeout,
+                canary_routed: s.canary_routed,
+                p50_wall_time_ms: s.p50_wall_time_ms,
+                p95_wall_time_ms: s.p95_wall_time_ms,
+            })
+            .collect(),
+    }))
+}
+
+// ---------------------------------------------------------------------------
+// M7b: capability の env 許可リスト承認（§4.4 / §15）
+//
+// §4.4 は「capability の付与（承認）は admin スコープを要する (MUST)」と規定する。
+// 版のアップロード（Deploy スコープ）から分離した**専用エンドポイント**にすることで、
+// deploy トークンが自分で env 許可リストを広げる権限昇格経路を構造的に消す。
+// secret 系（§4.5）と同じく admin スコープ + admin ロールの二重ガードを掛ける。
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Deserialize)]
+pub struct ApproveCapabilityEnvRequest {
+    /// 注入を許可する env 名の**全置換**リスト（空配列 = deny-all へ戻す）。
+    pub env: Vec<String>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ApproveCapabilityEnvResponse {
+    pub component_id: String,
+    pub version: String,
+    pub version_id: String,
+    pub env: Vec<String>,
+}
+
+/// PUT /components/{id}/versions/{version}/capabilities — env 許可リストを承認する（admin）。
+///
+/// `imports`（strict matching の結果）は受け付けない。あれは検証パイプラインが決める値であり、
+/// API から書き換えられてはならない。
+pub async fn approve_capability_env(
+    State(state): State<AppState>,
+    principal: Principal,
+    Path((component_id, version)): Path<(String, String)>,
+    JsonBody(req): JsonBody<ApproveCapabilityEnvRequest>,
+) -> Result<impl IntoResponse, AppError> {
+    // admin スコープ（ルータ）に加えて admin **ロール**も要求する（二重ガード, §3.7）。
+    require_admin_role(principal.role)?;
+    let tenant = &principal.tenant_id;
+
+    let approved = validation::validate_env_allowlist(&req.env)?;
+
+    let mut tx = state.pool().begin().await?;
+    db::set_tenant_guc(&mut tx, tenant).await?;
+
+    db::find_component_by_id(&mut *tx, tenant, &component_id)
+        .await?
+        .ok_or_else(|| FaasError::NotFound(format!("component '{component_id}'")))?;
+
+    let version_id = db::find_version_id(&mut *tx, tenant, &component_id, &version)
+        .await?
+        .ok_or_else(|| {
+            FaasError::NotFound(format!("version '{version}' of component '{component_id}'"))
+        })?;
+
+    // 既存の imports は保持し、env だけを差し替える。
+    let current = db::version_capabilities(&mut *tx, tenant, &version_id)
+        .await?
+        .unwrap_or(Value::Null);
+    let mut caps = validation::parse_capabilities(&current);
+    caps.env = approved.clone();
+
+    if !db::set_version_capabilities(&mut *tx, tenant, &version_id, &caps.to_json()).await? {
+        return Err(FaasError::NotFound(format!(
+            "version '{version}' of component '{component_id}'"
+        ))
+        .into());
+    }
+
+    // 監査には**承認された名前**だけを残す（値はここには存在しない）。
+    db::insert_audit_log(
+        &mut *tx,
+        tenant,
+        principal.user_id.as_deref(),
+        "capability_env_approved",
+        Some(&version_id),
+        Some(&json!({
+            "component_id": component_id,
+            "version": version,
+            "env": approved.iter().collect::<Vec<_>>(),
+        })),
+    )
+    .await?;
+
+    tx.commit().await?;
+
+    tracing::info!(
+        %component_id,
+        %version,
+        approved_env_count = approved.len(),
+        "capability env allowlist approved"
+    );
+
+    Ok(Json(ApproveCapabilityEnvResponse {
+        component_id,
+        version,
+        version_id,
+        env: approved.into_iter().collect(),
+    }))
+}
+
+// ---------------------------------------------------------------------------
+// M7b: per-function 環境変数（平文 config）の CRUD（§15 / §4.4）
+//
+// スコープは **deploy**（読み書きとも）。読み取りを read に置かない理由: config は平文であり、
+// 注入時に secret と同じ env 名前空間へ混ざる。運用者が資格情報を誤って config 側に入れる確率は
+// 現実的に高く、その瞬間 read スコープ（監視・ダッシュボード用途で最も広く配られる）が
+// 資格情報の読み取り権限になってしまう。1 段引き上げて被害面を縮める。
+// → README の露出ガード節に「config は平文であり deploy スコープで読める。資格情報は必ず
+//    secrets 側に置くこと」を明記する。
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Deserialize)]
+pub struct PutFunctionConfigRequest {
+    /// 環境変数の**全置換**マップ。空オブジェクトで全削除。
+    pub env: std::collections::BTreeMap<String, String>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct FunctionConfigResponse {
+    pub component_id: String,
+    pub env: std::collections::BTreeMap<String, String>,
+    pub updated_at: Option<chrono::DateTime<chrono::Utc>>,
+}
+
+/// config の入力（キー名・値長・件数・総バイト）を検証する純関数（DB / ストア非依存）。
+///
+/// 上限は `faas_shared` の定数を使う（CP の受付と worker の防御的 clamp で同じ値を参照する
+/// 二重防御）。超過は 400（`error.rs` は `InvalidRequest` を 400 にしか写像しない）。
+fn validate_env_map(env: &std::collections::BTreeMap<String, String>) -> Result<(), FaasError> {
+    if env.len() > faas_shared::MAX_FUNCTION_ENV_KEYS {
+        return Err(FaasError::InvalidRequest(format!(
+            "at most {} env entries are allowed per component",
+            faas_shared::MAX_FUNCTION_ENV_KEYS
+        )));
+    }
+    let mut total = 0usize;
+    for (k, v) in env {
+        if !faas_shared::is_valid_env_key(k) {
+            return Err(FaasError::InvalidRequest(format!(
+                "invalid env key '{k}': must match ^[A-Z_][A-Z0-9_]{{0,{}}}$",
+                faas_shared::MAX_ENV_KEY_LEN - 1
+            )));
+        }
+        if v.len() > faas_shared::MAX_ENV_VALUE_BYTES {
+            return Err(FaasError::InvalidRequest(format!(
+                "env value for '{k}' exceeds {} bytes",
+                faas_shared::MAX_ENV_VALUE_BYTES
+            )));
+        }
+        total += k.len() + v.len();
+    }
+    if total > faas_shared::MAX_FUNCTION_ENV_TOTAL_BYTES {
+        return Err(FaasError::InvalidRequest(format!(
+            "total env size exceeds {} bytes",
+            faas_shared::MAX_FUNCTION_ENV_TOTAL_BYTES
+        )));
+    }
+    Ok(())
+}
+
+/// GET /components/{id}/config — 平文 config を返す（deploy）。
+pub async fn get_function_config(
+    State(state): State<AppState>,
+    principal: Principal,
+    Path(component_id): Path<String>,
+) -> Result<impl IntoResponse, AppError> {
+    let tenant = &principal.tenant_id;
+
+    let mut tx = state.pool().begin().await?;
+    db::set_tenant_guc(&mut tx, tenant).await?;
+
+    db::find_component_by_id(&mut *tx, tenant, &component_id)
+        .await?
+        .ok_or_else(|| FaasError::NotFound(format!("component '{component_id}'")))?;
+
+    let rows = db::list_function_configs(&mut *tx, tenant, &component_id).await?;
+    tx.commit().await?;
+
+    let updated_at = rows.iter().map(|r| r.updated_at).max();
+    Ok(Json(FunctionConfigResponse {
+        component_id,
+        env: rows.into_iter().map(|r| (r.key, r.value)).collect(),
+        updated_at,
+    }))
+}
+
+/// PUT /components/{id}/config — 平文 config を全置換する（deploy）。
+///
+/// `PATCH` は既存 API の作法に無いので使わない（全置換のみ）。
+pub async fn put_function_config(
+    State(state): State<AppState>,
+    principal: Principal,
+    Path(component_id): Path<String>,
+    JsonBody(req): JsonBody<PutFunctionConfigRequest>,
+) -> Result<impl IntoResponse, AppError> {
+    let tenant = &principal.tenant_id;
+    validate_env_map(&req.env)?;
+
+    let mut tx = state.pool().begin().await?;
+    db::set_tenant_guc(&mut tx, tenant).await?;
+
+    db::find_component_by_id(&mut *tx, tenant, &component_id)
+        .await?
+        .ok_or_else(|| FaasError::NotFound(format!("component '{component_id}'")))?;
+
+    let entries: Vec<(String, String)> = req
+        .env
+        .iter()
+        .map(|(k, v)| (k.clone(), v.clone()))
+        .collect();
+    db::replace_function_configs(
+        &mut tx,
+        tenant,
+        &component_id,
+        &entries,
+        principal.user_id.as_deref(),
+    )
+    .await?;
+
+    // 監査には**キー名だけ**を残す（値は載せない: config は平文だが、誤って資格情報が
+    // 入れられていた場合に audit_logs へ二次的に残さないため）。
+    db::insert_audit_log(
+        &mut *tx,
+        tenant,
+        principal.user_id.as_deref(),
+        "function_config_updated",
+        Some(&component_id),
+        Some(&json!({ "keys": req.env.keys().collect::<Vec<_>>() })),
+    )
+    .await?;
+
+    let rows = db::list_function_configs(&mut *tx, tenant, &component_id).await?;
+    tx.commit().await?;
+
+    tracing::info!(%component_id, key_count = rows.len(), "function config replaced");
+
+    let updated_at = rows.iter().map(|r| r.updated_at).max();
+    Ok(Json(FunctionConfigResponse {
+        component_id,
+        env: rows.into_iter().map(|r| (r.key, r.value)).collect(),
+        updated_at,
+    }))
+}
+
+/// DELETE /components/{id}/config/{key} — 1 キー削除（deploy）。不在は 404。
+pub async fn delete_function_config(
+    State(state): State<AppState>,
+    principal: Principal,
+    Path((component_id, key)): Path<(String, String)>,
+) -> Result<impl IntoResponse, AppError> {
+    let tenant = &principal.tenant_id;
+
+    let mut tx = state.pool().begin().await?;
+    db::set_tenant_guc(&mut tx, tenant).await?;
+
+    db::find_component_by_id(&mut *tx, tenant, &component_id)
+        .await?
+        .ok_or_else(|| FaasError::NotFound(format!("component '{component_id}'")))?;
+
+    if !db::delete_function_config(&mut *tx, tenant, &component_id, &key).await? {
+        return Err(FaasError::NotFound(format!(
+            "config key '{key}' of component '{component_id}'"
+        ))
+        .into());
+    }
+
+    db::insert_audit_log(
+        &mut *tx,
+        tenant,
+        principal.user_id.as_deref(),
+        "function_config_deleted",
+        Some(&component_id),
+        Some(&json!({ "key": key })),
+    )
+    .await?;
+
+    tx.commit().await?;
+
+    tracing::info!(%component_id, %key, "function config key deleted");
+    Ok(StatusCode::NO_CONTENT)
 }
 
 fn map_unique_violation(e: sqlx::Error, msg: &str) -> AppError {

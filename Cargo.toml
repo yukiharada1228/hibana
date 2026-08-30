@@ -44,6 +44,13 @@ sqlx = { version = "0.8", features = [
 argon2 = "0.5"
 # opaque トークン secret と argon2 salt の生成。
 rand = "0.8"
+# M7-0 (§5.1): 秘密値ラッパ Redacted<T> の Drop 時ゼロ化。Cargo.lock に既存（推移依存）。
+zeroize = "1"
+# M7c (§4.1): secret の保存時暗号化（封筒暗号）。pure-Rust の RustCrypto 実装で
+# aws-lc-sys / cc に依存しない（TLS で rustls-ring を明示選択している方針と整合）。
+# XChaCha20-Poly1305（24 バイト nonce）を使うので、nonce を毎回 OsRng で引いても衝突確率が
+# 無視でき、カウンタ管理（＝状態）が要らない（ステートレス×N の CP と噛み合う）。
+chacha20poly1305 = { version = "0.10", features = ["alloc"], default-features = false }
 # LoginThrottle trait の async メソッド用（M3a は no-op スタブ、実装は M3d）。
 async-trait = "0.1"
 
