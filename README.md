@@ -751,29 +751,35 @@ CHAOS_ECHO=echo cargo test -p faas-control-plane --test chaos_m4 \
   -- --ignored chaos_b_idempotency_key_dedups --nocapture
 
 # Scenario A — Worker crash mid-execution → stuck-execution sweeper が failed で finalize
-# CP を短い deadline で起動し、worker を止めた状態で invoke
-pkill -f 'target.*control-plane'
+# テストは「オペレータが手で worker を落とす」前提で書かれているが、**worker を落とした状態で
+# 開始すれば自動化できる**（ジョブは JetStream に滞留し、pending 行を sweeper が終端化する）。
+pkill -f 'target/debug/faas-worker'     # 先に worker を落としておく
+pkill -f 'target/debug/control-plane'
 set -a; source .env; set +a
-STUCK_EXECUTION_DEADLINE_SECS=15 REAPER_INTERVAL_SECS=5 \
-  cargo run -p faas-control-plane --release > /tmp/cp.log 2>&1 &
-pkill -f 'target.*faas-worker'   # worker を落とす
+STUCK_EXECUTION_DEADLINE_SECS=20 REAPER_INTERVAL_SECS=5 \
+  ./target/debug/control-plane > /tmp/cp.log 2>&1 &
+sleep 15
 export CHAOS_TOKEN=$(make -s login | tail -1)
-CHAOS_STUCK_DEADLINE_SECS=15 CHAOS_WAIT_SECS=35 \
+CHAOS_WAIT_SECS=45 \
   cargo test -p faas-control-plane --test chaos_m4 \
-  -- --ignored chaos_a_worker_crash_finalizes_to_failed --nocapture
+  -- --ignored chaos_a_ --nocapture
+# 終わったら通常設定（既定 deadline 900s）で CP と worker を起動し直すこと。
 
 # Scenario C, D — 専用 component (always-trap / slow) を deploy してから実行
-cargo build --release -p always-trap -p slow --target wasm32-wasip2
-cp target/wasm32-wasip2/release/always_trap.wasm components-dist/always-trap.wasm
-cp target/wasm32-wasip2/release/slow.wasm components-dist/slow.wasm
-# always-trap と slow を POST /components → /components/{id}/versions で個別アップロード
-# （詳細手順は scripts/ に追加予定; 現状は手動 curl）
+# `make deploy-chaos-components` がビルド + component 作成 + アップロードまでを冪等に行う。
+# slow は SLOW_LIMITS（既定 max_wall_time_ms=1000 / max_execution_time_ms=2000）で上げる ——
+# 既定の 1s / 5s のままだと tokio timeout がテストの待ち窓（既定 10 秒）に収まらないことがある。
+make deploy-chaos-components
 make run-worker > /tmp/worker.log 2>&1 &
 CHAOS_ALWAYS_TRAP=always-trap CHAOS_SLOW=slow \
   cargo test -p faas-control-plane --test chaos_m4 \
-  -- --ignored chaos_c_dlq_finalizes_after_max_deliver \
-            chaos_d_tokio_timeout_finalizes_to_timeout --nocapture
+  -- --ignored chaos_c_ chaos_d_ --test-threads=1 --nocapture
 ```
+
+> **`make -n` で syntax check しないこと**: `deploy-chaos-components` を含む一部のターゲットは
+> レシピ内で `$(MAKE) -s login` を呼ぶ。make は `$(MAKE)` を含む行を「再帰 make」とみなし
+> **`-n` 指定でも実際に実行する**（POSIX）。しかも `-n` が子 make へ伝播してトークンが取れず失敗する。
+> 動作確認は実行して行うこと。
 
 期待される最終 status:
 - chaos_a: `status=failed`（sweeper, error.message に sweeper 由来文言）

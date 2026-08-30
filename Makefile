@@ -84,12 +84,17 @@ BASE_URL ?= http://localhost:$(lastword $(subst :, ,$(BIND_ADDR)))
 # deploy するバージョン（semver）。
 VERSION ?= 0.1.0
 
+# M4 chaos_d 用 slow component のリソース上限。ゲストが tight loop で回り続けるため、
+# epoch interruption（max_wall_time）と tokio timeout（max_execution_time）の両方が
+# 短時間で発火する値にする（既定の 1s / 5s だとテストの待ち窓に収まらないことがある）。
+SLOW_LIMITS ?= {"max_wall_time_ms":1000,"max_execution_time_ms":2000}
+
 # echo component の wasm32-wasip2 ビルド成果物パス（アップロード対象のローカル成果物）。
 ECHO_WASM := target/wasm32-wasip2/release/echo.wasm
 
 .DEFAULT_GOAL := help
 
-.PHONY: component-id traffic canary promote rollback approve-env set-secret secrets rekey help setup up down migrate minio-bucket build-component run-cp run-worker bootstrap login deploy invoke logs psql clean rls-lint
+.PHONY: deploy-chaos-components component-id traffic canary promote rollback approve-env set-secret secrets rekey help setup up down migrate minio-bucket build-component run-cp run-worker bootstrap login deploy invoke logs psql clean rls-lint
 
 help: ## 利用可能なターゲット一覧を表示
 	@echo "WASM FaaS Platform — M2 Makefile"
@@ -317,6 +322,34 @@ rekey: ## M7c: 当該テナントの secret を現行 KEK で再ラップ（**�
 	@set -e; \
 	TOKEN=$$($(MAKE) -s login); \
 	curl -sS -X POST "$(BASE_URL)/admin/secrets/rekey" -H "Authorization: Bearer $$TOKEN"; echo
+
+deploy-chaos-components: ## M4 chaos_c/d 用: always-trap / slow をビルドしてアップロード（冪等）
+	@set -e; \
+	echo "==> always-trap / slow を wasm32-wasip2 でビルド..."; \
+	cargo build -p always-trap -p slow --target wasm32-wasip2 --release; \
+	TOKEN=$$($(MAKE) -s login); \
+	resolve_cid() { \
+		curl -sS -o /dev/null -X POST "$(BASE_URL)/components" \
+			-H "Authorization: Bearer $$TOKEN" -H "Content-Type: application/json" \
+			-d "{\"name\":\"$$1\"}"; \
+		curl -sS "$(BASE_URL)/components" -H "Authorization: Bearer $$TOKEN" \
+			| tr '}' '\n' | grep "\"name\":\"$$1\"" \
+			| sed -n 's/.*"component_id"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -1; \
+	}; \
+	echo "==> always-trap"; \
+	TRAP_CID=$$(resolve_cid always-trap); \
+	test -n "$$TRAP_CID" || { echo "ERROR: always-trap の component_id を解決できませんでした"; exit 1; }; \
+	curl -sS -X POST "$(BASE_URL)/components/$$TRAP_CID/versions" \
+		-H "Authorization: Bearer $$TOKEN" -F "version=$(VERSION)" \
+		-F "wasm=@target/wasm32-wasip2/release/always_trap.wasm"; echo; \
+	echo "==> slow (resource_limits は SLOW_LIMITS 変数を参照)"; \
+	SLOW_CID=$$(resolve_cid slow); \
+	test -n "$$SLOW_CID" || { echo "ERROR: slow の component_id を解決できませんでした"; exit 1; }; \
+	curl -sS -X POST "$(BASE_URL)/components/$$SLOW_CID/versions" \
+		-H "Authorization: Bearer $$TOKEN" -F "version=$(VERSION)" \
+		-F 'resource_limits=$(SLOW_LIMITS)' \
+		-F "wasm=@target/wasm32-wasip2/release/slow.wasm"; echo; \
+	echo "OK: chaos 用 component をデプロイしました（CHAOS_ALWAYS_TRAP=always-trap CHAOS_SLOW=slow）。"
 
 rls-lint: ## M3b: テナント分離の静的ガード（SET app.tenant_id ハザード / 生 pool 渡し検出）
 	@./scripts/rls-lint.sh
