@@ -818,15 +818,17 @@ const B64URL_ALPHABET: &[u8; 64] =
 /// 任意バイト列を base64url（パディングなし）に符号化する。
 pub fn b64url_encode(input: &[u8]) -> String {
     let mut out = String::with_capacity(input.len().div_ceil(3) * 4);
-    let mut chunks = input.chunks_exact(3);
-    for chunk in &mut chunks {
+    // 3 バイト固定長で切り出す。`as_chunks::<3>()` は配列参照 `&[u8; 3]` を返すので、
+    // 添字アクセスの境界チェックがコンパイル時に消える（`chunks_exact` はスライスを返すため
+    // 残らざるを得ない）。第 2 要素が端数。
+    let (chunks, rem) = input.as_chunks::<3>();
+    for chunk in chunks {
         let n = (u32::from(chunk[0]) << 16) | (u32::from(chunk[1]) << 8) | u32::from(chunk[2]);
         out.push(B64URL_ALPHABET[((n >> 18) & 0x3f) as usize] as char);
         out.push(B64URL_ALPHABET[((n >> 12) & 0x3f) as usize] as char);
         out.push(B64URL_ALPHABET[((n >> 6) & 0x3f) as usize] as char);
         out.push(B64URL_ALPHABET[(n & 0x3f) as usize] as char);
     }
-    let rem = chunks.remainder();
     match rem.len() {
         1 => {
             let n = u32::from(rem[0]) << 16;
