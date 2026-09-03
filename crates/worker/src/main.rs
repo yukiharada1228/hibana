@@ -219,6 +219,40 @@ struct Settings {
     /// M8 (§3.7): lane discovery の周期（秒）。`faas.lane.changed` 通知の取りこぼしと
     /// worker 再起動直後を吸収する収束用の保険であり、通常の即応性は通知が担う。
     lane_discovery_interval_secs: u64,
+    /// M8 (§4.2): **このプロセス全体**の同時実行上限。lane を何本購読していても、
+    /// 実際に走るゲストの数はこれを超えない。
+    ///
+    /// この env の所有者は worker のみである（CP は知らないし、知る必要もない）。
+    /// lane 数で割った実効クレジットを lane ごとに配ることで、**プロセス全体の上限を
+    /// 「除算」で閉じる**（第 2 の Semaphore を重ねない）。第 2 の Semaphore を重ねると、
+    /// lane タスクが自 lane permit を握ったままグローバル permit を待つ hold-and-wait が
+    /// でき、ack_wait を超過して再配送 = 二重実行に化ける。
+    max_concurrency: u64,
+    /// M8 (§4.7): lane consumer の metadata が読めない / 壊れているときのフォールバック並列度。
+    /// 通常は CP が解決した値が consumer metadata に載ってくる。
+    lane_concurrency: u64,
+    /// M8 (§4.4): lane 数がプロセス容量を超えたときに、提供する lane 集合を回す周期（秒）。
+    /// 未提供 lane のテナントが待たされる最悪時間の上限でもある。
+    lane_rotation_secs: u64,
+    /// M8 (§4.6): SIGTERM を受けてから in-flight の完了を待つ上限（秒）。
+    ///
+    /// **既定 0 は「シグナルハンドラを一切インストールしない」**を意味し、M7 までと完全に同一の
+    /// 挙動になる（オプトイン）。`> 0` にするとドレインが有効になる。
+    ///
+    /// ドレインが必要な理由は正しさではなく**完了条件**である。強制終了しても結果は喪失せず
+    /// 二重課金もしないが（終端 CAS が守る）、**ゲストは 2 回実行され**、そのジョブは
+    /// `backoff[0]` 待ち + フル再実行を被る。scale-in は定常運用で何度も起きるので、
+    /// これを放置するとオートスケール機構自身がレイテンシを劣化させる。
+    drain_timeout_secs: u64,
+    /// M8 (§4.6): ドレイン時に未処理メッセージを差し戻すときの NAK 遅延（秒）。
+    ///
+    /// **0 にしてはならない**。0 だと、直後に落とされる次の worker へ即再配送されて NAK が連鎖し、
+    /// `MAX_DELIVER` を食い潰して「ゲストが一度も失敗していないジョブが DLQ で恒久失敗」になる。
+    /// scale-in のクールダウンと同じ長さを既定にして、群れが落ち着いてから再配送させる。
+    drain_nak_delay_secs: u64,
+    /// M8 (§4.6): ドレイン上限の健全性検査にだけ使う（consumer 設定には**使わない**。
+    /// consumer の作成者は control-plane 単独である, §3.5）。
+    ack_wait_secs: u64,
 }
 
 /// `WASM_CACHE_DIR` 未設定時の既定キャッシュ先。
@@ -231,6 +265,25 @@ const DEFAULT_CONTROL_PLANE_INTERNAL_URL: &str = "http://127.0.0.1:8081";
 const DEFAULT_JOB_ENV_FETCH_TIMEOUT_MS: u64 = 2000;
 /// `LANE_DISCOVERY_INTERVAL_SECS` 未設定時の既定。
 const DEFAULT_LANE_DISCOVERY_INTERVAL_SECS: u64 = 10;
+/// `WORKER_MAX_CONCURRENCY` 未設定時の既定（プロセス全体の同時実行上限）。
+const DEFAULT_WORKER_MAX_CONCURRENCY: u64 = 32;
+/// `WORKER_LANE_CONCURRENCY` 未設定時の既定（consumer metadata が読めないときのフォールバック）。
+const DEFAULT_WORKER_LANE_CONCURRENCY: u64 = 4;
+/// `LANE_ROTATION_SECS` 未設定時の既定（§4.4 の縮退時の回転周期）。
+const DEFAULT_LANE_ROTATION_SECS: u64 = 30;
+/// lane の pull バッチが空振りで戻るまでの待ち（秒）。
+///
+/// M7 までは 30 秒だった。M8 で 5 秒に縮める理由は「lane が消えた / クレジットが変わった」ことに
+/// 気づくまでの最悪待ちを縮めるため。§4.3 の permit 規律により、pull を出している間は
+/// **その lane の実行枠を確保済み**なので、長く待つほど自テナントの枠を遊ばせることになる。
+/// 空振り pull は JetStream にとって安価であり `num_waiting` として観測できる。
+const LANE_PULL_EXPIRES_SECS: u64 = 5;
+/// `WORKER_DRAIN_TIMEOUT_SECS` 未設定時の既定。**0 = ハンドラを入れない（M7 までと同一挙動）**。
+const DEFAULT_WORKER_DRAIN_TIMEOUT_SECS: u64 = 0;
+/// `SCALE_IN_COOLDOWN_SECS` 未設定時の既定（ドレイン NAK の遅延として使う）。
+const DEFAULT_SCALE_IN_COOLDOWN_SECS: u64 = 60;
+/// ドレイン中に in-flight の減少を確認する間隔。
+const DRAIN_POLL_INTERVAL_MS: u64 = 100;
 /// ゲスト stderr を封じ込めるときのバッファ上限（バイト）。
 ///
 /// secret を注入する実行では `inherit_stderr()` を**使わない**。inherit すると、ゲストが
@@ -269,6 +322,22 @@ impl Settings {
                 "LANE_DISCOVERY_INTERVAL_SECS",
                 DEFAULT_LANE_DISCOVERY_INTERVAL_SECS,
             )?,
+            // 0 は「同時実行 0 = 何も処理しない worker」になり、静かに詰まるだけで誰も得しない。
+            // 明示的に 1 へ引き上げる（`effective_lane_concurrency` も同じ floor を持つ）。
+            max_concurrency: env_u64("WORKER_MAX_CONCURRENCY", DEFAULT_WORKER_MAX_CONCURRENCY)?
+                .max(1),
+            lane_concurrency: env_u64("WORKER_LANE_CONCURRENCY", DEFAULT_WORKER_LANE_CONCURRENCY)?
+                .max(1),
+            lane_rotation_secs: env_u64("LANE_ROTATION_SECS", DEFAULT_LANE_ROTATION_SECS)?.max(1),
+            drain_timeout_secs: env_u64(
+                "WORKER_DRAIN_TIMEOUT_SECS",
+                DEFAULT_WORKER_DRAIN_TIMEOUT_SECS,
+            )?,
+            drain_nak_delay_secs: env_u64(
+                "SCALE_IN_COOLDOWN_SECS",
+                DEFAULT_SCALE_IN_COOLDOWN_SECS,
+            )?,
+            ack_wait_secs: env_u64("ACK_WAIT_SECS", faas_shared::ACK_WAIT_SECS)?,
         })
     }
 }
@@ -301,6 +370,82 @@ fn init_tracing(log_format: &str) {
     }
 }
 
+/// ドレイン状態（M8 §4.6）。「立ったら二度と降りない」ラッチ。
+///
+/// `Notify` 側は **`notify_waiters` ではなく `notify_one` を使わない**（複数の lane ループが
+/// 待つため）。`notified()` を待つ側は必ず**先に `is_draining()` を確認する**こと。
+/// 待ち始める前にシグナルが来ていた場合、通知は取りこぼされるからである。
+struct Shutdown {
+    draining: std::sync::atomic::AtomicBool,
+    notify: tokio::sync::Notify,
+}
+
+impl Shutdown {
+    fn new() -> Arc<Self> {
+        Arc::new(Self {
+            draining: std::sync::atomic::AtomicBool::new(false),
+            notify: tokio::sync::Notify::new(),
+        })
+    }
+
+    fn is_draining(&self) -> bool {
+        self.draining.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    fn begin(&self) {
+        self.draining
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        self.notify.notify_waiters();
+    }
+
+    /// ドレイン開始まで待つ。既に開始済みなら即座に返る（通知の取りこぼし対策）。
+    async fn wait(&self) {
+        if self.is_draining() {
+            return;
+        }
+        let notified = self.notify.notified();
+        // `notified()` を作った**後**に再確認する。この二度読みが無いと、
+        // `is_draining()` と `notified()` の間に来たシグナルを永久に待つ窓ができる。
+        if self.is_draining() {
+            return;
+        }
+        notified.await;
+    }
+}
+
+/// SIGTERM / Ctrl-C を待ってドレインを開始するタスクを起こす（§4.6）。
+///
+/// `drain_timeout_secs == 0` のときは**ハンドラを一切インストールしない**。既定の
+/// 「シグナルで即死」挙動をそのまま残すのが M7 までとの完全互換であり、オプトインの意味である。
+fn spawn_shutdown_listener(shutdown: Arc<Shutdown>, drain_timeout_secs: u64) {
+    if drain_timeout_secs == 0 {
+        info!(
+            "graceful drain disabled (WORKER_DRAIN_TIMEOUT_SECS=0); SIGTERM terminates immediately"
+        );
+        return;
+    }
+    tokio::spawn(async move {
+        let mut sigterm =
+            match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+                Ok(s) => s,
+                Err(e) => {
+                    // ハンドラを張れないなら黙って「ドレインしない」に落ちる。ここで落ちる方が
+                    // 「ドレインしているつもりで実は即死」より危険なので、loud に警告する。
+                    warn!(error = %e, "could not install SIGTERM handler; drain will not run");
+                    return;
+                }
+            };
+        tokio::select! {
+            _ = sigterm.recv() => info!("received SIGTERM; starting drain"),
+            r = tokio::signal::ctrl_c() => match r {
+                Ok(()) => info!("received Ctrl-C; starting drain"),
+                Err(e) => { warn!(error = %e, "ctrl_c listener failed"); return; }
+            },
+        }
+        shutdown.begin();
+    });
+}
+
 /// `/metrics` + `/readyz` + `/healthz` を返す最小 axum サーバを別 tokio task で起動する
 /// （M4a, §3.8）。
 ///
@@ -313,21 +458,37 @@ fn init_tracing(log_format: &str) {
 ///   NATS pull consumer の生死は pull ループ側のリトライで吸収するため readiness とは結合しない
 ///   （詰まり時の cascading restart 防止; §3.8 の liveness/readiness 分離方針）。
 ///   将来、NATS 接続性や DB pool 健全性を probe する場合はここで `state` を握って判定する。
-fn spawn_metrics_server(metrics: Arc<metrics::Metrics>, bind_addr: String) {
+/// - M8 (§4.6): **ドレイン中だけは 503 を返す**。上の「依存疎通を probe しない」方針とは
+///   衝突しない。ドレインは依存の健全性ではなく**このプロセス自身のライフサイクル状態**であり、
+///   これを晒さないとロードバランサが終了中の worker に新規トラフィックを送り続ける。
+fn spawn_metrics_server(
+    metrics: Arc<metrics::Metrics>,
+    bind_addr: String,
+    shutdown: Arc<Shutdown>,
+) {
     tokio::spawn(async move {
         use axum::{extract::State as AxState, routing::get, Router};
+
+        #[derive(Clone)]
+        struct ProbeState {
+            metrics: Arc<metrics::Metrics>,
+            shutdown: Arc<Shutdown>,
+        }
 
         async fn healthz() -> axum::http::StatusCode {
             axum::http::StatusCode::OK
         }
-        async fn readyz() -> axum::http::StatusCode {
-            // 本スライスでは依存疎通を probe しない（上記コメント参照）。
+        async fn readyz(AxState(s): AxState<ProbeState>) -> axum::http::StatusCode {
+            if s.shutdown.is_draining() {
+                return axum::http::StatusCode::SERVICE_UNAVAILABLE;
+            }
+            // ドレイン中以外は依存疎通を probe しない（上記コメント参照）。
             axum::http::StatusCode::OK
         }
         async fn metrics_handler(
-            AxState(m): AxState<Arc<metrics::Metrics>>,
+            AxState(s): AxState<ProbeState>,
         ) -> impl axum::response::IntoResponse {
-            let (headers, body) = m.render();
+            let (headers, body) = s.metrics.render();
             (axum::http::StatusCode::OK, headers, body)
         }
 
@@ -335,7 +496,7 @@ fn spawn_metrics_server(metrics: Arc<metrics::Metrics>, bind_addr: String) {
             .route("/healthz", get(healthz))
             .route("/readyz", get(readyz))
             .route("/metrics", get(metrics_handler))
-            .with_state(metrics);
+            .with_state(ProbeState { metrics, shutdown });
 
         let listener = match tokio::net::TcpListener::bind(&bind_addr).await {
             Ok(l) => l,
@@ -390,6 +551,19 @@ async fn main() -> anyhow::Result<()> {
 
     let settings = Settings::from_env()?;
 
+    // M8 (§4.6 / §8 不変条件 #7): ドレイン上限は ack_wait 未満でなければならない。
+    // 超えると、まだ実行中のジョブを JetStream が「応答が無い」と見なして再配送し、
+    // **ドレインしているのに二重実行になる**（ドレインの目的そのものが裏返る）。
+    // CP と違い worker は両方の値を知っているので、ここで検査できる。
+    if settings.drain_timeout_secs > 0 && settings.drain_timeout_secs >= settings.ack_wait_secs {
+        anyhow::bail!(
+            "WORKER_DRAIN_TIMEOUT_SECS ({}) must be strictly less than ACK_WAIT_SECS ({}); \
+             otherwise JetStream redelivers still-running jobs mid-drain and the guest runs twice",
+            settings.drain_timeout_secs,
+            settings.ack_wait_secs
+        );
+    }
+
     info!(nats = %settings.nats_url, "connecting to NATS");
     let nats = async_nats::connect(&settings.nats_url)
         .await
@@ -434,7 +608,13 @@ async fn main() -> anyhow::Result<()> {
     // M4a (§3.8): メトリクスは pull ループから独立した tokio task で公開する。pull ループが
     // 詰まっても /metrics と /readyz が応答できるように分離する。
     let worker_metrics = metrics::Metrics::init();
-    spawn_metrics_server(worker_metrics.clone(), settings.metrics_bind_addr.clone());
+    let shutdown = Shutdown::new();
+    spawn_shutdown_listener(Arc::clone(&shutdown), settings.drain_timeout_secs);
+    spawn_metrics_server(
+        worker_metrics.clone(),
+        settings.metrics_bind_addr.clone(),
+        Arc::clone(&shutdown),
+    );
 
     // M8-1 / M8-3: stream と lane consumer の作成者は **control-plane 単独**である。
     // worker は取得と不変条件の検査だけを行い、購読すべき lane は NATS から発見する。
@@ -469,8 +649,16 @@ async fn main() -> anyhow::Result<()> {
         worker,
         stream,
         nats,
-        settings.max_deliver as i64,
-        settings.lane_discovery_interval_secs,
+        LaneSupervisorSettings {
+            max_deliver: settings.max_deliver as i64,
+            discovery_interval_secs: settings.lane_discovery_interval_secs,
+            max_concurrency: settings.max_concurrency as usize,
+            fallback_lane_concurrency: settings.lane_concurrency as usize,
+            rotation_secs: settings.lane_rotation_secs,
+            drain_timeout: Duration::from_secs(settings.drain_timeout_secs),
+            drain_nak_delay: Duration::from_secs(settings.drain_nak_delay_secs),
+        },
+        shutdown,
     )
     .await
 }
@@ -488,17 +676,125 @@ async fn main() -> anyhow::Result<()> {
 ///    （`SYNC_REPLY_TIMEOUT_MS` は既定 5 秒）。
 /// 2. **周期 tick**（`LANE_DISCOVERY_INTERVAL_SECS`）。通知の取りこぼしと worker 再起動直後を
 ///    吸収する収束用の保険。
+struct LaneSupervisorSettings {
+    max_deliver: i64,
+    discovery_interval_secs: u64,
+    max_concurrency: usize,
+    fallback_lane_concurrency: usize,
+    rotation_secs: u64,
+    drain_timeout: Duration,
+    drain_nak_delay: Duration,
+}
+
+/// 1 本の lane に対応する、supervisor 側の持ち手。
+///
+/// `credits` は **lane タスクと共有する Semaphore** であり、supervisor は lane 数の変化に応じて
+/// 実効クレジットを張り替える。Semaphore を作り直さず permit を増減させる理由は、
+/// **走行中のタスクが握っている permit を失わせないため**である。作り直すと、返却先が消えた
+/// permit が in-flight を数え損ね、プロセス全体の上限が破れる。
+struct LaneHandle {
+    task: tokio::task::JoinHandle<()>,
+    credits: Arc<tokio::sync::Semaphore>,
+    /// 現在この lane に配ってあるクレジット総数（発行済み permit 数の上限）。
+    granted: usize,
+}
+
+impl LaneHandle {
+    /// 実効クレジットを `target` へ合わせる。
+    ///
+    /// 減らす側は `forget_permits` を使う。**待機中のタスクから奪うのではなく、
+    /// 「返ってきた permit を回収する」**意味論なので、実行中のジョブを中断しない
+    /// （縮小は次にジョブが終わった時点から効く）。
+    fn set_credits(&mut self, target: usize) {
+        let target = target.max(1);
+        match target.cmp(&self.granted) {
+            std::cmp::Ordering::Greater => {
+                self.credits.add_permits(target - self.granted);
+                self.granted = target;
+            }
+            std::cmp::Ordering::Less => {
+                // forget_permits は「今すぐ回収できた数」を返す。回収しきれなかった分は
+                // 実行中のジョブが握っているので、次周期に持ち越す（granted を実態に合わせる）。
+                let forgotten = self.credits.forget_permits(self.granted - target);
+                self.granted -= forgotten;
+            }
+            std::cmp::Ordering::Equal => {}
+        }
+    }
+}
+
+/// 提供する lane 集合を `capacity` 本に絞り、残りを未提供として返す（§4.4）。
+///
+/// `offset` で開始位置を回すことで、容量を超えた分の lane も**いずれは提供される**ようにする
+/// （飢餓ではなく遅延にする）。`lanes` は決定的順序（`BTreeSet` 由来）である前提。
+fn rotate_and_split(
+    lanes: &[String],
+    capacity: usize,
+    offset: usize,
+) -> (Vec<String>, Vec<String>) {
+    if lanes.is_empty() || capacity == 0 {
+        return (Vec::new(), lanes.to_vec());
+    }
+    if capacity >= lanes.len() {
+        return (lanes.to_vec(), Vec::new());
+    }
+    let n = lanes.len();
+    let start = offset % n;
+    let served: Vec<String> = (0..capacity)
+        .map(|i| lanes[(start + i) % n].clone())
+        .collect();
+    let unserved: Vec<String> = lanes
+        .iter()
+        .filter(|l| !served.contains(l))
+        .cloned()
+        .collect();
+    (served, unserved)
+}
+
+/// consumer metadata から per-lane 並列度を読む。読めなければ `None`（呼び出し側が既定へ落とす）。
+async fn lane_metadata_concurrency(
+    consumer: &async_nats::jetstream::consumer::Consumer<
+        async_nats::jetstream::consumer::pull::Config,
+    >,
+) -> Option<usize> {
+    let mut consumer = consumer.clone();
+    let info = consumer.info().await.ok()?;
+    info.config
+        .metadata
+        .get(faas_control_plane_lane_meta::LANE_CONCURRENCY)
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .filter(|v| *v > 0)
+}
+
+/// consumer metadata のキー。control-plane 側 (`lanes.rs`) の定義と一致させること。
+/// worker は control-plane crate に依存しないので、**文字列としての契約**をここに置く。
+mod faas_control_plane_lane_meta {
+    pub const LANE_CONCURRENCY: &str = "faas_lane_concurrency";
+}
+
 async fn run_lane_supervisor(
     worker: Arc<Worker>,
     stream: async_nats::jetstream::stream::Stream,
     nats: async_nats::Client,
-    max_deliver: i64,
-    discovery_interval_secs: u64,
+    settings: LaneSupervisorSettings,
+    shutdown: Arc<Shutdown>,
 ) -> anyhow::Result<()> {
     use std::collections::HashMap;
 
-    // lane 名 -> 実行中タスク。発見されなくなった lane は abort する。
-    let mut running: HashMap<String, tokio::task::JoinHandle<()>> = HashMap::new();
+    let LaneSupervisorSettings {
+        max_deliver,
+        discovery_interval_secs,
+        max_concurrency,
+        fallback_lane_concurrency,
+        rotation_secs,
+        drain_timeout,
+        drain_nak_delay,
+    } = settings;
+
+    // lane 名 -> 実行中タスク + クレジット。発見されなくなった lane は abort する。
+    let mut running: HashMap<String, LaneHandle> = HashMap::new();
+    // §4.4: lane 数がプロセス容量を超えたときに提供集合を回すためのオフセット。
+    let mut rotation_offset: usize = 0;
 
     // lane 変更通知の購読（core NATS。取りこぼしても周期 tick が収束させるので durable 不要）。
     let mut changed = match nats.subscribe(faas_shared::LANE_CHANGED_SUBJECT).await {
@@ -515,26 +811,50 @@ async fn run_lane_supervisor(
     };
 
     let mut ticker = tokio::time::interval(Duration::from_secs(discovery_interval_secs.max(1)));
+    let mut rotation = tokio::time::interval(Duration::from_secs(rotation_secs.max(1)));
 
     loop {
         // (1) 現在の lane 一覧を取り、タスク集合を収束させる。
         match discover_lanes(&stream).await {
             Ok(lanes) => {
-                // 消えた lane のタスクを止める。
+                // (a) §4.4: このプロセスが同時に提供できる lane 本数で絞る。
+                //     `served_lane_capacity` は「1 lane あたり最低 1 クレジット」を保証する
+                //     ための上限であり、これを超えて購読すると `effective_lane_concurrency` の
+                //     切り捨てで**総和がプロセス上限を超える**（floor(g/n) の n が大きすぎると
+                //     1 に張り付き、n > g で n 個 × 1 > g になる）。
+                let lanes: Vec<String> = lanes.into_iter().collect();
+                let capacity = faas_shared::served_lane_capacity(max_concurrency);
+                let (served, unserved) = rotate_and_split(&lanes, capacity, rotation_offset);
+                worker.metrics.lanes_unserved.set(unserved.len() as i64);
+                if !unserved.is_empty() {
+                    warn!(
+                        served = served.len(),
+                        unserved = unserved.len(),
+                        max_concurrency,
+                        rotation_secs,
+                        "more lanes than this worker can serve; rotating \
+                         (raise WORKER_MAX_CONCURRENCY or add workers)"
+                    );
+                }
+
+                // (b) 提供集合から外れた lane の pull を止める。
+                //     **実行中タスクは殺さない**: abort するのは pull ループ本体だけで、
+                //     すでに spawn 済みのジョブは自分のタスクで走り切る（ack-after-publish の
+                //     規約が破れないのはこのため）。
                 running.retain(|name, handle| {
-                    if lanes.contains(name) {
+                    if served.contains(name) {
                         true
                     } else {
-                        info!(lane = %name, "lane disappeared; stopping its pull loop");
-                        handle.abort();
+                        info!(lane = %name, "lane no longer served; stopping its pull loop");
+                        handle.task.abort();
                         false
                     }
                 });
-                // 新しい lane のタスクを起こす。
-                for name in &lanes {
-                    if running.contains_key(name) {
-                        continue;
-                    }
+
+                // (c) 実効クレジットを毎周期再計算し、既存 lane にも伝える。
+                //     lane が増減すると 1 lane あたりの取り分が変わるため、新規作成時だけでなく
+                //     **毎回**張り替える必要がある。
+                for name in &served {
                     let consumer = match stream
                         .get_consumer::<async_nats::jetstream::consumer::pull::Config>(name)
                         .await
@@ -545,15 +865,49 @@ async fn run_lane_supervisor(
                             continue;
                         }
                     };
-                    info!(lane = %name, "subscribing to lane");
-                    let w = Arc::clone(&worker);
-                    let lane_name = name.clone();
-                    running.insert(
-                        name.clone(),
-                        tokio::spawn(async move {
-                            lane_loop(w, consumer, lane_name, max_deliver).await;
-                        }),
+                    let configured = lane_metadata_concurrency(&consumer)
+                        .await
+                        .unwrap_or(fallback_lane_concurrency);
+                    let effective = faas_shared::effective_lane_concurrency(
+                        max_concurrency,
+                        served.len(),
+                        configured,
                     );
+
+                    match running.get_mut(name) {
+                        Some(handle) => handle.set_credits(effective),
+                        None => {
+                            info!(lane = %name, configured, effective, "subscribing to lane");
+                            // 初期 permit は 0 で作り、`set_credits` で目標値まで開ける。
+                            // こうすると「permit を配る唯一の経路」が set_credits に一本化され、
+                            // granted の会計がズレない。
+                            let credits = Arc::new(tokio::sync::Semaphore::new(0));
+                            let mut handle = LaneHandle {
+                                task: tokio::spawn({
+                                    let w = Arc::clone(&worker);
+                                    let lane_name = name.clone();
+                                    let credits = Arc::clone(&credits);
+                                    let shutdown = Arc::clone(&shutdown);
+                                    async move {
+                                        lane_loop(
+                                            w,
+                                            consumer,
+                                            lane_name,
+                                            max_deliver,
+                                            credits,
+                                            shutdown,
+                                            drain_nak_delay,
+                                        )
+                                        .await;
+                                    }
+                                }),
+                                credits,
+                                granted: 0,
+                            };
+                            handle.set_credits(effective);
+                            running.insert(name.clone(), handle);
+                        }
+                    }
                 }
                 worker.metrics.subscribed_lanes.set(running.len() as i64);
             }
@@ -563,11 +917,14 @@ async fn run_lane_supervisor(
             }
         }
 
-        // (2) 次の契機を待つ。
+        // (2) 次の契機を待つ。ドレイン開始も契機のひとつで、そのときは収束をやめて抜ける。
         match changed.as_mut() {
             Some(sub) => {
                 tokio::select! {
+                    biased;
+                    _ = shutdown.wait() => break,
                     _ = ticker.tick() => {}
+                    _ = rotation.tick() => { rotation_offset = rotation_offset.wrapping_add(1); }
                     msg = sub.next() => {
                         if msg.is_none() {
                             // 購読が閉じた。以後は周期 discovery のみで収束させる。
@@ -578,10 +935,77 @@ async fn run_lane_supervisor(
                 }
             }
             None => {
-                ticker.tick().await;
+                tokio::select! {
+                    biased;
+                    _ = shutdown.wait() => break,
+                    _ = ticker.tick() => {}
+                    _ = rotation.tick() => { rotation_offset = rotation_offset.wrapping_add(1); }
+                }
             }
         }
     }
+
+    // ----------------------------------------------------------------------
+    // M8 (§4.6): ドレイン。
+    //
+    // lane ループは自分でシグナルを見て抜ける（新規 pull をやめ、取得済みは NAK で差し戻す）。
+    // ここで待つのは **既に spawn 済みのジョブ**が結果を publish し終えるまでである。
+    // 待ち切れれば「結果喪失なし・二重実行なし」で終われる。
+    // ----------------------------------------------------------------------
+    info!(
+        lanes = running.len(),
+        drain_timeout_secs = drain_timeout.as_secs(),
+        "draining: no longer pulling new work"
+    );
+
+    let deadline = tokio::time::Instant::now() + drain_timeout;
+
+    // (1) まず lane ループが**自力で畳むのを待つ**。ここを待たずに abort すると、
+    //     `batch.next()` で待機中の lane が「取得済み未処理メッセージを NAK する」機会を
+    //     失い、そのメッセージは ack_wait（既定 30s）を丸ごと空費してから再配送される。
+    //     lane ループが抜けるまでの最悪待ちは pull の `expires`（+ NAK の往復）なので、
+    //     そのぶんだけ待てば十分である。ドレイン予算を食い切らないよう上限も掛ける。
+    //
+    // 全 lane 合計で 1 つの締切を使う（lane ごとに掛けると本数に比例して伸び、
+    // ドレイン予算を超える）。締切を過ぎたら JoinHandle を drop して detach する。
+    // detach しても暴走しない: lane ループはループ先頭で `is_draining()` を見るので、
+    // 次の周回で必ず自分から抜ける。
+    let lane_deadline = (tokio::time::Instant::now()
+        + Duration::from_secs(LANE_PULL_EXPIRES_SECS + 1))
+    .min(deadline);
+    for (name, handle) in running.drain() {
+        match tokio::time::timeout_at(lane_deadline, handle.task).await {
+            Ok(Ok(())) => info!(lane = %name, "lane pull loop stopped cleanly"),
+            Ok(Err(e)) => warn!(lane = %name, error = %e, "lane pull loop ended abnormally"),
+            Err(_) => {
+                warn!(lane = %name, "lane pull loop did not stop within the grace period; detaching")
+            }
+        }
+    }
+
+    // (2) 次に、既に spawn 済みのジョブが結果を publish し終えるのを待つ。
+    loop {
+        let inflight = worker.metrics.inflight_executions.get();
+        if inflight <= 0 {
+            info!("drain complete; all in-flight executions finished");
+            break;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            // 見捨てても喪失はしない（JetStream の再配送が保険）。ただしゲストは 2 回走るので
+            // loud に記録する。ここが増えるならタイムアウトが実行時間に対して短すぎる。
+            worker.metrics.drain_abandoned_total.inc_by(inflight as u64);
+            warn!(
+                inflight,
+                drain_timeout_secs = drain_timeout.as_secs(),
+                "drain timed out; abandoning in-flight executions \
+                 (they will be redelivered and re-executed by another worker)"
+            );
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(DRAIN_POLL_INTERVAL_MS)).await;
+    }
+
+    Ok(())
 }
 
 /// 1 本の lane（= consumer）を pull し続けるループ。
@@ -596,18 +1020,67 @@ async fn lane_loop(
     >,
     lane: String,
     max_deliver: i64,
+    credits: Arc<tokio::sync::Semaphore>,
+    shutdown: Arc<Shutdown>,
+    nak_delay: Duration,
 ) {
     loop {
+        // M8 (§4.6): ドレインが始まったら **新しいバッチを一切要求しない**。
+        // ここで抜けるのが「これ以上仕事を引き受けない」の実体である。
+        if shutdown.is_draining() {
+            info!(lane = %lane, "draining; stopping pull loop");
+            return;
+        }
+
+        // ------------------------------------------------------------------
+        // M8 (§4.3) permit 規律。ここが「プロセス全体の同時実行上限」の本体である。
+        //
+        // R1: 自 lane の専有 permit を **1 個だけ** await で取る。空きが無ければ pull しない
+        //     = メッセージを JetStream に残し、余力のある別 worker に取らせる（これが背圧）。
+        //     待つ対象は自 lane 専有の資源なので、**他テナントを一切ブロックしない**。
+        // ------------------------------------------------------------------
+        //
+        // ドレイン中はここで待ち続けると「permit が空くのを待つだけの lane」が
+        // ドレイン完了を遅らせるので、シグナルでも抜ける。
+        let anchor = tokio::select! {
+            biased;
+            _ = shutdown.wait() => {
+                info!(lane = %lane, "draining while waiting for credit; stopping pull loop");
+                return;
+            }
+            p = Arc::clone(&credits).acquire_owned() => match p {
+                Ok(p) => p,
+                Err(_) => {
+                    // Semaphore は close しない設計なので通常起きない。起きたら lane を畳む。
+                    warn!(lane = %lane, "lane credit semaphore closed; stopping pull loop");
+                    return;
+                }
+            },
+        };
+
+        // R2: 追加分は **`try_acquire` のみ**。await で複数取ると、複数 lane が部分取得したまま
+        //     互いに待つ hold-and-wait ができ、ack_wait 超過 → 再配送 → 二重実行に化ける。
+        let mut permits = vec![anchor];
+        while permits.len() < PULL_BATCH {
+            match Arc::clone(&credits).try_acquire_owned() {
+                Ok(p) => permits.push(p),
+                Err(_) => break,
+            }
+        }
+
+        // R3: 要求件数は「確保済み permit 数」ちょうど。over-fetch しないので、
+        //     引いたのに走らせられないメッセージ（= ack_wait を空費するだけの在庫）が出ない。
         let mut batch = match consumer
             .batch()
-            .max_messages(PULL_BATCH)
-            .expires(Duration::from_secs(30))
+            .max_messages(permits.len())
+            .expires(Duration::from_secs(LANE_PULL_EXPIRES_SECS))
             .messages()
             .await
         {
             Ok(b) => b,
             Err(e) => {
                 error!(lane = %lane, error = %e, "failed to pull batch; backing off");
+                drop(permits);
                 tokio::time::sleep(Duration::from_secs(1)).await;
                 continue;
             }
@@ -622,13 +1095,45 @@ async fn lane_loop(
                 }
             };
 
+            // M8 (§4.6): ドレイン開始後にバッチへ残っていたメッセージは、**明示的に NAK して
+            // 差し戻す**。放置して un-ack で終わらせると ack_wait（既定 30s）を丸ごと待たされる。
+            //
+            // NAK の遅延を 0 にしないのが肝心である。0 だと次に落とされる worker へ即再配送されて
+            // NAK が連鎖し、`MAX_DELIVER` を食い潰して「ゲストが一度も失敗していないジョブが
+            // DLQ で恒久失敗」になる。scale-in のクールダウンと同じだけ待たせて、群れが
+            // 落ち着いてから再配送させる。
+            if shutdown.is_draining() {
+                worker.metrics.drain_naked_total.inc();
+                if let Err(e) = msg
+                    .ack_with(async_nats::jetstream::AckKind::Nak(Some(nak_delay)))
+                    .await
+                {
+                    warn!(lane = %lane, error = %e, "failed to NAK message during drain; falling back to ack_wait redelivery");
+                }
+                continue;
+            }
+
             // M4c (§6.6): JetStream のメッセージメタデータから今回が何回目の配送かを取り出す。
             // `delivered` は 1 始まりで、今回の試行を含むカウント。`delivered >= max_deliver`
             // のときは「これが最後の試行」であり、ここで publish に失敗すると JetStream は
             // 二度と再配送しないため、worker は自前で `.failed` (DLQ) を publish しなければ
             // ならない（無音失踪を作らない）。info() が取れない（旧サーバ・形式不一致）場合は
             // 安全側で 1（=「最終ではない」扱い）とし、reaper の stuck sweeper に救済を委ねる。
+            // R4 (= 不変条件 W1): ここで permit を **await しない**。必ず確保済みの束から pop する。
+            // バッチ内側で await すると、JetStream 側では既に配送済みのメッセージを握ったまま
+            // 待つことになり、ack_wait を空費して再配送 = 二重実行を招く。
+            // pop できないのは「サーバが要求件数より多く返した」場合だけで、その時は残りを
+            // un-ack のまま手放して再配送に委ねる（喪失しない）。
+            let Some(permit) = permits.pop() else {
+                warn!(lane = %lane, "pulled more messages than credits; leaving the rest un-acked");
+                break;
+            };
+
             let delivered = msg.info().map(|i| i.delivered).unwrap_or(1);
+            // M8 (§6.4): 再配送は二重実行の直接の徴候なので、独立した counter で観測する。
+            if delivered >= 2 {
+                worker.metrics.redelivered_total.inc();
+            }
             let is_final_attempt = max_deliver > 0 && delivered >= max_deliver;
 
             // M3d (§8 / §6.6): ack は **結果 publish の成功後** に返す（ack-after-publish）。
@@ -643,9 +1148,16 @@ async fn lane_loop(
             // stuck deadline (既定 900s) まで pending/running が残り続けるため、worker は `.failed`
             // (DLQ) を publish して CP の subscriber に即時 finalize+DECR を促す。`.failed` の
             // publish にも失敗したら最終手段として reaper に委ねる（保険）。
+            let inflight = InflightGuard::new(&worker.metrics);
             let worker = Arc::clone(&worker);
             let payload = msg.payload.clone();
             tokio::spawn(async move {
+                // permit と gauge は **タスクの寿命に束ねる**。こう書くと、`handle_payload` が
+                // panic してもタスクのスタック巻き戻しで Drop が走り、クレジットも gauge も
+                // 必ず戻る。素の `inc()` / `dec()` だと panic 経路で gauge が単調増加し、
+                // ドレイン（§4.6）が「in-flight が 0 にならない」と誤認して必ず失敗する。
+                let _permit = permit;
+                let _inflight = inflight;
                 let published = worker.handle_payload(&payload).await;
                 if published {
                     if let Err(e) = msg.ack().await {
@@ -678,6 +1190,29 @@ async fn lane_loop(
                 }
             });
         }
+        // 使わなかった permit（サーバが要求より少なく返した分 / expires 空振り）は即座に返す。
+        // 返さないと、その lane は次の pull で自分自身の枠を待つことになる。
+        drop(permits);
+    }
+}
+
+/// in-flight gauge を **panic 経路でもリークさせない**ためのガード (§4.5)。
+///
+/// `handle_payload` は panic をキャッチしない。素の `inc()` / `dec()` で書くと、ゲスト実行中の
+/// panic で `dec()` に到達せず gauge が単調増加する。gauge が嘘をつくと、ドレイン（§4.6）が
+/// 「in-flight が 0 にならない」と誤認して必ずタイムアウトするので、単なる観測の劣化では済まない。
+struct InflightGuard(Arc<metrics::Metrics>);
+
+impl InflightGuard {
+    fn new(m: &Arc<metrics::Metrics>) -> Self {
+        m.inflight_executions.inc();
+        Self(Arc::clone(m))
+    }
+}
+
+impl Drop for InflightGuard {
+    fn drop(&mut self) {
+        self.0.inflight_executions.dec();
     }
 }
 
@@ -1846,6 +2381,108 @@ fn write_atomic(path: &Path, data: &[u8]) -> std::io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// M8 (§4.4): 容量が足りているときは **全 lane を提供し、未提供は空**。
+    /// 縮退ロジックが平常時に発動しないことを固定する（ここが誤ると全テナントが常時回転する）。
+    #[test]
+    fn rotate_and_split_serves_everything_when_capacity_suffices() {
+        let lanes: Vec<String> = ["a", "b", "c"].iter().map(|s| s.to_string()).collect();
+        for capacity in 3..=8 {
+            for offset in 0..5 {
+                let (served, unserved) = rotate_and_split(&lanes, capacity, offset);
+                assert_eq!(served, lanes, "capacity={capacity} offset={offset}");
+                assert!(unserved.is_empty());
+            }
+        }
+    }
+
+    /// 容量不足のときの不変条件: served と unserved は **重ならず、合わせて全体**、
+    /// かつ served はちょうど capacity 本。どれか 1 つでも破れると
+    /// 「二重購読（= 同一 lane を 2 タスクが引く）」か「lane の恒久的な喪失」になる。
+    #[test]
+    fn rotate_and_split_partitions_exactly() {
+        let lanes: Vec<String> = (0..7).map(|i| format!("workers-t-{i}")).collect();
+        for capacity in 1..7 {
+            for offset in 0..20 {
+                let (served, unserved) = rotate_and_split(&lanes, capacity, offset);
+                assert_eq!(
+                    served.len(),
+                    capacity,
+                    "capacity={capacity} offset={offset}"
+                );
+                assert_eq!(unserved.len(), lanes.len() - capacity);
+                for s in &served {
+                    assert!(!unserved.contains(s), "lane {s} in both halves");
+                }
+                let mut all: Vec<String> = served.iter().chain(unserved.iter()).cloned().collect();
+                all.sort();
+                let mut expected = lanes.clone();
+                expected.sort();
+                assert_eq!(all, expected, "capacity={capacity} offset={offset}");
+            }
+        }
+    }
+
+    /// 回転が **飢餓ではなく遅延** であることの担保: offset を 1 周ぶん進めれば
+    /// どの lane も少なくとも 1 度は提供される。これが崩れると、容量超過時に特定テナントが
+    /// 永久に処理されなくなる（喪失と区別がつかない障害になる）。
+    #[test]
+    fn rotation_eventually_serves_every_lane() {
+        let lanes: Vec<String> = (0..5).map(|i| format!("lane{i}")).collect();
+        let capacity = 2;
+        let mut seen = std::collections::BTreeSet::new();
+        for offset in 0..lanes.len() {
+            let (served, _) = rotate_and_split(&lanes, capacity, offset);
+            seen.extend(served);
+        }
+        assert_eq!(
+            seen.len(),
+            lanes.len(),
+            "some lane is never served: {seen:?}"
+        );
+    }
+
+    /// 退化ケース: lane 0 本、容量 0 本。パニックせず、容量 0 なら全部が未提供として晒される。
+    #[test]
+    fn rotate_and_split_handles_degenerate_inputs() {
+        let empty: Vec<String> = Vec::new();
+        assert_eq!(rotate_and_split(&empty, 4, 3), (vec![], vec![]));
+
+        let lanes: Vec<String> = ["x", "y"].iter().map(|s| s.to_string()).collect();
+        let (served, unserved) = rotate_and_split(&lanes, 0, 1);
+        assert!(served.is_empty());
+        assert_eq!(unserved, lanes);
+    }
+
+    /// M8 (§4.3): `LaneHandle::set_credits` の会計が Semaphore の実態とずれないこと。
+    /// ずれると「プロセス全体の同時実行上限を除算で閉じる」という設計の前提が崩れる。
+    #[test]
+    fn set_credits_grows_and_shrinks_available_permits() {
+        let credits = Arc::new(tokio::sync::Semaphore::new(0));
+        let mut handle = LaneHandle {
+            // ダミータスク。set_credits の会計しか見ないので中身は不要。
+            task: tokio::runtime::Runtime::new()
+                .expect("runtime")
+                .spawn(async {}),
+            credits: Arc::clone(&credits),
+            granted: 0,
+        };
+
+        handle.set_credits(4);
+        assert_eq!(credits.available_permits(), 4);
+        assert_eq!(handle.granted, 4);
+
+        handle.set_credits(2);
+        assert_eq!(credits.available_permits(), 2);
+        assert_eq!(handle.granted, 2);
+
+        // 0 を渡しても 1 まで（同時実行 0 の lane は静かに詰まるだけなので作らせない）。
+        handle.set_credits(0);
+        assert_eq!(credits.available_permits(), 1);
+        assert_eq!(handle.granted, 1);
+
+        handle.task.abort();
+    }
 
     /// M4b (§4.3): `ResourceLimits::max_execution_time()` は `max_execution_time_ms` を
     /// `Duration` として返し、worker が `tokio::time::timeout(...)` でホスト+ゲスト総時間を
