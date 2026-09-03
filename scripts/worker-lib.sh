@@ -155,6 +155,43 @@ start_worker() {
   return 1
 }
 
+# 停止する worker のカウンタを回収する。
+#
+# **プロセスが死ぬとカウンタも消える。** scale-in は定常運用で起きるので、回収しないと
+# 「投入 300 件に対し worker 側の実行数は 291 件」のような欠損が出て、
+# 「再実行ゼロ」を検証できなくなる（実際にそれで chaos U4 が落ちた）。
+#
+# ドレイン中に in-flight が完了してカウンタが進むので、**終了を待つ間くり返し**読んで
+# 最後に成功した値を `.last` に残す。累計への加算は死亡確認後に 1 度だけ行う
+# （毎回加算すると多重計上になり、プロセス再起動をまたぐと単調でなくなる）。
+harvest_slot() {
+  local slot=$1 port text succ red
+  port=$(worker_port "$slot")
+  text=$(curl -sS --max-time 2 "http://127.0.0.1:$port/metrics" 2>/dev/null) || return 0
+  # slot 一致を確認してから読む（別プロセスの値を拾わない）。
+  printf '%s' "$text" | grep -q "^wasmtime_worker_slot $slot$" || return 0
+
+  succ=$(printf '%s' "$text" | sed -n 's/^executions_total{outcome="succeeded"} \([0-9]*\).*$/\1/p' | head -1)
+  red=$(printf '%s' "$text" | sed -n 's/^wasmtime_redelivered_total \([0-9]*\).*$/\1/p' | head -1)
+  [ -n "$succ" ] && printf '%s' "$succ" > "$WORKER_RUNDIR/slot-$slot.executions_succeeded.last"
+  [ -n "$red" ] && printf '%s' "$red" > "$WORKER_RUNDIR/slot-$slot.redelivered.last"
+  return 0
+}
+
+# `.last`（そのプロセス寿命ぶんの最終値）を累計ファイルへ足し込む。死亡確認後に 1 度だけ呼ぶ。
+commit_harvest() {
+  local slot=$1 key total_file last_file total last
+  for key in executions_succeeded redelivered; do
+    total_file="$WORKER_RUNDIR/slot-$slot.$key"
+    last_file="$total_file.last"
+    [ -f "$last_file" ] || continue
+    total=$(cat "$total_file" 2>/dev/null || echo 0)
+    last=$(cat "$last_file" 2>/dev/null || echo 0)
+    printf '%s' "$(( total + last ))" > "$total_file"
+    rm -f "$last_file"
+  done
+}
+
 stop_worker() {
   local slot=$1 pidfile pid
   pidfile=$(worker_pidfile "$slot")
@@ -163,12 +200,15 @@ stop_worker() {
   [ -n "$pid" ] || { rm -f "$pidfile"; return 0; }
 
   echo "==> stopping worker slot=$slot pid=$pid (drain up to ${WORKER_STOP_GRACE_SECS}s)"
+  harvest_slot "$slot"
   kill -TERM "$pid" 2>/dev/null || true
 
   local waited=0
   while [ "$waited" -lt "$WORKER_STOP_GRACE_SECS" ] && kill -0 "$pid" 2>/dev/null; do
+    harvest_slot "$slot"
     sleep 1; waited=$((waited + 1))
   done
+  commit_harvest "$slot"
 
   if kill -0 "$pid" 2>/dev/null; then
     # ここに来るのは異常。ドレインが完了していないので、このプロセスが抱えていたジョブは
