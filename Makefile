@@ -88,6 +88,9 @@ VERSION ?= 0.1.0
 # epoch interruption（max_wall_time）と tokio timeout（max_execution_time）の両方が
 # 短時間で発火する値にする（既定の 1s / 5s だとテストの待ち窓に収まらないことがある）。
 SLOW_LIMITS ?= {"max_wall_time_ms":1000,"max_execution_time_ms":2000}
+# M8-7: burn は「N ミリ秒かかって **成功する**」ノブなので、slow と違い上限を十分広く取る。
+# 上限が burn_ms より短いと epoch interruption で timeout 終端し、ノブとして機能しない。
+BURN_LIMITS ?= {"max_wall_time_ms":15000,"max_execution_time_ms":20000}
 
 # echo component の wasm32-wasip2 ビルド成果物パス（アップロード対象のローカル成果物）。
 ECHO_WASM := target/wasm32-wasip2/release/echo.wasm
@@ -323,10 +326,10 @@ rekey: ## M7c: 当該テナントの secret を現行 KEK で再ラップ（**�
 	TOKEN=$$($(MAKE) -s login); \
 	curl -sS -X POST "$(BASE_URL)/admin/secrets/rekey" -H "Authorization: Bearer $$TOKEN"; echo
 
-deploy-chaos-components: ## M4 chaos_c/d 用: always-trap / slow をビルドしてアップロード（冪等）
+deploy-chaos-components: ## M4/M8 chaos 用: always-trap / slow / burn をビルドしてアップロード（冪等）
 	@set -e; \
 	echo "==> always-trap / slow を wasm32-wasip2 でビルド..."; \
-	cargo build -p always-trap -p slow --target wasm32-wasip2 --release; \
+	cargo build -p always-trap -p slow -p burn --target wasm32-wasip2 --release; \
 	TOKEN=$$($(MAKE) -s login); \
 	resolve_cid() { \
 		curl -sS -o /dev/null -X POST "$(BASE_URL)/components" \
@@ -349,7 +352,14 @@ deploy-chaos-components: ## M4 chaos_c/d 用: always-trap / slow をビルドし
 		-H "Authorization: Bearer $$TOKEN" -F "version=$(VERSION)" \
 		-F 'resource_limits=$(SLOW_LIMITS)' \
 		-F "wasm=@target/wasm32-wasip2/release/slow.wasm"; echo; \
-	echo "OK: chaos 用 component をデプロイしました（CHAOS_ALWAYS_TRAP=always-trap CHAOS_SLOW=slow）。"
+	echo "==> burn (resource_limits は BURN_LIMITS 変数を参照)"; \
+	BURN_CID=$$(resolve_cid burn); \
+	test -n "$$BURN_CID" || { echo "ERROR: burn の component_id を解決できませんでした"; exit 1; }; \
+	curl -sS -X POST "$(BASE_URL)/components/$$BURN_CID/versions" \
+		-H "Authorization: Bearer $$TOKEN" -F "version=$(VERSION)" \
+		-F 'resource_limits=$(BURN_LIMITS)' \
+		-F "wasm=@target/wasm32-wasip2/release/burn.wasm"; echo; \
+	echo "OK: chaos 用 component をデプロイしました（CHAOS_ALWAYS_TRAP=always-trap CHAOS_SLOW=slow CHAOS_BURN=burn）。"
 
 recreate-stream: ## M8-1: invoke stream を WorkQueue retention で作り直す（CP/worker を止めてから実行）
 	@echo "==> control-plane / worker が停止していることを確認してください（未消化 0 は本コマンドが検査します）"
