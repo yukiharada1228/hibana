@@ -22,6 +22,12 @@ use crate::store::{InflightParams, LockoutParams, RateLimitParams, Store};
 pub const QUOTA_MAX_INVOKE_RATE_PER_SEC: u64 = 500;
 /// 同上: 同時実行（pending+running）の運用上限。
 pub const QUOTA_MAX_CONCURRENT_EXECUTIONS: u64 = 200;
+/// M8 (§4.2): per-lane 実行クレジットの運用上限。
+///
+/// 実効値は worker 側の `effective_lane_concurrency` が「プロセス全体上限 ÷ 購読 lane 数」で
+/// さらに頭打ちにするため、ここは「テナントが希望できる上限」でしかない。過大な希望値が
+/// consumer metadata を通じて worker の計算へ流れ込まないようクランプする。
+pub const QUOTA_MAX_LANE_CONCURRENCY: u64 = 32;
 
 /// admission 制御のパラメータ束（M3d, §8）。`Config` のグローバル既定から派生し、
 /// invoke handler（レート制限 / in-flight）と login（ロックアウト）が参照する。
@@ -38,6 +44,9 @@ pub struct AdmissionConfig {
     pub lockout: LockoutParams,
     /// X-Forwarded-For を信頼してクライアント IP を取り出すか（§6.0; 既定 false）。
     pub trust_proxy_headers: bool,
+    /// M8 (§4.2): per-lane 実行クレジットのグローバル既定（`WORKER_LANE_CONCURRENCY`）。
+    /// テナント上書きが無ければこの値が consumer metadata 経由で worker へ配られる。
+    pub lane_concurrency: u64,
 }
 
 impl AdmissionConfig {
@@ -86,7 +95,23 @@ impl AdmissionConfig {
             inflight.max = clamped as i64;
         }
 
-        ResolvedAdmissionParams { rate, inflight }
+        let mut lane_concurrency = self.lane_concurrency;
+        if let Some(lc) = overrides.lane_concurrency {
+            lane_concurrency = clamp_quota_u64(
+                tenant_id,
+                "lane_concurrency",
+                lc,
+                QUOTA_MAX_LANE_CONCURRENCY,
+            )
+            // 0 は「lane が永久に停止する」ことを意味するので最低 1 に倒す。
+            .max(1);
+        }
+
+        ResolvedAdmissionParams {
+            rate,
+            inflight,
+            lane_concurrency,
+        }
     }
 }
 
@@ -113,6 +138,27 @@ fn clamp_quota_u64(tenant: &str, field: &str, value: u64, max: u64) -> u64 {
 pub struct ResolvedAdmissionParams {
     pub rate: RateLimitParams,
     pub inflight: InflightParams,
+    /// M8 (§4.2): worker 1 プロセスがこのテナントの lane に同時に割ける実行スロットの希望値。
+    /// consumer metadata 経由で worker へ配る（M8-4 が消費する）。
+    #[allow(dead_code)]
+    pub lane_concurrency: u64,
+}
+
+impl ResolvedAdmissionParams {
+    /// M8 (§3.5): このテナントの lane consumer に設定する `max_ack_pending`。
+    ///
+    /// **テナント自身の in-flight 上限 + headroom** で導出する。M7 までは全テナント合算の
+    /// 固定値 1000 だったため、`Σ(テナント数 × max_concurrent_executions)` がそれを超えると
+    /// **1 件しか投げていないテナントが他テナントの負荷で配送されない**（そして pending が
+    /// 減らないので、やがて自分が 429 になる）という、完了条件に真正面から違反する経路があった。
+    /// lane ごとに導出すれば、この合算の頭打ちが構造的に消える。
+    ///
+    /// headroom は「in-flight 上限ちょうどだと、終端と次の配送が重なる瞬間に配送が止まる」のを
+    /// 避けるための余裕である。
+    #[allow(dead_code)] // M8-4 の lane provisioning が唯一の呼び出し元になる。
+    pub fn lane_ack_pending(&self, headroom: u64) -> i64 {
+        (self.inflight.max.max(0) as u64).saturating_add(headroom) as i64
+    }
 }
 
 /// M6a (§15): 同期 invoke の per-instance waiter registry の型エイリアス。
@@ -347,6 +393,7 @@ mod tests {
                 window_secs: 900,
             },
             trust_proxy_headers: false,
+            lane_concurrency: 4,
         }
     }
 
@@ -369,6 +416,7 @@ mod tests {
             invoke_rate_per_sec: Some(100),
             invoke_burst: None,
             max_concurrent_executions: Some(50),
+            lane_concurrency: None,
         };
         let r = c.resolve_for_tenant("ten_a", &overrides);
         assert_eq!(r.rate.refill_per_sec, 100.0);
@@ -387,6 +435,7 @@ mod tests {
             invoke_rate_per_sec: Some(10_000),
             invoke_burst: None,
             max_concurrent_executions: Some(10_000),
+            lane_concurrency: None,
         };
         let r = c.resolve_for_tenant("ten_a", &overrides);
         assert_eq!(r.rate.refill_per_sec, QUOTA_MAX_INVOKE_RATE_PER_SEC as f64);
@@ -401,6 +450,7 @@ mod tests {
             invoke_rate_per_sec: Some(QUOTA_MAX_INVOKE_RATE_PER_SEC),
             invoke_burst: None,
             max_concurrent_executions: Some(QUOTA_MAX_CONCURRENT_EXECUTIONS),
+            lane_concurrency: None,
         };
         let r = c.resolve_for_tenant("ten_a", &overrides);
         assert_eq!(r.rate.refill_per_sec, QUOTA_MAX_INVOKE_RATE_PER_SEC as f64);
@@ -421,6 +471,7 @@ mod tests {
             invoke_rate_per_sec: Some(1),
             invoke_burst: Some(1),
             max_concurrent_executions: None,
+            lane_concurrency: None,
         };
         let resolved = c.resolve_for_tenant("ten_a", &overrides);
         // 上書き値がグローバル既定を下回っていることを担保（テストの前提）。
@@ -457,6 +508,7 @@ mod tests {
             invoke_rate_per_sec: Some(1),
             invoke_burst: Some(1),
             max_concurrent_executions: Some(1),
+            lane_concurrency: None,
         };
         let loose = TenantQuotaOverrides::default();
         let r_strict = c.resolve_for_tenant("ten_a", &strict);
@@ -466,5 +518,81 @@ mod tests {
         // 別テナントへ上書き値が「漏れない」ことの最低限の保証。
         assert_eq!(r_loose.rate.refill_per_sec, c.rate.refill_per_sec);
         assert_eq!(r_loose.inflight.max, c.inflight.max);
+    }
+
+    // ---- M8-2: lane_concurrency のマージ / クランプ / 導出（§4.2 / §3.5）----------
+
+    #[test]
+    fn lane_concurrency_falls_back_to_global_default() {
+        let cfg = cfg();
+        let r = cfg.resolve_for_tenant("ten_a", &TenantQuotaOverrides::default());
+        assert_eq!(
+            r.lane_concurrency, 4,
+            "override 無しならグローバル既定を継承する"
+        );
+    }
+
+    #[test]
+    fn lane_concurrency_override_is_applied_and_clamped() {
+        let cfg = cfg();
+
+        let r = cfg.resolve_for_tenant(
+            "ten_a",
+            &TenantQuotaOverrides {
+                lane_concurrency: Some(8),
+                ..Default::default()
+            },
+        );
+        assert_eq!(r.lane_concurrency, 8);
+
+        // 推奨上限でクランプされる（過大な希望値が worker の計算へ流れ込まない）。
+        let r = cfg.resolve_for_tenant(
+            "ten_a",
+            &TenantQuotaOverrides {
+                lane_concurrency: Some(9_999),
+                ..Default::default()
+            },
+        );
+        assert_eq!(r.lane_concurrency, QUOTA_MAX_LANE_CONCURRENCY);
+
+        // 0 は lane を永久停止させるので最低 1 に倒す。
+        let r = cfg.resolve_for_tenant(
+            "ten_a",
+            &TenantQuotaOverrides {
+                lane_concurrency: Some(0),
+                ..Default::default()
+            },
+        );
+        assert_eq!(r.lane_concurrency, 1);
+    }
+
+    /// lane の `max_ack_pending` は **テナント自身の in-flight 上限 + headroom** で導出する。
+    ///
+    /// M7 までは全テナント合算の固定値 1000 で、`Σ(テナント数 × max_concurrent)` がそれを超えると
+    /// 1 件しか投げていないテナントが他テナントの負荷で配送されなくなった（完了条件違反）。
+    #[test]
+    fn lane_ack_pending_is_inflight_plus_headroom() {
+        let cfg = cfg();
+        let r = cfg.resolve_for_tenant("ten_a", &TenantQuotaOverrides::default());
+        assert_eq!(r.lane_ack_pending(8), r.inflight.max + 8);
+
+        // 上書きした in-flight にも追随する（合算ではなくテナント単位である証拠）。
+        let r = cfg.resolve_for_tenant(
+            "ten_a",
+            &TenantQuotaOverrides {
+                max_concurrent_executions: Some(50),
+                ..Default::default()
+            },
+        );
+        assert_eq!(r.lane_ack_pending(8), 58);
+    }
+
+    /// lane provisioning は fail-open（NATS の一時不調で enqueue を止めない）。
+    #[test]
+    fn tenant_lane_fail_policy_is_open() {
+        assert_eq!(
+            crate::store::FailPolicy::TENANT_LANE,
+            crate::store::FailPolicy::Open
+        );
     }
 }

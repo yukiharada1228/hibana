@@ -64,6 +64,30 @@ const DEFAULT_CRON_POLL_INTERVAL_SECS: u64 = 10;
 const DEFAULT_INTERNAL_BIND_ADDR: &str = "127.0.0.1:8081";
 /// `/internal/job-env` の per-IP 上限（req/分）。無認証面のグローバル保護。
 const DEFAULT_JOB_ENV_EXCHANGE_RATE_PER_MIN: u64 = 600;
+// --- M8 弾力スケール / テナント間アイソレーション（§8 / §15） ---
+/// テナント別 lane consumer を有効にするか。**既定 false**（= M7 までと同一トポロジ）。
+///
+/// 既定を false にしているのは、lane 化が JetStream 側のトポロジを変える操作であり、
+/// 「アップグレードしたら黙って挙動が変わる」ことを避けるため。有効化は明示的な env で行う。
+const DEFAULT_TENANT_LANES_ENABLED: bool = false;
+/// 専有 lane を割り当てるテナント数の上限。超過分は overflow lane 1 本へ束ねる。
+///
+/// **完了条件を満たす regime はアクティブテナント数 ≤ この値**である。超えると超過分は
+/// overflow lane を共有し、その内部では合算の頭打ちが復活する（有界で明示的な劣化モード）。
+const DEFAULT_MAX_DEDICATED_LANES: u64 = 64;
+/// lane consumer の `max_ack_pending` に足す余裕。
+/// in-flight 上限ちょうどだと、終端と次の配送が重なる瞬間に配送が止まる。
+const DEFAULT_LANE_ACK_PENDING_HEADROOM: u64 = 8;
+/// overflow lane の `max_ack_pending`（固定）。
+///
+/// **所属テナント数に比例させない**。比例させると合算上限が事実上撤廃され、
+/// overflow lane が「M7 までの共有 consumer」そのものに戻ってしまう。
+const DEFAULT_LANE_OVERFLOW_ACK_PENDING: u64 = 1000;
+/// per-lane 実行クレジットのグローバル既定（worker 1 プロセスあたり）。
+const DEFAULT_WORKER_LANE_CONCURRENCY: u64 = 4;
+/// lane reconcile ループの周期（秒）。
+const DEFAULT_LANE_RECONCILE_INTERVAL_SECS: u64 = 10;
+
 /// `.env.example` に置く既知プレースホルダ。**この値のまま起動させない**（下記 MUST）。
 ///
 /// `JOB_SIGNING_KEY` と違い secret の**暗号文は DB に永続する**ため、既知鍵で暗号化して
@@ -181,6 +205,27 @@ pub struct Config {
     pub internal_bind_addr: String,
     /// `/internal/job-env` の per-IP 上限（req/分）。
     pub job_env_exchange_rate_per_min: u64,
+
+    // --- M8 弾力スケール / テナント間アイソレーション（§8 / §15） ---
+    // これらは lane reconcile（M8-3 / M8-4）が消費する。設定の読み取りを先に land して
+    // 「設定は入るが挙動は変わらない」段を作ることで、各段が単体で動作・テスト可能になる。
+    /// テナント別 lane consumer を有効にするか（既定 false = M7 までと同一トポロジ）。
+    #[allow(dead_code)]
+    pub tenant_lanes_enabled: bool,
+    /// 専有 lane の上限数。超過分は overflow lane 1 本へ束ねる。
+    #[allow(dead_code)]
+    pub max_dedicated_lanes: u64,
+    /// lane consumer の `max_ack_pending` に足す余裕。
+    #[allow(dead_code)]
+    pub lane_ack_pending_headroom: u64,
+    /// overflow lane の `max_ack_pending`（固定値）。
+    #[allow(dead_code)]
+    pub lane_overflow_ack_pending: u64,
+    /// per-lane 実行クレジットのグローバル既定。
+    pub worker_lane_concurrency: u64,
+    /// lane reconcile ループの周期（秒）。
+    #[allow(dead_code)]
+    pub lane_reconcile_interval_secs: u64,
 
     // --- 観測 (M4a, §3.8) ---
     /// ログ整形（"text" 既定 / "json"）。`json` のとき `tracing_subscriber::fmt().json()` を
@@ -366,6 +411,24 @@ impl Config {
                 "JOB_ENV_EXCHANGE_RATE_PER_MIN",
                 DEFAULT_JOB_ENV_EXCHANGE_RATE_PER_MIN,
             )?,
+            tenant_lanes_enabled: env_bool("TENANT_LANES_ENABLED", DEFAULT_TENANT_LANES_ENABLED),
+            max_dedicated_lanes: env_u64("MAX_DEDICATED_LANES", DEFAULT_MAX_DEDICATED_LANES)?,
+            lane_ack_pending_headroom: env_u64(
+                "LANE_ACK_PENDING_HEADROOM",
+                DEFAULT_LANE_ACK_PENDING_HEADROOM,
+            )?,
+            lane_overflow_ack_pending: env_u64(
+                "LANE_OVERFLOW_ACK_PENDING",
+                DEFAULT_LANE_OVERFLOW_ACK_PENDING,
+            )?,
+            worker_lane_concurrency: env_u64(
+                "WORKER_LANE_CONCURRENCY",
+                DEFAULT_WORKER_LANE_CONCURRENCY,
+            )?,
+            lane_reconcile_interval_secs: env_u64(
+                "LANE_RECONCILE_INTERVAL_SECS",
+                DEFAULT_LANE_RECONCILE_INTERVAL_SECS,
+            )?,
             log_format: env_or("LOG_FORMAT", "text"),
         })
     }
@@ -404,6 +467,7 @@ impl Config {
                 window_secs: self.login_lockout_window_secs,
             },
             trust_proxy_headers: self.trust_proxy_headers,
+            lane_concurrency: self.worker_lane_concurrency,
         }
     }
 }

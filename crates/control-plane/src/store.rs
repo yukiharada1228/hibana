@@ -54,6 +54,13 @@ impl FailPolicy {
     pub const INVOKE_RATE: FailPolicy = FailPolicy::Open;
     /// in-flight 同時実行の方針（§8: fail-open + 縮退記録）。
     pub const INFLIGHT: FailPolicy = FailPolicy::Open;
+    /// M8 (§7): テナント lane の provisioning の方針（fail-open + 縮退記録）。
+    ///
+    /// lane を作れない / 状態を読めないときに **enqueue を止めない**（可用性優先）。
+    /// 止めると「NATS の一時的な不調でテナントのジョブが一切受け付けられない」ことになり、
+    /// invoke_rate / in-flight と同じ可用性クラスの判断に従う。
+    /// 縮退したことは必ずログ・監査へ記録する（§8 の「fail-open は許可するが必ず記録する」）。
+    pub const TENANT_LANE: FailPolicy = FailPolicy::Open;
 }
 
 /// ストア操作のエラー。
