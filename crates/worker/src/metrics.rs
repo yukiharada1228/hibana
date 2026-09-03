@@ -94,6 +94,13 @@ pub struct Metrics {
     /// ゲストが 2 回実行される。増えているなら `WORKER_DRAIN_TIMEOUT_SECS` が実行時間に
     /// 対して短すぎる。
     pub drain_abandoned_total: IntCounter,
+    /// M8 (§5.5): supervisor が注入した slot 番号（`WORKER_SLOT`）。未設定なら -1。
+    ///
+    /// **同一性の検証にだけ使う**。参照アクチュエータは「起動したはずの slot i の worker が
+    /// 本当に `PORT_BASE+i` で応答しているか」を、この gauge の値が i と一致することで確認する。
+    /// これが無いと、手動で起動した worker がポートを掴んでいる状況で
+    /// 「supervisor は 1 台も起動していないのに live 判定が 1 になる」ことに気づけない。
+    pub worker_slot: IntGauge,
 }
 
 impl Metrics {
@@ -230,6 +237,22 @@ impl Metrics {
             .register(Box::new(drain_abandoned_total.clone()))
             .expect("register drain_abandoned_total");
 
+        let worker_slot = IntGauge::new(
+            "wasmtime_worker_slot",
+            "Supervisor-assigned slot number for this worker process (-1 when unmanaged)",
+        )
+        .expect("metric: worker_slot");
+        // 未設定は -1。0 を既定にすると「slot 0 として管理されている」と区別がつかない。
+        worker_slot.set(
+            std::env::var("WORKER_SLOT")
+                .ok()
+                .and_then(|v| v.trim().parse::<i64>().ok())
+                .unwrap_or(-1),
+        );
+        registry
+            .register(Box::new(worker_slot.clone()))
+            .expect("register worker_slot");
+
         Arc::new(Self {
             registry,
             wasmtime_execution_duration_seconds,
@@ -245,6 +268,7 @@ impl Metrics {
             redelivered_total,
             drain_naked_total,
             drain_abandoned_total,
+            worker_slot,
         })
     }
 
