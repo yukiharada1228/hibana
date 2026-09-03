@@ -219,6 +219,25 @@ fn to_pull_config(state: &AppState, lane: &DesiredLane) -> PullConfig {
 /// **既存の drift 判定（M7 までの worker 側）には `filter_subject` 軸と `metadata` 軸が無く、
 /// 誤った filter の lane が永久に是正されなかった**。lane 化では filter がトポロジそのものなので
 /// 必ず含める。
+/// サーバが実際に保存する ack_wait へ正規化する。
+///
+/// **NATS は `backoff` 配列が設定されているとき、`ack_wait` を `backoff[0]` から導出して保存する**
+/// （最初の再配送までの待ちが `backoff[0]` なので、意味的にもそれが正しい）。desired 側は
+/// TTL 結合の基準値として `ACK_WAIT_SECS`（既定 30）を持つが、`backoff = [5,15,60]` を併せて
+/// 送ると **サーバは ack_wait を 5 秒として保存する**。
+///
+/// この正規化を挟まないと `actual.ack_wait(5s) != desired.ack_wait(30s)` が恒久的に成立し、
+/// reconcile が毎周期 drift と判定して次を無限に繰り返す:
+/// consumer UPDATE を投げる → lane 世代をバンプ → **lane キャッシュが全消え**（invoke ホット
+/// パスが毎回 ensure を打つ）→ `faas.lane.changed` を publish → **全 worker が再 discovery**。
+/// 壊れはしないが、キャッシュと通知の設計意図が丸ごと無効化される。
+///
+/// TTL 結合（§3.3）は壊れない: トークン exp は `ack_wait * max_deliver`（= 150s）で計算する一方、
+/// backoff 配列構成の最悪滞留は `Σ backoff`（= 80s）なので、exp は依然として保守側に長い。
+fn effective_ack_wait(ack_wait: Duration, backoff: &[Duration]) -> Duration {
+    backoff.first().copied().unwrap_or(ack_wait)
+}
+
 fn has_drift(actual: &async_nats::jetstream::consumer::Config, desired: &PullConfig) -> bool {
     // filter は単一形 / 複数形のどちらで入っているかが実装依存なので、集合として比較する。
     let norm = |single: &str, multi: &[String]| -> BTreeSet<String> {
@@ -241,7 +260,8 @@ fn has_drift(actual: &async_nats::jetstream::consumer::Config, desired: &PullCon
         .any(|k| actual.metadata.get(*k) != desired.metadata.get(*k));
 
     actual_filters != desired_filters
-        || actual.ack_wait != desired.ack_wait
+        || effective_ack_wait(actual.ack_wait, &actual.backoff)
+            != effective_ack_wait(desired.ack_wait, &desired.backoff)
         || actual.max_deliver != desired.max_deliver
         || actual.backoff != desired.backoff
         || actual.max_ack_pending != desired.max_ack_pending
@@ -505,6 +525,151 @@ pub async fn ensure_lane_for_tenant(state: &AppState, tenant: &str) {
     }
 }
 
+// ============================================================================
+// M8-8 (§5.2): backlog シグナル
+// ============================================================================
+
+/// 1 lane ぶんの観測値。
+struct LaneDepth {
+    name: String,
+    num_pending: u64,
+    num_ack_pending: u64,
+}
+
+/// 全 lane を 1 パス走査して深さを集める。
+///
+/// `Consumer::info()` は `&mut self` を要求し、`cached_info()` は作成時スナップショットで
+/// ネットワークに出ないため、どちらもここでは使えない。`Stream::consumers()` の
+/// ストリームが返す `consumer::Info` を直接読む。
+async fn collect_lane_depths(stream: &Stream) -> anyhow::Result<Vec<LaneDepth>> {
+    let mut out = Vec::new();
+    let mut it = stream.consumers();
+    while let Some(info) = it.next().await {
+        let info = info.context("listing consumer info")?;
+        let name = info
+            .config
+            .durable_name
+            .clone()
+            .unwrap_or_else(|| info.name.clone());
+        if !is_managed_consumer(&name) {
+            continue;
+        }
+        out.push(LaneDepth {
+            name,
+            num_pending: info.num_pending,
+            num_ack_pending: info.num_ack_pending as u64,
+        });
+    }
+    Ok(out)
+}
+
+/// backlog ポーラ (§5.2.3)。
+///
+/// # backlog の定義
+///
+/// ```text
+/// backlog = Σ over all lanes ( num_pending + num_ack_pending )
+/// ```
+///
+/// **`num_pending` 単体を使ってはならない**。1 worker が大量に claim した瞬間 `num_pending` は
+/// 0 に落ちるが、仕事は終わっていない。`num_ack_pending` は「配送済みだが未 ack」= まさに
+/// 未完了の仕事なので、両者の和が唯一正しい「未消化の仕事量」である。worker が突然死した
+/// 場合も、抱えていたメッセージは `ack_wait` 経過まで `num_ack_pending` に残り backlog から
+/// 消えない（シグナルとして堅牢）。
+///
+/// # scale-from-zero が成立する根拠
+///
+/// lane / legacy consumer を作るのは **CP** であり（§3.7）、durable consumer はクライアント
+/// 接続と独立にサーバ側状態として残る。したがって **worker 0 台でも consumer 情報は読める**。
+/// これが scale-from-zero の成立条件そのものである（M7 までのように worker が consumer を
+/// 作る構造だと、worker 0 台 → consumer 無し → backlog 読めず → 増やす判断ができない、
+/// というブートストラップ・デッドロックになる）。
+pub async fn run_backlog_poller(state: AppState, interval_secs: u64) {
+    let period = Duration::from_secs(interval_secs.max(1));
+    let mut ticker = tokio::time::interval(period);
+    tracing::info!(
+        interval_secs = period.as_secs(),
+        "jetstream backlog poller started"
+    );
+
+    let mut stream: Option<Stream> = None;
+    let mut consecutive_failures: u64 = 0;
+
+    loop {
+        ticker.tick().await;
+
+        if stream.is_none() {
+            match state
+                .jetstream()
+                .get_stream(faas_shared::INVOKE_STREAM_NAME)
+                .await
+            {
+                Ok(s) => stream = Some(s),
+                Err(e) => {
+                    note_backlog_failure(&state, &mut consecutive_failures, &e.to_string());
+                    continue;
+                }
+            }
+        }
+        let Some(s) = stream.as_ref() else { continue };
+
+        match collect_lane_depths(s).await {
+            Ok(depths) => {
+                consecutive_failures = 0;
+                let m = state.metrics();
+                // lane が消えたら系列も消す（reaper の kid gauge と同じ理由で reset してから set）。
+                m.lane_pending_messages.reset();
+                m.lane_ack_pending.reset();
+                let mut backlog: u64 = 0;
+                for d in &depths {
+                    m.lane_pending_messages
+                        .with_label_values(&[d.name.as_str()])
+                        .set(d.num_pending as i64);
+                    m.lane_ack_pending
+                        .with_label_values(&[d.name.as_str()])
+                        .set(d.num_ack_pending as i64);
+                    backlog += d.num_pending + d.num_ack_pending;
+                }
+                let decision = state.observe_backlog(backlog, depths.len());
+                m.scale_backlog.set(backlog as i64);
+                m.scale_signal_age_seconds.set(0);
+                m.scale_desired_workers.set(i64::from(decision.target));
+            }
+            Err(e) => {
+                // ★ reaper の kid gauge と決定的に違う点: **backlog 側の gauge をリセットしない**。
+                //   0 に落とすと「仕事が無い」と誤読され、NATS の一時的な瞬断がそのまま
+                //   scale-to-zero を誘発する。代わりに age を伸ばし、判断ロジックを hold に落とす
+                //   （§5.3 R2）。この非対称性は意図的である。
+                state
+                    .metrics()
+                    .scale_signal_age_seconds
+                    .set(state.scale_signal_age_secs().min(i64::MAX as u64) as i64);
+                stream = None; // 次周期は get_stream からやり直す
+                note_backlog_failure(&state, &mut consecutive_failures, &e.to_string());
+            }
+        }
+    }
+}
+
+/// 観測失敗のログ抑制。1 回目は warn、以後は 60 周期に 1 回だけ出す。
+///
+/// 新規スタックでは「まだ stream / consumer が無い」状態が続くので、抑制が無いと
+/// 起動直後のログが警告で埋まり、本当の異常が見えなくなる。
+fn note_backlog_failure(state: &AppState, consecutive: &mut u64, error: &str) {
+    *consecutive += 1;
+    if *consecutive == 1 || (*consecutive).is_multiple_of(60) {
+        tracing::warn!(
+            error = %error,
+            consecutive_failures = *consecutive,
+            "failed to observe jetstream backlog; holding the previous signal"
+        );
+    }
+    state
+        .metrics()
+        .scale_signal_age_seconds
+        .set(state.scale_signal_age_secs().min(i64::MAX as u64) as i64);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -547,6 +712,46 @@ mod tests {
     fn no_drift_when_identical() {
         let d = desired("workers-t-ten_a", &["tenant.ten_a.component.invoke"], 28);
         assert!(!has_drift(&actual_from(&d), &d));
+    }
+
+    /// **回帰ガード**: `backoff` を設定すると NATS は `ack_wait` を `backoff[0]` から導出して
+    /// 保存する。それを正規化せずに比べると **恒久的に drift と判定され続け**、reconcile が
+    /// 毎周期 UPDATE を投げ、lane 世代をバンプし、全 worker に再 discovery を強いる
+    /// 無限ループになる（実機で 10 秒ごとに発生しているのを観測して発見した）。
+    #[test]
+    fn server_derived_ack_wait_from_backoff_is_not_drift() {
+        let mut d = desired("workers-t-ten_a", &["tenant.ten_a.component.invoke"], 28);
+        d.ack_wait = Duration::from_secs(30);
+        d.backoff = vec![
+            Duration::from_secs(5),
+            Duration::from_secs(15),
+            Duration::from_secs(60),
+        ];
+
+        let mut a = actual_from(&d);
+        // サーバが実際に保存する形（ack_wait = backoff[0]）。
+        a.ack_wait = Duration::from_secs(5);
+
+        assert!(
+            !has_drift(&a, &d),
+            "backoff[0] 由来の ack_wait を drift と誤判定してはならない"
+        );
+    }
+
+    /// ただし **backoff が空**なら ack_wait はそのまま比較される（正規化で検出力を落とさない）。
+    #[test]
+    fn ack_wait_drift_still_detected_without_backoff() {
+        let mut d = desired("workers-t-ten_a", &["tenant.ten_a.component.invoke"], 28);
+        d.ack_wait = Duration::from_secs(30);
+        d.backoff = Vec::new();
+
+        let mut a = actual_from(&d);
+        a.ack_wait = Duration::from_secs(5);
+
+        assert!(
+            has_drift(&a, &d),
+            "backoff 無しの ack_wait 差は drift である"
+        );
     }
 
     /// **filter 軸の drift を検出すること**。M7 までの判定にはこの軸が無く、
