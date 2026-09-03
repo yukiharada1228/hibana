@@ -333,6 +333,13 @@ async fn chaos_t1_canary_stepwise_shift_and_one_click_rollback() {
         .as_str()
         .unwrap_or_else(|| panic!("component must have an active version; body={t0}"))
         .to_string();
+    // 後始末で戻す先。**ハードコードしない** —— S1 の後始末が特定の semver を active に固定すると、
+    // 「その版が何を出力するか」に他シナリオが依存してしまう（S2/S3 は active の echo が env を
+    // 出力することを前提にしており、env 非対応の古い版へ固定されると必ず落ちる）。
+    let initial_stable_version = t0["stable"]["version"]
+        .as_str()
+        .unwrap_or_else(|| panic!("component must have an active version; body={t0}"))
+        .to_string();
 
     // canary の version_id を引く（PUT /traffic の応答が権威）。
     set_traffic(&client, &base, &token, &cid, CANARY_VERSION, 0).await;
@@ -464,7 +471,11 @@ async fn chaos_t1_canary_stepwise_shift_and_one_click_rollback() {
     );
 
     // --- (8) 宣言的 no-op 切替のあとでも rollback が効く（CASE ガードの回帰） ---
-    for v in ["0.1.0", CANARY_VERSION, CANARY_VERSION] {
+    for v in [
+        initial_stable_version.as_str(),
+        CANARY_VERSION,
+        CANARY_VERSION,
+    ] {
         let r = client
             .put(format!("{base}/components/{cid}/active-version"))
             .bearer_auth(&token)
@@ -538,7 +549,7 @@ async fn chaos_t1_canary_stepwise_shift_and_one_click_rollback() {
     let _ = client
         .put(format!("{base}/components/{cid}/active-version"))
         .bearer_auth(&token)
-        .json(&serde_json::json!({"version": "0.1.0"}))
+        .json(&serde_json::json!({"version": initial_stable_version}))
         .send()
         .await;
 
@@ -600,6 +611,23 @@ async fn invoke_sync_env(client: &reqwest::Client, base: &str, token: &str) -> s
     body["output"]["env"].clone()
 }
 
+/// S2 / S3 の前提: **active な echo が出力に `env` フィールドを含むビルドであること**。
+///
+/// `components/echo` は M7b で「注入された env を出力へ返す」ようになったが、それ以前に
+/// アップロードされた版が active のままだと出力に `env` が無く、S2 / S3 は
+/// 「注入が効いていない」という**誤った症状**で落ちる（実際には active 版が古いだけ）。
+/// 取り違えを防ぐため、前提が崩れていることを最初に明示的に失敗させる。
+async fn require_env_aware_echo(client: &reqwest::Client, base: &str, token: &str) {
+    let env = invoke_sync_env(client, base, token).await;
+    assert!(
+        env.is_object(),
+        "the active echo version does not report an `env` object in its output. \
+         S2/S3 require an env-aware build (components/echo since M7b). \
+         Re-deploy it and make it active: `make build-component && make deploy`, then \
+         PUT /components/{{id}}/active-version to that version. (got: {env})"
+    );
+}
+
 /// **Scenario S2**: admin 承認された env 名だけが注入され、平文 config と secret が
 /// 同じ env 名前空間で共存し、承認外のキーは値が存在しても注入されないことを検証する。
 ///
@@ -619,6 +647,7 @@ async fn chaos_t2_env_and_secret_injection() {
         .as_str()
         .expect("component must have an active version")
         .to_string();
+    require_env_aware_echo(&client, &base, &token).await;
     let secret_value = sentinel("t2");
 
     // --- (1) admin が env 許可リストを承認する ---
@@ -758,6 +787,7 @@ async fn chaos_t3_secret_non_disclosure() {
         .as_str()
         .expect("component must have an active version")
         .to_string();
+    require_env_aware_echo(&client, &base, &token).await;
     let v1 = sentinel("t3-v1");
     let v2 = sentinel("t3-v2");
 

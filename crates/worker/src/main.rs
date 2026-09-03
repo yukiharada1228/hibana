@@ -654,22 +654,36 @@ async fn ensure_consumer(
 > {
     use async_nats::jetstream::consumer::pull::Config as PullConfig;
     use async_nats::jetstream::consumer::{AckPolicy, DeliverPolicy};
-    use async_nats::jetstream::stream::Config as StreamConfig;
+    use async_nats::jetstream::stream::RetentionPolicy;
 
     // §3.3: テナントワイルドカード `tenant.*.component.invoke` で束ねる。
-    // 新規テナント追加時に stream/consumer の再構成が不要（`*` は 1 トークン=テナント ID に一致）。
-    // 注意: 既存の単一テナント subject で作られた FAAS_INVOKE stream があると、subjects 変更で
-    // get_or_create が競合しうる（README / risks 参照: 必要なら stream 更新 or 新名）。
     let subject = invoke_subject_wildcard().to_string();
 
-    let stream = jetstream
-        .get_or_create_stream(StreamConfig {
-            name: STREAM_NAME.to_string(),
-            subjects: vec![subject.clone()],
-            ..Default::default()
-        })
+    // M8-1 (§3.4): **worker は stream を作らない**。作成者は control-plane 単独であり、
+    // ここは取得と不変条件の検査だけを行う（二重定義による「先に起動した側が黙って勝つ」事故の除去）。
+    // stream が無ければ fail-fast する ＝ control-plane を先に起動する運用（README に明記）。
+    let mut stream = jetstream.get_stream(STREAM_NAME).await.map_err(|e| {
+        anyhow!(
+            "get_stream({STREAM_NAME}) failed: {e}. \
+             start the control-plane first: it is the sole creator of the invoke stream (M8-1)"
+        )
+    })?;
+
+    // retention の検査は control-plane と同一（起動時に不変条件を検査する既存作法）。
+    // Limits のままの stream に lane consumer を作ると、filter の重なりをサーバが拒否しなくなり
+    // 「どの subject もちょうど 1 consumer」の保証が静かに退化する。
+    let stream_info = stream
+        .info()
         .await
-        .map_err(|e| anyhow!("get_or_create_stream failed: {e}"))?;
+        .map_err(|e| anyhow!("stream info({STREAM_NAME}) failed: {e}"))?;
+    if stream_info.config.retention != RetentionPolicy::WorkQueue {
+        anyhow::bail!(
+            "stream {STREAM_NAME} has retention {:?} but M8 requires WorkQueue \
+             (see README トラブルシュート for the drain-and-recreate procedure)",
+            stream_info.config.retention
+        );
+    }
+    let stream = stream;
 
     let backoff: Vec<Duration> = backoff_secs
         .iter()

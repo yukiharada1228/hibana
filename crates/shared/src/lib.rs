@@ -351,6 +351,49 @@ pub fn served_lane_capacity(global: usize) -> usize {
     global.max(1)
 }
 
+/// invoke stream の config (M8 §3.4)。**control-plane だけがこれで stream を作る**。
+///
+/// # なぜ `WorkQueue` retention なのか（4 つの理由。どれか 1 つでも単独で移行を正当化する）
+///
+/// 1. **「どの subject もちょうど 1 consumer に属する」をサーバに強制させる**。lane 分割で最も怖い
+///    「filter の重なりによる二重配送」を、レビューではなく NATS に検出させる（filter が重なる
+///    consumer の作成をサーバが拒否する）。
+/// 2. **consumer の delete / recreate が replay 事故にならない**。`Limits` + `max_age=0` +
+///    `DeliverPolicy::All` では、drift 時の delete→recreate で **stream 全履歴の再配送**が起こりうる。
+///    ack floor は consumer 側の状態なので `delete_consumer` で失われる。`WorkQueue` では ack 済みが
+///    stream から消えるため、再作成は「未 ack 分だけの再配送」という正しい意味になる。
+/// 3. **負荷試験が環境を壊さない**。`Limits` / `max_age=0` / `File` のままだと docker volume が単調増加する。
+/// 4. **キュー深さの意味が正しくなる**。ack 済みが消えるので `num_pending` が「本当に未消化の仕事」を指す
+///    （オートスケールの backlog シグナルの前提）。
+///
+/// # なぜ上限ノブ（`max_msgs` / `max_bytes` / `max_age`）を設定しないのか
+///
+/// これらは **stream 単位**の上限であって lane 単位ではない。既定の `discard: Old` は
+/// **最も古い = 他テナントのメッセージから捨てる**ため、「1 テナントのバーストが他テナントの
+/// クォータを劣化させない」という完了条件を、新設した config 自身が破ることになる。
+/// 将来どうしても上限が要る場合は `discard: New` を必須とする（自分のメッセージが捨てられる側になる）。
+///
+/// # 運用上の注意 (MUST)
+///
+/// `retention` は NATS で**作成後に変更できない**。既存の `Limits` stream がある環境では
+/// stream を削除して作り直す必要がある（README のトラブルシュート参照）。
+/// `get_or_create_stream` は既存 config を更新しないため、手順を飛ばすと `Limits` のまま
+/// lane consumer が作られ、上記 1 の保証が**静かに退化する**。よって CP / worker の双方が
+/// 起動時に `retention == WorkQueue` を検査して fail-fast する。
+pub fn invoke_stream_config() -> async_nats::jetstream::stream::Config {
+    use async_nats::jetstream::stream::{Config, DiscardPolicy, RetentionPolicy, StorageType};
+    Config {
+        name: INVOKE_STREAM_NAME.to_string(),
+        subjects: vec![invoke_subject_wildcard().to_string()],
+        retention: RetentionPolicy::WorkQueue,
+        storage: StorageType::File,
+        // 上限ノブは設定しない（上記の理由）。discard は「万一上限を足したときに
+        // 他テナントを巻き込まない側」へ倒しておく。
+        discard: DiscardPolicy::New,
+        ..Default::default()
+    }
+}
+
 /// `BACKOFF_SECS` 形式の CSV を `Vec<u64>` に変換する (M4c → M8 で共有契約へ移設)。
 ///
 /// M8 で lane consumer の作成責務が worker から control-plane へ移ったため、

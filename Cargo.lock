@@ -1539,6 +1539,7 @@ dependencies = [
 name = "faas-shared"
 version = "0.1.0"
 dependencies = [
+ "async-nats",
  "serde",
  "serde_json",
  "thiserror 2.0.18",

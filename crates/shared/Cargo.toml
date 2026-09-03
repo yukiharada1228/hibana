@@ -11,3 +11,8 @@ uuid = { workspace = true }
 thiserror = { workspace = true }
 # M7-0 (§5.1): Redacted<T> の Drop 時ゼロ化。
 zeroize = { workspace = true }
+# M8 (§3.4): invoke stream の config を共有契約として 1 箇所に持つため。
+# stream 名 / retention / discard が worker と control-plane で食い違うと
+# 「先に起動した側が黙って勝つ」事故になるので、型ごと共有する。
+# 既に両 bin が同一版を依存しているのでビルドコストの増加は実質ゼロ。
+async-nats = { workspace = true }

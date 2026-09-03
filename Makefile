@@ -94,7 +94,7 @@ ECHO_WASM := target/wasm32-wasip2/release/echo.wasm
 
 .DEFAULT_GOAL := help
 
-.PHONY: deploy-chaos-components component-id traffic canary promote rollback approve-env set-secret secrets rekey help setup up down migrate minio-bucket build-component run-cp run-worker bootstrap login deploy invoke logs psql clean rls-lint
+.PHONY: recreate-stream deploy-chaos-components component-id traffic canary promote rollback approve-env set-secret secrets rekey help setup up down migrate minio-bucket build-component run-cp run-worker bootstrap login deploy invoke logs psql clean rls-lint
 
 help: ## 利用可能なターゲット一覧を表示
 	@echo "WASM FaaS Platform — M2 Makefile"
@@ -350,6 +350,11 @@ deploy-chaos-components: ## M4 chaos_c/d 用: always-trap / slow をビルドし
 		-F 'resource_limits=$(SLOW_LIMITS)' \
 		-F "wasm=@target/wasm32-wasip2/release/slow.wasm"; echo; \
 	echo "OK: chaos 用 component をデプロイしました（CHAOS_ALWAYS_TRAP=always-trap CHAOS_SLOW=slow）。"
+
+recreate-stream: ## M8-1: invoke stream を WorkQueue retention で作り直す（CP/worker を止めてから実行）
+	@echo "==> control-plane / worker が停止していることを確認してください（未消化 0 は本コマンドが検査します）"
+	@NATS_URL="$(NATS_URL)" cargo run --quiet -p faas-control-plane -- --recreate-invoke-stream $(FORCE_ARG)
+	@echo "OK: stream を再作成しました。control-plane → worker の順に起動してください。"
 
 rls-lint: ## M3b: テナント分離の静的ガード（SET app.tenant_id ハザード / 生 pool 渡し検出）
 	@./scripts/rls-lint.sh
