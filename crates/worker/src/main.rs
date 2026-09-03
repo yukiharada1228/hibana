@@ -73,8 +73,8 @@ use std::time::Duration;
 use anyhow::{anyhow, Context as _};
 use chrono::Utc;
 use faas_shared::{
-    failed_subject, invoke_subject_wildcard, result_subject, ExecutionStatus, FailedMessage,
-    JobMessage, ResourceLimits, ResultMessage, UsageMetrics,
+    failed_subject, result_subject, ExecutionStatus, FailedMessage, JobMessage, ResourceLimits,
+    ResultMessage, UsageMetrics,
 };
 use futures::StreamExt;
 use lru::LruCache;
@@ -89,13 +89,6 @@ use wasmtime_wasi::{ResourceTable, WasiCtx, WasiCtxBuilder, WasiView};
 
 use bindings::Handler;
 
-/// JetStream の共有 Pull Consumer の durable 名 (§6.3)。
-///
-/// M8: 名前の真実は `faas_shared` にある（worker と control-plane の二重定義を解消した）。
-/// M8-4 以降はテナント別 lane consumer が主経路になり、この legacy 名は
-/// `TENANT_LANES_ENABLED=false` のロールバック時のみ使われる。
-const DURABLE_NAME: &str = faas_shared::LEGACY_SHARED_DURABLE;
-
 /// JetStream stream 名。invoke subject を束ねる（真実は `faas_shared`）。
 const STREAM_NAME: &str = faas_shared::INVOKE_STREAM_NAME;
 
@@ -106,12 +99,11 @@ const PULL_BATCH: usize = 16;
 /// hit 経路が coldstart 短縮の主経路。容量超過時は最古を退避する。
 const COMPONENT_CACHE_CAP: usize = 64;
 
-/// JetStream consumer の MaxAckPending（M4d, §8 表 line 742）。
-///
-/// 「配送済み未 ack」の全テナント合算上限。CP 側 admission（per-tenant `max_concurrent_executions`）
-/// とは数える量が異なる（合算 vs テナント別）。値は仕様 §8 表に直接対応する固定値 1000。
-/// 運用目安: `Σ(アクティブテナント数 × max_concurrent_executions) ≲ MaxAckPending`（§8 line 750）。
-const MAX_ACK_PENDING: i64 = 1000;
+// M8-3: `MAX_ACK_PENDING`（全テナント合算の固定値 1000）はここから削除された。
+// consumer の作成者が control-plane へ移り、`max_ack_pending` は **lane（= テナント）ごとに**
+// `max_concurrent_executions + headroom` から導出されるようになったため（§8 / §3.5）。
+// 合算の頭打ちこそが「1 件しか投げていないテナントが他テナントの負荷で配送されない」という
+// クォータ劣化の本体であり、保存すべき不変条件ではなかった。
 
 // ============================================================================
 // Store のホスト状態
@@ -209,18 +201,13 @@ struct Settings {
     /// 取得した wasm 本体の事前コンパイル成果物 (cwasm) を置くローカルキャッシュ先 (§3.6)。
     /// 起動時に mkdir する。M2 で `COMPONENTS_DIR` 依存は撤去した。
     wasm_cache_dir: PathBuf,
-    /// M3c (§3.3 TTL 結合): JetStream consumer の ack 待ち秒数。CP のトークン exp 計算と
-    /// **同一の定数** から導出する（既定は faas_shared::ACK_WAIT_SECS）。env で上書き可能。
-    ack_wait_secs: u64,
-    /// M3c: JetStream consumer の最大再配送回数。CP の token exp と同一定数
-    /// （既定は faas_shared::MAX_DELIVER）。env で上書き可能。worker は鍵を持たない。
+    // M8-3: `ack_wait_secs` / `backoff_secs` はここから削除された。consumer の作成者が
+    // control-plane へ移ったため、**TTL 結合（§3.3: トークン exp と再配送間隔）の所有者も CP** になった。
+    // worker が同じ env を読んで別の値を持つと「どちらが効いているのか分からない」状態になるため、
+    // 二重に持たない。`max_deliver` だけは worker が「今回が最終試行か」を判定するのに要るので残す
+    // （CP と同じ env を読むので値はずれない）。
+    /// M4c (§6.6): 最終配送試行の判定に使う。CP が consumer に設定する値と同じ env から読む。
     max_deliver: u64,
-    /// M4c (§6.6 / §3.3): JetStream pull consumer の `backoff` 配列（秒）。CSV で渡す。
-    /// 既定 `[5, 15, 60]` 秒。空文字 / 空配列で「backoff 無効 = 固定 ack_wait 構成」となり、
-    /// 既存挙動と完全互換。CP の token exp 計算（§3.3）は固定 ack_wait/max_deliver から導出する
-    /// 既定式なので、backoff の合計が `ack_wait*max_deliver` を**下回る**範囲で使うこと
-    /// （上回ると正規の遅延結果がトークン失効後に届き、subscriber が drop して実行喪失する恐れ）。
-    backoff_secs: Vec<u64>,
     /// M4a (§3.8): /metrics + /readyz を返す最小 axum サーバの bind 先。既定 `0.0.0.0:9090`。
     /// 内部ネット越しのみで露出させる前提。ノード LB の readinessProbe ターゲットでもある。
     metrics_bind_addr: String,
@@ -229,6 +216,9 @@ struct Settings {
     control_plane_internal_url: String,
     /// M7c: 引き換え HTTP のタイムアウト（ミリ秒）。超過は **fail-closed**（実行を failed で終端）。
     job_env_fetch_timeout_ms: u64,
+    /// M8 (§3.7): lane discovery の周期（秒）。`faas.lane.changed` 通知の取りこぼしと
+    /// worker 再起動直後を吸収する収束用の保険であり、通常の即応性は通知が担う。
+    lane_discovery_interval_secs: u64,
 }
 
 /// `WASM_CACHE_DIR` 未設定時の既定キャッシュ先。
@@ -239,6 +229,8 @@ const DEFAULT_METRICS_BIND_ADDR: &str = "0.0.0.0:9090";
 const DEFAULT_CONTROL_PLANE_INTERNAL_URL: &str = "http://127.0.0.1:8081";
 /// `JOB_ENV_FETCH_TIMEOUT_MS` 未設定時の既定。
 const DEFAULT_JOB_ENV_FETCH_TIMEOUT_MS: u64 = 2000;
+/// `LANE_DISCOVERY_INTERVAL_SECS` 未設定時の既定。
+const DEFAULT_LANE_DISCOVERY_INTERVAL_SECS: u64 = 10;
 /// ゲスト stderr を封じ込めるときのバッファ上限（バイト）。
 ///
 /// secret を注入する実行では `inherit_stderr()` を**使わない**。inherit すると、ゲストが
@@ -256,10 +248,7 @@ impl Settings {
             .unwrap_or_else(|_| DEFAULT_WASM_CACHE_DIR.to_string())
             .into();
         // M3c TTL 結合: 既定は faas_shared の定数。CP と値を揃えること（README 参照）。
-        let ack_wait_secs = env_u64("ACK_WAIT_SECS", faas_shared::ACK_WAIT_SECS)?;
         let max_deliver = env_u64("MAX_DELIVER", faas_shared::MAX_DELIVER)?;
-        // M4c: BACKOFF_SECS は CSV（例 "5,15,60"）。空 / 未設定で既定 [5, 15, 60]、"" で無効化。
-        let backoff_secs = parse_backoff_secs("BACKOFF_SECS")?;
         let metrics_bind_addr = std::env::var("METRICS_BIND_ADDR")
             .map(|v| v.trim().to_string())
             .unwrap_or_else(|_| DEFAULT_METRICS_BIND_ADDR.to_string());
@@ -267,9 +256,7 @@ impl Settings {
             database_url,
             nats_url,
             wasm_cache_dir,
-            ack_wait_secs,
             max_deliver,
-            backoff_secs,
             metrics_bind_addr,
             control_plane_internal_url: std::env::var("CONTROL_PLANE_INTERNAL_URL")
                 .map(|v| v.trim().to_string())
@@ -278,25 +265,12 @@ impl Settings {
                 "JOB_ENV_FETCH_TIMEOUT_MS",
                 DEFAULT_JOB_ENV_FETCH_TIMEOUT_MS,
             )?,
+            lane_discovery_interval_secs: env_u64(
+                "LANE_DISCOVERY_INTERVAL_SECS",
+                DEFAULT_LANE_DISCOVERY_INTERVAL_SECS,
+            )?,
         })
     }
-}
-
-/// `BACKOFF_SECS` 環境変数（CSV）を `Vec<u64>` に変換する (M4c)。
-///
-/// 受理形式:
-/// - 未設定 → `[5, 15, 60]`（既定）
-/// - 空文字（"" や " "）→ `[]`（backoff 無効・固定 ack_wait 構成）
-/// - "5,15,60" / "5, 15, 60" → `[5, 15, 60]`
-///
-/// 不正値（負数・非数値）はエラー（fail-fast）。CP の token exp 計算と齟齬しないよう
-/// 合計値は呼び出し側の運用判断（README 注釈）。
-fn parse_backoff_secs(key: &str) -> anyhow::Result<Vec<u64>> {
-    // M8: 解釈規則の真実は faas_shared にある。control-plane も lane consumer を作る際に
-    // 同じ規則で backoff を読む必要があるため（TTL 結合: §3.3 のトークン exp 計算と
-    // consumer の再配送間隔がずれると、正規の遅延結果がトークン失効扱いになる）。
-    let raw = std::env::var(key).ok();
-    faas_shared::parse_backoff_secs(raw.as_deref()).map_err(|e| anyhow!("env var {key} {e}"))
 }
 
 /// u64 の任意 env。欠損は default、不正値はエラー。値は trim する。
@@ -462,34 +436,27 @@ async fn main() -> anyhow::Result<()> {
     let worker_metrics = metrics::Metrics::init();
     spawn_metrics_server(worker_metrics.clone(), settings.metrics_bind_addr.clone());
 
-    // JetStream stream / consumer を冪等に用意する。
-    // M3c: ack_wait / max_deliver は CP のトークン exp と同一定数から導出する（TTL 結合, §3.3）。
-    // M4c: backoff を pull consumer config に流し、最終配送試行のシグナルを `delivered` で取れるようにする。
-    let consumer = ensure_consumer(
-        &jetstream,
-        settings.ack_wait_secs,
-        settings.max_deliver,
-        &settings.backoff_secs,
-    )
-    .await?;
+    // M8-1 / M8-3: stream と lane consumer の作成者は **control-plane 単独**である。
+    // worker は取得と不変条件の検査だけを行い、購読すべき lane は NATS から発見する。
+    let stream = open_invoke_stream(&jetstream).await?;
+
     // M4c: `.failed` (DLQ) 用の core NATS 経路は stream を貼らず、CP の subscriber が core
     // で購読する（result と同じトランスポート規約）。stream を作らない理由は、(a) DLQ メッセージ
     // は最終配送失敗時に worker が 1 度 publish するだけで JetStream の durable 保証が無くても
     // reaper の stuck-execution sweeper が二重安全網になっていること、(b) stream を増やすと
-    // 観測・運用面の複雑度が増し M4c のブラスト半径が広がること、による。`.failed` の durable
-    // stream 化は後続スライス（M4 完了後）で再評価する。
+    // 観測・運用面の複雑度が増し M4c のブラスト半径が広がること、による。
 
     info!(
-        durable = DURABLE_NAME,
         stream = STREAM_NAME,
         cache_dir = %settings.wasm_cache_dir.display(),
-        "worker started; pulling jobs"
+        discovery_interval_secs = settings.lane_discovery_interval_secs,
+        "worker started; discovering lanes"
     );
 
     let worker = Arc::new(Worker {
         engine,
         pool,
-        nats,
+        nats: nats.clone(),
         http,
         wasm_cache_dir: settings.wasm_cache_dir,
         cache,
@@ -498,9 +465,138 @@ async fn main() -> anyhow::Result<()> {
         job_env_fetch_timeout: Duration::from_millis(settings.job_env_fetch_timeout_ms),
     });
 
-    let max_deliver = settings.max_deliver as i64;
+    run_lane_supervisor(
+        worker,
+        stream,
+        nats,
+        settings.max_deliver as i64,
+        settings.lane_discovery_interval_secs,
+    )
+    .await
+}
 
-    // 共有 Pull Consumer のメッセージループ。
+// ============================================================================
+// lane supervisor / lane ループ (M8-3, §3.7)
+// ============================================================================
+
+/// 購読すべき lane を発見し、lane ごとの pull ループを起動 / 停止し続ける。
+///
+/// discovery の契機は 2 つ:
+/// 1. **`faas.lane.changed` の core NATS 通知**（control-plane が lane を作成 / 削除したとき）。
+///    周期 discovery だけだと「lane はあるが worker がまだ購読していない」窓が最大 1 周期残り、
+///    新規テナントの初回 `POST /invoke?wait=1` が必ず 202 へ縮退して **M6 の完了条件が壊れる**
+///    （`SYNC_REPLY_TIMEOUT_MS` は既定 5 秒）。
+/// 2. **周期 tick**（`LANE_DISCOVERY_INTERVAL_SECS`）。通知の取りこぼしと worker 再起動直後を
+///    吸収する収束用の保険。
+async fn run_lane_supervisor(
+    worker: Arc<Worker>,
+    stream: async_nats::jetstream::stream::Stream,
+    nats: async_nats::Client,
+    max_deliver: i64,
+    discovery_interval_secs: u64,
+) -> anyhow::Result<()> {
+    use std::collections::HashMap;
+
+    // lane 名 -> 実行中タスク。発見されなくなった lane は abort する。
+    let mut running: HashMap<String, tokio::task::JoinHandle<()>> = HashMap::new();
+
+    // lane 変更通知の購読（core NATS。取りこぼしても周期 tick が収束させるので durable 不要）。
+    let mut changed = match nats.subscribe(faas_shared::LANE_CHANGED_SUBJECT).await {
+        Ok(sub) => Some(sub),
+        Err(e) => {
+            // 購読できなくても周期 discovery で収束する。ただし新規テナントの初回同期 invoke が
+            // 縮退しうるので loud に警告する。
+            warn!(
+                error = %e,
+                "could not subscribe to lane change notifications;                  falling back to periodic discovery only (first sync invoke of a new tenant may degrade to 202)"
+            );
+            None
+        }
+    };
+
+    let mut ticker = tokio::time::interval(Duration::from_secs(discovery_interval_secs.max(1)));
+
+    loop {
+        // (1) 現在の lane 一覧を取り、タスク集合を収束させる。
+        match discover_lanes(&stream).await {
+            Ok(lanes) => {
+                // 消えた lane のタスクを止める。
+                running.retain(|name, handle| {
+                    if lanes.contains(name) {
+                        true
+                    } else {
+                        info!(lane = %name, "lane disappeared; stopping its pull loop");
+                        handle.abort();
+                        false
+                    }
+                });
+                // 新しい lane のタスクを起こす。
+                for name in &lanes {
+                    if running.contains_key(name) {
+                        continue;
+                    }
+                    let consumer = match stream
+                        .get_consumer::<async_nats::jetstream::consumer::pull::Config>(name)
+                        .await
+                    {
+                        Ok(c) => c,
+                        Err(e) => {
+                            warn!(lane = %name, error = %e, "failed to open lane consumer");
+                            continue;
+                        }
+                    };
+                    info!(lane = %name, "subscribing to lane");
+                    let w = Arc::clone(&worker);
+                    let lane_name = name.clone();
+                    running.insert(
+                        name.clone(),
+                        tokio::spawn(async move {
+                            lane_loop(w, consumer, lane_name, max_deliver).await;
+                        }),
+                    );
+                }
+                worker.metrics.subscribed_lanes.set(running.len() as i64);
+            }
+            Err(e) => {
+                // best-effort: 発見に失敗しても既存の lane ループは動き続ける。
+                warn!(error = %e, "lane discovery failed; keeping current subscriptions");
+            }
+        }
+
+        // (2) 次の契機を待つ。
+        match changed.as_mut() {
+            Some(sub) => {
+                tokio::select! {
+                    _ = ticker.tick() => {}
+                    msg = sub.next() => {
+                        if msg.is_none() {
+                            // 購読が閉じた。以後は周期 discovery のみで収束させる。
+                            warn!("lane change subscription closed; falling back to periodic discovery");
+                            changed = None;
+                        }
+                    }
+                }
+            }
+            None => {
+                ticker.tick().await;
+            }
+        }
+    }
+}
+
+/// 1 本の lane（= consumer）を pull し続けるループ。
+///
+/// **M7 までの共有 consumer ループと、メッセージ処理の中身は 1 行も変えていない**
+/// （ack-after-publish / DLQ / 再配送の規約は M3d / M4c で確立した不変条件そのものであり、
+/// lane 分割はその外側の「どの consumer から引くか」だけを変える）。
+async fn lane_loop(
+    worker: Arc<Worker>,
+    consumer: async_nats::jetstream::consumer::Consumer<
+        async_nats::jetstream::consumer::pull::Config,
+    >,
+    lane: String,
+    max_deliver: i64,
+) {
     loop {
         let mut batch = match consumer
             .batch()
@@ -511,7 +607,7 @@ async fn main() -> anyhow::Result<()> {
         {
             Ok(b) => b,
             Err(e) => {
-                error!(error = %e, "failed to pull batch; backing off");
+                error!(lane = %lane, error = %e, "failed to pull batch; backing off");
                 tokio::time::sleep(Duration::from_secs(1)).await;
                 continue;
             }
@@ -521,7 +617,7 @@ async fn main() -> anyhow::Result<()> {
             let msg = match item {
                 Ok(m) => m,
                 Err(e) => {
-                    warn!(error = %e, "error reading pulled message");
+                    warn!(lane = %lane, error = %e, "error reading pulled message");
                     continue;
                 }
             };
@@ -626,129 +722,75 @@ fn build_engine() -> anyhow::Result<Engine> {
 // JetStream consumer 用意
 // ============================================================================
 
-/// invoke subject を束ねる stream と、共有 Pull Consumer (durable) を冪等に作る。
+/// invoke stream を取得し、**不変条件を検査する**（M8-1 / M8-3）。
 ///
-/// M3c (§3.3 TTL 結合): `ack_wait_secs` / `max_deliver` は CP のトークン exp
-/// （`exp = iat + ack_wait*max_deliver + 実行上限 + 余裕`）と **同一の定数** から渡される。
-/// これにより通常の再配送がトークン失効より先に届き、正規の遅延結果を取りこぼさない。
+/// M7 までは worker が stream と共有 durable consumer の両方を `get_or_create` していたが、
+/// M8 で **どちらも control-plane が唯一の作成者**になった。理由は 2 つ:
 ///
-/// M4c (§3.3 / §6.6): `backoff_secs` を pull consumer の `backoff` 配列にセットする。空配列なら
-/// 従来の「固定 ack_wait」構成（既存挙動）と同一。最悪滞留時間 `Σ backoff[i]` は CP の token exp と
-/// 整合させること（README 注釈）。DLQ subject は別接続（core NATS の `tenant.*.component.failed`）に
-/// 流す方針のため pull consumer 自体には dead-letter 設定を持たせない。代わりに worker が
-/// `delivered >= max_deliver` の最終試行で publish 失敗を検知したとき、自前で `.failed` を publish
-/// してから un-ack に倒す（[`Worker::publish_failed`] / [`Worker::handle_payload`] 参照）。
+/// 1. テナント別 lane consumer を作るにはテナント一覧とクォータが要り、それは CP の持ち物である。
+/// 2. worker 0 台のとき consumer が存在しないと、backlog シグナル（オートスケールの入力）が
+///    「未消化の仕事があるのに consumer が無いので読めない」というブートストラップ・
+///    デッドロックを起こし、scale-from-zero が原理的に成立しない。
 ///
-/// 注意（drift）: `get_or_create_consumer` は **既存の durable consumer の config を必ずしも
-/// 更新しない**。既存 "workers" consumer が古い設定（ack_wait/max_deliver/backoff 未設定）で残って
-/// いると、ここで渡す値が黙って無視され TTL 結合が崩れる。本実装では、起動時に `consumer.info()`
-/// で現状値を取得し、欲しい設定とドリフトしていれば `delete_consumer` → 再 create でドリフトを
-/// 解消する。durable の場合でも stream 側に再配送状態が残っているため、消費中ジョブは取りこぼさない。
-async fn ensure_consumer(
+/// あわせて、M7 まで worker が持っていた drift 時の `delete_consumer` → 再 create も CP 側の
+/// `update_consumer` へ置き換わった。旧実装のコメントは「durable の場合でも stream 側に
+/// 再配送状態が残るため消費中ジョブは取りこぼさない」と書いていたが、**ack floor は consumer 側の
+/// 状態**であり `delete_consumer` で失われる（`DeliverPolicy::All` と Limits retention の
+/// 組み合わせでは stream 全履歴の再配送を招きうる）。
+///
+/// worker は取得と検査だけを行い、無ければ fail-fast する（CP を先に起動する運用）。
+async fn open_invoke_stream(
     jetstream: &async_nats::jetstream::Context,
-    ack_wait_secs: u64,
-    max_deliver: u64,
-    backoff_secs: &[u64],
-) -> anyhow::Result<
-    async_nats::jetstream::consumer::Consumer<async_nats::jetstream::consumer::pull::Config>,
-> {
-    use async_nats::jetstream::consumer::pull::Config as PullConfig;
-    use async_nats::jetstream::consumer::{AckPolicy, DeliverPolicy};
+) -> anyhow::Result<async_nats::jetstream::stream::Stream> {
     use async_nats::jetstream::stream::RetentionPolicy;
 
-    // §3.3: テナントワイルドカード `tenant.*.component.invoke` で束ねる。
-    let subject = invoke_subject_wildcard().to_string();
-
-    // M8-1 (§3.4): **worker は stream を作らない**。作成者は control-plane 単独であり、
-    // ここは取得と不変条件の検査だけを行う（二重定義による「先に起動した側が黙って勝つ」事故の除去）。
-    // stream が無ければ fail-fast する ＝ control-plane を先に起動する運用（README に明記）。
     let mut stream = jetstream.get_stream(STREAM_NAME).await.map_err(|e| {
         anyhow!(
             "get_stream({STREAM_NAME}) failed: {e}. \
-             start the control-plane first: it is the sole creator of the invoke stream (M8-1)"
+             start the control-plane first: it is the sole creator of the invoke stream and \
+             of the lane consumers (M8-1 / M8-3)"
         )
     })?;
 
-    // retention の検査は control-plane と同一（起動時に不変条件を検査する既存作法）。
     // Limits のままの stream に lane consumer を作ると、filter の重なりをサーバが拒否しなくなり
-    // 「どの subject もちょうど 1 consumer」の保証が静かに退化する。
-    let stream_info = stream
+    // 「どの subject もちょうど 1 consumer」の保証が静かに退化する。起動時に検査して止める。
+    let info = stream
         .info()
         .await
         .map_err(|e| anyhow!("stream info({STREAM_NAME}) failed: {e}"))?;
-    if stream_info.config.retention != RetentionPolicy::WorkQueue {
+    if info.config.retention != RetentionPolicy::WorkQueue {
         anyhow::bail!(
             "stream {STREAM_NAME} has retention {:?} but M8 requires WorkQueue \
-             (see README トラブルシュート for the drain-and-recreate procedure)",
-            stream_info.config.retention
+             (run `make recreate-stream`; see README トラブルシュート)",
+            info.config.retention
         );
     }
-    let stream = stream;
 
-    let backoff: Vec<Duration> = backoff_secs
-        .iter()
-        .copied()
-        .map(Duration::from_secs)
-        .collect();
-    let desired = PullConfig {
-        durable_name: Some(DURABLE_NAME.to_string()),
-        ack_policy: AckPolicy::Explicit,
-        deliver_policy: DeliverPolicy::All,
-        filter_subject: subject.clone(),
-        // M3c: トークン exp と同一定数から導出した ack_wait / max_deliver (§3.3)。
-        ack_wait: Duration::from_secs(ack_wait_secs),
-        max_deliver: max_deliver as i64,
-        // M4c: 再配送 backoff（§6.6）。空配列なら固定 ack_wait 構成。
-        backoff: backoff.clone(),
-        // M4d (§8 表 line 742): JetStream consumer の「配送済み未 ack」上限。
-        // 全テナント合算の後段歯止め。CP 側 admission の max_concurrent_executions は
-        // **テナント別**の上限であり MaxAckPending とは数える量が異なる（§8 line 750 解説）。
-        // 運用目安: Σ(アクティブテナント数 × max_concurrent_executions) ≲ MaxAckPending。
-        // 既定 1000 は仕様 §8 表に直接対応する固定値（env 化は M4 では行わない）。
-        max_ack_pending: MAX_ACK_PENDING,
-        ..Default::default()
-    };
+    Ok(stream)
+}
 
-    // durable + AckExplicit + DeliverAll で、複数 worker が共有して
-    // メッセージを分配する Pull Consumer を構成する (§6.3)。
-    let consumer = stream
-        .get_or_create_consumer(DURABLE_NAME, desired.clone())
-        .await
-        .map_err(|e| anyhow!("get_or_create_consumer failed: {e}"))?;
-
-    // M4c (drift 解消): `get_or_create_consumer` は既存 durable の config を更新しないため、
-    // info() の現状値を比較し、ドリフトしていれば delete + recreate する。durable 状態
-    // （stream-side の再配送進捗）は stream に残るため、消費中メッセージは取りこぼさない。
-    // 比較は ack_wait / max_deliver / backoff の 3 軸のみ（filter_subject 等は subject 体系で固定）。
-    let mut consumer = consumer;
-    let info = consumer
-        .info()
-        .await
-        .map_err(|e| anyhow!("consumer.info() failed: {e}"))?
-        .clone();
-    let drift = info.config.ack_wait != desired.ack_wait
-        || info.config.max_deliver != desired.max_deliver
-        || info.config.backoff != backoff
-        // M4d: 既存 durable が古い max_ack_pending（既定値）で残っていると §8 の
-        // backpressure 上限が黙って無効化されるため、ドリフト軸に含めて recreate する。
-        || info.config.max_ack_pending != desired.max_ack_pending;
-    if drift {
-        warn!(
-            durable = DURABLE_NAME,
-            stream = STREAM_NAME,
-            "consumer config drift detected; recreating to apply ack_wait/max_deliver/backoff/max_ack_pending"
-        );
-        stream
-            .delete_consumer(DURABLE_NAME)
-            .await
-            .map_err(|e| anyhow!("delete_consumer failed: {e}"))?;
-        consumer = stream
-            .get_or_create_consumer(DURABLE_NAME, desired)
-            .await
-            .map_err(|e| anyhow!("get_or_create_consumer (recreate) failed: {e}"))?;
+/// この worker が購読すべき lane（= consumer 名）の一覧を NATS から発見する (M8-3, §3.7)。
+///
+/// **権威は NATS の consumer 一覧**であり、worker は DB も CP の HTTP も触らない
+/// （テナント一覧を知る必要が無い ＝ 責務分離）。CP が作った consumer のうち、
+/// この worker が扱うべき 3 種（テナント専有 lane / overflow lane / legacy 共有）だけを拾う。
+async fn discover_lanes(
+    stream: &async_nats::jetstream::stream::Stream,
+) -> anyhow::Result<Vec<String>> {
+    let mut names = Vec::new();
+    let mut it = stream.consumer_names();
+    while let Some(n) = it.next().await {
+        let n = n.map_err(|e| anyhow!("listing consumer names failed: {e}"))?;
+        let mine = n == faas_shared::LEGACY_SHARED_DURABLE
+            || n == faas_shared::OVERFLOW_LANE_DURABLE
+            || faas_shared::tenant_from_lane_durable(&n).is_some();
+        if mine {
+            names.push(n);
+        }
     }
-
-    Ok(consumer)
+    // 決定的な順序にしておく（ログとメトリクスの読みやすさのため）。
+    names.sort();
+    Ok(names)
 }
 
 // ============================================================================
@@ -1967,32 +2009,7 @@ mod tests {
         assert_eq!(peak.load(Ordering::Relaxed), 1024);
     }
 
-    /// M4c: `BACKOFF_SECS` env のパースが既定 / 空 / CSV / 不正値で意図どおりに振る舞う。
-    /// 環境変数の状態はテスト間でグローバルなので、各ケースで先に `remove_var` して固定する。
-    #[test]
-    fn parse_backoff_secs_default_empty_and_csv() {
-        const KEY: &str = "TEST_BACKOFF_SECS_VAR";
-
-        // 未設定なら既定 `[5, 15, 60]`。
-        std::env::remove_var(KEY);
-        assert_eq!(parse_backoff_secs(KEY).unwrap(), vec![5, 15, 60]);
-
-        // 空文字（trim 後）は「backoff 無効」を意味する空 Vec。
-        std::env::set_var(KEY, "");
-        assert_eq!(parse_backoff_secs(KEY).unwrap(), Vec::<u64>::new());
-        std::env::set_var(KEY, "   ");
-        assert_eq!(parse_backoff_secs(KEY).unwrap(), Vec::<u64>::new());
-
-        // CSV（前後空白も許容）。
-        std::env::set_var(KEY, "5,15,60");
-        assert_eq!(parse_backoff_secs(KEY).unwrap(), vec![5, 15, 60]);
-        std::env::set_var(KEY, " 1, 2 ,3 ");
-        assert_eq!(parse_backoff_secs(KEY).unwrap(), vec![1, 2, 3]);
-
-        // 不正値は fail-fast（後続スライスで CP の token exp と齟齬を起こさせない）。
-        std::env::set_var(KEY, "5,abc,60");
-        assert!(parse_backoff_secs(KEY).is_err());
-
-        std::env::remove_var(KEY);
-    }
+    // M8-3: `parse_backoff_secs` の単体テストは faas_shared へ移った
+    // （`parse_backoff_secs_matches_legacy_rules`）。consumer の作成者が control-plane へ移り、
+    // backoff の解釈規則を CP と worker が共有する必要が生じたため、規則ごと共有契約へ移設した。
 }

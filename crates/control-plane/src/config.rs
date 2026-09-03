@@ -146,6 +146,11 @@ pub struct Config {
     pub ack_wait_secs: u64,
     /// JetStream consumer の最大再配送回数（worker と共有。token exp 計算にも使う）。
     pub max_deliver: u64,
+    /// M8: 再配送 backoff（秒, CSV）。M7 までは worker だけが読んでいたが、consumer の作成者が
+    /// control-plane へ移ったため **CP もこの値の所有者**になった（§3.3 の TTL 結合: トークン exp と
+    /// 再配送間隔がずれると、正規の遅延結果がトークン失効扱いで破棄される）。
+    /// worker と同じ `BACKOFF_SECS` を読み、解釈規則も `faas_shared::parse_backoff_secs` で共有する。
+    pub backoff_secs: Vec<u64>,
     /// token exp に足す余裕秒数。
     pub token_margin_secs: u64,
 
@@ -363,6 +368,10 @@ impl Config {
             // M3c: 署名鍵 / kid は必須。TTL 定数は faas_shared の既定を env で上書き可能。
             job_signing_key: Redacted::new(env_required("JOB_SIGNING_KEY")?),
             job_signing_kid: env_required("JOB_SIGNING_KID")?,
+            backoff_secs: faas_shared::parse_backoff_secs(
+                std::env::var("BACKOFF_SECS").ok().as_deref(),
+            )
+            .map_err(|e| anyhow::anyhow!("env var BACKOFF_SECS {e}"))?,
             ack_wait_secs: env_u64("ACK_WAIT_SECS", faas_shared::ACK_WAIT_SECS)?,
             max_deliver: env_u64("MAX_DELIVER", faas_shared::MAX_DELIVER)?,
             token_margin_secs: env_u64("TOKEN_MARGIN_SECS", faas_shared::TOKEN_MARGIN_SECS)?,
@@ -451,6 +460,19 @@ impl Config {
     /// グローバル既定から admission 制御パラメータ束を組み立てる (M3d, §8)。
     ///
     /// 現状はグローバル既定のみを反映する（per-tenant `quotas` 上書きは後続スライス）。
+    /// M8 (§3.7): lane provisioning の設定束を組み立てる。
+    pub fn lanes(&self) -> crate::state::LaneConfig {
+        crate::state::LaneConfig {
+            enabled: self.tenant_lanes_enabled,
+            max_dedicated: self.max_dedicated_lanes,
+            ack_pending_headroom: self.lane_ack_pending_headroom,
+            overflow_ack_pending: self.lane_overflow_ack_pending,
+            ack_wait_secs: self.ack_wait_secs,
+            max_deliver: self.max_deliver,
+            backoff_secs: self.backoff_secs.clone(),
+        }
+    }
+
     pub fn admission(&self) -> crate::state::AdmissionConfig {
         use crate::store::{InflightParams, LockoutParams, RateLimitParams};
         crate::state::AdmissionConfig {

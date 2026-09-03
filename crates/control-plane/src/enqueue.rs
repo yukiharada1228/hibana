@@ -295,6 +295,14 @@ pub async fn enqueue_execution(
     };
     let payload = serde_json::to_vec(&job)?;
 
+    // --- M8-3 (§3.7.3): publish は必ず lane 作成の後 ---
+    // これで「メッセージは stream にあるが誰も購読していない」窓が消える。
+    // `TENANT_LANES_ENABLED=false` のときは何もしない（M7 までと完全に同一の経路）。
+    // **fail-open**: lane を作れなくても enqueue は止めない（`FailPolicy::TENANT_LANE`）。
+    // 止めると NATS の一時的な不調でテナントのジョブが一切受け付けられなくなる。
+    // 取りこぼしは reconcile が最大 1 周期以内に収束させる。
+    crate::lanes::ensure_lane_for_tenant(state, req.tenant).await;
+
     let mut headers = NatsHeaderMap::new();
     headers.insert("Nats-Msg-Id", req.execution_id.as_str());
     let ack = match state

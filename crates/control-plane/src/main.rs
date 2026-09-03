@@ -21,6 +21,7 @@ mod error;
 mod extract;
 mod handlers;
 mod handlers_secrets;
+mod lanes;
 mod login;
 mod metrics;
 mod reaper;
@@ -208,6 +209,7 @@ async fn main() -> anyhow::Result<()> {
         config.sync_reply_timeout_ms,
         secret_keyring,
         config.job_env_exchange_rate_per_min,
+        config.lanes(),
     );
 
     // --- result 購読タスク ---
@@ -260,6 +262,15 @@ async fn main() -> anyhow::Result<()> {
     let cron_poll_interval = config.cron_poll_interval_secs;
     tokio::spawn(async move {
         scheduler::run(scheduler_state, cron_poll_interval).await;
+    });
+
+    // --- lane reconciler（M8-3, §3.7）---
+    // consumer の作成 / 更新 / 削除は **control-plane が唯一の書き手**である（M7 までは worker）。
+    // 単一 writer は pg_try_advisory_lock で強制する（CP はステートレス × N が前提のため）。
+    let lane_state = state.clone();
+    let lane_interval = config.lane_reconcile_interval_secs;
+    tokio::spawn(async move {
+        lanes::run_lane_reconcile(lane_state, lane_interval).await;
     });
 
     // --- KEK ローテーション進捗の gauge 更新（M7c-4, §4.7.2）---

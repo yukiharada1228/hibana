@@ -60,6 +60,11 @@ pub struct Metrics {
     /// 内容は一切見ずに捨てるが、「ゲストが何か書いている」ことだけは観測できるようにする
     /// （デバッグの手掛かりを残しつつ、何を書いたかは分からない状態を保つ）。
     pub guest_stderr_dropped_bytes_total: IntCounter,
+    /// M8 (§3.7): この worker が現に購読している lane 数。
+    ///
+    /// lane discovery が収束しているかを見るための gauge。0 のまま張り付いていれば
+    /// 「control-plane が lane を作っていない」か「discovery が失敗し続けている」ことが分かる。
+    pub subscribed_lanes: IntGauge,
 }
 
 impl Metrics {
@@ -142,6 +147,15 @@ impl Metrics {
             .register(Box::new(guest_stderr_dropped_bytes_total.clone()))
             .expect("register guest_stderr_dropped_bytes_total");
 
+        let subscribed_lanes = IntGauge::new(
+            "wasmtime_subscribed_lanes",
+            "Number of JetStream lane consumers this worker is currently pulling from",
+        )
+        .expect("metric: subscribed_lanes");
+        registry
+            .register(Box::new(subscribed_lanes.clone()))
+            .expect("register subscribed_lanes");
+
         Arc::new(Self {
             registry,
             wasmtime_execution_duration_seconds,
@@ -151,6 +165,7 @@ impl Metrics {
             executions_total,
             dlq_published_total,
             guest_stderr_dropped_bytes_total,
+            subscribed_lanes,
         })
     }
 

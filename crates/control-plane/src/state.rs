@@ -2,6 +2,7 @@
 //!
 //! axum ハンドラ / バックグラウンド task / 認証層が共有する。
 
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -28,6 +29,51 @@ pub const QUOTA_MAX_CONCURRENT_EXECUTIONS: u64 = 200;
 /// さらに頭打ちにするため、ここは「テナントが希望できる上限」でしかない。過大な希望値が
 /// consumer metadata を通じて worker の計算へ流れ込まないようクランプする。
 pub const QUOTA_MAX_LANE_CONCURRENCY: u64 = 32;
+
+/// lane reconcile の advisory lock キー（プロセス間で固定・衝突しない値）。
+///
+/// 他の advisory lock 用途が増えたときのために、値の由来をここに明記しておく:
+/// "faas" + M8 のマイルストン番号を並べただけの固定値であり、意味は無い（一意であればよい）。
+const LANE_RECONCILE_LOCK_KEY: i64 = 0x0FAA_5008;
+
+/// lane reconcile の単一 writer ロック。drop で解放する。
+pub struct LaneReconcileGuard {
+    conn: Option<sqlx::pool::PoolConnection<sqlx::Postgres>>,
+}
+
+impl Drop for LaneReconcileGuard {
+    fn drop(&mut self) {
+        // セッションロックなので、接続を返す前に明示的に解放する。接続がプールへ戻って
+        // 別の用途で使われたときにロックを持ち越さないため。
+        if let Some(mut conn) = self.conn.take() {
+            tokio::spawn(async move {
+                let _ = sqlx::query("SELECT pg_advisory_unlock($1)")
+                    .bind(LANE_RECONCILE_LOCK_KEY)
+                    .execute(&mut *conn)
+                    .await;
+            });
+        }
+    }
+}
+
+/// M8 (§3.7): lane provisioning の設定束。`Config` から派生する。
+#[derive(Debug, Clone)]
+pub struct LaneConfig {
+    /// テナント別 lane を有効にするか（false = M7 までと同一トポロジ）。
+    pub enabled: bool,
+    /// 専有 lane の上限数。超過分は overflow lane 1 本へ束ねる。
+    pub max_dedicated: u64,
+    /// lane consumer の `max_ack_pending` に足す余裕。
+    pub ack_pending_headroom: u64,
+    /// overflow lane の `max_ack_pending`（固定値）。
+    pub overflow_ack_pending: u64,
+    /// consumer の ack_wait 秒（トークン exp と同一定数から導出, §3.3）。
+    pub ack_wait_secs: u64,
+    /// consumer の最大再配送回数。
+    pub max_deliver: u64,
+    /// 再配送 backoff（秒）。
+    pub backoff_secs: Vec<u64>,
+}
 
 /// admission 制御のパラメータ束（M3d, §8）。`Config` のグローバル既定から派生し、
 /// invoke handler（レート制限 / in-flight）と login（ロックアウト）が参照する。
@@ -216,6 +262,19 @@ struct Inner {
     waiters: WaiterRegistry,
     /// M7c (§4.6): `/internal/job-env` の per-IP / per-tenant レート上限（req/分）。
     job_env_exchange_rate_per_min: u64,
+    /// M8 (§3.7): lane provisioning の設定束（reconcile と enqueue ensure が参照する）。
+    lanes: LaneConfig,
+    /// M8 (§3.7.3): 「この lane は既に在る」ことのプロセスローカルなキャッシュ。
+    ///
+    /// **世代カウンタとセットで使う**。reconcile が lane を 1 本でも作成 / 削除したら世代を
+    /// バンプし、次の ensure がキャッシュを丸ごと捨てる。これが無いと
+    /// 「suspend → reconcile が lane 削除 → 再 activate」の後にキャッシュヒットで二度と
+    /// lane を作り直さず、そのテナントのジョブが**無音で配送されなくなる**。
+    lane_cache: DashMap<String, u64>,
+    /// lane トポロジの世代。reconcile が変更を加えるたびに +1 する。
+    lane_generation: AtomicU64,
+    /// reconcile が最後に観測した dedicated lane 数（ホットパスで assign_lanes を評価しないため）。
+    dedicated_lane_count: AtomicU64,
     /// M7c (§10 / §15): secret の KEK キーリング。**control-plane だけが持つ**（worker は
     /// keyless by design, §3.3）。暗号化は常に active kid、復号は行の kid で選ぶ。
     secret_keyring: Arc<crate::secrets::SecretKeyring>,
@@ -241,6 +300,7 @@ impl AppState {
         sync_reply_timeout_ms: u64,
         secret_keyring: Arc<crate::secrets::SecretKeyring>,
         job_env_exchange_rate_per_min: u64,
+        lanes: LaneConfig,
     ) -> Self {
         // invoke の JetStream publish 用 context は NATS クライアントから構築する。
         let jetstream = async_nats::jetstream::new(nats.clone());
@@ -266,6 +326,10 @@ impl AppState {
                 waiters: Arc::new(DashMap::new()),
                 secret_keyring,
                 job_env_exchange_rate_per_min,
+                lanes,
+                lane_cache: DashMap::new(),
+                lane_generation: AtomicU64::new(0),
+                dedicated_lane_count: AtomicU64::new(0),
             }),
         }
     }
@@ -283,7 +347,94 @@ impl AppState {
         &self.inner.jetstream
     }
 
-    /// ジョブ署名器（invoke が sign、subscriber が verify に使う）。
+    // --- M8 (§3.7): lane provisioning ---
+
+    /// テナント別 lane が有効か。
+    pub fn tenant_lanes_enabled(&self) -> bool {
+        self.inner.lanes.enabled
+    }
+
+    /// 専有 lane の上限数。
+    pub fn max_dedicated_lanes(&self) -> usize {
+        self.inner.lanes.max_dedicated as usize
+    }
+
+    /// lane consumer の `max_ack_pending` に足す余裕。
+    pub fn lane_ack_pending_headroom(&self) -> u64 {
+        self.inner.lanes.ack_pending_headroom
+    }
+
+    /// overflow lane / legacy consumer の `max_ack_pending`。
+    pub fn lane_overflow_ack_pending(&self) -> i64 {
+        self.inner.lanes.overflow_ack_pending as i64
+    }
+
+    /// lane consumer の配送パラメータ（ack_wait 秒 / max_deliver / backoff 秒）。
+    ///
+    /// M8 で consumer の作成者が control-plane へ移ったため、**トークン exp と再配送間隔の
+    /// TTL 結合（§3.3）の責任も control-plane が持つ**。worker と値をずらしてはならない。
+    pub fn lane_delivery_params(&self) -> (u64, u64, Vec<u64>) {
+        (
+            self.inner.lanes.ack_wait_secs,
+            self.inner.lanes.max_deliver,
+            self.inner.lanes.backoff_secs.clone(),
+        )
+    }
+
+    /// lane ensure キャッシュに載っているか（**現世代のエントリだけ有効**）。
+    pub fn lane_cache_contains(&self, tenant: &str) -> bool {
+        let gen = self.inner.lane_generation.load(Ordering::Relaxed);
+        self.inner
+            .lane_cache
+            .get(tenant)
+            .map(|e| *e.value() == gen)
+            .unwrap_or(false)
+    }
+
+    /// lane ensure キャッシュへ現世代で載せる。
+    pub fn lane_cache_insert(&self, tenant: &str) {
+        let gen = self.inner.lane_generation.load(Ordering::Relaxed);
+        self.inner.lane_cache.insert(tenant.to_string(), gen);
+    }
+
+    /// lane トポロジの世代をバンプする（= 既存キャッシュを一斉に無効化する）。
+    pub fn bump_lane_generation(&self) {
+        self.inner.lane_generation.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// reconcile が観測した dedicated lane 数を記録する。
+    pub fn set_dedicated_lane_count(&self, n: usize) {
+        self.inner
+            .dedicated_lane_count
+            .store(n as u64, Ordering::Relaxed);
+    }
+
+    /// 専有 lane 枠に空きがあるか（enqueue ホットパスの判定。`assign_lanes` を評価しない）。
+    pub fn has_dedicated_lane_capacity(&self) -> bool {
+        (self.inner.dedicated_lane_count.load(Ordering::Relaxed) as usize)
+            < self.max_dedicated_lanes()
+    }
+
+    /// lane reconcile の単一 writer ロックを試みる (§3.7.1)。
+    ///
+    /// `pg_try_advisory_lock` のセッションロックを**専用接続**の上で取る。パス中に NATS の
+    /// RPC を挟むため tx は張らない。取れなければ `None`（他インスタンスに任せる）。
+    /// 返り値の [`LaneReconcileGuard`] は drop 時に `pg_advisory_unlock` を試みる。
+    pub async fn try_lane_reconcile_lock(&self) -> anyhow::Result<Option<LaneReconcileGuard>> {
+        use sqlx::Row as _;
+        let mut conn = self.pool().acquire().await?;
+        let got: bool = sqlx::query("SELECT pg_try_advisory_lock($1) AS locked")
+            .bind(LANE_RECONCILE_LOCK_KEY)
+            .fetch_one(&mut *conn)
+            .await?
+            .try_get("locked")?;
+        if got {
+            Ok(Some(LaneReconcileGuard { conn: Some(conn) }))
+        } else {
+            Ok(None)
+        }
+    }
+
     /// `/internal/job-env` のレート上限（req/分）。
     pub fn job_env_exchange_rate_per_min(&self) -> u64 {
         self.inner.job_env_exchange_rate_per_min
