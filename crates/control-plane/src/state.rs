@@ -278,6 +278,26 @@ struct Inner {
     /// M7c (§10 / §15): secret の KEK キーリング。**control-plane だけが持つ**（worker は
     /// keyless by design, §3.3）。暗号化は常に active kid、復号は行の kid で選ぶ。
     secret_keyring: Arc<crate::secrets::SecretKeyring>,
+    /// M8 (§5): オートスケールの方針（env 由来・不変）。
+    scale_policy: crate::scale::ScalePolicy,
+    /// M8 (§5): backlog ポーラが書き、`GET /internal/scale` が読む共有スナップショット。
+    ///
+    /// `std::sync::Mutex` で足りる。中身は数値 4 つで、ロックを持ったまま await しない
+    /// （async な Mutex を使うと「観測ループが HTTP ハンドラを待つ」構造ができてしまう）。
+    scale_snapshot: std::sync::Mutex<ScaleSnapshot>,
+}
+
+/// M8 (§5.2 / §5.4): 観測と露出のあいだで受け渡す最小の状態。
+#[derive(Debug, Clone, Copy)]
+pub struct ScaleSnapshot {
+    pub backlog: u64,
+    pub lanes: usize,
+    /// 最後に成功した観測の時刻。`None` = 一度も観測できていない。
+    pub last_ok: Option<std::time::Instant>,
+    /// 判断ロジックの持ち越し状態。
+    pub state: crate::scale::ScaleState,
+    /// 直近の判断結果。まだ判断していなければ `None`。
+    pub last_decision: Option<crate::scale::Decision>,
 }
 
 impl AppState {
@@ -301,6 +321,7 @@ impl AppState {
         secret_keyring: Arc<crate::secrets::SecretKeyring>,
         job_env_exchange_rate_per_min: u64,
         lanes: LaneConfig,
+        scale_policy: crate::scale::ScalePolicy,
     ) -> Self {
         // invoke の JetStream publish 用 context は NATS クライアントから構築する。
         let jetstream = async_nats::jetstream::new(nats.clone());
@@ -330,6 +351,15 @@ impl AppState {
                 lane_cache: DashMap::new(),
                 lane_generation: AtomicU64::new(0),
                 dedicated_lane_count: AtomicU64::new(0),
+                scale_policy,
+                scale_snapshot: std::sync::Mutex::new(ScaleSnapshot {
+                    backlog: 0,
+                    lanes: 0,
+                    last_ok: None,
+                    // 初期 target は 0 ではなく min_workers（§5.3 `ScaleState::new` の doc 参照）。
+                    state: crate::scale::ScaleState::new(&scale_policy),
+                    last_decision: None,
+                }),
             }),
         }
     }
@@ -413,6 +443,84 @@ impl AppState {
     pub fn has_dedicated_lane_capacity(&self) -> bool {
         (self.inner.dedicated_lane_count.load(Ordering::Relaxed) as usize)
             < self.max_dedicated_lanes()
+    }
+
+    /// M8 (§5): スケール方針（env 由来・不変）。
+    pub fn scale_policy(&self) -> &crate::scale::ScalePolicy {
+        &self.inner.scale_policy
+    }
+
+    /// M8 (§5.2): ポーラが 1 周期ぶんの観測を反映し、判断ロジックを 1 歩進める。
+    ///
+    /// 判断結果を返すのは、呼び出し側が gauge に出すためである（gauge への書き込みまで
+    /// ここでやると、状態と観測の責務が混ざる）。
+    pub fn observe_backlog(&self, backlog: u64, lanes: usize) -> crate::scale::Decision {
+        let now = std::time::Instant::now();
+        let mut snap = self.lock_scale_snapshot();
+        snap.backlog = backlog;
+        snap.lanes = lanes;
+        snap.last_ok = Some(now);
+        let sig = crate::scale::ScaleSignal {
+            backlog,
+            age_secs: 0,
+            ever_observed: true,
+        };
+        // 時計は「プロセス起動からの単調秒」を使う。壁時計を使うと NTP の巻き戻しで
+        // cooldown の計時が壊れる。
+        let decision = crate::scale::decide(
+            &self.inner.scale_policy,
+            &sig,
+            &mut snap.state,
+            monotonic_secs(),
+        );
+        snap.last_decision = Some(decision);
+        decision
+    }
+
+    /// M8 (§5.4): `GET /internal/scale` が読む現在値。
+    ///
+    /// **観測が失敗している間も backlog を 0 に落とさない**（前回値を保持する）。
+    /// 0 に落とすと「仕事が無い」と誤読され、NATS の一時的な瞬断がそのまま
+    /// scale-to-zero を誘発する。代わりに `age_secs` が伸び、判断ロジックが hold に落ちる。
+    pub fn scale_view(&self) -> (ScaleSnapshot, crate::scale::Decision) {
+        let mut snap = self.lock_scale_snapshot();
+        let age_secs = snap
+            .last_ok
+            .map(|t| t.elapsed().as_secs())
+            .unwrap_or(u64::MAX);
+        let sig = crate::scale::ScaleSignal {
+            backlog: snap.backlog,
+            age_secs,
+            ever_observed: snap.last_ok.is_some(),
+        };
+        let decision = crate::scale::decide(
+            &self.inner.scale_policy,
+            &sig,
+            &mut snap.state,
+            monotonic_secs(),
+        );
+        snap.last_decision = Some(decision);
+        (*snap, decision)
+    }
+
+    /// M8: `scale_signal_age_seconds` gauge 用。観測の鮮度だけを取り出す。
+    pub fn scale_signal_age_secs(&self) -> u64 {
+        self.lock_scale_snapshot()
+            .last_ok
+            .map(|t| t.elapsed().as_secs())
+            .unwrap_or(u64::MAX)
+    }
+
+    /// poisoned な Mutex から復帰する。
+    ///
+    /// 中身は数値だけで不変条件を持たないので、パニックした書き手が壊した「途中の状態」は
+    /// 存在しない。ここで panic を伝播させると、観測ループの一度の事故が
+    /// **`/internal/scale` を恒久的に落とす**ことになるので、明示的に握って続行する。
+    fn lock_scale_snapshot(&self) -> std::sync::MutexGuard<'_, ScaleSnapshot> {
+        self.inner
+            .scale_snapshot
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
     }
 
     /// lane reconcile の単一 writer ロックを試みる (§3.7.1)。
@@ -523,6 +631,20 @@ impl AppState {
     pub fn waiters(&self) -> &WaiterRegistry {
         &self.inner.waiters
     }
+}
+
+/// プロセス起動からの単調経過秒。
+///
+/// スケール判断のヒステリシスは**壁時計を使ってはならない**。NTP の巻き戻しで
+/// `now - below_since` が負方向に飛ぶと、cooldown が満たされないまま永久に待つか、
+/// 逆に一瞬で満たされて flapping する。単調時計なら両方起きない。
+fn monotonic_secs() -> u64 {
+    use std::sync::OnceLock;
+    static ORIGIN: OnceLock<std::time::Instant> = OnceLock::new();
+    ORIGIN
+        .get_or_init(std::time::Instant::now)
+        .elapsed()
+        .as_secs()
 }
 
 #[cfg(test)]

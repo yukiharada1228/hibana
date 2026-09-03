@@ -26,6 +26,7 @@ mod login;
 mod metrics;
 mod reaper;
 mod routing;
+mod scale;
 mod scheduler;
 mod secrets;
 mod signing;
@@ -210,6 +211,7 @@ async fn main() -> anyhow::Result<()> {
         secret_keyring,
         config.job_env_exchange_rate_per_min,
         config.lanes(),
+        config.scale_policy(),
     );
 
     // --- result 購読タスク ---
@@ -273,6 +275,25 @@ async fn main() -> anyhow::Result<()> {
         lanes::run_lane_reconcile(lane_state, lane_interval).await;
     });
 
+    // --- backlog ポーラ（M8-8, §5.2）---
+    // **0 = spawn しない**（既定）。観測ループを増やすのはオプトインにする。
+    //
+    // reaper の 30 秒周期を再利用しない理由: 30 秒古い depth で判断すると scale-out が最大
+    // 30 秒遅れ、それがそのままレイテンシの悪化になる。下の kid gauge が「頻度を要さない観測
+    // なので専用 env は増やさない」としているのとは**逆の判断**であり、差は
+    // 「観測の鮮度そのものが完了条件に効くかどうか」にある。
+    if config.scale_poll_interval_secs > 0 {
+        let scale_state = state.clone();
+        let scale_interval = config.scale_poll_interval_secs;
+        tokio::spawn(async move {
+            lanes::run_backlog_poller(scale_state, scale_interval).await;
+        });
+    } else {
+        tracing::info!(
+            "backlog poller disabled (SCALE_POLL_INTERVAL_SECS=0); GET /internal/scale will return 503"
+        );
+    }
+
     // --- KEK ローテーション進捗の gauge 更新（M7c-4, §4.7.2）---
     // reaper と同じ周期で回す（頻度を要さない観測なので専用 env は増やさない）。
     let kid_gauge_state = state.clone();
@@ -322,12 +343,25 @@ async fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// **内部専用**ルータ (M7c, §4.6.1)。`POST /internal/job-env` だけを載せる。
+/// **内部専用**ルータ (M7c §4.6.1 / M8 §5.4)。
+///
+/// # 載せる 2 ルートは、認証の根拠が異なる
+///
+/// | ルート | 認証の根拠 |
+/// | --- | --- |
+/// | `POST /internal/job-env` | **env-token の Ed25519 署名そのもの**。ハンドラ内でテナント停止も明示的に遮断する |
+/// | `GET /internal/scale` | **無認証**。ただし応答は stream の集計値のみで、テナント名も execution_id も含まない |
+///
+/// `GET /internal/scale` に `Principal` を要求しない根拠は「テナントデータを含まないこと」で
+/// あり、これは不変条件として維持しなければならない: **この応答に per-tenant の値を足しては
+/// ならない**（足すなら同時に認証を課すこと）。この listener は worker が `job-env` を叩く先で
+/// あり、worker は Ed25519 鍵を持たない**別トラストドメイン**である（仕様書 §3.3）。したがって
+/// ここに載せてよいのは「worker に見せてよい情報」だけで、キュー深さと目標台数はそれを満たす。
 ///
 /// # MUST NOT
 ///
 /// このルータを公開 listener（`BIND_ADDR`）へマウントしてはならない。`build_router` が被せる
-/// `auth::authenticate` / `require_scope` の外にあり、認証は **env-token の署名そのもの**である。
+/// `auth::authenticate` / `require_scope` の外にあり、`job-env` の認証は署名そのものである。
 /// 公開すると、署名鍵を持たない相手でも per-IP レート上限まで総当たりの試行ができる面が
 /// インターネットに露出する（署名検証は破れないが、無用な攻撃面を作らない）。
 ///
@@ -337,6 +371,7 @@ async fn main() -> anyhow::Result<()> {
 fn build_internal_router(state: AppState) -> Router {
     Router::new()
         .route("/internal/job-env", post(handlers_secrets::job_env))
+        .route("/internal/scale", get(handlers::internal_scale))
         .with_state(state)
 }
 
