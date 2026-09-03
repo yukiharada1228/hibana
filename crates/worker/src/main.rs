@@ -89,11 +89,15 @@ use wasmtime_wasi::{ResourceTable, WasiCtx, WasiCtxBuilder, WasiView};
 
 use bindings::Handler;
 
-/// JetStream の共有 Pull Consumer の durable 名。全 worker が共有する (§6.3)。
-const DURABLE_NAME: &str = "workers";
+/// JetStream の共有 Pull Consumer の durable 名 (§6.3)。
+///
+/// M8: 名前の真実は `faas_shared` にある（worker と control-plane の二重定義を解消した）。
+/// M8-4 以降はテナント別 lane consumer が主経路になり、この legacy 名は
+/// `TENANT_LANES_ENABLED=false` のロールバック時のみ使われる。
+const DURABLE_NAME: &str = faas_shared::LEGACY_SHARED_DURABLE;
 
-/// JetStream stream 名。invoke subject を束ねる。
-const STREAM_NAME: &str = "FAAS_INVOKE";
+/// JetStream stream 名。invoke subject を束ねる（真実は `faas_shared`）。
+const STREAM_NAME: &str = faas_shared::INVOKE_STREAM_NAME;
 
 /// 1 度の Pull で取りに行く最大メッセージ数。
 const PULL_BATCH: usize = 16;
@@ -288,24 +292,11 @@ impl Settings {
 /// 不正値（負数・非数値）はエラー（fail-fast）。CP の token exp 計算と齟齬しないよう
 /// 合計値は呼び出し側の運用判断（README 注釈）。
 fn parse_backoff_secs(key: &str) -> anyhow::Result<Vec<u64>> {
-    const DEFAULT_BACKOFF_SECS: &[u64] = &[5, 15, 60];
-    match std::env::var(key) {
-        Err(_) => Ok(DEFAULT_BACKOFF_SECS.to_vec()),
-        Ok(raw) => {
-            let trimmed = raw.trim();
-            if trimmed.is_empty() {
-                return Ok(Vec::new());
-            }
-            trimmed
-                .split(',')
-                .map(|s| {
-                    s.trim()
-                        .parse::<u64>()
-                        .with_context(|| format!("env var {key} contains a non-integer entry"))
-                })
-                .collect()
-        }
-    }
+    // M8: 解釈規則の真実は faas_shared にある。control-plane も lane consumer を作る際に
+    // 同じ規則で backoff を読む必要があるため（TTL 結合: §3.3 のトークン exp 計算と
+    // consumer の再配送間隔がずれると、正規の遅延結果がトークン失効扱いになる）。
+    let raw = std::env::var(key).ok();
+    faas_shared::parse_backoff_secs(raw.as_deref()).map_err(|e| anyhow!("env var {key} {e}"))
 }
 
 /// u64 の任意 env。欠損は default、不正値はエラー。値は trim する。

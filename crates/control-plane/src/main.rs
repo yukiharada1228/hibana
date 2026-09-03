@@ -526,17 +526,20 @@ async fn ensure_invoke_stream(jetstream: &async_nats::jetstream::Context) -> any
     use anyhow::anyhow;
     use async_nats::jetstream::stream::Config as StreamConfig;
 
-    // worker 側と一致: name=FAAS_INVOKE / subjects=[tenant.*.component.invoke]。
+    // M8: stream 名の真実は faas_shared にある（worker との二重定義を解消した）。
     let subject = faas_shared::invoke_subject_wildcard().to_string();
     jetstream
         .get_or_create_stream(StreamConfig {
-            name: "FAAS_INVOKE".to_string(),
+            name: faas_shared::INVOKE_STREAM_NAME.to_string(),
             subjects: vec![subject],
             ..Default::default()
         })
         .await
         .map_err(|e| anyhow!("get_or_create_stream(FAAS_INVOKE) failed: {e}"))?;
-    tracing::info!(stream = "FAAS_INVOKE", "ensured invoke jetstream stream");
+    tracing::info!(
+        stream = faas_shared::INVOKE_STREAM_NAME,
+        "ensured invoke jetstream stream"
+    );
     Ok(())
 }
 

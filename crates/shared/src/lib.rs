@@ -250,6 +250,140 @@ pub fn invoke_subject_wildcard() -> &'static str {
     "tenant.*.component.invoke"
 }
 
+// ============================================================================
+// JetStream トポロジ（M8, §3.3 / §8）
+// ============================================================================
+//
+// M8 以前は stream 名 / durable 名が worker と control-plane に**二重定義**されており、
+// 「先に起動した側の設定が黙って勝つ」事故の余地があった。共有契約はここが唯一の真実である。
+
+/// invoke stream 名。
+pub const INVOKE_STREAM_NAME: &str = "FAAS_INVOKE";
+
+/// テナント専有 lane の durable 名接頭辞。worker はこの接頭辞で lane を discovery する。
+pub const LANE_DURABLE_PREFIX: &str = "workers-t-";
+
+/// overflow lane の durable 名（固定）。dedicated 枠を超えたテナントを 1 本へ束ねる。
+pub const OVERFLOW_LANE_DURABLE: &str = "workers-overflow";
+
+/// M8-4 以前 / ロールバック時の共有 durable 名。
+///
+/// `TENANT_LANES_ENABLED=false` の間は control-plane がこの名前の consumer を
+/// ワイルドカード filter で 1 本だけ作る（= M7 までと同じトポロジ）。
+pub const LEGACY_SHARED_DURABLE: &str = "workers";
+
+/// lane トポロジの変更を worker へ即時通知する core NATS subject (M8, §3.7)。
+///
+/// 周期 discovery だけだと「lane はあるが worker がまだ購読していない」窓が最大 1 周期残り、
+/// 新規テナントの初回 `POST /invoke?wait=1` が必ず 202 へ縮退して **M6 の完了条件が壊れる**。
+/// control-plane は lane の作成 / 削除時にここへ 1 発 publish し、worker は即時再 discovery する。
+pub const LANE_CHANGED_SUBJECT: &str = "faas.lane.changed";
+
+/// テナント専有 lane の durable 名。
+pub fn lane_durable(tenant: &str) -> String {
+    format!("{LANE_DURABLE_PREFIX}{tenant}")
+}
+
+/// durable 名からテナント ID を復元する（worker の discovery が使う）。
+///
+/// overflow / legacy / 未知の consumer は `None`。
+pub fn tenant_from_lane_durable(name: &str) -> Option<&str> {
+    name.strip_prefix(LANE_DURABLE_PREFIX)
+        .filter(|t| !t.is_empty())
+}
+
+/// lane 割り当ての結果 (M8, §3.2)。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LaneAssignment {
+    /// `(durable 名, tenant_id)`。1 テナント 1 lane。
+    pub dedicated: Vec<(String, String)>,
+    /// overflow lane に入るテナント。
+    ///
+    /// **空なら overflow lane を作ってはならない (MUST)**: `filter_subjects` が空の consumer は
+    /// 「全 subject 購読」を意味し、「どの subject もちょうど 1 consumer」という不変条件を破壊する。
+    pub overflow: Vec<String>,
+}
+
+/// lane 割り当て（純関数, M8 §3.2）。
+///
+/// `tenants` は **(created_at ASC, id ASC) でソート済み**であること。
+/// 先頭 `max_dedicated` 件が専有 lane、残りが overflow lane に入る。
+///
+/// **安定性 (MUST)**: 入力が作成順なので、新規テナントの追加は既存の割り当てを一切動かさない。
+/// 割り当てが動くと consumer の delete/create が発生し、その窓でメッセージが
+/// 「どの lane にも属さない」状態になる（900 秒後に stuck sweeper が偽 failed を作る）。
+pub fn assign_lanes(tenants: &[String], max_dedicated: usize) -> LaneAssignment {
+    let split = max_dedicated.min(tenants.len());
+    LaneAssignment {
+        dedicated: tenants[..split]
+            .iter()
+            .map(|t| (lane_durable(t), t.clone()))
+            .collect(),
+        overflow: tenants[split..].to_vec(),
+    }
+}
+
+/// 1 lane に配る実効同時実行スロット数を決める（純関数, M8 §4.2）。
+///
+/// - `global`: `WORKER_MAX_CONCURRENCY`（このプロセス全体の上限）
+/// - `served_lanes`: このプロセスが現に購読している lane 数
+/// - `configured`: control-plane が consumer metadata で配った per-lane 設定
+///
+/// **なぜ Semaphore の二段構成にしないか**: 「per-lane Semaphore + プロセス全体 Semaphore」は
+/// `Σ(lane_concurrency) > global` のとき必ず破綻する —— lane ごとに独立タスクが走るため、
+/// 複数 lane が global permit を部分取得したまま互いに待つ hold-and-wait（デッドロック）が成立し、
+/// 空いている lane が `expires` 秒ぶん global permit を死蔵し、さらにメッセージ保持中に
+/// permit を待つと `ack_wait` を超えて**二重実行**を誘発する。
+/// 割り算で構成的に閉じれば、これら 3 つの障害の**経路そのものが存在しなくなる**。
+///
+/// 不変条件（CI で全列挙証明する）:
+/// `served_lanes <= global` の regime では `served_lanes * effective <= global`。
+pub fn effective_lane_concurrency(global: usize, served_lanes: usize, configured: usize) -> usize {
+    let fair_share = global / served_lanes.max(1);
+    // 最低 1 は必ず配る（0 だとその lane が永久に停止し、テナントのジョブが一切進まない）。
+    configured.min(fair_share).max(1)
+}
+
+/// このプロセスが購読してよい lane の上限 (M8 §4.2)。
+///
+/// これを超えた lane は「未提供」として loud に晒す（黙って詰まらせない）。
+pub fn served_lane_capacity(global: usize) -> usize {
+    global.max(1)
+}
+
+/// `BACKOFF_SECS` 形式の CSV を `Vec<u64>` に変換する (M4c → M8 で共有契約へ移設)。
+///
+/// M8 で lane consumer の作成責務が worker から control-plane へ移ったため、
+/// **両者が同じ規則で backoff を解釈する**必要がある（TTL 結合: §3.3 のトークン exp 計算と
+/// consumer の再配送間隔がずれると、正規の遅延結果がトークン失効扱いになる）。
+///
+/// 受理形式:
+/// - `None` → `[5, 15, 60]`（既定）
+/// - 空文字（`""` や `" "`）→ `[]`（backoff 無効・固定 ack_wait 構成）
+/// - `"5,15,60"` / `"5, 15, 60"` → `[5, 15, 60]`
+///
+/// 不正値（負数・非数値）は `Err(メッセージ)`（呼び出し側が fail-fast する）。
+pub fn parse_backoff_secs(raw: Option<&str>) -> std::result::Result<Vec<u64>, String> {
+    const DEFAULT_BACKOFF_SECS: &[u64] = &[5, 15, 60];
+    match raw {
+        None => Ok(DEFAULT_BACKOFF_SECS.to_vec()),
+        Some(raw) => {
+            let trimmed = raw.trim();
+            if trimmed.is_empty() {
+                return Ok(Vec::new());
+            }
+            trimmed
+                .split(',')
+                .map(|s| {
+                    s.trim()
+                        .parse::<u64>()
+                        .map_err(|_| format!("contains a non-integer entry: {:?}", s.trim()))
+                })
+                .collect()
+        }
+    }
+}
+
 /// result subject のテナントワイルドカード形 `tenant.*.component.result` (§3.3)。
 ///
 /// control-plane の subscriber が購読する。テナントは subject の第 2 トークンから導出し
@@ -1932,5 +2066,194 @@ mod tests {
         );
         // member の上限に admin は含まれない。
         assert!(!Role::Member.ceiling().contains(&Scope::Admin));
+    }
+
+    // ---- M8: JetStream トポロジの純関数（§3.2 / §4.2）----------------------
+
+    /// **I1 の数学的証明**: 任意のテナント集合 × 任意の `max_dedicated` について、
+    /// 全 `invoke_subject(t)` が **ちょうど 1 つの lane** の filter に現れる。
+    ///
+    /// これが「どの subject もちょうど 1 consumer に属する」＝ WorkQueue retention が
+    /// サーバ側で強制する不変条件の、クライアント側の対応物である。
+    #[test]
+    fn lanes_cover_every_subject_exactly_once() {
+        for n in 0..=24usize {
+            let tenants: Vec<String> = (0..n).map(|i| format!("ten_{i:03}")).collect();
+            for max_dedicated in 0..=24usize {
+                let a = assign_lanes(&tenants, max_dedicated);
+
+                // 各テナントの subject が現れる回数を数える。
+                let mut seen: std::collections::BTreeMap<String, usize> = tenants
+                    .iter()
+                    .map(|t| (invoke_subject(t), 0usize))
+                    .collect();
+                for (_, t) in &a.dedicated {
+                    *seen.get_mut(&invoke_subject(t)).expect("dedicated tenant") += 1;
+                }
+                for t in &a.overflow {
+                    *seen.get_mut(&invoke_subject(t)).expect("overflow tenant") += 1;
+                }
+
+                for (subject, count) in &seen {
+                    assert_eq!(
+                        *count, 1,
+                        "subject {subject} must belong to exactly one lane \
+                         (n={n}, max_dedicated={max_dedicated})"
+                    );
+                }
+                assert_eq!(a.dedicated.len() + a.overflow.len(), n);
+                assert_eq!(a.dedicated.len(), max_dedicated.min(n));
+            }
+        }
+    }
+
+    /// 末尾へのテナント追加が、既存の割り当てを 1 つも動かさないこと。
+    ///
+    /// 動くと consumer の delete/create が発生し、その窓のメッセージがどの lane にも属さなくなる
+    /// （900 秒後に stuck sweeper が偽 failed を作る）。
+    #[test]
+    fn adding_a_tenant_never_moves_existing_assignments() {
+        for max_dedicated in [0usize, 1, 3, 8, 64] {
+            let mut tenants: Vec<String> = Vec::new();
+            let mut prev = assign_lanes(&tenants, max_dedicated);
+            for i in 0..20usize {
+                tenants.push(format!("ten_{i:03}"));
+                let next = assign_lanes(&tenants, max_dedicated);
+                // 既存の dedicated 割り当ては接頭辞として保たれる。
+                assert!(
+                    next.dedicated.starts_with(&prev.dedicated),
+                    "dedicated assignments must be stable under append \
+                     (max_dedicated={max_dedicated}, i={i})"
+                );
+                // overflow も接頭辞として保たれる（末尾に足されるだけ）。
+                assert!(next.overflow.starts_with(&prev.overflow));
+                prev = next;
+            }
+        }
+    }
+
+    /// overflow が空なら overflow lane を作らない（呼び出し側が守るべき前提の明示）。
+    ///
+    /// `filter_subjects` が空の consumer は「全 subject 購読」を意味し、I1 を破壊する。
+    #[test]
+    fn overflow_is_absent_when_empty() {
+        let tenants: Vec<String> = (0..5).map(|i| format!("ten_{i}")).collect();
+        assert!(assign_lanes(&tenants, 5).overflow.is_empty());
+        assert!(assign_lanes(&tenants, 99).overflow.is_empty());
+        assert!(assign_lanes(&[], 0).overflow.is_empty());
+        // 逆に溢れれば overflow に入る。
+        assert_eq!(assign_lanes(&tenants, 3).overflow.len(), 2);
+    }
+
+    /// 生成する durable 名が subject / consumer 名として安全であること。
+    #[test]
+    fn lane_durable_names_are_subject_and_name_safe() {
+        for t in ["ten_abc", "ten_0", &"t".repeat(64)] {
+            let name = lane_durable(t);
+            for bad in ['.', '*', '>', ' ', '/', '\\'] {
+                assert!(
+                    !name.contains(bad),
+                    "durable name {name:?} must not contain {bad:?}"
+                );
+            }
+            assert!(!name.is_empty());
+        }
+        // 固定名も同じ性質を満たす。
+        for name in [OVERFLOW_LANE_DURABLE, LEGACY_SHARED_DURABLE] {
+            for bad in ['.', '*', '>', ' ', '/'] {
+                assert!(!name.contains(bad), "{name:?} must not contain {bad:?}");
+            }
+        }
+    }
+
+    /// `tenant_from_lane_durable` が `lane_durable` の逆写像であること。
+    #[test]
+    fn tenant_from_lane_durable_roundtrips() {
+        for t in ["ten_abc", "ten_0", "x"] {
+            assert_eq!(tenant_from_lane_durable(&lane_durable(t)), Some(t));
+        }
+        // overflow / legacy / 未知の consumer は None（worker が誤って lane 扱いしない）。
+        assert_eq!(tenant_from_lane_durable(OVERFLOW_LANE_DURABLE), None);
+        assert_eq!(tenant_from_lane_durable(LEGACY_SHARED_DURABLE), None);
+        assert_eq!(tenant_from_lane_durable("some-other-consumer"), None);
+        // 接頭辞だけで tenant が空の名前も None。
+        assert_eq!(tenant_from_lane_durable(LANE_DURABLE_PREFIX), None);
+    }
+
+    /// **プロセス全体上限が構成的に守られること**の全列挙証明。
+    ///
+    /// `served_lanes <= global` の regime では `served * effective <= global`。
+    /// これが成り立つので、worker は「プロセス全体 Semaphore」を持つ必要が無く、
+    /// デッドロック / permit 死蔵 / ack_wait 超過の 3 障害の経路そのものが消える。
+    #[test]
+    fn sum_of_effective_never_exceeds_global() {
+        for global in 1..=64usize {
+            for served in 1..=global {
+                for configured in 1..=64usize {
+                    let eff = effective_lane_concurrency(global, served, configured);
+                    assert!(
+                        served * eff <= global,
+                        "served({served}) * effective({eff}) must fit in global({global}) \
+                         [configured={configured}]"
+                    );
+                }
+            }
+        }
+    }
+
+    /// lane には必ず 1 以上のスロットを配る（0 だとその lane が永久に停止する）。
+    #[test]
+    fn effective_is_at_least_one() {
+        for global in 0..=8usize {
+            for served in 0..=16usize {
+                for configured in 0..=8usize {
+                    assert!(effective_lane_concurrency(global, served, configured) >= 1);
+                }
+            }
+        }
+    }
+
+    /// 設定値を超えて配らない（テナントが要求した以上の並行度を勝手に与えない）。
+    #[test]
+    fn effective_never_exceeds_configured() {
+        for global in 1..=32usize {
+            for served in 1..=32usize {
+                for configured in 1..=32usize {
+                    assert!(
+                        effective_lane_concurrency(global, served, configured) <= configured.max(1)
+                    );
+                }
+            }
+        }
+    }
+
+    /// 共有定数が M7 までのリテラルと一致すること（挙動不変の担保）。
+    #[test]
+    fn shared_constants_match_legacy_literals() {
+        assert_eq!(INVOKE_STREAM_NAME, "FAAS_INVOKE");
+        assert_eq!(LEGACY_SHARED_DURABLE, "workers");
+        // lane 名は legacy と衝突しない（同時に存在しうる移行期を壊さない）。
+        assert_ne!(LEGACY_SHARED_DURABLE, OVERFLOW_LANE_DURABLE);
+        assert!(!OVERFLOW_LANE_DURABLE.starts_with(LANE_DURABLE_PREFIX));
+        assert!(!LEGACY_SHARED_DURABLE.starts_with(LANE_DURABLE_PREFIX));
+    }
+
+    /// `parse_backoff_secs` は worker の M4c 実装と同一の規則であること。
+    #[test]
+    fn parse_backoff_secs_matches_legacy_rules() {
+        assert_eq!(parse_backoff_secs(None).unwrap(), vec![5, 15, 60]);
+        assert_eq!(parse_backoff_secs(Some("")).unwrap(), Vec::<u64>::new());
+        assert_eq!(parse_backoff_secs(Some("   ")).unwrap(), Vec::<u64>::new());
+        assert_eq!(
+            parse_backoff_secs(Some("5,15,60")).unwrap(),
+            vec![5, 15, 60]
+        );
+        assert_eq!(
+            parse_backoff_secs(Some("5, 15, 60")).unwrap(),
+            vec![5, 15, 60]
+        );
+        assert_eq!(parse_backoff_secs(Some("1")).unwrap(), vec![1]);
+        assert!(parse_backoff_secs(Some("5,x")).is_err());
+        assert!(parse_backoff_secs(Some("-1")).is_err());
     }
 }
