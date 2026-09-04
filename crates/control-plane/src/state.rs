@@ -280,6 +280,10 @@ struct Inner {
     /// M7c (§10 / §15): secret の KEK キーリング。**control-plane だけが持つ**（worker は
     /// keyless by design, §3.3）。暗号化は常に active kid、復号は行の kid で選ぶ。
     secret_keyring: Arc<crate::secrets::SecretKeyring>,
+    /// M10 follow-up (§3.8 / §6.2): `faas_tenant_invoke_total` に `tenant_id` ラベルを付けるか。
+    /// 既定 true（従来挙動）。false でテナント数に比例する系列爆発を防ぐ（`"aggregate"` に畳む）。
+    /// M8 の `METRICS_LANE_LABELS` と同じ思想（テナント数と一緒に伸びる軸に逃げ道を用意する）。
+    metrics_include_tenant_label: bool,
     /// M8 (§5): オートスケールの方針（env 由来・不変）。
     scale_policy: crate::scale::ScalePolicy,
     /// M8 (§5): backlog ポーラが書き、`GET /internal/scale` が読む共有スナップショット。
@@ -324,6 +328,7 @@ impl AppState {
         job_env_exchange_rate_per_min: u64,
         lanes: LaneConfig,
         scale_policy: crate::scale::ScalePolicy,
+        metrics_include_tenant_label: bool,
     ) -> Self {
         // invoke の JetStream publish 用 context は NATS クライアントから構築する。
         let jetstream = async_nats::jetstream::new(nats.clone());
@@ -349,6 +354,7 @@ impl AppState {
                 waiters: Arc::new(DashMap::new()),
                 secret_keyring,
                 job_env_exchange_rate_per_min,
+                metrics_include_tenant_label,
                 lanes,
                 lane_cache: DashMap::new(),
                 lane_generation: AtomicU64::new(0),
@@ -389,6 +395,12 @@ impl AppState {
     /// lane gauge に `lane` ラベルを付けるか（§6.2）。
     pub fn metrics_lane_labels(&self) -> bool {
         self.inner.lanes.metrics_lane_labels
+    }
+
+    /// `faas_tenant_invoke_total` に `tenant_id` ラベルを付けるか（M10 follow-up）。
+    /// false のときは `"aggregate"` に畳んで系列爆発を防ぐ。
+    pub fn metrics_include_tenant_label(&self) -> bool {
+        self.inner.metrics_include_tenant_label
     }
 
     /// 専有 lane の上限数。

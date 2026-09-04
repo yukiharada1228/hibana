@@ -558,10 +558,17 @@ pub async fn invoke(
     // M4a (§3.8): per-tenant の invoke 受付数を観測する（admission の rate-limit より「呼ばれた回数」
     // を観測したいので、429 で弾く前に inc する）。429 で弾かれた件は admission_rejections_total が
     // 別に増えるため、(tenant_invoke_total - admission_rejections_total[kind=*]) で許可数を導出できる。
+    // M10 follow-up: tenant_id ラベルはテナント数に比例して系列が増える軸なので、
+    // `METRICS_INCLUDE_TENANT_LABEL=false` で `"aggregate"` に畳める（M8 の lane ラベルと同じ思想）。
+    let tenant_label = if state.metrics_include_tenant_label() {
+        tenant.as_str()
+    } else {
+        "aggregate"
+    };
     state
         .metrics()
         .tenant_invoke_total
-        .with_label_values(&[tenant.as_str()])
+        .with_label_values(&[tenant_label])
         .inc();
 
     // --- M4d (§8): per-tenant 上書きを反映した admission パラメータを解決する ---

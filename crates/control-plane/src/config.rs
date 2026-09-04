@@ -113,6 +113,9 @@ const DEFAULT_SCALE_SIGNAL_STALE_SECS: u64 = 30;
 /// 性質が違う。それでも**テナント数と一緒に伸びる軸**であることに変わりはないので、
 /// 運用者が上限を制御できる逃げ道を用意する。
 const DEFAULT_METRICS_LANE_LABELS: bool = true;
+/// `faas_tenant_invoke_total` に `tenant_id` ラベルを付けるか（M10 follow-up）。
+/// 既定 true（従来挙動）。テナント数に比例して系列が増える軸なので、運用者が畳める逃げ道。
+const DEFAULT_METRICS_INCLUDE_TENANT_LABEL: bool = true;
 
 /// `.env.example` に置く既知プレースホルダ。**この値のまま起動させない**（下記 MUST）。
 ///
@@ -284,6 +287,8 @@ pub struct Config {
     pub scale_signal_stale_secs: u64,
     /// lane gauge に `lane` ラベルを付けるか。false なら `"aggregate"` 1 値に畳む（§6.2）。
     pub metrics_lane_labels: bool,
+    /// `faas_tenant_invoke_total` に tenant_id ラベルを付けるか。false で "aggregate" に畳む（M10 follow-up）。
+    pub metrics_include_tenant_label: bool,
 
     // --- 観測 (M4a, §3.8) ---
     /// ログ整形（"text" 既定 / "json"）。`json` のとき `tracing_subscriber::fmt().json()` を
@@ -509,6 +514,10 @@ impl Config {
                 DEFAULT_SCALE_SIGNAL_STALE_SECS,
             )?,
             metrics_lane_labels: env_bool("METRICS_LANE_LABELS", DEFAULT_METRICS_LANE_LABELS),
+            metrics_include_tenant_label: env_bool(
+                "METRICS_INCLUDE_TENANT_LABEL",
+                DEFAULT_METRICS_INCLUDE_TENANT_LABEL,
+            ),
             log_format: env_or("LOG_FORMAT", "text"),
         };
 

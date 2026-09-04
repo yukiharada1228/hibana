@@ -1497,8 +1497,6 @@ M9 完了済み（本リポジトリの現状）。**M5〜M9 が完了**し、�
 - **M4 follow-ups**（M4 範囲内で残る配線）:
   - HTTP middleware で `faas_http_requests_total` / `_duration_seconds` の observe 配線
   - `execution_duration_seconds`（created_at→finished_at）を subscriber finalize 時に observe
-  - per-tenant ラベル（`faas_tenant_invoke_total{tenant_id}`）のカーディナリティ対策
-    （`METRICS_INCLUDE_TENANT_LABEL=false` フラグ追加）
   - `.result` / `.failed` の JetStream 化（現状 core NATS、CP 再起動で in-flight ドロップ）
 
 詳細は `仕様書.md` の §15 実装ロードマップを参照してください。
