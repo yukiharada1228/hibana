@@ -88,13 +88,21 @@ VERSION ?= 0.1.0
 # epoch interruption（max_wall_time）と tokio timeout（max_execution_time）の両方が
 # 短時間で発火する値にする（既定の 1s / 5s だとテストの待ち窓に収まらないことがある）。
 SLOW_LIMITS ?= {"max_wall_time_ms":1000,"max_execution_time_ms":2000}
+# M8-7: burn は「N ミリ秒かかって **成功する**」ノブなので、slow と違い上限を十分広く取る。
+# 上限が burn_ms より短いと epoch interruption で timeout 終端し、ノブとして機能しない。
+BURN_LIMITS ?= {"max_wall_time_ms":15000,"max_execution_time_ms":20000}
+
+# M8: 内部専用 listener（GET /internal/scale / POST /internal/job-env）。既定 loopback。
+CONTROL_PLANE_INTERNAL_URL ?= http://127.0.0.1:8081
+# control-plane の /metrics は公開 listener 側にある。
+BASE_URL_METRICS ?= $(BASE_URL)
 
 # echo component の wasm32-wasip2 ビルド成果物パス（アップロード対象のローカル成果物）。
 ECHO_WASM := target/wasm32-wasip2/release/echo.wasm
 
 .DEFAULT_GOAL := help
 
-.PHONY: deploy-chaos-components component-id traffic canary promote rollback approve-env set-secret secrets rekey help setup up down migrate minio-bucket build-component run-cp run-worker bootstrap login deploy invoke logs psql clean rls-lint
+.PHONY: run-workers autoscale stop-workers scale-status lane-status recreate-stream deploy-chaos-components component-id traffic canary promote rollback approve-env set-secret secrets rekey help setup up down migrate minio-bucket build-component run-cp run-worker bootstrap login deploy invoke logs psql clean rls-lint
 
 help: ## 利用可能なターゲット一覧を表示
 	@echo "WASM FaaS Platform — M2 Makefile"
@@ -323,10 +331,10 @@ rekey: ## M7c: 当該テナントの secret を現行 KEK で再ラップ（**�
 	TOKEN=$$($(MAKE) -s login); \
 	curl -sS -X POST "$(BASE_URL)/admin/secrets/rekey" -H "Authorization: Bearer $$TOKEN"; echo
 
-deploy-chaos-components: ## M4 chaos_c/d 用: always-trap / slow をビルドしてアップロード（冪等）
+deploy-chaos-components: ## M4/M8 chaos 用: always-trap / slow / burn をビルドしてアップロード（冪等）
 	@set -e; \
 	echo "==> always-trap / slow を wasm32-wasip2 でビルド..."; \
-	cargo build -p always-trap -p slow --target wasm32-wasip2 --release; \
+	cargo build -p always-trap -p slow -p burn --target wasm32-wasip2 --release; \
 	TOKEN=$$($(MAKE) -s login); \
 	resolve_cid() { \
 		curl -sS -o /dev/null -X POST "$(BASE_URL)/components" \
@@ -349,7 +357,43 @@ deploy-chaos-components: ## M4 chaos_c/d 用: always-trap / slow をビルドし
 		-H "Authorization: Bearer $$TOKEN" -F "version=$(VERSION)" \
 		-F 'resource_limits=$(SLOW_LIMITS)' \
 		-F "wasm=@target/wasm32-wasip2/release/slow.wasm"; echo; \
-	echo "OK: chaos 用 component をデプロイしました（CHAOS_ALWAYS_TRAP=always-trap CHAOS_SLOW=slow）。"
+	echo "==> burn (resource_limits は BURN_LIMITS 変数を参照)"; \
+	BURN_CID=$$(resolve_cid burn); \
+	test -n "$$BURN_CID" || { echo "ERROR: burn の component_id を解決できませんでした"; exit 1; }; \
+	curl -sS -X POST "$(BASE_URL)/components/$$BURN_CID/versions" \
+		-H "Authorization: Bearer $$TOKEN" -F "version=$(VERSION)" \
+		-F 'resource_limits=$(BURN_LIMITS)' \
+		-F "wasm=@target/wasm32-wasip2/release/burn.wasm"; echo; \
+	echo "OK: chaos 用 component をデプロイしました（CHAOS_ALWAYS_TRAP=always-trap CHAOS_SLOW=slow CHAOS_BURN=burn）。"
+
+recreate-stream: ## M8-1: invoke stream を WorkQueue retention で作り直す（CP/worker を止めてから実行）
+	@echo "==> control-plane / worker が停止していることを確認してください（未消化 0 は本コマンドが検査します）"
+	@NATS_URL="$(NATS_URL)" cargo run --quiet -p faas-control-plane -- --recreate-invoke-stream $(FORCE_ARG)
+	@echo "OK: stream を再作成しました。control-plane → worker の順に起動してください。"
+
+# --- M8: 弾力スケールとアイソレーション（§8 / §10 / §15 M8） ---
+# worker は事前ビルドしたバイナリを直接 N 個起動する。`cargo run` を N 回叩くと
+# target/ のビルドロックで直列化するため、supervisor 経由では使わない。
+# メトリクスポートは 9101 起点（9090 と衝突させない。手動 worker の混入を検出可能にするため）。
+
+run-workers: ## M8: worker を固定 N 台起動（例: make run-workers N=3）
+	@cargo build -p faas-worker
+	@./scripts/run-workers.sh $(or $(N),1)
+
+autoscale: ## M8: GET /internal/scale をポーリングして worker を増減させる参照アクチュエータ
+	@cargo build -p faas-worker
+	@./scripts/worker-autoscale.sh
+
+stop-workers: ## M8: supervisor 管理下の worker を全台ドレイン停止
+	@./scripts/stop-workers.sh
+
+scale-status: ## M8: 現在の backlog / desired worker 数を表示（GET /internal/scale）
+	@curl -sS -w '\nHTTP %{http_code}\n' "$(CONTROL_PLANE_INTERNAL_URL)/internal/scale"
+
+lane-status: ## M8: lane consumer ごとの未消化件数を表示（Prometheus gauge 経由）
+	@curl -sS "$(BASE_URL_METRICS)/metrics" \
+		| grep -E '^faas_(lane_pending_messages|lane_ack_pending|scale_)' \
+		|| echo "(control-plane の /metrics が取得できません。起動と BIND_ADDR を確認してください)"
 
 rls-lint: ## M3b: テナント分離の静的ガード（SET app.tenant_id ハザード / 生 pool 渡し検出）
 	@./scripts/rls-lint.sh

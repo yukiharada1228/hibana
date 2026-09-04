@@ -1,21 +1,24 @@
-# WASM FaaS Platform — M7 (デプロイ運用とコンフィグ: canary / rollback / per-function env / Secrets)
+# WASM FaaS Platform — M8 (弾力スケールとテナント間アイソレーション)
 
 [![CI](https://github.com/yukiharada1228/wasm-fass/actions/workflows/ci.yml/badge.svg?branch=develop)](https://github.com/yukiharada1228/wasm-fass/actions/workflows/ci.yml)
 
 WebAssembly Component をアップロードして invoke すると、Wasmtime Worker が実行して
-結果を返す FaaS プラットフォームです。本リポジトリの現状は **仕様書.md §15 の M7
-（デプロイ運用とコンフィグ）範囲**であり、M1 の invoke 経路・M2 のアップロード/検証/デプロイ・M3 の
+結果を返す FaaS プラットフォームです。本リポジトリの現状は **仕様書.md §15 の M8
+（弾力スケールとテナント間アイソレーション）範囲**であり、M1 の invoke 経路・M2 のアップロード/検証/デプロイ・M3 の
 マルチテナント / 認証 / RLS / 結果出所認証 / Capability 強制 / 共有 admission ストア /
 大容量 I/O 退避・M4 の Prometheus メトリクス + `/readyz`・構造化ログ・`.failed` (DLQ) subscriber と
 OS スレッドベースの epoch ticker による完全なリトライ/タイムアウト処理・全リソース制限・
 テナント別クォータ・M5 の per-execution 利用量計量（CPU fuel / wall time / peak memory /
 出力バイト）と冪等な期間集計（`usage_rollups`）/ 利用量参照 API（`GET /usage`）の上に、
-M6 の Invoke 経路拡充（同期 Invoke / Cron / 外部イベントトリガー）の上に、
-**本番運用に耐えるリリース安全性**を追加します。具体的には
-(1) **バージョン traffic splitting / canary**（10%→50%→100% の段階移行）と**ワンクリック rollback**、
-(2) **per-function 環境変数**（注入できる env 名そのものを admin 承認の対象にする）、
-(3) **Secrets Manager**（封筒暗号での保存・execution 基準の世代固定注入・KEK ローテーション）を、
-いずれも **既存の冪等性・テナント分離・計量（M5）を壊さず**に積み上げます。
+M6 の Invoke 経路拡充（同期 Invoke / Cron / 外部イベントトリガー）・
+M7 のデプロイ運用（canary / rollback / per-function env / Secrets）の上に、
+**「隣のテナントの負荷で自分が遅くならない」ことと「負荷に応じて worker が増減すること」**を
+追加します。具体的には
+(1) **テナント別 lane Consumer**（JetStream の配送枠をテナント単位で分ける, §3.3 / §8）、
+(2) **worker の実行クレジットと SIGTERM ドレイン**（プロセス全体の同時実行上限と、
+    scale-in でゲストを二度実行しないこと, §4.2 / §4.6）、
+(3) **backlog シグナルと参照アクチュエータ**（`GET /internal/scale` と worker supervisor, §5）を、
+いずれも **既存の冪等性・テナント分離・計量（M5）・同期 Invoke（M6）を壊さず**に積み上げます。
 
 ```
                         ┌─ POST /components/{id}/versions (multipart) ─┐
@@ -52,7 +55,13 @@ Client ──HTTP──▶ control-plane ──put──▶ MinIO (Object Storag
     `input_ref` 完全一致検証で退避（M3d §3.4 / §5.2）。
   - result subject を購読し、ジョブトークンを kid で署名検証 → claim と DB / subject 整合を
     確認 → CAS で executions を終端状態へ更新。検証失敗は drop + `audit_logs`（append-only）に記録（M3c §3.3 / §3.7）。
-- `worker`: NATS JetStream の invoke subject を共有 Pull Consumer（durable `workers`）で購読。
+- `worker`: NATS JetStream の invoke subject を **テナント別 lane Consumer**（durable
+  `workers-t-{tenant}` / 超過分は `workers-overflow`, M8 §3.3）で購読。**consumer は作らない**
+  —— 作成者は control-plane 単独であり、worker は NATS の consumer 一覧から購読先を発見する
+  （`faas.lane.changed` の即時通知 + 周期 discovery）。プロセス全体の同時実行は
+  `WORKER_MAX_CONCURRENCY` を lane 数で割った実効クレジットで閉じ、SIGTERM では
+  in-flight を待ってから終了する（§4）。`TENANT_LANES_ENABLED=false` なら M7 までと同じ
+  共有 durable `workers` 1 本に収束する。
   JobMessage の `wasm_url`（presigned GET URL）から本体を取得し、`wasm_sha256` をキーに
   **Component をキャッシュ + 事前コンパイル**する（§3.6）。cwasm は `WASM_CACHE_DIR/{sha256}.cwasm`
   として永続化し、2 回目以降は cache hit で deserialize するだけになり coldstart が短縮される。
@@ -60,6 +69,92 @@ Client ──HTTP──▶ control-plane ──put──▶ MinIO (Object Storag
   （§3.3 MUST NOT）。
 - `components/echo`: 入力をそのまま返す最小の Component（`wasm32-wasip2`）。アップロード対象の
   ローカル成果物。
+- `components/burn`: 入力 `{"burn_ms": N}` のぶんだけ busy-loop してから **succeeded で終端**する
+  検証用 Component（M8）。`components/slow` は無限ループで必ず timeout 終端するため
+  「N ミリ秒かかって成功する」ノブとしては使えず、M8 の負荷（件数 × 1 件あたり実行時間）を
+  制御するために新設した。
+- `scripts/worker-autoscale.sh` ほか: `GET /internal/scale` を見て worker プロセスを増減させる
+  **参照アクチュエータ**（M8 §5.5）。`make run-workers` / `make autoscale` / `make stop-workers`。
+
+---
+
+## M8 スコープ（と非スコープ）
+
+仕様書.md §15 M8 に準拠。**「隣のテナントの負荷で自分が遅くならない」ことと「負荷に応じて
+worker が増減すること」**を与える。
+
+### 完了条件を書き換えた理由（重要）
+
+§15 M8 の当初の完了条件は「あるテナントのバーストが他テナントの **p99 レイテンシ**を劣化させない」
+だった。これは**このリポジトリでは測れない**。chaos は公開 API だけを使う黒箱テストであり、
+Prometheus の histogram を読む手段が無いからである。測れない条件は「通ったことにする」以外の
+使い道が無いので、同じ性質を**測れる形**へ書き換えた:
+
+> あるテナントのバーストが他テナントの **サーバ時計で測ったキュー待ちの絶対上限**・
+> **429 件数**・**実行順序の件数**を劣化させず、負荷に応じて worker の**実プロセス数**が増減すること。
+
+- キュー待ちは `started_at - created_at`（どちらもサーバが書いた時刻）で測る。
+  クライアントの `Instant` は使わない
+- 順序は「B の最後の実行より前に始まった A の実行の**件数**」で測る。
+  FIFO 単一レーンなら構造的に BURST 件、lane が分かれていれば数十のオーダーになる
+- worker 台数は `wasmtime_worker_slot` gauge で数える（プロセス introspection は使わない）
+
+### 含む（M8a: テナント別 lane Consumer, §3.3 / §8）
+
+- **JetStream の配送枠をテナント単位で分ける**。`max_ack_pending` を**テナント自身の
+  in-flight 上限から導出**する（M7 までは全テナント合算の固定値 1000 だった）
+- 専有 lane の上限 `MAX_DEDICATED_LANES` を超えた分は **overflow lane 1 本**へ束ねる
+- consumer の作成 / 更新 / 削除の責務を **worker から control-plane へ移管**。
+  単一 writer は `pg_try_advisory_lock` で強制する
+- stream の retention を `WorkQueue` へ移行（`make recreate-stream`）
+- **ロールバックは env 1 個で完結する**（`TENANT_LANES_ENABLED=false` で legacy へ収束）
+
+> **なぜ合算方式が壊れるのか**: `Σ(アクティブテナント数 × max_concurrent_executions)` が
+> 1000 を超えると、**1 件しか投げていないテナントが、他テナントで埋まった配送枠のせいで
+> 配送されない**。配送されないと pending 行が減らず、reaper が Redis カウンタを高いまま維持し、
+> やがてそのテナント自身の invoke が 429 になる。既定 20/テナントなら **50 テナントで到達する**。
+
+### 含む（M8b: worker の実行クレジット + ドレイン, §4.2 / §4.3 / §4.6）
+
+- `WORKER_MAX_CONCURRENCY` を lane 数で割った実効クレジットを lane ごとに配り、
+  **プロセス全体の同時実行上限を「除算」で閉じる**（第 2 の Semaphore を重ねない）
+- pull は「確保済み permit 数ちょうど」しか要求しない（over-fetch しない）
+- `WORKER_DRAIN_TIMEOUT_SECS`（**既定 0 = 無効**）で SIGTERM ドレイン。
+  ドレイン中は `/readyz` が 503 になり、取得済み未処理メッセージは**遅延付き NAK** で差し戻す
+
+### 含む（M8c: backlog シグナルと参照アクチュエータ, §5）
+
+- `backlog = Σ over all lanes (num_pending + num_ack_pending)` を周期観測（`SCALE_POLL_INTERVAL_SECS`）
+- `GET /internal/scale` が desired worker 数を返す。**未観測 / 陳腐化 / ポーラ無効のときは 503**
+  （`desired: 0` を返すとアクチュエータが全台停止させるため、「値が取れない」と「0」を HTTP で分ける）
+- scale-out は即時、scale-in は `SCALE_IN_COOLDOWN_SECS` のヒステリシス
+- `scripts/worker-autoscale.sh`（+ `make autoscale`）が参照実装
+
+> **scale-from-zero が成立する根拠**: lane consumer を作るのは control-plane であり、
+> durable consumer はクライアント接続と独立にサーバ側状態として残る。したがって
+> **worker 0 台でも backlog が読める**。M7 までのように worker が consumer を作る構造だと
+> 「worker 0 台 → consumer 無し → backlog 読めず → 増やす判断ができない」というブートストラップ・
+> デッドロックになる。実機で 0 台のまま `backlog=150 / desired=4` を確認済み。
+
+### 含まない（M9 以降の follow-up）
+
+- **Dockerfile / docker compose の worker サービス**: `--scale worker=N` は per-replica の固定
+  ホストポートを公開できず、「何台生きているか」の観測手段を壊す。参照アクチュエータは
+  ローカルプロセスの supervisor として実装した（§5.5.2）
+- **k8s HPA / KEDA 連携**: `GET /internal/scale` は外部アクチュエータが読める形にしてあるが、
+  マニフェストは同梱しない
+- **テナント別レイテンシ分布のメトリクス**: `METRICS_INCLUDE_TENANT_LABEL` は M9 へ
+- **worker の cwasm 事前 warm**: プロセス初期化に比べ寄与が小さいと見込まれ、
+  「どの component を warm すべきか」を worker は知らない。実測で支配的と判明したら M9 で導入
+
+### 運用上の縮退モード（静かに壊れないための設計）
+
+| 状況 | 挙動 | 検出 |
+| --- | --- | --- |
+| アクティブテナント数 > `MAX_DEDICATED_LANES` | 超過分は overflow lane を共有し、その中では合算の頭打ちが復活する | `faas_lane_*{lane="workers-overflow"}` |
+| lane 数 > worker のプロセス容量 | 先頭 N 本だけ提供し `LANE_ROTATION_SECS` ごとに回転（喪失はしない。最大でこの秒数待たされる） | `wasmtime_lanes_unserved > 0` + warn ログ |
+| NATS が一時的に見えない | backlog を **0 に落とさず**前回値を保持し、判断ロジックが hold に落ちる | `faas_scale_signal_age_seconds` が伸びる / `/internal/scale` が 503 |
+| ドレインが間に合わない | 諦めてプロセス終了。JetStream の再配送が保険として効く（ゲストは 2 回走る） | `wasmtime_drain_abandoned_total` |
 
 ---
 
@@ -500,13 +595,45 @@ cp .env.example .env
 > `CONTROL_PLANE_INTERNAL_URL`（既定 `http://127.0.0.1:8081`）/ `JOB_ENV_FETCH_TIMEOUT_MS`（既定 2000）は
 > **worker** が読みます（引き換え先とタイムアウト。超過は fail-closed で実行を failed 終端）。
 
+> **M8 の新規 env（§3.3 / §4 / §5 / §15）** — **control-plane** が読むもの:
+> `TENANT_LANES_ENABLED`（既定 false。テナント別 lane の有効化。**ロールバックはこの 1 個を false に
+> 戻すだけで完結**する）/ `MAX_DEDICATED_LANES`（既定 64。超過分は overflow lane へ）/
+> `LANE_ACK_PENDING_HEADROOM`（既定 8）/ `LANE_OVERFLOW_ACK_PENDING`（既定 1000。**所属テナント数に
+> 比例させない**）/ `LANE_RECONCILE_INTERVAL_SECS`（既定 10）/ `BACKOFF_SECS`（既定 `5,15,60`。
+> **M8 で worker から CP へ所有移管**。consumer を作るのが CP になったため）/
+> `SCALE_POLL_INTERVAL_SECS`（既定 **0 = ポーラを spawn しない**。`.env.example` は 5）/
+> `SCALE_JOBS_PER_WORKER`（既定 32）/ `SCALE_MIN_WORKERS`（既定 1。0 で scale-to-zero を許可）/
+> `SCALE_MAX_WORKERS`（既定 4）/ `SCALE_IN_COOLDOWN_SECS`（既定 60）/ `SCALE_SIGNAL_STALE_SECS`（既定 30）/
+> `METRICS_LANE_LABELS`（既定 true。`faas_lane_*` の `lane` ラベルを付けるか。false で `"aggregate"`
+> 1 値に畳む。系列数は `min(テナント数, MAX_DEDICATED_LANES) + 1` で有界だが、**テナント数と
+> 一緒に伸びる軸**ではあるので逃げ道を用意してある）。
+>
+> **worker** が読むもの: `WORKER_MAX_CONCURRENCY`（既定 32。**プロセス全体**の同時実行上限）/
+> `WORKER_LANE_CONCURRENCY`（既定 4。consumer metadata が読めないときのフォールバック）/
+> `LANE_DISCOVERY_INTERVAL_SECS`（既定 10）/ `LANE_ROTATION_SECS`（既定 30）/
+> `WORKER_DRAIN_TIMEOUT_SECS`（既定 **0 = ハンドラを入れない = M7 までと完全に同一挙動**）/
+> `WORKER_SLOT`（supervisor が注入。`wasmtime_worker_slot` gauge に出る）。
+>
+> **【不変条件】`WORKER_DRAIN_TIMEOUT_SECS < ACK_WAIT_SECS`**（既定 30）。超えると、まだ実行中の
+> ジョブを JetStream が再配送し、**ドレインしているのに二重実行**になります（目的が裏返る）。
+> worker は起動時にこれを検査して fail-fast します。
+>
+> **`SCALE_JOBS_PER_WORKER` は `WORKER_MAX_CONCURRENCY` と揃えてください。** control-plane は
+> worker の env を知らないので検査できません（既定を一致させてあります）。
+>
+> **`SCALE_MIN_WORKERS` の既定を 0 にしていない理由**: M6 の同期 invoke はサーバ側
+> `SYNC_REPLY_TIMEOUT_MS`（既定 5000）で打ち切られます。from-zero の coldstart はこの窓を容易に
+> 超えるため、既定 0 は **M6 の完了条件を壊します**。scale-to-zero は opt-in です。
+
 > **M3c 結合の注意**: `JOB_SIGNING_KEY` / `JOB_SIGNING_KID` は **control-plane のみ**が読みます
 > （worker は鍵を持たず、不透明トークンを echo するだけ）。`ACK_WAIT_SECS` / `MAX_DELIVER` は
-> control-plane（token exp）と worker（consumer 設定）の **両方**が読むため、値をずらすと
-> 正規の遅延結果がトークン失効扱いになりえます（subscriber は「失効しても行が pending/running
-> なら受理」する安全網を持ちますが、定数は揃えてください）。既存の durable consumer
-> `workers` が既定値で作成済みの場合、ack_wait/max_deliver の変更が反映されないことがあります
-> （その場合は consumer を作り直してください）。
+> control-plane（token exp）と worker（最終配送試行の判定）が読みます。
+> **M8 で consumer の作成者は control-plane 単独になった**ため、consumer 設定に効くのは CP 側の値
+> だけです（worker は `MAX_DELIVER` を「今回が最終試行か」の判定にのみ使い、`ACK_WAIT_SECS` は
+> ドレイン上限の健全性検査にのみ使います）。値をずらすと正規の遅延結果がトークン失効扱いに
+> なりえます（subscriber は「失効しても行が pending/running なら受理」する安全網を持ちますが、
+> 定数は揃えてください）。consumer の drift は CP の reconciler が毎周期是正するので、
+> 設定変更後に consumer を手で作り直す必要はありません（M7 まではその必要がありました）。
 
 ---
 
@@ -559,11 +686,42 @@ make run-cp    # cargo run -p faas-control-plane
 ### 5. worker 起動（別ターミナル）
 
 ```bash
-make run-worker  # cargo run -p faas-worker
+make run-worker         # 1 台だけ（開発・デバッグ用。メトリクスは 9090）
+# または
+make run-workers N=3    # M8: 固定 N 台（メトリクスは 9101 起点）
+make autoscale          # M8: GET /internal/scale を見て自動増減
 ```
 
 worker は JobMessage の presigned GET URL から本体を取得し、`WASM_CACHE_DIR` に cwasm を
 キャッシュします（M1 のように `COMPONENTS_DIR` から直接 wasm を読むことはありません）。
+
+**M8 以降、worker は consumer を作りません。** 作成者は control-plane 単独です（§3.7）。
+したがって **control-plane を先に起動してください**。worker は NATS の consumer 一覧から
+購読先を発見します（`wasmtime_subscribed_lanes` が 0 のまま張り付いていたら、CP が lane を
+作っていないか discovery が失敗し続けています）。
+
+> **`make run-worker` と `make run-workers` を混ぜないこと。** 前者は 9090、後者は 9101 起点を
+> 使いますが、worker は metrics サーバの bind に失敗しても warn するだけで**プロセスは無言で
+> 稼働を続けます**。混ぜると「何台生きているか」の観測が信用できなくなります。
+
+### 5-b. 既存スタックからの移行（M8-1: stream の WorkQueue 化）
+
+M8 より前に作られた `FAAS_INVOKE` stream は `Limits` retention のままです。M8 の
+control-plane は起動時に retention を検査して **fail-fast** するので、一度だけ作り直します。
+
+```bash
+# CP / worker を止めてから実行する。未消化 0 でなければコマンド自身が拒否します。
+make stop-workers          # または run-worker を止める
+make recreate-stream
+# 未消化が残っていて意図的に捨てる場合のみ:
+# make recreate-stream FORCE_ARG=--force
+```
+
+WorkQueue にする理由は 4 つあり、どれか 1 つでも単独で移行を正当化します:
+(1) 「どの subject もちょうど 1 consumer に属する」をサーバに強制させる（filter の重なりによる
+二重配送を、レビューではなく NATS に検出させる）/ (2) consumer の delete→recreate が
+**stream 全履歴の再配送**にならない / (3) ack 済みメッセージが消えるので backlog シグナルが
+素直に効く / (4) 保持期間の設定ミスが他テナントのメッセージを巻き込まない。
 
 ---
 
@@ -850,6 +1008,131 @@ curl -s -X POST http://localhost:8080/triggers \
 
 ---
 
+### Chaos / M8 弾力スケール・アイソレーションテスト（M8 完了条件の検証）
+
+`crates/control-plane/tests/chaos_m8.rs` の 4 シナリオ（U1: バーストが他テナントのクォータを
+劣化させない / U2: キュー待ちが backlog に比例しない / U3: admission バイパス経路でも分離が効く
++ M6 回帰 / U4: worker が自動増減する）で end-to-end 検証します。
+
+> **`--test-threads=1` で実行すること**: 4 シナリオは共有 JetStream stream の depth、worker の
+> 実行スロット、worker プロセス台数という**プロセス外の共有状態**を飽和させます。並行実行すると
+> 互いの backlog を測ってしまい、どの assert も意味を失います。通しで約 3 分です。
+
+#### 前提（満たさないと skip ではなく panic します）
+
+最も見落としやすいのは **admission ゲート 2** です。A の in-flight は
+`max_concurrent_executions`（既定 20）で頭打ちになるため、既定のまま 300 件投げても
+**A の実 execution は 20〜40 件にしかならず**、「A の後ろに B が並ぶ」状況が再現しません。
+その状態では C4 の閾値が修正前でも自明に成立し、**テストが vacuous に通ります**。
+
+さらに上限は `CHAOS_M8_BURST` より**大きく**必要です（同時投入なので上限が BURST 以下だと
+超過分がその場で 429 になる）。既定 BURST=300 に対し 400 を推奨します。
+
+```bash
+make up && make migrate
+
+# control-plane は M8 の前提 env で起動する
+QUOTA_MAX_CONCURRENT_EXECUTIONS=400 TENANT_LANES_ENABLED=true SCALE_POLL_INTERVAL_SECS=5 \
+  make run-cp > /tmp/cp.log 2>&1 &
+
+# テナント A / B（U3 の M6 回帰ガードを有効にするなら C も）
+make bootstrap
+export CHAOS_TOKEN=$(make -s login)
+make bootstrap SMOKE_TENANT_SLUG=chaos-b SMOKE_EMAIL=b@example.com
+export CHAOS_TOKEN_B=$(make -s login SMOKE_TENANT_SLUG=chaos-b SMOKE_EMAIL=b@example.com)
+
+# burn を各テナントへ（「N ミリ秒かかって succeeded で終端する」ノブ）
+make deploy-chaos-components
+
+# U1〜U3 は worker 1 台
+make run-workers N=1
+cargo test -p faas-control-plane --test chaos_m8 -- --ignored --test-threads=1 chaos_u1_ chaos_u2_ chaos_u3_
+
+# U4 はアクチュエータを回した状態で（手動 worker が 9090 に居ないこと）
+make stop-workers
+make autoscale > /tmp/autoscale.log 2>&1 &
+cargo test -p faas-control-plane --test chaos_m8 -- --ignored --test-threads=1 chaos_u4_
+```
+
+#### 「修正前は red、修正後は green」の対比（実測値）
+
+**修正前から緑になる assert は完了条件の証拠になりません。** `TENANT_LANES_ENABLED=false`
+（= M8 適用前と同じ共有 consumer 1 本のトポロジ）で実際に回した結果:
+
+| assert | lanes=true | lanes=false | 判定 |
+| --- | --- | --- | --- |
+| **U2 / C3**（B のキュー待ち上限） | green | **red** | **これが M8 の証拠** |
+| U1 / C2-a（B の 429 が 0） | green | green | 2 テナントでは識別力なし |
+
+lanes=false での U2 の実測:
+
+```text
+B のキュー待ち最大値が 40689ms で、上限 5000ms を超えました
+（同時刻の A の最大値は 40010ms）。
+```
+
+B の待ち時間が A のそれと**ほぼ同一**になっています。これは「B が A の backlog の後ろに
+丸ごと並んだ」ことの直接観測であり、M8 が解く問題そのものです。
+
+再現手順:
+
+```bash
+# CP を lanes 無効で起動し直す（reconciler が全 lane を消して legacy consumer へ収束する）
+QUOTA_MAX_CONCURRENT_EXECUTIONS=400 TENANT_LANES_ENABLED=false SCALE_POLL_INTERVAL_SECS=5 \
+  make run-cp > /tmp/cp_legacy.log 2>&1 &
+make stop-workers && make run-workers N=1
+cargo test -p faas-control-plane --test chaos_m8 -- --ignored chaos_u2_   # ← 落ちる
+```
+
+> C2-a が 2 テナントで発火しない理由: legacy 共有 consumer の合算 `max_ack_pending`（1000）を
+> 溢れさせる必要があり、`Σ(テナント数 × max_concurrent_executions) > 1000` が要ります。
+> 2 × 400 = 800 では届きません（既定クォータ 20 なら 50 テナント必要）。
+> **C2-a は「劣化していないことの回帰ガード」であって、分離の証明ではありません。**
+
+#### 黒箱で検証できない部分は手で確認する
+
+```bash
+# 1) lane トポロジの目視 —— 「分離が配送層で効いている」ことの最も直接的な証拠。
+#    バースト中に A の lane だけ num_pending が大きく、B の lane が 0 に張り付くこと。
+curl -s localhost:8222/jsz?consumers=1 \
+  | jq '.account_details[].stream_detail[].consumer_detail[] | {name, num_pending, num_ack_pending}'
+
+# 2) 不変条件 I1 の目視 —— 同じ subject が 2 つの consumer に現れないこと。
+curl -s localhost:8222/jsz?consumers=1 \
+  | jq -r '.account_details[].stream_detail[].consumer_detail[] | .config.filter_subject // (.config.filter_subjects[]?)' \
+  | sort | uniq -d      # ← 何も出力されないこと
+
+# 3) retention の目視 —— workqueue であること（起動時 fail-fast の二重確認）。
+curl -s 'localhost:8222/jsz?streams=true' \
+  | jq '.account_details[].stream_detail[] | {name, retention: .config.retention}'
+
+# 4) テナント別キュー待ちの参考値（assert はしない）。
+make psql <<'SQL'
+SELECT tenant_id,
+       percentile_cont(0.99) WITHIN GROUP (
+         ORDER BY EXTRACT(EPOCH FROM (started_at - created_at)) * 1000) AS p99_queue_wait_ms
+FROM executions
+WHERE created_at >= now() - interval '10 minutes' AND started_at IS NOT NULL
+GROUP BY tenant_id;
+SQL
+```
+
+#### 運用（弾力スケール）
+
+```bash
+make run-workers N=3    # 固定 3 台（負荷試験・手動デバッグ）
+make autoscale          # /internal/scale を見て自動増減
+make stop-workers       # 全台ドレイン停止
+make scale-status       # 現在の backlog / desired
+make lane-status        # lane ごとの未消化件数
+```
+
+> **worker のメトリクスポートは 9101 起点**です（`make run-worker` の 9090 と分離してあります）。
+> 分離の理由: worker は metrics サーバの bind に失敗しても warn するだけで**プロセスは無言で
+> 稼働を続ける**ため、ポートが重なると「supervisor は 1 台も起動していないのに live 判定が 1 になる」
+> という最も気づきにくい混入が起きます。supervisor は `/readyz` の 200 では満足せず、
+> `wasmtime_worker_slot` が期待 slot と一致することまで確認します。
+
 ### Chaos / M7 デプロイ運用テスト（M7 完了条件の検証）
 
 仕様書 §15 M7 完了条件「active-version を 10%→100% へ段階移行でき、ワンクリック rollback が効き、
@@ -895,8 +1178,12 @@ curl -s -X POST "http://localhost:8080/invoke?wait=1" \
   -d '{"component":"echo","input":{}}' > /dev/null
 
 # 2) ログに sentinel が出ていないこと（CP / worker とも 0 であること）
-grep -c "$SENTINEL" /tmp/worker.log          # => 0
-docker compose logs control-plane worker 2>/dev/null | grep -c "$SENTINEL"   # => 0
+#    control-plane / worker は compose のサービスではなくホストのプロセスなので、
+#    `docker compose logs` では**何も取れない**（M8 で誤りに気づいて修正）。
+#    それぞれのリダイレクト先を直接見ること。
+grep -c "$SENTINEL" /tmp/worker.log          # => 0   (make run-worker のリダイレクト先)
+grep -c "$SENTINEL" /tmp/cp.log              # => 0   (make run-cp のリダイレクト先)
+grep -c "$SENTINEL" .workers/worker-*.log    # => 全て 0 (make run-workers / autoscale 使用時)
 
 # 3) 監査ログに値が入っていないこと（names と count だけが残る）
 docker compose exec -T postgres psql -U faas -d faas -c \
@@ -980,6 +1267,7 @@ curl -s http://localhost:8080/metrics | grep faas_secret_versions_by_kid
 | `DELETE /components/{id}/secrets/{name}` | admin | **M7c**: soft delete（204）。版台帳は追記専用なので残る。**同名で作り直せる**（部分 UNIQUE index, §10） |
 | `POST /admin/secrets/rekey` | admin | **M7c**: 当該テナントの secret を現行 KEK で再ラップ（`{"rewrapped": n}`）。**侵害復旧ではない**（露出ガード 4 を参照, §10） |
 | `POST /internal/job-env` | 内部専用 | **M7c**: worker が `env_token` と引き換えに復号済み env を受け取る。**`INTERNAL_BIND_ADDR` にしか生えない**（公開 listener では 404）。認証は env-token の署名そのもの（§4.6） |
+| `GET /internal/scale` | 内部専用 | **M8**: 現在の backlog と desired worker 数。**未観測 / 陳腐化 / ポーラ無効のときは 503 + `{"error":"scaler_unavailable"}`** で `desired` を出さない（`desired: 0` を返すとアクチュエータが全台停止させるため、「値が取れない」と「0」を HTTP のレイヤで分ける）。**無認証だが応答にテナントデータを含まない**ことが根拠であり、これは維持すべき不変条件（§5.4） |
 
 > **`GET /usage` の集計セマンティクス（課金解釈の明示, M5）**: `invocation_count` と
 > `succeeded_count`/`failed_count`/`timeout_count` は **全終端実行**で +1 される（worker 落下を
@@ -1025,11 +1313,12 @@ curl -s http://localhost:8080/metrics | grep faas_secret_versions_by_kid
 ## ディレクトリ構成
 
 ```
-Cargo.toml                 # [workspace] members（crates/* と components/echo）
+Cargo.toml                 # [workspace] members（crates/* と components/*）
 rust-toolchain.toml        # stable + wasm32-wasip2
 .env.example               # 環境変数の雛形（S3_* / WASM_CACHE_DIR / 上限・TTL 含む）
 docker-compose.yml         # postgres:16 + nats:2 (--jetstream) + minio (+ minio-setup)
 Makefile                   # setup / up / migrate / minio-bucket / build-component / run-* / deploy / invoke
+                           #   M8: run-workers / autoscale / stop-workers / scale-status / lane-status
 wit/world.wit              # faas:component@1.0.0（handler world）
 migrations/0001_init.sql   # M1: tenants / components / component_versions / executions
 migrations/0002_m2.sql     # M2: バージョン管理・サイズ等の追加カラム / インデックス
@@ -1051,11 +1340,14 @@ crates/control-plane/tests/chaos_m4.rs  # M4 障害注入の end-to-end テス�
 crates/control-plane/tests/chaos_m5.rs  # M5 冪等会計の end-to-end テスト（E1: 重複は+1 / E2: N件は+N, #[ignore]）
 crates/control-plane/tests/chaos_m6.rs  # M6 起動形態の end-to-end テスト（S1: 同期 / S2: Cron / S3: トリガー, #[ignore]）
 crates/control-plane/tests/chaos_m7.rs  # M7 デプロイ運用の end-to-end テスト（S1: canary/rollback / S2: env・secret 注入 / S3: 非漏洩, #[ignore]）
+crates/control-plane/tests/chaos_m8.rs  # M8 弾力スケール/アイソレーションの end-to-end テスト（U1〜U4, #[ignore]、要 CHAOS_TOKEN_B）
 crates/control-plane/src/routing.rs     # M7a: canary の決定的バケット選択（DB/時刻/乱数に非依存の純関数）
 crates/control-plane/src/secrets.rs     # M7c: 封筒暗号（XChaCha20-Poly1305）+ KEK キーリング + execution 基準の世代解決
 crates/control-plane/src/handlers_secrets.rs # M7c: secret の write-only API と POST /internal/job-env
 crates/shared/src/redacted.rs           # M7-0: Redacted<T>（Serialize を実装しない秘密値ラッパ）
 crates/worker/src/env.rs                # M7b/M7c: 許可リストで畳む env 組み立て（expose() の allowlist 対象）
+crates/control-plane/src/lanes.rs       # M8: テナント別 lane の provisioning（単一 writer は advisory lock）+ backlog ポーラ
+crates/control-plane/src/scale.rs       # M8: オートスケールの判断ロジック（純関数。時計は引数で注入し CI で決定的に検証）
 crates/control-plane/src/metrics.rs     # M4a: Prometheus Registry とメトリクス定義
 crates/worker/             # faas-worker (bin): wasmtime + async-nats + reqwest + cwasm キャッシュ
                            #   epoch ticker は OS スレッド (chaos_d 対策。M4b 設計メモ参照)
@@ -1063,6 +1355,11 @@ crates/worker/src/metrics.rs            # M4a: worker 側 Prometheus 公開（�
 components/echo/           # サンプル Component（cdylib, wasm32-wasip2）
 components/always-trap/    # M4 chaos_c 用: handle 入口で panic（trap → DLQ 経路）
 components/slow/           # M4 chaos_d 用: handle が tight loop（epoch interrupt → timeout 経路）
+components/burn/           # M8 chaos 用: {"burn_ms": N} のぶん busy-loop して **succeeded で終端**（slow と違い成功する）
+scripts/worker-lib.sh      # M8: worker プロセスを slot 番号で管理する共通関数（起動確認 / ドレイン停止 / カウンタ退避）
+scripts/run-workers.sh     # M8: worker を固定 N 台起動
+scripts/worker-autoscale.sh # M8: GET /internal/scale を見て増減させる参照アクチュエータ
+scripts/stop-workers.sh    # M8: 全台ドレイン停止
 仕様書.md                  # 全体仕様（M5 範囲は §15 M5 / §14 メータリング行、M6 範囲は §15 M6 / §6.3 / §11 / §14 同期 Invoke・トリガー・Cron 行）
 ```
 
@@ -1070,12 +1367,12 @@ components/slow/           # M4 chaos_d 用: handle が tight loop（epoch inter
 
 ## 次のマイルストーン（仕様書 §15）
 
-M7 完了済み（本リポジトリの現状）。次は M8 以降の将来⬜:
+M8 完了済み（本リポジトリの現状）。次は M9 以降の将来⬜:
 
 - **M8 以降（商用マルチテナント SaaS 化, §15）**: 商用クラウド SaaS として成立させる段階実装。
   基本線は **M5 課金・メータリング → M6 Invoke 拡充（同期 Invoke + 外部イベント/Cron トリガー）
   → M7 デプロイ運用（canary / rollback / per-function env / Secrets）→ M8 弾力スケール +
-  テナント間アイソレーション → M9 サンドボックス強化・サプライチェーン**（M5/M6/M7 は完了済み）。分散トレーシング（OpenTelemetry）は
+  テナント間アイソレーション → M9 サンドボックス強化・サプライチェーン**（M5/M6/M7/M8 は完了済み）。分散トレーシング（OpenTelemetry）は
   高レバレッジで前倒し推奨。Workflow Engine / Result Ingestor 分離 / Multi Region は固定順序を
   持たない**需要発火型**。AI/LLM はプラットフォーム機能ではなく Capability 経由の外部呼び出し
   （§4.4 / §13）で充足するため、ロードマップ項目から除外。

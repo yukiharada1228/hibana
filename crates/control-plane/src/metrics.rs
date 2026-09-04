@@ -109,6 +109,28 @@ pub struct Metrics {
     /// 全テナント横断の集計なので HTTP 応答には載せない（`POST /admin/secrets/rekey` は
     /// 件数だけを返す）。旧 kid の gauge が 0 になったら `SECRETS_RETIRED_KEYS` を撤去してよい。
     pub secret_versions_by_kid: IntGaugeVec,
+
+    // --- M8 (§5.2 / §6): 弾力スケールと配送層の分離 ---
+    /// lane 別の未配送メッセージ数（`num_pending`）。labels: lane。
+    ///
+    /// **単体で backlog として使ってはならない**。1 worker が大量に claim した瞬間これは 0 に
+    /// 落ちるが、仕事は終わっていない（下の `lane_ack_pending` と足して初めて意味を持つ）。
+    /// lane 別に取る価値は別にあり、**「分離が配送層で効いている」ことの直接証拠**になる。
+    pub lane_pending_messages: IntGaugeVec,
+    /// lane 別の配送済み未 ack 数（`num_ack_pending`）。labels: lane。
+    ///
+    /// worker が突然死しても、抱えていたメッセージは `ack_wait` 経過までここに残る。
+    /// つまり backlog から勝手に消えないので、シグナルとして堅牢である。
+    pub lane_ack_pending: IntGaugeVec,
+    /// 全 lane 合計の未消化仕事量 = Σ(`num_pending` + `num_ack_pending`)。autoscale の入力。
+    pub scale_backlog: IntGauge,
+    /// 最後に**成功した**観測からの経過秒。
+    ///
+    /// これが伸びている間は判断ロジックが hold に落ちる（§5.3 R2）。
+    /// 「NATS が見えないので現状維持している」ことを外から判別するための唯一の手掛かり。
+    pub scale_signal_age_seconds: IntGauge,
+    /// 現在の desired worker 数（判断ロジックの出力）。
+    pub scale_desired_workers: IntGauge,
 }
 
 impl Metrics {
@@ -257,6 +279,57 @@ impl Metrics {
             .register(Box::new(secret_versions_by_kid.clone()))
             .expect("register secret_versions_by_kid");
 
+        let lane_pending_messages = IntGaugeVec::new(
+            Opts::new(
+                "faas_lane_pending_messages",
+                "Undelivered messages per JetStream lane consumer (num_pending)",
+            ),
+            &["lane"],
+        )
+        .expect("metric: lane_pending_messages");
+        registry
+            .register(Box::new(lane_pending_messages.clone()))
+            .expect("register lane_pending_messages");
+
+        let lane_ack_pending = IntGaugeVec::new(
+            Opts::new(
+                "faas_lane_ack_pending",
+                "Delivered-but-unacked messages per JetStream lane consumer (num_ack_pending)",
+            ),
+            &["lane"],
+        )
+        .expect("metric: lane_ack_pending");
+        registry
+            .register(Box::new(lane_ack_pending.clone()))
+            .expect("register lane_ack_pending");
+
+        let scale_backlog = IntGauge::new(
+            "faas_scale_backlog",
+            "Total unfinished work across all lanes (sum of num_pending + num_ack_pending)",
+        )
+        .expect("metric: scale_backlog");
+        registry
+            .register(Box::new(scale_backlog.clone()))
+            .expect("register scale_backlog");
+
+        let scale_signal_age_seconds = IntGauge::new(
+            "faas_scale_signal_age_seconds",
+            "Seconds since the last successful backlog observation",
+        )
+        .expect("metric: scale_signal_age_seconds");
+        registry
+            .register(Box::new(scale_signal_age_seconds.clone()))
+            .expect("register scale_signal_age_seconds");
+
+        let scale_desired_workers = IntGauge::new(
+            "faas_scale_desired_workers",
+            "Desired worker count produced by the autoscale decision logic",
+        )
+        .expect("metric: scale_desired_workers");
+        registry
+            .register(Box::new(scale_desired_workers.clone()))
+            .expect("register scale_desired_workers");
+
         Arc::new(Self {
             registry,
             http_requests_total,
@@ -271,6 +344,11 @@ impl Metrics {
             canary_routed_total,
             secret_material_issued_total,
             secret_versions_by_kid,
+            lane_pending_messages,
+            lane_ack_pending,
+            scale_backlog,
+            scale_signal_age_seconds,
+            scale_desired_workers,
         })
     }
 

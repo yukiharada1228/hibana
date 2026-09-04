@@ -64,6 +64,56 @@ const DEFAULT_CRON_POLL_INTERVAL_SECS: u64 = 10;
 const DEFAULT_INTERNAL_BIND_ADDR: &str = "127.0.0.1:8081";
 /// `/internal/job-env` の per-IP 上限（req/分）。無認証面のグローバル保護。
 const DEFAULT_JOB_ENV_EXCHANGE_RATE_PER_MIN: u64 = 600;
+// --- M8 弾力スケール / テナント間アイソレーション（§8 / §15） ---
+/// テナント別 lane consumer を有効にするか。**既定 false**（= M7 までと同一トポロジ）。
+///
+/// 既定を false にしているのは、lane 化が JetStream 側のトポロジを変える操作であり、
+/// 「アップグレードしたら黙って挙動が変わる」ことを避けるため。有効化は明示的な env で行う。
+const DEFAULT_TENANT_LANES_ENABLED: bool = false;
+/// 専有 lane を割り当てるテナント数の上限。超過分は overflow lane 1 本へ束ねる。
+///
+/// **完了条件を満たす regime はアクティブテナント数 ≤ この値**である。超えると超過分は
+/// overflow lane を共有し、その内部では合算の頭打ちが復活する（有界で明示的な劣化モード）。
+const DEFAULT_MAX_DEDICATED_LANES: u64 = 64;
+/// lane consumer の `max_ack_pending` に足す余裕。
+/// in-flight 上限ちょうどだと、終端と次の配送が重なる瞬間に配送が止まる。
+const DEFAULT_LANE_ACK_PENDING_HEADROOM: u64 = 8;
+/// overflow lane の `max_ack_pending`（固定）。
+///
+/// **所属テナント数に比例させない**。比例させると合算上限が事実上撤廃され、
+/// overflow lane が「M7 までの共有 consumer」そのものに戻ってしまう。
+const DEFAULT_LANE_OVERFLOW_ACK_PENDING: u64 = 1000;
+/// per-lane 実行クレジットのグローバル既定（worker 1 プロセスあたり）。
+const DEFAULT_WORKER_LANE_CONCURRENCY: u64 = 4;
+/// lane reconcile ループの周期（秒）。
+const DEFAULT_LANE_RECONCILE_INTERVAL_SECS: u64 = 10;
+
+/// backlog ポーラの周期（秒）。**0 = ポーラを spawn しない**。
+///
+/// M7 までと完全に同一の挙動を既定に保つ（観測ループを増やすのはオプトイン）。
+/// `.env.example` は 5 を出荷する。
+const DEFAULT_SCALE_POLL_INTERVAL_SECS: u64 = 0;
+/// desired の分母。worker 側 `WORKER_MAX_CONCURRENCY` の既定と一致させてある。
+const DEFAULT_SCALE_JOBS_PER_WORKER: u64 = 32;
+/// worker 台数の下限。scale-to-zero は opt-in なので既定は 1（§5.3 の根拠を参照）。
+const DEFAULT_SCALE_MIN_WORKERS: u64 = 1;
+/// worker 台数の上限。
+///
+/// 根拠: worker 1 台が PG 接続を最大 8 本張る。postgres:16 の既定 `max_connections=100` に対し
+/// CP も接続するので、ローカルでは 4 × 8 = 32 が安全圏。
+const DEFAULT_SCALE_MAX_WORKERS: u64 = 4;
+/// scale-in のヒステリシス（秒）。`ACK_WAIT_SECS`（既定 30）より長く取る。
+const DEFAULT_SCALE_IN_COOLDOWN_SECS: u64 = 60;
+/// シグナル陳腐化の閾値（秒）。poll 周期 5 秒の 6 倍。
+const DEFAULT_SCALE_SIGNAL_STALE_SECS: u64 = 30;
+/// lane gauge に `lane` ラベルを付けるか（§6.2）。
+///
+/// 既定 true。`lane` ラベルの系列数は `min(テナント数, MAX_DEDICATED_LANES) + 1` で**有界**
+/// （既定 65）なので、`faas_tenant_invoke_total` のような「テナント数 × ルート数」の積とは
+/// 性質が違う。それでも**テナント数と一緒に伸びる軸**であることに変わりはないので、
+/// 運用者が上限を制御できる逃げ道を用意する。
+const DEFAULT_METRICS_LANE_LABELS: bool = true;
+
 /// `.env.example` に置く既知プレースホルダ。**この値のまま起動させない**（下記 MUST）。
 ///
 /// `JOB_SIGNING_KEY` と違い secret の**暗号文は DB に永続する**ため、既知鍵で暗号化して
@@ -122,6 +172,11 @@ pub struct Config {
     pub ack_wait_secs: u64,
     /// JetStream consumer の最大再配送回数（worker と共有。token exp 計算にも使う）。
     pub max_deliver: u64,
+    /// M8: 再配送 backoff（秒, CSV）。M7 までは worker だけが読んでいたが、consumer の作成者が
+    /// control-plane へ移ったため **CP もこの値の所有者**になった（§3.3 の TTL 結合: トークン exp と
+    /// 再配送間隔がずれると、正規の遅延結果がトークン失効扱いで破棄される）。
+    /// worker と同じ `BACKOFF_SECS` を読み、解釈規則も `faas_shared::parse_backoff_secs` で共有する。
+    pub backoff_secs: Vec<u64>,
     /// token exp に足す余裕秒数。
     pub token_margin_secs: u64,
 
@@ -181,6 +236,54 @@ pub struct Config {
     pub internal_bind_addr: String,
     /// `/internal/job-env` の per-IP 上限（req/分）。
     pub job_env_exchange_rate_per_min: u64,
+
+    // --- M8 弾力スケール / テナント間アイソレーション（§8 / §15） ---
+    // これらは lane reconcile（M8-3 / M8-4）が消費する。設定の読み取りを先に land して
+    // 「設定は入るが挙動は変わらない」段を作ることで、各段が単体で動作・テスト可能になる。
+    /// テナント別 lane consumer を有効にするか（既定 false = M7 までと同一トポロジ）。
+    #[allow(dead_code)]
+    pub tenant_lanes_enabled: bool,
+    /// 専有 lane の上限数。超過分は overflow lane 1 本へ束ねる。
+    #[allow(dead_code)]
+    pub max_dedicated_lanes: u64,
+    /// lane consumer の `max_ack_pending` に足す余裕。
+    #[allow(dead_code)]
+    pub lane_ack_pending_headroom: u64,
+    /// overflow lane の `max_ack_pending`（固定値）。
+    #[allow(dead_code)]
+    pub lane_overflow_ack_pending: u64,
+    /// per-lane 実行クレジットのグローバル既定。
+    pub worker_lane_concurrency: u64,
+    /// lane reconcile ループの周期（秒）。
+    #[allow(dead_code)]
+    pub lane_reconcile_interval_secs: u64,
+
+    // --- M8 (§5): 弾力スケール ---
+    /// backlog ポーラの周期（秒）。**0 = ポーラを spawn しない**（既定）。
+    ///
+    /// reaper の 30 秒周期を再利用しない理由: 30 秒古い depth で判断すると scale-out が
+    /// 最大 30 秒遅れ、それがそのままレイテンシの悪化になる。reaper 側のコメントは
+    /// 「頻度を要さない観測なので専用 env は増やさない」と述べるが、こちらは
+    /// **観測の鮮度そのものが完了条件に効く**ので逆の判断をする。
+    pub scale_poll_interval_secs: u64,
+    /// desired の分母。**`WORKER_MAX_CONCURRENCY` と揃えること**（CP は worker の env を
+    /// 知らないので検査できない。既定を一致させ、ズレは chaos の前提 assert で潰す）。
+    pub scale_jobs_per_worker: u64,
+    /// worker 台数の下限。`0` で scale-to-zero を許可する（**opt-in**）。
+    ///
+    /// 既定を 0 にしない理由: M6 の同期 invoke はサーバ側 `SYNC_REPLY_TIMEOUT_MS`（既定 5000）で
+    /// 打ち切られる。from-zero の coldstart はこの窓を容易に超えるので、既定 0 は
+    /// **M6 の完了条件を壊す**。
+    pub scale_min_workers: u64,
+    /// worker 台数の上限。
+    pub scale_max_workers: u64,
+    /// scale-in のヒステリシス（秒）。`ACK_WAIT_SECS` より長く取る
+    /// （scale-in 直後に再配送が走ると backlog が跳ねて flapping する）。
+    pub scale_in_cooldown_secs: u64,
+    /// シグナルがこの秒数より古くなったら信用しない。
+    pub scale_signal_stale_secs: u64,
+    /// lane gauge に `lane` ラベルを付けるか。false なら `"aggregate"` 1 値に畳む（§6.2）。
+    pub metrics_lane_labels: bool,
 
     // --- 観測 (M4a, §3.8) ---
     /// ログ整形（"text" 既定 / "json"）。`json` のとき `tracing_subscriber::fmt().json()` を
@@ -299,7 +402,7 @@ impl Config {
         // 未設定なら database_url にフォールバック（所有者 1 本運用の開発用途）。
         let migration_database_url =
             env_optional("MIGRATION_DATABASE_URL").unwrap_or_else(|| database_url.clone());
-        Ok(Self {
+        let cfg = Self {
             database_url,
             migration_database_url,
             nats_url: env_or("NATS_URL", "nats://127.0.0.1:4222"),
@@ -318,6 +421,10 @@ impl Config {
             // M3c: 署名鍵 / kid は必須。TTL 定数は faas_shared の既定を env で上書き可能。
             job_signing_key: Redacted::new(env_required("JOB_SIGNING_KEY")?),
             job_signing_kid: env_required("JOB_SIGNING_KID")?,
+            backoff_secs: faas_shared::parse_backoff_secs(
+                std::env::var("BACKOFF_SECS").ok().as_deref(),
+            )
+            .map_err(|e| anyhow::anyhow!("env var BACKOFF_SECS {e}"))?,
             ack_wait_secs: env_u64("ACK_WAIT_SECS", faas_shared::ACK_WAIT_SECS)?,
             max_deliver: env_u64("MAX_DELIVER", faas_shared::MAX_DELIVER)?,
             token_margin_secs: env_u64("TOKEN_MARGIN_SECS", faas_shared::TOKEN_MARGIN_SECS)?,
@@ -366,8 +473,70 @@ impl Config {
                 "JOB_ENV_EXCHANGE_RATE_PER_MIN",
                 DEFAULT_JOB_ENV_EXCHANGE_RATE_PER_MIN,
             )?,
+            tenant_lanes_enabled: env_bool("TENANT_LANES_ENABLED", DEFAULT_TENANT_LANES_ENABLED),
+            max_dedicated_lanes: env_u64("MAX_DEDICATED_LANES", DEFAULT_MAX_DEDICATED_LANES)?,
+            lane_ack_pending_headroom: env_u64(
+                "LANE_ACK_PENDING_HEADROOM",
+                DEFAULT_LANE_ACK_PENDING_HEADROOM,
+            )?,
+            lane_overflow_ack_pending: env_u64(
+                "LANE_OVERFLOW_ACK_PENDING",
+                DEFAULT_LANE_OVERFLOW_ACK_PENDING,
+            )?,
+            worker_lane_concurrency: env_u64(
+                "WORKER_LANE_CONCURRENCY",
+                DEFAULT_WORKER_LANE_CONCURRENCY,
+            )?,
+            lane_reconcile_interval_secs: env_u64(
+                "LANE_RECONCILE_INTERVAL_SECS",
+                DEFAULT_LANE_RECONCILE_INTERVAL_SECS,
+            )?,
+            scale_poll_interval_secs: env_u64(
+                "SCALE_POLL_INTERVAL_SECS",
+                DEFAULT_SCALE_POLL_INTERVAL_SECS,
+            )?,
+            scale_jobs_per_worker: env_u64("SCALE_JOBS_PER_WORKER", DEFAULT_SCALE_JOBS_PER_WORKER)?
+                // 0 は div_ceil の分母として使えない（ゼロ除算）。1 へ引き上げる。
+                .max(1),
+            scale_min_workers: env_u64("SCALE_MIN_WORKERS", DEFAULT_SCALE_MIN_WORKERS)?,
+            scale_max_workers: env_u64("SCALE_MAX_WORKERS", DEFAULT_SCALE_MAX_WORKERS)?,
+            scale_in_cooldown_secs: env_u64(
+                "SCALE_IN_COOLDOWN_SECS",
+                DEFAULT_SCALE_IN_COOLDOWN_SECS,
+            )?,
+            scale_signal_stale_secs: env_u64(
+                "SCALE_SIGNAL_STALE_SECS",
+                DEFAULT_SCALE_SIGNAL_STALE_SECS,
+            )?,
+            metrics_lane_labels: env_bool("METRICS_LANE_LABELS", DEFAULT_METRICS_LANE_LABELS),
             log_format: env_or("LOG_FORMAT", "text"),
-        })
+        };
+
+        // M8 (§5.3 R0): `min > max` は clamp の意味論が壊れる設定なので **起動時に落とす**。
+        // 実行時に黙って握り潰すと「なぜか常に min 台」という診断しづらい形で現れる。
+        if cfg.scale_min_workers > cfg.scale_max_workers {
+            anyhow::bail!(
+                "SCALE_MIN_WORKERS ({}) must not exceed SCALE_MAX_WORKERS ({})",
+                cfg.scale_min_workers,
+                cfg.scale_max_workers
+            );
+        }
+
+        Ok(cfg)
+    }
+
+    /// M8 (§5.3): スケール方針を組み立てる。
+    pub fn scale_policy(&self) -> crate::scale::ScalePolicy {
+        // u32 へ落とす。実運用のオーダを大きく超える値は上限で頭打ちにする
+        // （設定ミスで u32 を溢れさせても panic させない）。
+        let to_u32 = |v: u64| u32::try_from(v).unwrap_or(u32::MAX);
+        crate::scale::ScalePolicy {
+            jobs_per_worker: to_u32(self.scale_jobs_per_worker),
+            min_workers: to_u32(self.scale_min_workers),
+            max_workers: to_u32(self.scale_max_workers),
+            scale_in_cooldown_secs: self.scale_in_cooldown_secs,
+            stale_after_secs: self.scale_signal_stale_secs,
+        }
     }
 
     /// 指定の壁時計上限（ms）から、トークンの `exp` オフセット秒数を計算する (§3.3)。
@@ -388,6 +557,20 @@ impl Config {
     /// グローバル既定から admission 制御パラメータ束を組み立てる (M3d, §8)。
     ///
     /// 現状はグローバル既定のみを反映する（per-tenant `quotas` 上書きは後続スライス）。
+    /// M8 (§3.7): lane provisioning の設定束を組み立てる。
+    pub fn lanes(&self) -> crate::state::LaneConfig {
+        crate::state::LaneConfig {
+            metrics_lane_labels: self.metrics_lane_labels,
+            enabled: self.tenant_lanes_enabled,
+            max_dedicated: self.max_dedicated_lanes,
+            ack_pending_headroom: self.lane_ack_pending_headroom,
+            overflow_ack_pending: self.lane_overflow_ack_pending,
+            ack_wait_secs: self.ack_wait_secs,
+            max_deliver: self.max_deliver,
+            backoff_secs: self.backoff_secs.clone(),
+        }
+    }
+
     pub fn admission(&self) -> crate::state::AdmissionConfig {
         use crate::store::{InflightParams, LockoutParams, RateLimitParams};
         crate::state::AdmissionConfig {
@@ -404,6 +587,7 @@ impl Config {
                 window_secs: self.login_lockout_window_secs,
             },
             trust_proxy_headers: self.trust_proxy_headers,
+            lane_concurrency: self.worker_lane_concurrency,
         }
     }
 }

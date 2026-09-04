@@ -21,10 +21,12 @@ mod error;
 mod extract;
 mod handlers;
 mod handlers_secrets;
+mod lanes;
 mod login;
 mod metrics;
 mod reaper;
 mod routing;
+mod scale;
 mod scheduler;
 mod secrets;
 mod signing;
@@ -63,6 +65,15 @@ async fn main() -> anyhow::Result<()> {
     // JOB_SIGNING_KEY などのランタイム用必須 env が無くても通る（migrate に必要なのは DB URL だけ）。
     if std::env::args().any(|a| a == "--migrate-only") {
         return run_migrate_only().await;
+    }
+
+    // M8-1 (§3.4): `--recreate-invoke-stream` は invoke stream を WorkQueue retention で作り直す。
+    // retention は NATS で**作成後に変更できない**ため、M8 以前の `Limits` stream が残っている環境では
+    // 削除して作り直すしかない。手作業の手順書にすると「未消化 0 の確認」を飛ばす事故が起きるので、
+    // **確認を機械にやらせる**（`--migrate-only` と同じ「運用手順を実行可能にする」作法）。
+    if std::env::args().any(|a| a == "--recreate-invoke-stream") {
+        let force = std::env::args().any(|a| a == "--force");
+        return run_recreate_invoke_stream(force).await;
     }
 
     let config = Config::from_env()?;
@@ -199,6 +210,8 @@ async fn main() -> anyhow::Result<()> {
         config.sync_reply_timeout_ms,
         secret_keyring,
         config.job_env_exchange_rate_per_min,
+        config.lanes(),
+        config.scale_policy(),
     );
 
     // --- result 購読タスク ---
@@ -253,6 +266,34 @@ async fn main() -> anyhow::Result<()> {
         scheduler::run(scheduler_state, cron_poll_interval).await;
     });
 
+    // --- lane reconciler（M8-3, §3.7）---
+    // consumer の作成 / 更新 / 削除は **control-plane が唯一の書き手**である（M7 までは worker）。
+    // 単一 writer は pg_try_advisory_lock で強制する（CP はステートレス × N が前提のため）。
+    let lane_state = state.clone();
+    let lane_interval = config.lane_reconcile_interval_secs;
+    tokio::spawn(async move {
+        lanes::run_lane_reconcile(lane_state, lane_interval).await;
+    });
+
+    // --- backlog ポーラ（M8-8, §5.2）---
+    // **0 = spawn しない**（既定）。観測ループを増やすのはオプトインにする。
+    //
+    // reaper の 30 秒周期を再利用しない理由: 30 秒古い depth で判断すると scale-out が最大
+    // 30 秒遅れ、それがそのままレイテンシの悪化になる。下の kid gauge が「頻度を要さない観測
+    // なので専用 env は増やさない」としているのとは**逆の判断**であり、差は
+    // 「観測の鮮度そのものが完了条件に効くかどうか」にある。
+    if config.scale_poll_interval_secs > 0 {
+        let scale_state = state.clone();
+        let scale_interval = config.scale_poll_interval_secs;
+        tokio::spawn(async move {
+            lanes::run_backlog_poller(scale_state, scale_interval).await;
+        });
+    } else {
+        tracing::info!(
+            "backlog poller disabled (SCALE_POLL_INTERVAL_SECS=0); GET /internal/scale will return 503"
+        );
+    }
+
     // --- KEK ローテーション進捗の gauge 更新（M7c-4, §4.7.2）---
     // reaper と同じ周期で回す（頻度を要さない観測なので専用 env は増やさない）。
     let kid_gauge_state = state.clone();
@@ -302,12 +343,25 @@ async fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// **内部専用**ルータ (M7c, §4.6.1)。`POST /internal/job-env` だけを載せる。
+/// **内部専用**ルータ (M7c §4.6.1 / M8 §5.4)。
+///
+/// # 載せる 2 ルートは、認証の根拠が異なる
+///
+/// | ルート | 認証の根拠 |
+/// | --- | --- |
+/// | `POST /internal/job-env` | **env-token の Ed25519 署名そのもの**。ハンドラ内でテナント停止も明示的に遮断する |
+/// | `GET /internal/scale` | **無認証**。ただし応答は stream の集計値のみで、テナント名も execution_id も含まない |
+///
+/// `GET /internal/scale` に `Principal` を要求しない根拠は「テナントデータを含まないこと」で
+/// あり、これは不変条件として維持しなければならない: **この応答に per-tenant の値を足しては
+/// ならない**（足すなら同時に認証を課すこと）。この listener は worker が `job-env` を叩く先で
+/// あり、worker は Ed25519 鍵を持たない**別トラストドメイン**である（仕様書 §3.3）。したがって
+/// ここに載せてよいのは「worker に見せてよい情報」だけで、キュー深さと目標台数はそれを満たす。
 ///
 /// # MUST NOT
 ///
 /// このルータを公開 listener（`BIND_ADDR`）へマウントしてはならない。`build_router` が被せる
-/// `auth::authenticate` / `require_scope` の外にあり、認証は **env-token の署名そのもの**である。
+/// `auth::authenticate` / `require_scope` の外にあり、`job-env` の認証は署名そのものである。
 /// 公開すると、署名鍵を持たない相手でも per-IP レート上限まで総当たりの試行ができる面が
 /// インターネットに露出する（署名検証は破れないが、無用な攻撃面を作らない）。
 ///
@@ -317,6 +371,7 @@ async fn main() -> anyhow::Result<()> {
 fn build_internal_router(state: AppState) -> Router {
     Router::new()
         .route("/internal/job-env", post(handlers_secrets::job_env))
+        .route("/internal/scale", get(handlers::internal_scale))
         .with_state(state)
 }
 
@@ -524,19 +579,155 @@ fn build_router(state: AppState) -> Router {
 /// CP のリトライによる同一 execution_id の二重 enqueue を防げる。
 async fn ensure_invoke_stream(jetstream: &async_nats::jetstream::Context) -> anyhow::Result<()> {
     use anyhow::anyhow;
-    use async_nats::jetstream::stream::Config as StreamConfig;
+    use async_nats::jetstream::stream::RetentionPolicy;
 
-    // worker 側と一致: name=FAAS_INVOKE / subjects=[tenant.*.component.invoke]。
-    let subject = faas_shared::invoke_subject_wildcard().to_string();
-    jetstream
-        .get_or_create_stream(StreamConfig {
-            name: "FAAS_INVOKE".to_string(),
-            subjects: vec![subject],
-            ..Default::default()
-        })
+    // M8-1 (§3.4): **control-plane が stream の唯一の作成者**である（worker からは撤去した）。
+    // config の真実は faas_shared::invoke_stream_config()。
+    let mut stream = jetstream
+        .get_or_create_stream(faas_shared::invoke_stream_config())
         .await
         .map_err(|e| anyhow!("get_or_create_stream(FAAS_INVOKE) failed: {e}"))?;
-    tracing::info!(stream = "FAAS_INVOKE", "ensured invoke jetstream stream");
+
+    // **不変条件の起動時検査 (MUST)**: `get_or_create_stream` は既存 stream があっても
+    // config を更新せずそのまま返す。したがって M8 以前の `Limits` stream が残っている環境では、
+    // 「どの subject もちょうど 1 consumer」というサーバ強制が**静かに退化する**
+    // （lane の filter が重なっても NATS が拒否しなくなり、二重配送が起こりうる）。
+    // 黙って劣化させるより起動を止める（assert_non_privileged_runtime_role と同じ作法）。
+    let info = stream
+        .info()
+        .await
+        .map_err(|e| anyhow!("stream info(FAAS_INVOKE) failed: {e}"))?;
+    if info.config.retention != RetentionPolicy::WorkQueue {
+        anyhow::bail!(
+            "stream {} has retention {:?} but M8 requires WorkQueue. \
+             retention cannot be changed after creation: stop the control-plane and all workers, \
+             confirm the stream is drained (curl -s localhost:8222/jsz?streams=true shows messages=0), \
+             delete the stream, then start the control-plane again. \
+             See README トラブルシュート.",
+            faas_shared::INVOKE_STREAM_NAME,
+            info.config.retention
+        );
+    }
+
+    tracing::info!(
+        stream = faas_shared::INVOKE_STREAM_NAME,
+        retention = ?info.config.retention,
+        "ensured invoke jetstream stream"
+    );
+    Ok(())
+}
+
+/// `--recreate-invoke-stream` モード: invoke stream を WorkQueue retention で作り直して exit する (M8-1)。
+///
+/// # 安全確認（既定。`--force` で省略できる）
+///
+/// 全 consumer の `num_pending + num_ack_pending` が **0** であることを確認してから削除する。
+/// **`messages` が 0 であることは要求しない** —— M8 以前の `Limits` retention では ack 済みの
+/// メッセージも stream に残るため、`messages == 0` は正常な運用状態でも達成できない条件である
+/// （未消化の仕事があるかどうかを表すのは consumer 側の `num_pending` / `num_ack_pending`）。
+///
+/// # 失われるもの
+///
+/// - **`Nats-Msg-Id` の重複排除ウィンドウ**（既定 2 分）がリセットされる。冪等性三層（§6.6）のうち
+///   layer 3 が一時的に消えることを意味する。layer 1（`executions` の
+///   `(tenant_id, idempotency_key)` 部分 UNIQUE）と layer 2（`executions.id` PK）は DB 側なので
+///   効き続けるが、**三層のうち 1 層を意図的に落とす瞬間がある**ことを認識して実行すること。
+/// - ack 済みメッセージの履歴（`Limits` retention で溜まっていた分）。実行結果は DB にあるため会計は壊れない。
+///
+/// # 手順
+///
+/// 1. control-plane と worker をすべて停止する。
+/// 2. `cargo run -p faas-control-plane -- --recreate-invoke-stream`（= `make recreate-stream`）。
+/// 3. control-plane → worker の順に起動する。
+async fn run_recreate_invoke_stream(force: bool) -> anyhow::Result<()> {
+    use anyhow::{anyhow, Context as _};
+    use async_nats::jetstream::stream::RetentionPolicy;
+    use futures::StreamExt as _;
+
+    let nats_url = std::env::var("NATS_URL").context("NATS_URL must be set")?;
+    let nats = async_nats::connect(&nats_url).await?;
+    let jetstream = async_nats::jetstream::new(nats);
+    let name = faas_shared::INVOKE_STREAM_NAME;
+
+    match jetstream.get_stream(name).await {
+        Err(_) => {
+            tracing::info!(stream = name, "stream does not exist; will create fresh");
+        }
+        Ok(mut stream) => {
+            // info() は &mut self を取るので、後段の consumers()（&self）と借用が重ならないよう
+            // 必要な値だけ先にコピーしてから借用を落とす。
+            let (retention, messages) = {
+                let info = stream
+                    .info()
+                    .await
+                    .map_err(|e| anyhow!("stream info({name}) failed: {e}"))?;
+                (info.config.retention, info.state.messages)
+            };
+            if retention == RetentionPolicy::WorkQueue {
+                tracing::info!(stream = name, "stream is already WorkQueue; nothing to do");
+                return Ok(());
+            }
+
+            // 未消化の仕事が残っていないことを確認する（残っていれば消すと実行喪失になる）。
+            if !force {
+                let mut consumers = stream.consumers();
+                let mut undelivered = 0u64;
+                while let Some(c) = consumers.next().await {
+                    let c = c.map_err(|e| anyhow!("consumer info failed: {e}"))?;
+                    let outstanding = c.num_pending + c.num_ack_pending as u64;
+                    if outstanding > 0 {
+                        tracing::warn!(
+                            consumer = %c.name,
+                            num_pending = c.num_pending,
+                            num_ack_pending = c.num_ack_pending,
+                            "consumer still has undelivered work"
+                        );
+                    }
+                    undelivered += outstanding;
+                }
+                if undelivered > 0 {
+                    anyhow::bail!(
+                        "refusing to delete stream {name}: {undelivered} message(s) are still \
+                         unprocessed. start the workers, let them drain, then retry. \
+                         (pass --force to delete anyway; in-flight jobs would be lost and their \
+                          DB rows finalized as failed by the stuck-execution sweeper)"
+                    );
+                }
+            }
+
+            tracing::warn!(
+                stream = name,
+                retention = ?retention,
+                messages,
+                "deleting stream to change retention to WorkQueue \
+                 (the Nats-Msg-Id dedup window resets; idempotency layers 1 and 2 remain in the DB)"
+            );
+            jetstream
+                .delete_stream(name)
+                .await
+                .map_err(|e| anyhow!("delete_stream({name}) failed: {e}"))?;
+        }
+    }
+
+    let mut created = jetstream
+        .create_stream(faas_shared::invoke_stream_config())
+        .await
+        .map_err(|e| anyhow!("create_stream({name}) failed: {e}"))?;
+    let info = created
+        .info()
+        .await
+        .map_err(|e| anyhow!("stream info({name}) failed after create: {e}"))?;
+    anyhow::ensure!(
+        info.config.retention == RetentionPolicy::WorkQueue,
+        "stream {name} was created but retention is {:?}",
+        info.config.retention
+    );
+
+    tracing::info!(
+        stream = name,
+        retention = ?info.config.retention,
+        "invoke stream recreated with WorkQueue retention; start the control-plane and workers now"
+    );
     Ok(())
 }
 

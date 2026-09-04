@@ -7,6 +7,7 @@ members = [
     "components/echo",
     "components/always-trap",
     "components/slow",
+    "components/burn",
 ]
 
 # control-plane / worker / components/echo は後続エージェントが各ディレクトリを作成する。

@@ -60,6 +60,47 @@ pub struct Metrics {
     /// 内容は一切見ずに捨てるが、「ゲストが何か書いている」ことだけは観測できるようにする
     /// （デバッグの手掛かりを残しつつ、何を書いたかは分からない状態を保つ）。
     pub guest_stderr_dropped_bytes_total: IntCounter,
+    /// M8 (§3.7): この worker が現に購読している lane 数。
+    ///
+    /// lane discovery が収束しているかを見るための gauge。0 のまま張り付いていれば
+    /// 「control-plane が lane を作っていない」か「discovery が失敗し続けている」ことが分かる。
+    pub subscribed_lanes: IntGauge,
+    /// M8 (§4.4): lane 数がこの worker のプロセス容量を超えたため、**今この瞬間は購読していない**
+    /// lane の数。
+    ///
+    /// 0 より大きい状態は「完了条件のスコープ外の縮退 regime」に入ったことを意味する。
+    /// メッセージは WorkQueue に残るので喪失はしないが、未提供 lane のテナントは最大
+    /// `LANE_ROTATION_SECS` 待たされる。静かに壊れることだけは避けたいので gauge に晒す
+    /// （対処は `WORKER_MAX_CONCURRENCY` を上げるか worker 台数を増やすか）。
+    pub lanes_unserved: IntGauge,
+    /// M8 (§4.3): 現在この worker で実行中（spawn 済み・未完了）のジョブ数。
+    ///
+    /// `InflightGuard` が inc/dec するので **panic 経路でもリークしない**。
+    /// ドレイン（§4.6）はこれが 0 に落ちることを完了条件にするため、リークすると
+    /// 「ドレインが必ずタイムアウトする」という形で壊れる。
+    pub inflight_executions: IntGauge,
+    /// M8 (§6.4): `delivered >= 2`（= JetStream が再配送した）メッセージを引いた回数の累計。
+    ///
+    /// 二重実行の**直接の観測点**。scale-in のたびに増えるなら、ドレイン（§4.6）が効いていない。
+    pub redelivered_total: IntCounter,
+    /// M8 (§4.6): ドレイン中に NAK で差し戻したメッセージ数の累計。
+    ///
+    /// §4.3 の permit 規律により over-fetch しないので、**定常状態ではほぼ 0 のはず**である。
+    /// 増え続けるなら「引いたのに走らせられていない」= 規律が破れているサイン。
+    pub drain_naked_total: IntCounter,
+    /// M8 (§4.6): ドレインのタイムアウトで**待ちきれずに見捨てた** in-flight ジョブ数の累計。
+    ///
+    /// 見捨てても喪失はしない（JetStream の再配送が保険として効く）が、そのジョブは
+    /// ゲストが 2 回実行される。増えているなら `WORKER_DRAIN_TIMEOUT_SECS` が実行時間に
+    /// 対して短すぎる。
+    pub drain_abandoned_total: IntCounter,
+    /// M8 (§5.5): supervisor が注入した slot 番号（`WORKER_SLOT`）。未設定なら -1。
+    ///
+    /// **同一性の検証にだけ使う**。参照アクチュエータは「起動したはずの slot i の worker が
+    /// 本当に `PORT_BASE+i` で応答しているか」を、この gauge の値が i と一致することで確認する。
+    /// これが無いと、手動で起動した worker がポートを掴んでいる状況で
+    /// 「supervisor は 1 台も起動していないのに live 判定が 1 になる」ことに気づけない。
+    pub worker_slot: IntGauge,
 }
 
 impl Metrics {
@@ -142,6 +183,76 @@ impl Metrics {
             .register(Box::new(guest_stderr_dropped_bytes_total.clone()))
             .expect("register guest_stderr_dropped_bytes_total");
 
+        let subscribed_lanes = IntGauge::new(
+            "wasmtime_subscribed_lanes",
+            "Number of JetStream lane consumers this worker is currently pulling from",
+        )
+        .expect("metric: subscribed_lanes");
+        registry
+            .register(Box::new(subscribed_lanes.clone()))
+            .expect("register subscribed_lanes");
+
+        let lanes_unserved = IntGauge::new(
+            "wasmtime_lanes_unserved",
+            "Lanes this worker discovered but is not currently pulling from (process capacity exceeded)",
+        )
+        .expect("metric: lanes_unserved");
+        registry
+            .register(Box::new(lanes_unserved.clone()))
+            .expect("register lanes_unserved");
+
+        let inflight_executions = IntGauge::new(
+            "wasmtime_inflight_executions",
+            "Executions currently running in this worker process",
+        )
+        .expect("metric: inflight_executions");
+        registry
+            .register(Box::new(inflight_executions.clone()))
+            .expect("register inflight_executions");
+
+        let redelivered_total = IntCounter::new(
+            "wasmtime_redelivered_total",
+            "Messages pulled with delivered >= 2 (JetStream redelivery; direct signal of re-execution)",
+        )
+        .expect("metric: redelivered_total");
+        registry
+            .register(Box::new(redelivered_total.clone()))
+            .expect("register redelivered_total");
+
+        let drain_naked_total = IntCounter::new(
+            "wasmtime_drain_naked_total",
+            "Messages explicitly NAK'd back to JetStream during graceful drain",
+        )
+        .expect("metric: drain_naked_total");
+        registry
+            .register(Box::new(drain_naked_total.clone()))
+            .expect("register drain_naked_total");
+
+        let drain_abandoned_total = IntCounter::new(
+            "wasmtime_drain_abandoned_total",
+            "In-flight executions abandoned because the drain timeout elapsed",
+        )
+        .expect("metric: drain_abandoned_total");
+        registry
+            .register(Box::new(drain_abandoned_total.clone()))
+            .expect("register drain_abandoned_total");
+
+        let worker_slot = IntGauge::new(
+            "wasmtime_worker_slot",
+            "Supervisor-assigned slot number for this worker process (-1 when unmanaged)",
+        )
+        .expect("metric: worker_slot");
+        // 未設定は -1。0 を既定にすると「slot 0 として管理されている」と区別がつかない。
+        worker_slot.set(
+            std::env::var("WORKER_SLOT")
+                .ok()
+                .and_then(|v| v.trim().parse::<i64>().ok())
+                .unwrap_or(-1),
+        );
+        registry
+            .register(Box::new(worker_slot.clone()))
+            .expect("register worker_slot");
+
         Arc::new(Self {
             registry,
             wasmtime_execution_duration_seconds,
@@ -151,6 +262,13 @@ impl Metrics {
             executions_total,
             dlq_published_total,
             guest_stderr_dropped_bytes_total,
+            subscribed_lanes,
+            lanes_unserved,
+            inflight_executions,
+            redelivered_total,
+            drain_naked_total,
+            drain_abandoned_total,
+            worker_slot,
         })
     }
 

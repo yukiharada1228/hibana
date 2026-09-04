@@ -3644,6 +3644,64 @@ fn write_canonical(v: &Value, out: &mut Vec<u8>) {
     }
 }
 
+/// `GET /internal/scale` (M8-8, §5.4) — 現在の backlog と desired worker 数。
+///
+/// **内部専用 listener 専用**。応答は stream の集計値のみで、テナント名も execution_id も
+/// 含まない（`build_internal_router` の doc にある不変条件。ここに per-tenant の値を足すなら
+/// 同時に認証を課すこと）。
+///
+/// # 503 を返す 3 つの場合
+///
+/// ポーラ無効 / 未観測 / シグナル陳腐化のとき、**`desired` を出さずに 503** を返す。
+/// `desired: 0` を返すとアクチュエータが素直に全台停止させてしまうからである。
+/// 「値が取れない」と「値が 0」は運用上まったく違う意味なので、HTTP のレイヤで分ける。
+/// アクチュエータ側は 503 を「現状維持」として扱う（§5.5）。
+///
+/// # なぜ周期パラメータまで返すのか
+///
+/// chaos とアクチュエータが**タイムアウト予算をこの応答から算術で導出**できるようにするため。
+/// `poll_interval_secs` などをスクリプト側にハードコードすると、env を変えた瞬間に
+/// 「テストは緑だが実際には間に合っていない」という静かなズレが生まれる。
+pub async fn internal_scale(State(state): State<AppState>) -> Response {
+    let policy = *state.scale_policy();
+    let (snap, decision) = state.scale_view();
+    let age_secs = snap.last_ok.map(|t| t.elapsed().as_secs());
+
+    let common = json!({
+        "stream": faas_shared::INVOKE_STREAM_NAME,
+        "lanes": snap.lanes,
+        "backlog": snap.backlog,
+        "signal_age_secs": age_secs,
+        "min_workers": policy.min_workers,
+        "max_workers": policy.max_workers,
+        "jobs_per_worker": policy.jobs_per_worker,
+        "scale_in_cooldown_secs": policy.scale_in_cooldown_secs,
+        "stale_after_secs": policy.stale_after_secs,
+    });
+
+    // NoSignalYet / StaleSignal は「判断の材料が無い」ので desired を出さない。
+    // ScaleInCooldown は材料があり判断もできている（減らさないだけ）ので 200 で出す。
+    if let Some(reason) = decision.hold.filter(|r| {
+        matches!(
+            r,
+            crate::scale::HoldReason::NoSignalYet | crate::scale::HoldReason::StaleSignal
+        )
+    }) {
+        let mut body = common;
+        body["error"] = json!("scaler_unavailable");
+        body["reason"] = json!(reason.as_str());
+        return (StatusCode::SERVICE_UNAVAILABLE, Json(body)).into_response();
+    }
+
+    let mut body = common;
+    body["desired"] = json!(decision.target);
+    body["hold_reason"] = match decision.hold {
+        Some(r) => json!(r.as_str()),
+        None => Value::Null,
+    };
+    (StatusCode::OK, Json(body)).into_response()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

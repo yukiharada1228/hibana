@@ -1475,6 +1475,13 @@ pub struct TenantQuotaOverrides {
     /// in-flight 同時実行（pending+running）の上書き。
     #[serde(default)]
     pub max_concurrent_executions: Option<u64>,
+    /// M8 (§4.2): worker 1 プロセスがこのテナントの lane に同時に割ける実行スロットの上書き。
+    ///
+    /// 受付層（`invoke_rate` / `max_concurrent_executions`）とは別の**実行層**のノブである。
+    /// 実効値は `faas_shared::effective_lane_concurrency` が worker 側で
+    /// 「プロセス全体上限 ÷ 購読 lane 数」で頭打ちにするため、ここは希望値にすぎない。
+    #[serde(default)]
+    pub lane_concurrency: Option<u64>,
 }
 
 /// M4d (§3.2): テナントの実行ステータス（active|suspended）+ クォータ上書き JSONB。
@@ -1531,6 +1538,37 @@ pub async fn list_active_tenant_ids(
         .await?;
     rows.into_iter()
         .map(|r| r.try_get::<String, _>("id"))
+        .collect()
+}
+
+/// M8 (§3.7): lane reconcile 用に、active テナントを **作成順** で id + クォータごと引く。
+///
+/// **順序が `created_at ASC, id ASC` 固定であることが本質**である。`assign_lanes`
+/// （`faas_shared`）はこの順序を前提に「先頭 N 件が専有 lane」と決めるため、順序が揺れると
+/// 既存テナントの lane 割り当てが動き、consumer の delete/create が発生する。その窓では
+/// メッセージが「どの lane にも属さない」状態になり、900 秒後に stuck sweeper が偽 failed を作る。
+/// `created_at` が同値のときのために `id` を第 2 キーに置いて全順序にしている。
+///
+/// クォータ JSONB が壊れていても既定へ縮退する（`load_tenant_status_and_quotas` と同じ規約）。
+/// lane を作れないほうが害が大きいため、ここでエラーにはしない。
+#[allow(dead_code)] // M8-3 の lane reconcile が唯一の呼び出し元になる。
+pub async fn list_active_tenants_with_quotas(
+    executor: impl sqlx::PgExecutor<'_>,
+) -> Result<Vec<(String, TenantQuotaOverrides)>, sqlx::Error> {
+    let rows = sqlx::query(
+        "SELECT id, quotas FROM tenants WHERE status = 'active' ORDER BY created_at ASC, id ASC",
+    )
+    .fetch_all(executor)
+    .await?;
+
+    rows.into_iter()
+        .map(|r| {
+            let id: String = r.try_get("id")?;
+            let quotas: Value = r.try_get("quotas")?;
+            let overrides =
+                serde_json::from_value::<TenantQuotaOverrides>(quotas).unwrap_or_default();
+            Ok((id, overrides))
+        })
         .collect()
 }
 
