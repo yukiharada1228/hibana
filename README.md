@@ -1,24 +1,22 @@
-# WASM FaaS Platform — M8 (弾力スケールとテナント間アイソレーション)
+# WASM FaaS Platform — M9 (サンドボックス強化・サプライチェーン)
 
-[![CI](https://github.com/yukiharada1228/wasm-fass/actions/workflows/ci.yml/badge.svg?branch=develop)](https://github.com/yukiharada1228/wasm-fass/actions/workflows/ci.yml)
+[![CI](https://github.com/yukiharada1228/hibana/actions/workflows/ci.yml/badge.svg?branch=develop)](https://github.com/yukiharada1228/hibana/actions/workflows/ci.yml)
 
 WebAssembly Component をアップロードして invoke すると、Wasmtime Worker が実行して
-結果を返す FaaS プラットフォームです。本リポジトリの現状は **仕様書.md §15 の M8
-（弾力スケールとテナント間アイソレーション）範囲**であり、M1 の invoke 経路・M2 のアップロード/検証/デプロイ・M3 の
-マルチテナント / 認証 / RLS / 結果出所認証 / Capability 強制 / 共有 admission ストア /
-大容量 I/O 退避・M4 の Prometheus メトリクス + `/readyz`・構造化ログ・`.failed` (DLQ) subscriber と
-OS スレッドベースの epoch ticker による完全なリトライ/タイムアウト処理・全リソース制限・
-テナント別クォータ・M5 の per-execution 利用量計量（CPU fuel / wall time / peak memory /
-出力バイト）と冪等な期間集計（`usage_rollups`）/ 利用量参照 API（`GET /usage`）の上に、
-M6 の Invoke 経路拡充（同期 Invoke / Cron / 外部イベントトリガー）・
-M7 のデプロイ運用（canary / rollback / per-function env / Secrets）の上に、
-**「隣のテナントの負荷で自分が遅くならない」ことと「負荷に応じて worker が増減すること」**を
-追加します。具体的には
-(1) **テナント別 lane Consumer**（JetStream の配送枠をテナント単位で分ける, §3.3 / §8）、
-(2) **worker の実行クレジットと SIGTERM ドレイン**（プロセス全体の同時実行上限と、
-    scale-in でゲストを二度実行しないこと, §4.2 / §4.6）、
-(3) **backlog シグナルと参照アクチュエータ**（`GET /internal/scale` と worker supervisor, §5）を、
-いずれも **既存の冪等性・テナント分離・計量（M5）・同期 Invoke（M6）を壊さず**に積み上げます。
+結果を返す FaaS プラットフォームです。本リポジトリの現状は **仕様書.md §15 の M9
+（サンドボックス強化・サプライチェーン）範囲**であり、M1〜M6 の invoke 経路 / アップロード・検証・
+デプロイ / マルチテナント・認証・RLS・結果出所認証・Capability 強制 / メトリクス・DLQ・
+完全なリトライ/タイムアウト / 利用量計量 / 同期 Invoke・Cron・トリガー、
+M7 のデプロイ運用（canary / rollback / per-function env / Secrets）、
+M8 の弾力スケールとテナント間アイソレーション（テナント別 lane / 実行クレジット / オートスケール）の上に、
+**「未信頼 wasm をマルチテナントで常時実行するための多層防御」**を完成させます。具体的には
+(1) **検証のプロセス隔離**（悪性 wasm による検証 DoS を子プロセス 1 個に限局, M9b / §6.2）、
+(2) **egress allowlist の実効強制**（承認した `host:port` へのみ outbound。SSRF / DNS rebinding を
+    ハードデニーで塞ぐ, M9c / §4.4）、
+(3) **署名付き Component**（テナント鍵での供給網検証。deploy トークン漏洩を単独で無力化, M9a / §6.2）を、
+いずれも **既存の分離・計量・デプロイ運用・スケールを壊さず**に積み上げます。完了条件は脅威モデル
+（T1〜T8）に基づくレッドチームテスト `chaos_m9.rs`（v1/v3/v4/v5/v6/v7）で、悪意ある wasm が
+隣接テナント / ホスト / 未許可 outbound / 供給網に到達できないことを確認します。
 
 ```
                         ┌─ POST /components/{id}/versions (multipart) ─┐
@@ -75,6 +73,56 @@ Client ──HTTP──▶ control-plane ──put──▶ MinIO (Object Storag
   制御するために新設した。
 - `scripts/worker-autoscale.sh` ほか: `GET /internal/scale` を見て worker プロセスを増減させる
   **参照アクチュエータ**（M8 §5.5）。`make run-workers` / `make autoscale` / `make stop-workers`。
+
+---
+
+## M9 スコープ（と非スコープ）
+
+仕様書.md §15 M9 に準拠。**未信頼 wasm をマルチテナントで常時実行するための多層防御を完成させる**
+（§12 原則 5）。設計の詳細と脅威モデル（T1〜T8）は `docs/M9-design.md`。
+
+### 着手前に現状を実測した（レッドチーム偵察）
+
+敵対的 component を作り、既存の防御が実際にどこで止めるかを確かめた。分かったこと:
+**防御は二重で両方 deny-by-default** ——(1) アップロード検証、(2) ランタイムの `WasiCtxBuilder::new()`
+が何も grant しない（env 非継承 / preopen 無し / socket_addr_check 既定全拒否）。
+**真の防御は空の WasiCtx** であり、M9 はこの結論に沿って「import は許可し、実際の到達はランタイムで
+gate する」形にした。埋めた穴は 3 つ:
+
+### 含む（M9b: 検証のプロセス隔離, §6.2）
+
+- wasm 検証を control-plane 本体とは**別プロセス**で実行（`--validate-stdin` で自分自身を起動）。
+  悪性 wasm が wasmparser の資源を食い潰しても被害を子プロセス 1 個に限局する。
+- 子は Linux の `RLIMIT_AS` + wall-clock timeout で二重に縛る。timeout/OOM/クラッシュは wasm 起因
+  として 4xx、子の spawn 失敗のみ 503。`VALIDATION_TIMEOUT_SECS` / `VALIDATION_MEM_LIMIT_MB`。
+
+### 含む（M9c: egress allowlist の実効強制, §4.4）
+
+- admin 承認した `host:port`（`capabilities.net_allow_outbound`）へのみ outbound を許す。
+  未承認 / allowlist 外は worker の `socket_addr_check` が拒否する。
+- **SSRF / DNS rebinding 対策が核**: `socket_addr_check` は解決後の IP しか見えないので、worker が
+  allowlist を自分で解決して IP 照合し、プライベート/メタデータ IP（`169.254.169.254` 等）を
+  **allowlist より優先して hard-deny** する（`crates/shared/src/egress.rs`、網羅テスト済み）。
+- `wasi:sockets/*` / `wasi:filesystem/*` の **import は許可**する（Rust std が推移的に要求するため）。
+  実際の到達可否はランタイムが決める（fs は preopen 無しで全拒否）。
+
+### 含む（M9a: 署名付き Component と供給網検証, §6.2）
+
+- テナントが登録した Ed25519 公開鍵で wasm 本体の sha256 への detached 署名を検証する。
+  deploy トークン漏洩を単独で無力化する（認可と真正性を別々の秘密に依存させる）。
+- per-tenant の `require_signed_components`（既定 false = 後方互換）。**秘密鍵は渡さない**
+  （公開鍵だけ登録。複数鍵でローテーション、retire は検証を残す soft）。
+
+### 完了条件（レッドチームテスト）
+
+`crates/control-plane/tests/chaos_m9.rs` の v1（fs 全拒否）/ v3・v4・v5（egress）/ v6（検証 DoS）/
+v7（署名）が全緑。悪意ある wasm が隣接テナント / ホスト / 未許可 outbound / 供給網に到達できない
+ことを、各シナリオに**負の対照**（正規操作が成功すること）を付けて確認する。
+
+### 含まない（M10 以降 / follow-up）
+
+- egress バイトの計量（到達可否のみが M9 スコープ）/ mTLS・証明書ピンニング /
+  seccomp・gVisor 等の OS レベル追加サンドボックス（`docs/M9-design.md` §8）。
 
 ---
 
@@ -1018,6 +1066,36 @@ curl -s -X POST http://localhost:8080/triggers \
 
 ---
 
+### Chaos / M9 サンドボックス強化テスト（M9 完了条件の検証・レッドチーム）
+
+`crates/control-plane/tests/chaos_m9.rs` の 6 シナリオで、悪意ある wasm が各層で弾かれることを
+end-to-end 検証します（**各シナリオに負の対照** ——「正規操作は成功する」——を付け、「全部拒否」を
+安全と誤読しない）。
+
+| シナリオ | 脅威 | 検証 |
+| --- | --- | --- |
+| `chaos_v1_filesystem_denied_at_runtime` | T1 | fs は import できても実行時に全パス拒否（preopen 無し） |
+| `chaos_v3_unapproved_egress_denied` | T3 | egress 未承認は一切 outbound 不可 |
+| `chaos_v4_approved_egress_only_to_allowlist` | T3 | 承認先には到達でき（要外向き網）、allowlist 外は拒否 |
+| `chaos_v5_internal_target_denied_even_if_approved` | T4 | 承認名が内部 IP を指しても hard-deny が優先して拒否 |
+| `chaos_v6_validation_dos_does_not_kill_cp` | T5 | 検証 DoS を浴びても CP が `/readyz`=200 を保つ |
+| `chaos_v7_unsigned_or_bad_signature_rejected` | T6 | 署名必須下で署名なし/不正署名を拒否、正しい署名は通る |
+
+```sh
+docker compose up -d && make migrate
+make run-cp > /tmp/cp.log 2>&1 &
+make bootstrap && export CHAOS_TOKEN=$(make -s login)
+make build-component && make deploy          # 正常 echo を用意
+make deploy-chaos-components                  # netprobe（egress 検証用）を用意
+make run-workers N=1                          # v3/v4/v5 は worker が要る
+cargo test -p faas-control-plane --test chaos_m9 -- --ignored --test-threads=1
+```
+
+> **v4 は外向きネットワーク**（`CHAOS_M9_EGRESS_TARGET`、既定 example.com:443 への TCP）を要します。
+> 全て `#[ignore]` + `--test-threads=1`（検証セマフォ / 子プロセス / worker という共有資源を飽和させるため）。
+
+---
+
 ### Chaos / M8 弾力スケール・アイソレーションテスト（M8 完了条件の検証）
 
 `crates/control-plane/tests/chaos_m8.rs` の 4 シナリオ（U1: バーストが他テナントのクォータを
@@ -1341,8 +1419,10 @@ migrations/0008_m6.sql     # M6: cron_jobs / triggers / trigger_deliveries（FOR
 migrations/0009_m7a_traffic_split.sql   # M7a: components へ canary 4 列 + executions.routing_reason（新表なし）
 migrations/0010_m7b_function_configs.sql # M7b: function_configs（平文 env・行=1キー・複合 FK・FORCE RLS）
 migrations/0011_m7c_secrets.sql          # M7c: function_secrets / function_secret_versions（追記専用の版台帳）
+migrations/0012_m9a_component_signing.sql # M9a: component_signing_keys（FORCE RLS）+ tenants.require_signed_components
 crates/shared/             # faas-shared: 型・NATS subject・メッセージ・エラー（共有契約の唯一の真実）
                            #   FailedMessage / failed_subject 等の M4c DLQ 型 + M6 reply subject / instance id を含む
+crates/shared/src/egress.rs             # M9c: egress の SSRF ハードデニー純関数（IP 分類）+ host:port パーサ
 crates/control-plane/      # faas-control-plane (bin): axum + storage(MinIO) + validation(wasmparser)
                            #   admission(Redis) / signing(Ed25519) / authz / RLS / subscriber
                            #   reaper + DLQ subscriber + metrics (M4a/c)
@@ -1351,6 +1431,7 @@ crates/control-plane/tests/chaos_m5.rs  # M5 冪等会計の end-to-end テス�
 crates/control-plane/tests/chaos_m6.rs  # M6 起動形態の end-to-end テスト（S1: 同期 / S2: Cron / S3: トリガー, #[ignore]）
 crates/control-plane/tests/chaos_m7.rs  # M7 デプロイ運用の end-to-end テスト（S1: canary/rollback / S2: env・secret 注入 / S3: 非漏洩, #[ignore]）
 crates/control-plane/tests/chaos_m8.rs  # M8 弾力スケール/アイソレーションの end-to-end テスト（U1〜U4, #[ignore]、要 CHAOS_TOKEN_B）
+crates/control-plane/tests/chaos_m9.rs  # M9 サンドボックス強化のレッドチーム（v1/v3/v4/v5/v6/v7, #[ignore]）
 crates/control-plane/src/routing.rs     # M7a: canary の決定的バケット選択（DB/時刻/乱数に非依存の純関数）
 crates/control-plane/src/secrets.rs     # M7c: 封筒暗号（XChaCha20-Poly1305）+ KEK キーリング + execution 基準の世代解決
 crates/control-plane/src/handlers_secrets.rs # M7c: secret の write-only API と POST /internal/job-env
@@ -1366,6 +1447,7 @@ components/echo/           # サンプル Component（cdylib, wasm32-wasip2）
 components/always-trap/    # M4 chaos_c 用: handle 入口で panic（trap → DLQ 経路）
 components/slow/           # M4 chaos_d 用: handle が tight loop（epoch interrupt → timeout 経路）
 components/burn/           # M8 chaos 用: {"burn_ms": N} のぶん busy-loop して **succeeded で終端**（slow と違い成功する）
+components/netprobe/       # M9c chaos 用: {"target":"host:port"} へ TCP 接続を試し、fs 到達も試す（egress/fs の実効検証）
 scripts/worker-lib.sh      # M8: worker プロセスを slot 番号で管理する共通関数（起動確認 / ドレイン停止 / カウンタ退避）
 scripts/run-workers.sh     # M8: worker を固定 N 台起動
 scripts/worker-autoscale.sh # M8: GET /internal/scale を見て増減させる参照アクチュエータ
@@ -1377,23 +1459,25 @@ scripts/stop-workers.sh    # M8: 全台ドレイン停止
 
 ## 次のマイルストーン（仕様書 §15）
 
-M8 完了済み（本リポジトリの現状）。次は M9 以降の将来⬜:
+M9 完了済み（本リポジトリの現状）。**M5〜M9 が完了**し、商用マルチテナント SaaS の基本線が揃った。
+次は M10 以降⬜:
 
-- **M8 以降（商用マルチテナント SaaS 化, §15）**: 商用クラウド SaaS として成立させる段階実装。
-  基本線は **M5 課金・メータリング → M6 Invoke 拡充（同期 Invoke + 外部イベント/Cron トリガー）
-  → M7 デプロイ運用（canary / rollback / per-function env / Secrets）→ M8 弾力スケール +
-  テナント間アイソレーション → M9 サンドボックス強化・サプライチェーン**（M5/M6/M7/M8 は完了済み）。分散トレーシング（OpenTelemetry）は
-  高レバレッジで前倒し推奨。Workflow Engine / Result Ingestor 分離 / Multi Region は固定順序を
-  持たない**需要発火型**。AI/LLM はプラットフォーム機能ではなく Capability 経由の外部呼び出し
-  （§4.4 / §13）で充足するため、ロードマップ項目から除外。
-- **M4 follow-ups**（M4 範囲内で残る配線。`crates/control-plane/src/metrics.rs` 等の
-  メトリクス登録は完了しているが record 配線が未到達）:
+- **M10: 可観測性の完成 / Multi Region（需要発火型, §15）**: 分散トレーシング（OpenTelemetry。
+  M4a の correlation ID を OTel スパンへ。invoke → worker → result の経路を end-to-end に追う）。
+  **WASM + NATS 経路はブラックボックス化しやすく高レバレッジ**のため前倒し推奨。Multi Region は
+  地理分散要求が顕在化した時点で着手する需要発火型。Workflow Engine / Result Ingestor 分離も
+  固定順序を持たない需要発火型。AI/LLM はプラットフォーム機能ではなく Capability 経由の外部呼び出し
+  （§4.4 / §13。M9c の egress allowlist で実際に到達可能になった）で充足するため、ロードマップから除外。
+- **M9 follow-ups**（M9 完了条件のスコープ外として意図的に送ったもの）:
+  - egress バイトの計量（§14。M9c は到達可否のみ。gauge 配線は別途）
+  - lane gauge の per-tenant ラベル（`METRICS_LANE_LABELS` は M8 で gate 済み）/ mTLS・宛先証明書
+    ピンニング / seccomp・gVisor 等の OS レベル追加サンドボックス（M9 設計書 §8 参照）
+- **M4 follow-ups**（M4 範囲内で残る配線）:
   - HTTP middleware で `faas_http_requests_total` / `_duration_seconds` の observe 配線
   - `execution_duration_seconds`（created_at→finished_at）を subscriber finalize 時に observe
   - per-tenant ラベル（`faas_tenant_invoke_total{tenant_id}`）のカーディナリティ対策
     （`METRICS_INCLUDE_TENANT_LABEL=false` フラグ追加）
   - `.result` / `.failed` の JetStream 化（現状 core NATS、CP 再起動で in-flight ドロップ）
   - `tenants.quotas` / `tenants.status` の admin API（現状 SQL 直 UPDATE）
-  - 検証パイプラインの隔離プロセス化（§6.2 MUST。現状はインプロセス）
 
 詳細は `仕様書.md` の §15 実装ロードマップを参照してください。
