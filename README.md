@@ -1308,6 +1308,27 @@ curl -s http://localhost:8080/metrics | grep faas_secret_versions_by_kid
 
 ---
 
+## 分散トレーシング（M10, §3.8）
+
+invoke → worker → result の因果を **1 本のトレース**で追える（OpenTelemetry）。**opt-in** で、
+`OTEL_EXPORTER_OTLP_ENDPOINT` を設定したときだけ有効。未設定なら M4a の fmt/json ログのみ・挙動不変。
+
+```bash
+docker compose up -d jaeger                         # OTLP 受信 + UI(:16686) を起動
+OTEL_EXPORTER_OTLP_ENDPOINT=http://localhost:4318 make run-cp     > /tmp/cp.log 2>&1 &
+OTEL_EXPORTER_OTLP_ENDPOINT=http://localhost:4318 make run-worker > /tmp/worker.log 2>&1 &
+# invoke を 1 回 → http://localhost:16686 で service=faas-control-plane のトレースを開くと
+# invoke（CP）→ worker.process → worker.handle_payload（worker）が 1 トレースに並ぶ。
+```
+
+- **伝搬**: CP が publish 時に W3C `traceparent` を NATS ヘッダへ相乗りさせ（`Nats-Msg-Id` は不変）、
+  worker が extract して実行 span を CP の invoke span の子にする。
+- exporter は HTTP/protobuf（reqwest。gRPC=tonic と C 依存を避ける）。batch + 終了時 flush。
+- `service.name` は `faas-control-plane` / `faas-worker` で区別。Prometheus メトリクス（M4a）と
+  構造化ログ（correlation ID）はそのまま併用する（OTel へ移行しない）。
+
+---
+
 ## エンドポイント一覧
 
 | メソッド / パス | 認証 | 説明 |
@@ -1423,6 +1444,7 @@ migrations/0012_m9a_component_signing.sql # M9a: component_signing_keys（FORCE 
 crates/shared/             # faas-shared: 型・NATS subject・メッセージ・エラー（共有契約の唯一の真実）
                            #   FailedMessage / failed_subject 等の M4c DLQ 型 + M6 reply subject / instance id を含む
 crates/shared/src/egress.rs             # M9c: egress の SSRF ハードデニー純関数（IP 分類）+ host:port パーサ
+crates/shared/src/otel.rs               # M10: 分散トレーシング初期化（opt-in）+ NATS ヘッダでの traceparent 伝搬
 crates/control-plane/      # faas-control-plane (bin): axum + storage(MinIO) + validation(wasmparser)
                            #   admission(Redis) / signing(Ed25519) / authz / RLS / subscriber
                            #   reaper + DLQ subscriber + metrics (M4a/c)
@@ -1462,11 +1484,10 @@ scripts/stop-workers.sh    # M8: 全台ドレイン停止
 M9 完了済み（本リポジトリの現状）。**M5〜M9 が完了**し、商用マルチテナント SaaS の基本線が揃った。
 次は M10 以降⬜:
 
-- **M10: 可観測性の完成 / Multi Region（需要発火型, §15）**: 分散トレーシング（OpenTelemetry。
-  M4a の correlation ID を OTel スパンへ。invoke → worker → result の経路を end-to-end に追う）。
-  **WASM + NATS 経路はブラックボックス化しやすく高レバレッジ**のため前倒し推奨。Multi Region は
-  地理分散要求が顕在化した時点で着手する需要発火型。Workflow Engine / Result Ingestor 分離も
-  固定順序を持たない需要発火型。AI/LLM はプラットフォーム機能ではなく Capability 経由の外部呼び出し
+- **M10: 可観測性の完成 / Multi Region（需要発火型, §15）**: 分散トレーシング（OpenTelemetry）は
+  **実装済み**（invoke → worker → result が 1 トレースに繋がる。上の「分散トレーシング」節）。
+  残る Multi Region は地理分散要求が顕在化した時点で着手する需要発火型。Workflow Engine /
+  Result Ingestor 分離も固定順序を持たない需要発火型。AI/LLM はプラットフォーム機能ではなく Capability 経由の外部呼び出し
   （§4.4 / §13。M9c の egress allowlist で実際に到達可能になった）で充足するため、ロードマップから除外。
 - **M9 follow-ups**（M9 完了条件のスコープ外として意図的に送ったもの）:
   - egress バイトの計量（§14。M9c は到達可否のみ。gauge 配線は別途）

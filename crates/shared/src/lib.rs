@@ -24,6 +24,7 @@ mod redacted;
 pub use redacted::{expose_once, Redacted};
 
 pub mod egress;
+pub mod otel;
 
 // ============================================================================
 // ID 採番ヘルパ（uuid 由来の不透明文字列）

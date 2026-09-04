@@ -59,6 +59,19 @@ async-trait = "0.1"
 # --- メッセージング ---
 async-nats = "0.38"
 
+# --- 分散トレーシング (M10, §3.8 / §10): opt-in（OTEL_EXPORTER_OTLP_ENDPOINT 設定時のみ有効）。
+# exporter は HTTP/protobuf（reqwest + rustls）を使い、gRPC(tonic/prost) と C 依存を持ち込まない
+# （repo の rustls / reqwest / pure-Rust 方針と整合）。既定 off なら一切動かない。
+opentelemetry = "0.32"
+opentelemetry_sdk = { version = "0.32", features = ["rt-tokio"] }
+opentelemetry-otlp = { version = "0.32", default-features = false, features = [
+    "trace",
+    "http-proto",
+    "reqwest-blocking-client",
+    "reqwest-rustls",
+] }
+tracing-opentelemetry = "0.33"
+
 # --- 同期 invoke の per-instance waiter registry（M6a, §15）。correlation_id -> oneshot::Sender の
 # 並行マップ。reply 購読タスク（remove）と invoke ハンドラ（insert）が共有ロックなしで触る。pure-Rust。
 dashmap = "6"

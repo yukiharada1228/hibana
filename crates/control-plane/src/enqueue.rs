@@ -305,6 +305,9 @@ pub async fn enqueue_execution(
 
     let mut headers = NatsHeaderMap::new();
     headers.insert("Nats-Msg-Id", req.execution_id.as_str());
+    // M10 (§3.8): 現在の span の trace context を W3C traceparent として NATS ヘッダへ相乗りさせる。
+    // OTel 無効時は current context が空なので何も書かれない（無害）。`Nats-Msg-Id` は触らない。
+    faas_shared::otel::inject_trace_context(&mut headers);
     let ack = match state
         .jetstream()
         .publish_with_headers(invoke_subject(req.tenant), headers, payload.into())
