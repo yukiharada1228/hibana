@@ -522,6 +522,14 @@ fn build_router(state: AppState) -> Router {
             "/components/{component_id}/versions/{version}/capabilities",
             put(handlers::approve_capability_env),
         )
+        // --- M9c: capability の egress allowlist 承認 (§4.4 / §15 M9) ---
+        // PUT /components/{id}/versions/{version}/capabilities/egress:
+        // 許可する outbound 先（host:port）を承認する。env と同じく admin 専用経路
+        // （deploy トークンが自分で外部到達を承認できてはならない）。
+        .route(
+            "/components/{component_id}/versions/{version}/capabilities/egress",
+            put(handlers::approve_capability_egress),
+        )
         // --- M7c: Secrets Manager (§10 / §15) ---
         // 書き込み系はすべて admin スコープ + require_admin_role の二重ガード
         // （§4.4「付与（承認）は admin スコープを要する (MUST)」に従う）。

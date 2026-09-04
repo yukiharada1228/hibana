@@ -91,6 +91,8 @@ SLOW_LIMITS ?= {"max_wall_time_ms":1000,"max_execution_time_ms":2000}
 # M8-7: burn は「N ミリ秒かかって **成功する**」ノブなので、slow と違い上限を十分広く取る。
 # 上限が burn_ms より短いと epoch interruption で timeout 終端し、ノブとして機能しない。
 BURN_LIMITS ?= {"max_wall_time_ms":15000,"max_execution_time_ms":20000}
+# M9c: netprobe は外部接続を試すので wall/exec を少し広めに取る。
+NETPROBE_LIMITS ?= {"max_wall_time_ms":10000,"max_execution_time_ms":15000}
 
 # M8: 内部専用 listener（GET /internal/scale / POST /internal/job-env）。既定 loopback。
 CONTROL_PLANE_INTERNAL_URL ?= http://127.0.0.1:8081
@@ -102,7 +104,7 @@ ECHO_WASM := target/wasm32-wasip2/release/echo.wasm
 
 .DEFAULT_GOAL := help
 
-.PHONY: run-workers autoscale stop-workers scale-status lane-status recreate-stream deploy-chaos-components component-id traffic canary promote rollback approve-env set-secret secrets rekey help setup up down migrate minio-bucket build-component run-cp run-worker bootstrap login deploy invoke logs psql clean rls-lint
+.PHONY: run-workers autoscale stop-workers scale-status lane-status recreate-stream deploy-chaos-components component-id traffic canary promote rollback approve-env approve-egress set-secret secrets rekey help setup up down migrate minio-bucket build-component run-cp run-worker bootstrap login deploy invoke logs psql clean rls-lint
 
 help: ## 利用可能なターゲット一覧を表示
 	@echo "WASM FaaS Platform — M2 Makefile"
@@ -309,6 +311,17 @@ approve-env: ## M7b: 注入を許可する env 名を承認（ENV_NAMES=API_KEY,
 	  -H "Authorization: Bearer $$TOKEN" -H "Content-Type: application/json" \
 	  -d "{\"env\":$$JSON}"; echo
 
+approve-egress: ## M9c: 許可 outbound を承認（EGRESS=api.example.com:443,1.2.3.4:8080 VERSION=1.0.0 [CID=...]）
+	@set -e; \
+	test -n "$(EGRESS)" || { echo "ERROR: EGRESS=host:port,host:port を指定してください（空にするには EGRESS=- で明示）"; exit 1; }; \
+	TOKEN=$$($(MAKE) -s login); \
+	CID=$${CID:-$$($(MAKE) -s component-id)}; \
+	RAW="$(EGRESS)"; [ "$$RAW" = "-" ] && RAW=""; \
+	JSON=$$(printf '%s' "$$RAW" | awk -F, '{printf "["; for(i=1;i<=NF;i++){ if($$i!=""){printf "%s\"%s\"", (i>1?",":""), $$i}}; printf "]"}'); \
+	curl -sS -X PUT "$(BASE_URL)/components/$$CID/versions/$(VERSION)/capabilities/egress" \
+	  -H "Authorization: Bearer $$TOKEN" -H "Content-Type: application/json" \
+	  -d "{\"allow_outbound\":$$JSON}"; echo
+
 set-secret: ## M7c: secret を設定（NAME=API_KEY VALUE=... [CID=...]）。**値はエコーしない**
 	@set -e; \
 	test -n "$(NAME)" || { echo "ERROR: NAME=API_KEY を指定してください"; exit 1; }; \
@@ -334,7 +347,7 @@ rekey: ## M7c: 当該テナントの secret を現行 KEK で再ラップ（**�
 deploy-chaos-components: ## M4/M8 chaos 用: always-trap / slow / burn をビルドしてアップロード（冪等）
 	@set -e; \
 	echo "==> always-trap / slow を wasm32-wasip2 でビルド..."; \
-	cargo build -p always-trap -p slow -p burn --target wasm32-wasip2 --release; \
+	cargo build -p always-trap -p slow -p burn -p netprobe --target wasm32-wasip2 --release; \
 	TOKEN=$$($(MAKE) -s login); \
 	resolve_cid() { \
 		curl -sS -o /dev/null -X POST "$(BASE_URL)/components" \
@@ -364,7 +377,14 @@ deploy-chaos-components: ## M4/M8 chaos 用: always-trap / slow / burn をビル
 		-H "Authorization: Bearer $$TOKEN" -F "version=$(VERSION)" \
 		-F 'resource_limits=$(BURN_LIMITS)' \
 		-F "wasm=@target/wasm32-wasip2/release/burn.wasm"; echo; \
-	echo "OK: chaos 用 component をデプロイしました（CHAOS_ALWAYS_TRAP=always-trap CHAOS_SLOW=slow CHAOS_BURN=burn）。"
+	echo "==> netprobe (M9c egress 検証用)"; \
+	NETPROBE_CID=$$(resolve_cid netprobe); \
+	test -n "$$NETPROBE_CID" || { echo "ERROR: netprobe の component_id を解決できませんでした"; exit 1; }; \
+	curl -sS -X POST "$(BASE_URL)/components/$$NETPROBE_CID/versions" \
+		-H "Authorization: Bearer $$TOKEN" -F "version=1.0.0" \
+		-F 'resource_limits=$(NETPROBE_LIMITS)' \
+		-F "wasm=@target/wasm32-wasip2/release/netprobe.wasm"; echo; \
+	echo "OK: chaos 用 component をデプロイしました（CHAOS_ALWAYS_TRAP=always-trap CHAOS_SLOW=slow CHAOS_BURN=burn CHAOS_NETPROBE=netprobe）。"
 
 recreate-stream: ## M8-1: invoke stream を WorkQueue retention で作り直す（CP/worker を止めてから実行）
 	@echo "==> control-plane / worker が停止していることを確認してください（未消化 0 は本コマンドが検査します）"

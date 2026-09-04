@@ -1339,6 +1339,9 @@ struct ResolvedVersion {
     /// `component_versions.capabilities.env`（admin 承認済みの注入可能 env 名）。
     /// 行が引けない / 壊れている場合は空 ＝ **deny-all**（fail-closed）。
     allowed_env: std::collections::BTreeSet<String>,
+    /// M9c: `component_versions.capabilities.net_allow_outbound`（admin 承認済みの outbound 先 host:port）。
+    /// 空 = egress deny-all（fail-closed）。worker はこれを解決して `socket_addr_check` を組む。
+    allow_outbound: Vec<faas_shared::egress::EgressEndpoint>,
     /// `function_configs` の平文キー・値。
     config: std::collections::BTreeMap<String, String>,
 }
@@ -1361,6 +1364,26 @@ fn parse_allowed_env(capabilities: &serde_json::Value) -> std::collections::BTre
                 .collect()
         })
         // 旧形式（素の配列）/ null / 壊れた値 → deny-all。
+        .unwrap_or_default()
+}
+
+/// M9c (§4.4): `component_versions.capabilities.net_allow_outbound` から egress allowlist を読む。
+///
+/// CP 側 `validation::parse_capabilities` と同じく **パースできる host:port だけ** を採り、
+/// 壊れた値は落とす（fail-closed）。空 = egress deny-all。
+fn parse_allow_outbound(
+    capabilities: &serde_json::Value,
+) -> Vec<faas_shared::egress::EgressEndpoint> {
+    capabilities
+        .as_object()
+        .and_then(|m| m.get("net_allow_outbound"))
+        .and_then(|v| v.as_array())
+        .map(|a| {
+            a.iter()
+                .filter_map(|x| x.as_str())
+                .filter_map(|s| faas_shared::egress::parse_egress_endpoint(s).ok())
+                .collect()
+        })
         .unwrap_or_default()
 }
 
@@ -1606,8 +1629,49 @@ impl Worker {
                 .map_err(|e| ExecError::Failed(format!("failed to encode input: {e}")))?,
         };
 
-        self.run_component(component, input_bytes, limits, built_env)
+        // M9c (§4.4): 承認された egress allowlist を **worker 側で解決**して IP:port の集合にする。
+        // socket_addr_check には接続時に解決後の IP しか渡ってこない（ホスト名は来ない）ので、
+        // 「許可ホストを自分で解決した IP」と照合する。解決時点で hard-deny の IP は除外する
+        // （承認された名前が内部 IP を指していても、ここで落とす。ランタイムの check でも再度弾く）。
+        let allowed_addrs = self
+            .resolve_egress_allowlist(&resolved.allow_outbound)
+            .await;
+
+        self.run_component(component, input_bytes, limits, built_env, allowed_addrs)
             .await
+    }
+
+    /// egress allowlist の各 `host:port` を解決し、**hard-deny でない** IP:port の集合を返す。
+    ///
+    /// 解決に失敗したエントリは黙って落とす（到達不能なだけで、fail-closed 側に倒れる）。
+    /// 空を返せば worker はネットワークを一切開かない（deny-all）。
+    async fn resolve_egress_allowlist(
+        &self,
+        endpoints: &[faas_shared::egress::EgressEndpoint],
+    ) -> std::collections::HashSet<std::net::SocketAddr> {
+        use std::collections::HashSet;
+        let mut out: HashSet<std::net::SocketAddr> = HashSet::new();
+        for ep in endpoints {
+            match tokio::net::lookup_host((ep.host.as_str(), ep.port)).await {
+                Ok(addrs) => {
+                    for addr in addrs {
+                        if faas_shared::egress::is_hard_denied(addr.ip()) {
+                            tracing::warn!(
+                                host = %ep.host, port = ep.port, ip = %addr.ip(),
+                                "approved egress host resolved to a hard-denied IP; dropping (possible rebinding)"
+                            );
+                            continue;
+                        }
+                        out.insert(addr);
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(host = %ep.host, port = ep.port, error = %e,
+                        "could not resolve approved egress host; skipping");
+                }
+            }
+        }
+        out
     }
 
     /// M7c (§4.6): env-token と引き換えに復号済み secret を CP から受け取る。
@@ -1832,6 +1896,7 @@ impl Worker {
         input: Vec<u8>,
         limits: ResourceLimits,
         built_env: env::BuiltEnv,
+        allowed_addrs: std::collections::HashSet<std::net::SocketAddr>,
     ) -> std::result::Result<(serde_json::Value, UsageMetrics), ExecError> {
         // StoreLimits: max_memory を適用する (§4.3)。
         let store_limits = StoreLimitsBuilder::new()
@@ -1870,6 +1935,39 @@ impl Worker {
         for (k, v) in &built_env.pairs {
             wasi_builder.env(k, v);
         }
+
+        // M9c (§4.4): egress の実効強制。
+        //
+        // **安全上の要点**: `AllowedNetworkUses::default()` は `tcp:true`/`udp:true` だが、
+        // `SocketAddrCheck::default()` が全アドレスを拒否するため、既定の WasiCtx は結果的に
+        // 全 egress を塞いでいる。したがって allowlist が空のときは**ネットワークを一切触らない**
+        // （builder を素のままにして deny-all を維持する）。非空のときだけ TCP を開け、
+        // socket_addr_check で「解決済み allowlist に一致し、かつ hard-deny でない」宛先だけ通す。
+        if !allowed_addrs.is_empty() {
+            let allowed = std::sync::Arc::new(allowed_addrs);
+            wasi_builder.allow_tcp(true);
+            // UDP は用途が無く攻撃面だけ増えるので開けない。
+            wasi_builder.allow_udp(false);
+            // ホスト名解決は許可する（一般的な HTTP クライアントが動くように）。ただし接続は
+            // 下の check が解決済み IP と照合するので、名前で allowlist 外へは到達できない。
+            wasi_builder.allow_ip_name_lookup(true);
+            wasi_builder.socket_addr_check(move |addr, use_| {
+                let allowed = std::sync::Arc::clone(&allowed);
+                Box::pin(async move {
+                    // TcpConnect 以外（bind / UDP 系）は一律拒否。
+                    if !matches!(use_, wasmtime_wasi::SocketAddrUse::TcpConnect) {
+                        return false;
+                    }
+                    // SSRF ハードデニーが allowlist より**優先**する（DNS rebinding 対策の核）。
+                    if faas_shared::egress::is_hard_denied(addr.ip()) {
+                        return false;
+                    }
+                    // 承認済み allowlist を worker 自身が解決した IP:port と一致するもののみ許可。
+                    allowed.contains(&addr)
+                })
+            });
+        }
+
         let wasi = wasi_builder.build();
         let host = HostState {
             ctx: wasi,
@@ -2137,7 +2235,9 @@ impl Worker {
         let component_id: String = r.try_get("component_id")?;
         let limits: ResourceLimits =
             serde_json::from_value(r.try_get("resource_limits")?).unwrap_or_default();
-        let allowed_env = parse_allowed_env(&r.try_get::<serde_json::Value, _>("capabilities")?);
+        let caps_json = r.try_get::<serde_json::Value, _>("capabilities")?;
+        let allowed_env = parse_allowed_env(&caps_json);
+        let allow_outbound = parse_allow_outbound(&caps_json);
 
         // 平文 config を同じ tx（同じ GUC）で引く。
         let config_rows = sqlx::query(
@@ -2161,6 +2261,7 @@ impl Worker {
         Ok(ResolvedVersion {
             limits,
             allowed_env,
+            allow_outbound,
             config,
         })
     }

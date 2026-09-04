@@ -67,6 +67,24 @@ const BASELINE_APPROVED_PREFIXES: &[&str] = &[
     "wasi:clocks/",
     "wasi:random/",
     "faas:component/",
+    // M9c: `wasi:sockets/*` は **import を許可する**が、実際の egress は別途 admin 承認した
+    // allowlist（`capabilities.net_allow_outbound`）が非空のときだけ worker の `socket_addr_check`
+    // が通す。これは `wasi:cli/environment` を許可しつつ値の注入を admin 承認で縛る env モデルと
+    // 同じ構造である。**安全性の根拠**: worker の WasiCtx は既定で全アドレスを拒否する
+    // （`SocketAddrCheck::default()` が全拒否）。したがって import を許しても、承認された allowlist
+    // が無い限り 1 バイトも外へ出られない。deny-by-default はランタイムが担保する（§6.2 の
+    // 「二重の enforcement」のうち runtime 側が本体）。
+    "wasi:sockets/",
+    // M9c: `wasi:filesystem/*` も **import は許可する**。理由は 2 つ:
+    // (1) Rust std は `std::net` だけを使う component でも filesystem import を**推移的に焼き込む**
+    //     （std のランタイム初期化が参照する）。fs を拒否すると std ベースの egress component が
+    //     一切アップロードできず、egress 機能が事実上使えない。
+    // (2) env / sockets と同じく、**import できること ≠ 到達できること**。worker の WasiCtx は
+    //     preopen ディレクトリを 1 つも与えない（`WasiCtxBuilder::new()` のまま）ので、
+    //     `wasi:filesystem/preopens` は空を返し、ゲストはどのパスも開けない。fs の deny-by-default は
+    //     ランタイムが担保する（chaos_v1 で「アップロードは通るが実行時に fs は全拒否」を実測固定する）。
+    // これは「真の防御は空の WasiCtx」という M9 偵察の結論に沿った設計である。
+    "wasi:filesystem/",
 ];
 
 /// admin が承認した capability 集合 (§4.4)。WIT import を strict matching する際の権威。
@@ -459,6 +477,12 @@ pub struct CapabilitySet {
     pub imports: Vec<String>,
     /// 注入を許可された env 名（admin 承認）。空 = deny-all。
     pub env: BTreeSet<String>,
+    /// M9c (§4.4): 承認された outbound 先（`host:port`）。空 = egress deny-all。
+    ///
+    /// `wasi:sockets/*` の import は baseline で許可される（env と同じく「import できる」ことと
+    /// 「実際に到達できる」ことを分ける）が、**実際の egress はこの allowlist が空でない限り
+    /// worker の `socket_addr_check` が全拒否する**。admin 承認でのみ非空になる。
+    pub net_allow_outbound: BTreeSet<String>,
 }
 
 impl CapabilitySet {
@@ -467,6 +491,7 @@ impl CapabilitySet {
         serde_json::json!({
             "imports": self.imports,
             "env": self.env.iter().collect::<Vec<_>>(),
+            "net_allow_outbound": self.net_allow_outbound.iter().collect::<Vec<_>>(),
         })
     }
 }
@@ -488,6 +513,7 @@ pub fn parse_capabilities(value: &serde_json::Value) -> CapabilitySet {
         serde_json::Value::Array(_) => CapabilitySet {
             imports: string_list(Some(value)),
             env: BTreeSet::new(),
+            net_allow_outbound: BTreeSet::new(),
         },
         serde_json::Value::Object(map) => CapabilitySet {
             imports: string_list(map.get("imports")),
@@ -495,6 +521,11 @@ pub fn parse_capabilities(value: &serde_json::Value) -> CapabilitySet {
             env: string_list(map.get("env"))
                 .into_iter()
                 .filter(|k| faas_shared::is_valid_env_key(k))
+                .collect(),
+            // egress も「パースできる host:port だけ」を採る（壊れた値は落として fail-closed）。
+            net_allow_outbound: string_list(map.get("net_allow_outbound"))
+                .into_iter()
+                .filter(|e| faas_shared::egress::parse_egress_endpoint(e).is_ok())
                 .collect(),
         },
         // null / 数値 / 文字列 / パース不能 → deny-all（fail-closed）。
@@ -574,16 +605,59 @@ mod tests {
     }
 
     /// §4.4 defense-in-depth: bare `wasi:` namespace を承認しないため、network egress
-    /// （`wasi:sockets/*`）と fs（`wasi:filesystem/*`）は baseline で **未承認**（→ 422）。
-    /// これらは本スライスの deny-all が対象外と宣言する capability であり、policy 層で塞ぐ。
+    /// M9c: `wasi:filesystem/*` の **import は baseline で許可**する。Rust std は net-only の
+    /// component でも filesystem import を推移的に焼き込むため、拒否すると std ベースの egress
+    /// component が一切アップロードできない。**実際の fs アクセスはランタイムが塞ぐ**
+    /// （WasiCtx が preopen を 1 つも与えない → どのパスも開けない）。この deny-by-default は
+    /// chaos_v1 が実行時に固定する（「アップロードは通るが実行時に fs は全拒否」）。
     #[test]
-    fn baseline_excludes_sockets_and_filesystem() {
+    fn baseline_allows_filesystem_import_but_runtime_denies_access() {
         let approved = ApprovedCapabilities::baseline();
-        assert!(!approved.approves("wasi:sockets/tcp@0.2.6"));
-        assert!(!approved.approves("wasi:sockets/udp@0.2.6"));
-        assert!(!approved.approves("wasi:sockets/ip-name-lookup@0.2.6"));
-        assert!(!approved.approves("wasi:filesystem/types@0.2.6"));
-        assert!(!approved.approves("wasi:filesystem/preopens@0.2.6"));
+        assert!(approved.approves("wasi:filesystem/types@0.2.6"));
+        assert!(approved.approves("wasi:filesystem/preopens@0.2.6"));
+    }
+
+    /// M9c: `wasi:sockets/*` の **import は baseline で許可**する（env モデルと同じく「import できる」
+    /// ことと「実際に到達できる」ことを分ける）。実際の egress は admin 承認した allowlist が
+    /// 非空のときだけ worker の `socket_addr_check` が通し、空なら全拒否する（deny-by-default は
+    /// ランタイムが担保する）。したがって import 許可だけでは 1 バイトも外へ出られない。
+    #[test]
+    fn baseline_allows_sockets_import_but_runtime_gates_egress() {
+        let approved = ApprovedCapabilities::baseline();
+        assert!(approved.approves("wasi:sockets/tcp@0.2.6"));
+        assert!(approved.approves("wasi:sockets/ip-name-lookup@0.2.6"));
+        // upload は egress allowlist を常に空で保存する（= runtime で deny-all）。
+        let stored = CapabilitySet {
+            imports: vec!["wasi:sockets/tcp@0.2.6".to_string()],
+            env: BTreeSet::new(),
+            net_allow_outbound: BTreeSet::new(),
+        };
+        assert!(
+            parse_capabilities(&stored.to_json())
+                .net_allow_outbound
+                .is_empty(),
+            "the deploy path must persist an empty egress allowlist (runtime denies all)"
+        );
+    }
+
+    /// egress allowlist は host:port として妥当なものだけを round-trip する（壊れた値は落とす）。
+    #[test]
+    fn egress_allowlist_round_trips_valid_entries_only() {
+        let caps = CapabilitySet {
+            imports: vec![],
+            env: BTreeSet::new(),
+            net_allow_outbound: ["api.example.com:443", "not a valid entry", "1.2.3.4:8080"]
+                .iter()
+                .map(|s| s.to_string())
+                .collect(),
+        };
+        let parsed = parse_capabilities(&caps.to_json());
+        assert!(parsed.net_allow_outbound.contains("api.example.com:443"));
+        assert!(parsed.net_allow_outbound.contains("1.2.3.4:8080"));
+        assert!(
+            !parsed.net_allow_outbound.contains("not a valid entry"),
+            "malformed egress entries must be dropped (fail-closed)"
+        );
     }
 
     /// §4.4: baseline が承認する WASI Preview2 サブインターフェース（stdio/clocks/random）。
@@ -772,10 +846,16 @@ mod tests {
             let stored = CapabilitySet {
                 imports: vec!["wasi:cli/environment@0.2.0".to_string()],
                 env: BTreeSet::new(),
+                net_allow_outbound: BTreeSet::new(),
             };
+            let parsed = parse_capabilities(&stored.to_json());
             assert!(
-                parse_capabilities(&stored.to_json()).env.is_empty(),
+                parsed.env.is_empty(),
                 "the deploy path must always persist an empty env allowlist"
+            );
+            assert!(
+                parsed.net_allow_outbound.is_empty(),
+                "the deploy path must always persist an empty egress allowlist (M9c)"
             );
         }
     }
