@@ -1,0 +1,14 @@
+-- M10 follow-up: テナントの status / quotas を **API から**変更できるようにする（§8 / §9）。
+--
+-- 0001-0012 への ADD のみ（列追加なし・GRANT のみ）。テーブル所有ロール（MIGRATION_DATABASE_URL）で
+-- 実行する（GRANT は所有権を要する）。
+--
+-- 背景: これまで tenants.status（suspend / 再有効化）と tenants.quotas（レート / 同時実行上限）は
+-- **SQL 直 UPDATE** でしか変えられず、運用で「テナントを止める」「クォータを上げる」が手作業だった。
+-- 平台管理 API（bootstrap トークン gate）で変更できるようにするため、ランタイムロール faas_app に
+-- **この 2 列だけ** UPDATE を許す（列スコープ GRANT）。他列（id / created_at 等）は触れない。
+--
+-- 0012 で require_signed_components 列に UPDATE を付けたのと同じ思想。tenants に RLS は無いが、
+-- 更新は set_tenant_status / set_tenant_quotas が WHERE id = 対象テナント に限定し、呼び出しは
+-- bootstrap トークンで gate する（テナント自身が自分の status/quotas を上げられてはならない）。
+GRANT UPDATE (status, quotas) ON tenants TO faas_app;

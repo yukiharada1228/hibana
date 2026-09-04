@@ -1631,6 +1631,40 @@ pub async fn load_tenant_status_and_quotas(
     Ok(Some((status, quotas)))
 }
 
+/// M10 follow-up: テナントの実行ステータスを設定する（platform admin op, §3.2 / §9）。
+///
+/// `status` は呼び出し側で `active` / `suspended` に検証済みであること。0 行 = テナント不在 → 404。
+/// `suspended` にすると `auth.rs` の middleware が以後のリクエストを 403 で弾く（次リクエストから即時）。
+pub async fn set_tenant_status(
+    executor: impl sqlx::PgExecutor<'_>,
+    tenant_id: &str,
+    status: &str,
+) -> Result<bool, sqlx::Error> {
+    let r = sqlx::query("UPDATE tenants SET status = $2 WHERE id = $1")
+        .bind(tenant_id)
+        .bind(status)
+        .execute(executor)
+        .await?;
+    Ok(r.rows_affected() > 0)
+}
+
+/// M10 follow-up: テナントのクォータ上書き（`tenants.quotas` JSONB）を全置換する（platform admin op, §8）。
+///
+/// `quotas` は呼び出し側で [`TenantQuotaOverrides`] 形へ検証・正規化済みの JSON であること。
+/// 0 行 = テナント不在 → 404。次の invoke から `load_tenant_status_and_quotas` が新値を読む。
+pub async fn set_tenant_quotas(
+    executor: impl sqlx::PgExecutor<'_>,
+    tenant_id: &str,
+    quotas: &Value,
+) -> Result<bool, sqlx::Error> {
+    let r = sqlx::query("UPDATE tenants SET quotas = $2 WHERE id = $1")
+        .bind(tenant_id)
+        .bind(quotas)
+        .execute(executor)
+        .await?;
+    Ok(r.rows_affected() > 0)
+}
+
 /// reaper 用: 現存する全テナント id を列挙する (M3d, §8)。
 ///
 /// `tenants` には RLS が無い（0004_rls.sql: tenant_id 列を持たないため対象外）。faas_app は

@@ -104,7 +104,7 @@ ECHO_WASM := target/wasm32-wasip2/release/echo.wasm
 
 .DEFAULT_GOAL := help
 
-.PHONY: run-workers autoscale stop-workers scale-status lane-status recreate-stream deploy-chaos-components component-id traffic canary promote rollback approve-env approve-egress set-secret secrets rekey help setup up down migrate minio-bucket build-component run-cp run-worker bootstrap login deploy invoke logs psql clean rls-lint
+.PHONY: run-workers autoscale stop-workers scale-status lane-status recreate-stream deploy-chaos-components component-id traffic canary promote rollback approve-env approve-egress tenant-status tenant-quotas set-secret secrets rekey help setup up down migrate minio-bucket build-component run-cp run-worker bootstrap login deploy invoke logs psql clean rls-lint
 
 help: ## 利用可能なターゲット一覧を表示
 	@echo "WASM FaaS Platform — M2 Makefile"
@@ -189,6 +189,22 @@ bootstrap: ## M3a: テナント + 最初の admin ユーザを 1 回で作成（
 	TID=$$(printf '%s' "$$TBODY" | sed -n 's/.*"tenant_id"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p'); \
 	test -n "$$TID" || { echo "ERROR: bootstrap 応答から tenant_id を取得できませんでした。" >&2; exit 1; }; \
 	echo "OK: tenant_id=$$TID + admin ユーザ($(SMOKE_EMAIL)) を作成しました。'make login' でトークンを取得できます。"
+
+tenant-status: ## M10: テナントを suspend/再有効化（TID=ten_... STATUS=active|suspended）。bootstrap トークン gate
+	@set -e; \
+	test -n "$(TID)" || { echo "ERROR: TID=ten_... を指定してください"; exit 1; }; \
+	test -n "$(STATUS)" || { echo "ERROR: STATUS=active|suspended を指定してください"; exit 1; }; \
+	curl -sS -w '\n%{http_code}\n' -X PUT "$(BASE_URL)/admin/tenants/$(TID)/status" \
+	  -H "Authorization: Bearer $(BOOTSTRAP_ADMIN_TOKEN)" -H "Content-Type: application/json" \
+	  -d '{"status":"$(STATUS)"}'
+
+tenant-quotas: ## M10: テナントのクォータ上書き（TID=ten_... QUOTAS='{"invoke_rate_per_sec":100}'）。bootstrap トークン gate
+	@set -e; \
+	test -n "$(TID)" || { echo "ERROR: TID=ten_... を指定してください"; exit 1; }; \
+	test -n "$(QUOTAS)" || { echo "ERROR: QUOTAS='{...}' を指定してください（空にするには QUOTAS='{}'）"; exit 1; }; \
+	curl -sS -w '\n%{http_code}\n' -X PUT "$(BASE_URL)/admin/tenants/$(TID)/quotas" \
+	  -H "Authorization: Bearer $(BOOTSTRAP_ADMIN_TOKEN)" -H "Content-Type: application/json" \
+	  -d '$(QUOTAS)'
 
 login: ## POST /auth/login でトークンを標準出力に出す（TOKEN=$$(make -s login)）
 	@set -e; \

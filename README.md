@@ -461,7 +461,6 @@ Prometheus の histogram を読む手段が無いからである。測れない�
 - `execution_duration_seconds` の subscriber finalize 時の observe（created_at→finished_at）
 - per-tenant ラベルのカーディナリティ対策（`METRICS_INCLUDE_TENANT_LABEL=false` フラグ）
 - `.result` / `.failed` の JetStream 化（現状 core NATS、CP 再起動で in-flight 結果ドロップの恐れ）
-- `tenants.quotas` / `tenants.status` の admin API（現状 SQL 直 UPDATE）
 
 > **露出ガード（仕様書 §15 MUST NOT）**: M4 完了により「Observability / 完全リトライ DLQ / 孤児
 > GC / 全リソース制限 / 完全クォータ」が成立しました。仕様書 §15 M4 の **完了条件**「障害注入
@@ -1338,6 +1337,8 @@ OTEL_EXPORTER_OTLP_ENDPOINT=http://localhost:4318 make run-worker > /tmp/worker.
 | `GET /metrics` | 不要 | **M4a**: Prometheus exposition format（control-plane: `faas_*` 系、worker: `wasmtime_*` 系 + `executions_total{outcome}`）。worker は別 axum サーバ（既定 `:9090`）で公開（§3.8） |
 | `POST /auth/login` | 不要 | email+password で API トークンを発行（一度だけ平文 secret を返す, §3.3） |
 | `POST /admin/tenants` | bootstrap | テナント + 最初の admin ユーザを作成（§9 bootstrap）。`BOOTSTRAP_ADMIN_TOKEN` で gate（§3.3） |
+| `PUT /admin/tenants/{id}/status` | bootstrap | **M10**: テナントを suspend / 再有効化（`{"status":"active"\|"suspended"}`）。suspended は次リクエストから 403（§3.2）。`BOOTSTRAP_ADMIN_TOKEN` で gate |
+| `PUT /admin/tenants/{id}/quotas` | bootstrap | **M10**: クォータ上書きを全置換（`invoke_rate_per_sec` / `invoke_burst` / `max_concurrent_executions` / `lane_concurrency`）。省略は既定継承。`BOOTSTRAP_ADMIN_TOKEN` で gate（§8） |
 | `POST /tenants/{id}/users` | admin | テナント内ユーザ作成（自テナント限定。他テナントは 404, §3.3） |
 | `POST /tokens` | admin | 対象ユーザ向け API トークン発行（要求 ∩ 発行者 ∩ 対象ロール上限, §3.3） |
 | `DELETE /tokens/{id}` | admin | トークン失効（自テナント限定。他テナントは 404, §3.3） |
@@ -1499,6 +1500,5 @@ M9 完了済み（本リポジトリの現状）。**M5〜M9 が完了**し、�
   - per-tenant ラベル（`faas_tenant_invoke_total{tenant_id}`）のカーディナリティ対策
     （`METRICS_INCLUDE_TENANT_LABEL=false` フラグ追加）
   - `.result` / `.failed` の JetStream 化（現状 core NATS、CP 再起動で in-flight ドロップ）
-  - `tenants.quotas` / `tenants.status` の admin API（現状 SQL 直 UPDATE）
 
 詳細は `仕様書.md` の §15 実装ロードマップを参照してください。
