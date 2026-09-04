@@ -331,9 +331,13 @@ pub async fn upload_version(
     // Deploy スコープのこの経路では**常に空**（deny-all）で保存する。deploy トークンが
     // `env: ["PROD_API_KEY"]` を宣言できると、その wasm が `wasi:cli/environment`（baseline 承認済み）
     // で読んだ値を invoke 出力へ返すだけで admin 専用の secret を平文で取得できる（権限昇格）。
+    // M9c: egress allowlist も upload（deploy スコープ）では**常に空**（deny-all）で保存する。
+    // `wasi:sockets/*` の import は baseline 承認だが、実際の外部到達は admin が
+    // `PUT .../capabilities/egress` で承認するまで worker の socket_addr_check が全拒否する。
     let capabilities_json = validation::CapabilitySet {
         imports: validated.approved_imports.clone(),
         env: std::collections::BTreeSet::new(),
+        net_allow_outbound: std::collections::BTreeSet::new(),
     }
     .to_json();
 
@@ -3275,6 +3279,106 @@ pub async fn approve_capability_env(
         version,
         version_id,
         env: approved.into_iter().collect(),
+    }))
+}
+
+#[derive(Debug, Deserialize)]
+pub struct ApproveCapabilityEgressRequest {
+    /// 許可する outbound 先（`host:port`）の**全置換**リスト（空配列 = egress deny-all へ戻す）。
+    pub allow_outbound: Vec<String>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ApproveCapabilityEgressResponse {
+    pub component_id: String,
+    pub version: String,
+    pub version_id: String,
+    pub allow_outbound: Vec<String>,
+}
+
+/// PUT /components/{id}/versions/{version}/capabilities/egress — egress allowlist を承認する（admin, M9c）。
+///
+/// `approve_capability_env` と**同型**（admin スコープ + admin ロールの二重ガード, §3.7）。
+/// `wasi:sockets/*` の import は baseline で許可されるが、実際の outbound はこの allowlist が
+/// 非空のときだけ worker の `socket_addr_check` が通す。ここで承認された `host:port` を
+/// `capabilities.net_allow_outbound` へ**全置換**で書く。空配列は egress を deny-all に戻す。
+///
+/// **deploy スコープの upload 経路ではこの値を書けない**（upload は常に空で保存する）。
+/// egress は admin 専用の管理操作である（deploy トークンが自分で外部到達を承認できてはならない）。
+pub async fn approve_capability_egress(
+    State(state): State<AppState>,
+    principal: Principal,
+    Path((component_id, version)): Path<(String, String)>,
+    JsonBody(req): JsonBody<ApproveCapabilityEgressRequest>,
+) -> Result<impl IntoResponse, AppError> {
+    require_admin_role(principal.role)?;
+    let tenant = &principal.tenant_id;
+
+    // 各エントリを host:port として検証し、正規化する（重複は BTreeSet が畳む）。
+    // 1 つでも不正なら 400 で全体を拒否する（部分承認しない）。
+    let mut approved = std::collections::BTreeSet::new();
+    for raw in &req.allow_outbound {
+        let ep = faas_shared::egress::parse_egress_endpoint(raw).map_err(|e| {
+            FaasError::InvalidRequest(format!("invalid egress endpoint '{raw}': {e}"))
+        })?;
+        approved.insert(format!("{}:{}", ep.host, ep.port));
+    }
+
+    let mut tx = state.pool().begin().await?;
+    db::set_tenant_guc(&mut tx, tenant).await?;
+
+    db::find_component_by_id(&mut *tx, tenant, &component_id)
+        .await?
+        .ok_or_else(|| FaasError::NotFound(format!("component '{component_id}'")))?;
+
+    let version_id = db::find_version_id(&mut *tx, tenant, &component_id, &version)
+        .await?
+        .ok_or_else(|| {
+            FaasError::NotFound(format!("version '{version}' of component '{component_id}'"))
+        })?;
+
+    // 既存の imports / env は保持し、net_allow_outbound だけを差し替える。
+    let current = db::version_capabilities(&mut *tx, tenant, &version_id)
+        .await?
+        .unwrap_or(Value::Null);
+    let mut caps = validation::parse_capabilities(&current);
+    caps.net_allow_outbound = approved.clone();
+
+    if !db::set_version_capabilities(&mut *tx, tenant, &version_id, &caps.to_json()).await? {
+        return Err(FaasError::NotFound(format!(
+            "version '{version}' of component '{component_id}'"
+        ))
+        .into());
+    }
+
+    db::insert_audit_log(
+        &mut *tx,
+        tenant,
+        principal.user_id.as_deref(),
+        "capability_egress_approved",
+        Some(&version_id),
+        Some(&json!({
+            "component_id": component_id,
+            "version": version,
+            "allow_outbound": approved.iter().collect::<Vec<_>>(),
+        })),
+    )
+    .await?;
+
+    tx.commit().await?;
+
+    tracing::info!(
+        %component_id,
+        %version,
+        approved_egress_count = approved.len(),
+        "capability egress allowlist approved"
+    );
+
+    Ok(Json(ApproveCapabilityEgressResponse {
+        component_id,
+        version,
+        version_id,
+        allow_outbound: approved.into_iter().collect(),
     }))
 }
 

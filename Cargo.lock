@@ -2582,6 +2582,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "netprobe"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "wit-bindgen 0.36.0",
+]
+
+[[package]]
 name = "nkeys"
 version = "0.4.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
