@@ -50,6 +50,8 @@ function run(cmd, args) {
 }
 
 export async function buildComponent({ entry, out, wit, world }) {
+  wit = wit || DEFAULT_WIT;
+  world = world || "handler";
   const entryAbs = resolve(process.cwd(), entry);
   const outAbs = resolve(process.cwd(), out);
   const witAbs = resolve(process.cwd(), wit);
