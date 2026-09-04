@@ -23,6 +23,8 @@ pub const DEFAULT_TENANT: &str = "default";
 mod redacted;
 pub use redacted::{expose_once, Redacted};
 
+pub mod egress;
+
 // ============================================================================
 // ID 採番ヘルパ（uuid 由来の不透明文字列）
 // ============================================================================
