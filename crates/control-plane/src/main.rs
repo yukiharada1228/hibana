@@ -530,6 +530,15 @@ fn build_router(state: AppState) -> Router {
             "/components/{component_id}/versions/{version}/capabilities/egress",
             put(handlers::approve_capability_egress),
         )
+        // --- M9a: Component 署名鍵の管理 + 署名必須ポリシー (§6.2 / §15 M9) ---
+        // 供給網検証: deploy トークンが漏れても、テナント登録鍵で署名された wasm でなければ
+        // active にできない。鍵管理とポリシーは admin 専用（deploy から分離）。
+        .route("/admin/signing-keys", get(handlers::list_signing_keys))
+        .route(
+            "/admin/signing-keys/{key_id}",
+            put(handlers::register_signing_key).delete(handlers::retire_signing_key),
+        )
+        .route("/admin/signing-policy", put(handlers::set_signing_policy))
         // --- M7c: Secrets Manager (§10 / §15) ---
         // 書き込み系はすべて admin スコープ + require_admin_role の二重ガード
         // （§4.4「付与（承認）は admin スコープを要する (MUST)」に従う）。

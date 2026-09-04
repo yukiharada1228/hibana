@@ -485,6 +485,14 @@ Prometheus の histogram を読む手段が無いからである。測れない�
   sha256, §6.2）。**M9b (§6.2): 検証は control-plane 本体とは別プロセスで実行**し、悪性 wasm が
   検証器の資源を食い潰しても被害を子プロセス 1 個に限局する（子は Linux の `RLIMIT_AS` +
   wall-clock timeout で縛る）。`VALIDATION_TIMEOUT_SECS` / `VALIDATION_MEM_LIMIT_MB`
+- **署名付き Component（M9a, §6.2 / §15 M9）**: テナントが登録した Ed25519 公開鍵で wasm 本体の
+  sha256 への detached 署名を検証する。`require_signed_components=true` のテナントは署名必須
+  （deploy トークンが漏れても署名鍵無しでは active にできない = 供給網汚染の防御）。既定 false で
+  従来どおり（署名が有れば検証、無ければ通す）。鍵登録・ポリシー切替は admin 専用
+  （`PUT /admin/signing-keys/{key_id}` / `PUT /admin/signing-policy`）。**秘密鍵は渡さない**。
+- **egress allowlist（M9c, §4.4 / §15 M9）**: admin 承認した `host:port` へのみ outbound を許す。
+  承認名が内部 IP（`169.254.169.254` 等）へ解決されても SSRF ハードデニーが優先して拒否する。
+  `PUT /components/{id}/versions/{version}/capabilities/egress`
 - Object Storage: MinIO への本体保存と Worker への presigned GET URL（§3.4）
 - Worker: `wasm_sha256` キーの Component キャッシュ + 事前コンパイル（cwasm, §3.6）
 - バージョン管理（§6.7）: 一覧 / soft delete / `active-version` 切替（ロールバック）

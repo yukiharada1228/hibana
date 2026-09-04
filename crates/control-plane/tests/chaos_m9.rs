@@ -12,7 +12,8 @@
 //! - **v6（M9b）**: 検証 DoS が control-plane を落とさない（§6.2）。
 //! - **v1（M9c）**: filesystem は import できても実行時に全拒否される（deny-by-default の実測）。
 //! - **v3/v4/v5（M9c）**: egress allowlist の実効強制（未承認拒否 / 承認のみ到達 / 内部 hard-deny）。
-//! - v7（署名, M9a）/ v2/v8（回帰ガード）は後続スライスで追加。
+//! - **v7（M9a）**: 署名必須ポリシー下で、署名なし / 不正署名の wasm を拒否する（供給網検証, T6）。
+//! - v2/v8（回帰ガード）は後続スライスで追加。
 //!
 //! ## v1/v3/v4/v5 が検証すること（信頼境界の明示）
 //!
@@ -519,5 +520,184 @@ async fn chaos_v5_internal_target_denied_even_if_approved() {
     assert!(
         net_ip.starts_with("denied"),
         "ループバック IP 直指定へ到達できてしまった: net={net_ip}"
+    );
+}
+
+// ============================================================================
+// M9a: 署名付き Component（v7）
+// ============================================================================
+
+/// echo.wasm のバイト列を読む（chaos_m7 と同じ既定パス解決）。
+fn echo_wasm_bytes() -> Vec<u8> {
+    let path = std::env::var("CHAOS_ECHO_WASM").unwrap_or_else(|_| {
+        format!(
+            "{}/../../components-dist/echo.wasm",
+            env!("CARGO_MANIFEST_DIR")
+        )
+    });
+    std::fs::read(&path)
+        .unwrap_or_else(|e| panic!("cannot read {path} (run `make build-component`): {e}"))
+}
+
+/// wasm を（任意の署名付きで）アップロードし、HTTP ステータスを返す。
+async fn upload_signed(
+    client: &reqwest::Client,
+    base: &str,
+    token: &str,
+    cid: &str,
+    version: &str,
+    wasm: Vec<u8>,
+    signature: Option<&str>,
+) -> u16 {
+    let mut form = reqwest::multipart::Form::new()
+        .text("version", version.to_string())
+        .part(
+            "wasm",
+            reqwest::multipart::Part::bytes(wasm).file_name("echo.wasm"),
+        );
+    if let Some(sig) = signature {
+        form = form.text("signature", sig.to_string());
+    }
+    client
+        .post(format!("{base}/components/{cid}/versions"))
+        .bearer_auth(token)
+        .multipart(form)
+        .send()
+        .await
+        .map(|r| r.status().as_u16())
+        .unwrap_or(0)
+}
+
+/// **Scenario V7**: 署名必須ポリシー（require_signed_components=true）のテナントで、
+/// (1) 署名なし → 拒否、(2) **正しい署名 → 成功（負の対照）**、(3) 不正署名 → 拒否。
+///
+/// 供給網汚染（T6）の防御: deploy トークンが漏れても、テナント登録鍵で署名された wasm でなければ
+/// active にできない。負の対照（正しい署名は通る）が無いと「署名機能が全アップロードを殺している」
+/// のを見逃す。
+///
+/// 後始末: ポリシーを false に戻し、登録鍵を retire する（他テストへの影響を残さない）。
+#[tokio::test]
+#[ignore = "chaos: requires docker compose stack + CHAOS_TOKEN + echo; run: cargo test -p faas-control-plane --test chaos_m9 -- --ignored --test-threads=1 chaos_v7_"]
+async fn chaos_v7_unsigned_or_bad_signature_rejected() {
+    use ed25519_dalek::{Signer as _, SigningKey};
+
+    let base = base_url();
+    let token = token();
+    let client = client();
+    let echo = echo_component();
+    let cid = resolve_component_id(&client, &base, &token, &echo).await;
+
+    // テスト専用の署名鍵（決定的 seed）。秘密鍵はテスト内だけに存在し、公開鍵を登録する。
+    let sk = SigningKey::from_bytes(&[42u8; 32]);
+    let pk_b64 = faas_shared::b64url_encode(sk.verifying_key().as_bytes());
+    let key_id = "chaos-v7-key";
+
+    // 署名鍵を登録。
+    let reg = client
+        .put(format!("{base}/admin/signing-keys/{key_id}"))
+        .bearer_auth(&token)
+        .json(&serde_json::json!({ "public_key": pk_b64 }))
+        .send()
+        .await
+        .expect("register signing key");
+    assert_eq!(reg.status().as_u16(), 200, "署名鍵の登録は 200 であること");
+
+    // ポリシーを署名必須へ。
+    let pol = client
+        .put(format!("{base}/admin/signing-policy"))
+        .bearer_auth(&token)
+        .json(&serde_json::json!({ "require_signed_components": true }))
+        .send()
+        .await
+        .expect("set signing policy");
+    assert_eq!(pol.status().as_u16(), 200, "ポリシー設定は 200 であること");
+
+    // 後始末は assert より前に必ず実行する（chaos の作法）。失敗しても他テストへ波及させない。
+    // ここでは検証結果を貯めてから、末尾で後始末 → assert する。
+    let wasm = echo_wasm_bytes();
+
+    // 署名対象は wasm 本体の sha256（16 進文字列の UTF-8 バイト）。CP と同一規約。
+    let sha_hex = {
+        use sha2::{Digest, Sha256};
+        let mut h = Sha256::new();
+        h.update(&wasm);
+        h.finalize()
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect::<String>()
+    };
+    let good_sig = faas_shared::b64url_encode(&sk.sign(sha_hex.as_bytes()).to_bytes());
+    // 別ダイジェストへの署名（本体に対しては不正）。
+    let bad_sig = faas_shared::b64url_encode(&sk.sign(b"not the real digest").to_bytes());
+
+    // 衝突しない version を選ぶ（署名検証の前に「version 既存」で 400 になると誤判定するため）。
+    let base_ver = format!(
+        "7.{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0)
+    );
+
+    let unsigned = upload_signed(
+        &client,
+        &base,
+        &token,
+        &cid,
+        &format!("{base_ver}.0"),
+        wasm.clone(),
+        None,
+    )
+    .await;
+    let signed_ok = upload_signed(
+        &client,
+        &base,
+        &token,
+        &cid,
+        &format!("{base_ver}.1"),
+        wasm.clone(),
+        Some(&good_sig),
+    )
+    .await;
+    let bad_signed = upload_signed(
+        &client,
+        &base,
+        &token,
+        &cid,
+        &format!("{base_ver}.2"),
+        wasm.clone(),
+        Some(&bad_sig),
+    )
+    .await;
+
+    // --- 後始末（assert より前）: ポリシーを戻し鍵を retire する ---
+    let _ = client
+        .put(format!("{base}/admin/signing-policy"))
+        .bearer_auth(&token)
+        .json(&serde_json::json!({ "require_signed_components": false }))
+        .send()
+        .await;
+    let _ = client
+        .delete(format!("{base}/admin/signing-keys/{key_id}"))
+        .bearer_auth(&token)
+        .send()
+        .await;
+
+    // --- assert ---
+    assert!(
+        (400..500).contains(&unsigned),
+        "署名必須なのに署名なしアップロードが {unsigned}（4xx 拒否を期待）。\n\
+         deploy トークンだけで任意 wasm を active にできる = 供給網汚染（T6）を防げていない"
+    );
+    // 負の対照: 正しい署名は通る。これが無いと「全部拒否」を安全と誤読する。
+    assert_eq!(
+        signed_ok, 201,
+        "正しい署名付きアップロードが {signed_ok}（201 を期待）。\n\
+         署名検証が正規のデプロイまで殺している（負の対照が落ちた）"
+    );
+    assert!(
+        (400..500).contains(&bad_signed),
+        "不正署名のアップロードが {bad_signed}（4xx 拒否を期待）。\n\
+         署名が付いていれば内容と一致するか必ず検証すること"
     );
 }

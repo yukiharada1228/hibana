@@ -33,6 +33,7 @@ use crate::enqueue;
 use crate::error::AppError;
 use crate::extract::JsonBody;
 use crate::routing;
+use crate::signing;
 use crate::state::AppState;
 use crate::validation;
 
@@ -229,6 +230,8 @@ pub async fn upload_version(
     let mut version: Option<String> = None;
     let mut wasm_bytes: Option<Vec<u8>> = None;
     let mut capabilities: Option<Value> = None;
+    // M9a: 本体 sha256 に対する detached Ed25519 署名（base64url）。任意フィールド。
+    let mut signature: Option<String> = None;
     let mut resource_limits: ResourceLimits = ResourceLimits::default();
     // M7a: アップロード直後に stable を差し替えるか。**既定 true**（M6 までと同一挙動）。
     // canary の段階移行は「新版を activate=false で上げてから PUT /traffic で 10% 流す」という
@@ -297,6 +300,16 @@ pub async fn upload_version(
                 // `"false"` だけを false と解釈する（未知値は既定 true ＝ 従来挙動へ倒す）。
                 activate = !text.trim().eq_ignore_ascii_case("false");
             }
+            Some("signature") => {
+                // M9a: 本体 sha256 に対する detached Ed25519 署名（base64url）。
+                let v = field.text().await.map_err(|e| {
+                    FaasError::InvalidRequest(format!("invalid signature field: {e}"))
+                })?;
+                let v = v.trim().to_string();
+                if !v.is_empty() {
+                    signature = Some(v);
+                }
+            }
             // 未知フィールドは無視（前方互換）。
             _ => {
                 let _ = field.bytes().await;
@@ -320,6 +333,67 @@ pub async fn upload_version(
     // **承認済みとして解決した import 集合**（validated.approved_imports）を使う。
     let approved = validation::ApprovedCapabilities::baseline();
     let validated = validation::validate_wasm(wasm_bytes.clone(), approved).await?;
+
+    // M9a (§6.2): 供給網検証 —— テナントが登録した公開鍵での署名検証。
+    //
+    // deploy トークンは「アップロードの認可」、署名は「本体の真正性」で、**別々の秘密**に
+    // 依存させる（片方が漏れても攻撃が成立しない）。ポリシー `require_signed_components`:
+    //   - true: 署名が必須。無い / 検証失敗 / 鍵不在は 422（fail-closed）。
+    //   - false（既定）: 署名が**有れば**検証する（不正署名は拒否）。無ければ従来どおり通す。
+    // どちらでも「署名が付いていて不正」は拒否する（誤検証を黙認しない）。
+    //
+    // 署名対象は本体そのものではなく `validated.sha256`（検証パイプラインが算出済みの 16 進文字列）。
+    let require_signed = db::require_signed_components(&mut *tx, tenant).await?;
+    if require_signed || signature.is_some() {
+        let audit_reject = |reason: &'static str| {
+            tracing::warn!(%component_id, reason, require_signed, "component signature rejected");
+        };
+        let sig = signature.as_deref().ok_or_else(|| {
+            audit_reject("signature_required");
+            FaasError::InvalidRequest(
+                "this tenant requires signed components; provide a 'signature' field \
+                 (detached Ed25519 over the wasm sha256, base64url)"
+                    .into(),
+            )
+        })?;
+
+        let keys = db::list_signing_keys(&mut *tx, tenant)
+            .await?
+            .into_iter()
+            .map(|k| (k.key_id, k.public_key))
+            .collect::<Vec<_>>();
+        if keys.is_empty() {
+            audit_reject("no_signing_keys_registered");
+            return Err(FaasError::InvalidRequest(
+                "component signature present/required but no signing keys are registered for this \
+                 tenant (register one via PUT /admin/signing-keys/{key_id})"
+                    .into(),
+            )
+            .into());
+        }
+
+        if let Err(e) = signing::verify_component_signature(&validated.sha256, sig, &keys) {
+            audit_reject(e.reason());
+            db::insert_audit_log(
+                &mut *tx,
+                tenant,
+                principal.user_id.as_deref(),
+                "component_signature_rejected",
+                Some(&component.id),
+                Some(&json!({
+                    "version": version,
+                    "sha256": validated.sha256,
+                    "reason": e.reason(),
+                })),
+            )
+            .await?;
+            return Err(FaasError::InvalidRequest(format!(
+                "component signature verification failed: {}",
+                e.reason()
+            ))
+            .into());
+        }
+    }
 
     if let Some(caps) = &capabilities {
         // 宣言値は監査・観測用にログするのみ（保存・付与には使わない, §4.4）。
@@ -3379,6 +3453,184 @@ pub async fn approve_capability_egress(
         version,
         version_id,
         allow_outbound: approved.into_iter().collect(),
+    }))
+}
+
+// ---------------------------------------------------------------------------
+// M9a: Component 署名鍵の管理 + 署名必須ポリシー（§6.2 / §15 M9）
+//
+// すべて admin スコープ（ルータ）+ admin ロール（require_admin_role）の二重ガード。
+// **秘密鍵はプラットフォームに一切渡らない**（テナントが手元で署名し、公開鍵だけ登録する）。
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Deserialize)]
+pub struct RegisterSigningKeyRequest {
+    /// Ed25519 公開鍵（base64url, パディング無し, 32 バイト）。
+    pub public_key: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct SigningKeyView {
+    pub key_id: String,
+    pub public_key: String,
+    pub status: String,
+}
+
+/// PUT /admin/signing-keys/{key_id} — 署名鍵を登録 / 差し替える（admin）。
+///
+/// 同一 key_id への再 PUT は公開鍵を上書きし status を active に戻す（ローテーション時の再登録）。
+pub async fn register_signing_key(
+    State(state): State<AppState>,
+    principal: Principal,
+    Path(key_id): Path<String>,
+    JsonBody(req): JsonBody<RegisterSigningKeyRequest>,
+) -> Result<impl IntoResponse, AppError> {
+    require_admin_role(principal.role)?;
+    let tenant = &principal.tenant_id;
+
+    // 公開鍵として妥当（32 バイトの Ed25519 点）であることを登録時に検証する。
+    // 壊れた鍵を DB に入れると、後の署名検証で「使える鍵が 1 つも無い」に化ける。
+    signing::validate_public_key_b64url(&req.public_key)
+        .map_err(|e| FaasError::InvalidRequest(format!("invalid public_key: {}", e.reason())))?;
+
+    if key_id.trim().is_empty() || key_id.len() > 128 {
+        return Err(FaasError::InvalidRequest("key_id must be 1..=128 chars".into()).into());
+    }
+
+    let mut tx = state.pool().begin().await?;
+    db::set_tenant_guc(&mut tx, tenant).await?;
+    db::upsert_signing_key(
+        &mut *tx,
+        tenant,
+        &key_id,
+        &req.public_key,
+        principal.user_id.as_deref(),
+    )
+    .await?;
+    db::insert_audit_log(
+        &mut *tx,
+        tenant,
+        principal.user_id.as_deref(),
+        "signing_key_registered",
+        Some(&key_id),
+        // 公開鍵は秘密ではないが、監査には key_id だけ残す（応答で公開鍵は返す）。
+        Some(&json!({ "key_id": key_id })),
+    )
+    .await?;
+    tx.commit().await?;
+
+    tracing::info!(%key_id, "component signing key registered");
+    Ok(Json(SigningKeyView {
+        key_id,
+        public_key: req.public_key,
+        status: "active".into(),
+    }))
+}
+
+/// GET /admin/signing-keys — 登録済み署名鍵の一覧（admin）。
+pub async fn list_signing_keys(
+    State(state): State<AppState>,
+    principal: Principal,
+) -> Result<impl IntoResponse, AppError> {
+    require_admin_role(principal.role)?;
+    let tenant = &principal.tenant_id;
+
+    let mut tx = state.pool().begin().await?;
+    db::set_tenant_guc(&mut tx, tenant).await?;
+    let keys = db::list_signing_keys(&mut *tx, tenant).await?;
+    tx.commit().await?;
+
+    let out: Vec<SigningKeyView> = keys
+        .into_iter()
+        .map(|k| SigningKeyView {
+            key_id: k.key_id,
+            public_key: k.public_key,
+            status: k.status,
+        })
+        .collect();
+    Ok(Json(out))
+}
+
+/// DELETE /admin/signing-keys/{key_id} — 鍵を retire する（admin）。
+///
+/// 物理削除ではなく retire（status='retired'）。過去にその鍵で署名された version の再検証を
+/// 壊さないため（M7c secret の KEK と同じ思想）。不在は 404。
+pub async fn retire_signing_key(
+    State(state): State<AppState>,
+    principal: Principal,
+    Path(key_id): Path<String>,
+) -> Result<impl IntoResponse, AppError> {
+    require_admin_role(principal.role)?;
+    let tenant = &principal.tenant_id;
+
+    let mut tx = state.pool().begin().await?;
+    db::set_tenant_guc(&mut tx, tenant).await?;
+    let found = db::retire_signing_key(&mut *tx, tenant, &key_id).await?;
+    if !found {
+        return Err(FaasError::NotFound(format!("signing key '{key_id}'")).into());
+    }
+    db::insert_audit_log(
+        &mut *tx,
+        tenant,
+        principal.user_id.as_deref(),
+        "signing_key_retired",
+        Some(&key_id),
+        Some(&json!({ "key_id": key_id })),
+    )
+    .await?;
+    tx.commit().await?;
+
+    tracing::info!(%key_id, "component signing key retired");
+    Ok(StatusCode::NO_CONTENT)
+}
+
+#[derive(Debug, Deserialize)]
+pub struct SigningPolicyRequest {
+    /// true にすると署名必須。false で従来どおり（署名が有れば検証するが必須ではない）。
+    pub require_signed_components: bool,
+}
+
+#[derive(Debug, Serialize)]
+pub struct SigningPolicyResponse {
+    pub require_signed_components: bool,
+}
+
+/// PUT /admin/signing-policy — 署名必須ポリシーを切り替える（admin）。
+///
+/// true にする前に**有効な鍵を登録し、既存 active version が署名済みであること**を
+/// 運用者が確認する必要がある（true 化後は署名なしの再アップロードができなくなる）。
+pub async fn set_signing_policy(
+    State(state): State<AppState>,
+    principal: Principal,
+    JsonBody(req): JsonBody<SigningPolicyRequest>,
+) -> Result<impl IntoResponse, AppError> {
+    require_admin_role(principal.role)?;
+    let tenant = &principal.tenant_id;
+
+    let mut tx = state.pool().begin().await?;
+    db::set_tenant_guc(&mut tx, tenant).await?;
+    let ok =
+        db::set_require_signed_components(&mut *tx, tenant, req.require_signed_components).await?;
+    if !ok {
+        return Err(FaasError::NotFound(format!("tenant '{tenant}'")).into());
+    }
+    db::insert_audit_log(
+        &mut *tx,
+        tenant,
+        principal.user_id.as_deref(),
+        "signing_policy_updated",
+        None,
+        Some(&json!({ "require_signed_components": req.require_signed_components })),
+    )
+    .await?;
+    tx.commit().await?;
+
+    tracing::info!(
+        require_signed = req.require_signed_components,
+        "component signing policy updated"
+    );
+    Ok(Json(SigningPolicyResponse {
+        require_signed_components: req.require_signed_components,
     }))
 }
 
