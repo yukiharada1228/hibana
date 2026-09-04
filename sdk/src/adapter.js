@@ -19,8 +19,10 @@
 // event loop を完了まで pump する。実機検証済み）。Hono の app.fetch は
 // Promise を返すため、この async 性が必須である。
 
+// **base64url（パディングなし）**。プラットフォームの Rust 側 `faas_shared::b64url_*`
+// と同一スキーム（url-safe `-_`・`=` 無し）。ingress gateway が Rust で往復するため一致必須。
 const B64 =
-  "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+  "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
 
 function bytesToBase64(bytes) {
   let out = "";
@@ -30,14 +32,14 @@ function bytesToBase64(bytes) {
     const b2 = i + 2 < bytes.length ? bytes[i + 2] : 0;
     out += B64[b0 >> 2];
     out += B64[((b0 & 3) << 4) | (b1 >> 4)];
-    out += i + 1 < bytes.length ? B64[((b1 & 15) << 2) | (b2 >> 6)] : "=";
-    out += i + 2 < bytes.length ? B64[b2 & 63] : "=";
+    if (i + 1 < bytes.length) out += B64[((b1 & 15) << 2) | (b2 >> 6)];
+    if (i + 2 < bytes.length) out += B64[b2 & 63];
   }
   return out;
 }
 
 function base64ToBytes(str) {
-  const clean = str.replace(/[^A-Za-z0-9+/]/g, "");
+  const clean = str.replace(/[^A-Za-z0-9\-_]/g, "");
   const len = Math.floor((clean.length * 3) / 4);
   const out = new Uint8Array(len);
   let p = 0;

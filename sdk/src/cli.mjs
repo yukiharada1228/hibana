@@ -45,7 +45,46 @@ function config() {
     tenant: process.env.HIBANA_TENANT || "smoke",
     email: process.env.HIBANA_EMAIL || "admin@example.com",
     password: process.env.HIBANA_PASSWORD || "dev-password",
+    // 公開 ingress のベースドメイン（サーバの INGRESS_BASE_DOMAIN と一致させる）。
+    // 設定時のみ deploy --public / publish が公開 URL を表示する。
+    ingressDomain: process.env.HIBANA_INGRESS_DOMAIN || null,
   };
+}
+
+// 公開 URL（<app>.<tenant>.<base>）。ベースドメイン未設定なら null。
+function ingressUrl(cfg, name) {
+  return cfg.ingressDomain
+    ? `http://${name}.${cfg.tenant}.${cfg.ingressDomain}/`
+    : null;
+}
+
+async function setIngress(cfg, token, name, enabled) {
+  const id = await resolveComponentId(cfg, token, name);
+  if (!id) die(`no such component: ${name}`);
+  await api(cfg, "PUT", `/components/${id}/ingress`, {
+    token,
+    json: { enabled },
+  });
+  return id;
+}
+
+// 初回 invoke を打って worker に component を precompile・キャッシュさせる（best-effort）。
+async function warmUp(cfg, token, name) {
+  try {
+    let r = await api(cfg, "POST", "/invoke?wait=1", {
+      token,
+      json: { component: name, input: { method: "GET", path: "/" } },
+    });
+    if (r.status === "pending" && r.execution_id) {
+      const started = Date.now();
+      while (r.status === "pending" && Date.now() - started < 90_000) {
+        await sleep(600);
+        r = await api(cfg, "GET", `/executions/${r.execution_id}`, { token });
+      }
+    }
+  } catch {
+    // warm-up の失敗は致命ではない（初回ヒットが cold になるだけ）。
+  }
 }
 
 async function api(cfg, method, path, { token, json, form } = {}) {
@@ -182,13 +221,55 @@ async function cmdDeploy(args) {
   });
   stepDone();
 
+  // 初回 precompile（十数 MiB）を deploy 中に済ませる。これで公開 URL や invoke の
+  // 初回ヒットが cold precompile で待たされない（worker がキャッシュ済みになる）。
+  step("Warming up");
+  await warmUp(cfg, token, name);
+  stepDone();
+
+  let published = false;
+  if (flags.public) {
+    step("Publishing (public ingress)");
+    await setIngress(cfg, token, name, true);
+    published = true;
+    stepDone();
+  }
+
   ok(bold(`Deployed ${name}@${version}`));
-  console.log(
-    dim(
-      `\n  Invoke it:\n    hibana invoke ${name} GET /\n` +
-        `\n  Or via API:\n    POST ${cfg.url}/invoke  {"component":"${name}","input":{"method":"GET","path":"/"}}\n`,
-    ),
-  );
+  const url = published ? ingressUrl(cfg, name) : null;
+  if (url) {
+    console.log(`${green("→")} ${bold(url)}`);
+    console.log(
+      dim(
+        `  (Local dev: curl -H "Host: ${name}.${cfg.tenant}.${cfg.ingressDomain}" ${cfg.url}/ )\n`,
+      ),
+    );
+  } else {
+    console.log(
+      dim(
+        `\n  Invoke it:\n    hibana invoke ${name} GET /` +
+          (published
+            ? `\n  Public ingress is ON (set HIBANA_INGRESS_DOMAIN to print the URL).\n`
+            : `\n  Make it public:  hibana publish ${name}\n`),
+      ),
+    );
+  }
+}
+
+async function cmdPublish(args, enabled) {
+  const { pos } = parseFlags(args);
+  const [name] = pos;
+  if (!name)
+    die(`usage: hibana ${enabled ? "publish" : "unpublish"} <app>`);
+  const cfg = config();
+  const token = await login(cfg);
+  await setIngress(cfg, token, name, enabled);
+  if (enabled) {
+    const url = ingressUrl(cfg, name);
+    ok(`published ${bold(name)}` + (url ? ` → ${bold(url)}` : " (public ingress ON)"));
+  } else {
+    ok(`unpublished ${bold(name)} (public ingress OFF)`);
+  }
 }
 
 async function cmdInvoke(args) {
@@ -321,12 +402,14 @@ async function cmdLogs(args) {
 function usage() {
   console.log(
     `${bold("hibana")} — write a Hono app, ship it as a WebAssembly Component\n\n` +
-      `  hibana deploy   [--entry src/index.ts] [--name <app>] [--version 0.1.0]\n` +
-      `  hibana dev      [--entry src/index.ts] [--port 8787]\n` +
-      `  hibana invoke   <app> [METHOD] [PATH] [--body '<str>'] [--header k:v]\n` +
-      `  hibana secret   set <app> <NAME> <VALUE>\n` +
-      `  hibana rollback <app> [version]\n` +
-      `  hibana logs     <execution_id>\n`,
+      `  hibana deploy    [--entry src/index.ts] [--name <app>] [--version 0.1.0] [--public]\n` +
+      `  hibana dev       [--entry src/index.ts] [--port 8787]\n` +
+      `  hibana invoke    <app> [METHOD] [PATH] [--body '<str>'] [--header k:v]\n` +
+      `  hibana publish   <app>        make reachable at <app>.<tenant>.<base>\n` +
+      `  hibana unpublish <app>        disable public ingress\n` +
+      `  hibana secret    set <app> <NAME> <VALUE>\n` +
+      `  hibana rollback  <app> [version]\n` +
+      `  hibana logs      <execution_id>\n`,
   );
 }
 
@@ -337,6 +420,8 @@ async function main() {
       case "deploy": return await cmdDeploy(rest);
       case "dev": return await cmdDev(rest);
       case "invoke": return await cmdInvoke(rest);
+      case "publish": return await cmdPublish(rest, true);
+      case "unpublish": return await cmdPublish(rest, false);
       case "secret": return await cmdSecret(rest);
       case "rollback": return await cmdRollback(rest);
       case "logs": return await cmdLogs(rest);

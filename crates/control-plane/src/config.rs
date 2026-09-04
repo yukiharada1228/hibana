@@ -290,6 +290,11 @@ pub struct Config {
     /// `faas_tenant_invoke_total` に tenant_id ラベルを付けるか。false で "aggregate" に畳む（M10 follow-up）。
     pub metrics_include_tenant_label: bool,
 
+    /// M11 (§4.2): 公開 HTTP ingress gateway のベースドメイン（例 `hibana.local`）。
+    /// `<app>.<tenant>.<base>` の Host からテナント/アプリを解決する。未設定なら
+    /// gateway は無効（どの Host も 404）。deny-by-default: 有効化には明示設定が要る。
+    pub ingress_base_domain: Option<String>,
+
     // --- 観測 (M4a, §3.8) ---
     /// ログ整形（"text" 既定 / "json"）。`json` のとき `tracing_subscriber::fmt().json()` を
     /// 有効化し、フィールドを flatten した JSON ライン形式で吐く。集約基盤（Loki/ELK 等）に
@@ -519,6 +524,10 @@ impl Config {
                 DEFAULT_METRICS_INCLUDE_TENANT_LABEL,
             ),
             log_format: env_or("LOG_FORMAT", "text"),
+            // M11 (§4.2): 空文字は「未設定」と同義に畳む（gateway 無効）。前後の '.' は落とす。
+            ingress_base_domain: env_optional("INGRESS_BASE_DOMAIN")
+                .map(|s| s.trim().trim_matches('.').to_ascii_lowercase())
+                .filter(|s| !s.is_empty()),
         };
 
         // M8 (§5.3 R0): `min > max` は clamp の意味論が壊れる設定なので **起動時に落とす**。

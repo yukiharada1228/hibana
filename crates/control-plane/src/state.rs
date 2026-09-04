@@ -284,6 +284,8 @@ struct Inner {
     /// 既定 true（従来挙動）。false でテナント数に比例する系列爆発を防ぐ（`"aggregate"` に畳む）。
     /// M8 の `METRICS_LANE_LABELS` と同じ思想（テナント数と一緒に伸びる軸に逃げ道を用意する）。
     metrics_include_tenant_label: bool,
+    /// M11 (§4.2): 公開 HTTP ingress gateway のベースドメイン。None で gateway 無効。
+    ingress_base_domain: Option<String>,
     /// M8 (§5): オートスケールの方針（env 由来・不変）。
     scale_policy: crate::scale::ScalePolicy,
     /// M8 (§5): backlog ポーラが書き、`GET /internal/scale` が読む共有スナップショット。
@@ -329,6 +331,7 @@ impl AppState {
         lanes: LaneConfig,
         scale_policy: crate::scale::ScalePolicy,
         metrics_include_tenant_label: bool,
+        ingress_base_domain: Option<String>,
     ) -> Self {
         // invoke の JetStream publish 用 context は NATS クライアントから構築する。
         let jetstream = async_nats::jetstream::new(nats.clone());
@@ -355,6 +358,7 @@ impl AppState {
                 secret_keyring,
                 job_env_exchange_rate_per_min,
                 metrics_include_tenant_label,
+                ingress_base_domain,
                 lanes,
                 lane_cache: DashMap::new(),
                 lane_generation: AtomicU64::new(0),
@@ -401,6 +405,11 @@ impl AppState {
     /// false のときは `"aggregate"` に畳んで系列爆発を防ぐ。
     pub fn metrics_include_tenant_label(&self) -> bool {
         self.inner.metrics_include_tenant_label
+    }
+
+    /// M11 (§4.2): 公開 ingress gateway のベースドメイン。None なら gateway 無効。
+    pub fn ingress_base_domain(&self) -> Option<&str> {
+        self.inner.ingress_base_domain.as_deref()
     }
 
     /// 専有 lane の上限数。

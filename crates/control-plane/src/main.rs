@@ -21,6 +21,7 @@ mod error;
 mod extract;
 mod handlers;
 mod handlers_secrets;
+mod ingress;
 mod lanes;
 mod login;
 mod metrics;
@@ -228,6 +229,7 @@ async fn main() -> anyhow::Result<()> {
         config.lanes(),
         config.scale_policy(),
         config.metrics_include_tenant_label,
+        config.ingress_base_domain.clone(),
     );
 
     // --- result 購読タスク ---
@@ -461,6 +463,12 @@ fn build_router(state: AppState) -> Router {
                 state.max_wasm_upload_bytes() as usize + 1024 * 1024,
             )),
         )
+        // PUT /components/{id}/ingress: 公開 HTTP ingress の opt-in 切り替え (M11, §4.2。
+        // component ライフサイクル相当の Deploy スコープ)。
+        .route(
+            "/components/{component_id}/ingress",
+            put(handlers::set_component_ingress),
+        )
         // POST /cron-jobs: Cron ジョブ登録 (M6b, §15。component ライフサイクル相当の Deploy スコープ)。
         .route("/cron-jobs", post(handlers::create_cron_job))
         // POST /triggers: トリガー登録 (M6c, §15。component ライフサイクル相当の Deploy スコープ)。
@@ -616,6 +624,10 @@ fn build_router(state: AppState) -> Router {
             put(handlers::set_tenant_quotas),
         )
         .merge(protected)
+        // M11 (§4.2): 公開 HTTP ingress gateway。API ルートにマッチしなかったリクエストのうち
+        // Host が `<app>.<tenant>.<INGRESS_BASE_DOMAIN>` のものだけを gateway として処理する
+        // （それ以外は 404）。deny-by-default（ingress_enabled な component だけ到達可能）。
+        .fallback(ingress::ingress_fallback)
         // M10 follow-up (§3.8): HTTP リクエストメトリクスを observe する。TraceLayer より内側に
         // 置くことで、routing 済み（MatchedPath が extensions に載った状態）で method/route/status を
         // 拾える。**path はルートテンプレート**（`/components/{id}/versions`）を使い、生 URI の

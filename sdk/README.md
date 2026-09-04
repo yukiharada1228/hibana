@@ -48,12 +48,38 @@ requests through `wasi:http` — egress stays behind the platform's M9c allowlis
 
 | Command | Description |
 |---|---|
-| `hibana deploy [--entry src/index.ts] [--name <app>] [--version 0.1.0]` | Build → upload → activate |
+| `hibana deploy [--entry src/index.ts] [--name <app>] [--version 0.1.0] [--public]` | Build → upload → activate → warm up (→ publish, with `--public`) |
 | `hibana dev [--entry src/index.ts] [--port 8787]` | Run the Hono app natively on localhost for fast iteration |
 | `hibana invoke <app> [METHOD] [PATH] [--body '<str>'] [--header k:v]` | Call a deployed app; renders the HTTP response |
+| `hibana publish <app>` / `hibana unpublish <app>` | Turn the public URL on/off (deny-by-default) |
 | `hibana secret set <app> <NAME> <VALUE>` | Set a per-function secret (M7c) |
 | `hibana rollback <app> [version]` | One-click rollback to the previous stable version (M7) |
 | `hibana logs <execution_id>` | Fetch a single execution record |
+
+## Public URLs
+
+A deployed app is reachable at a real HTTP URL once you publish it:
+
+```console
+$ HIBANA_INGRESS_DOMAIN=hibana.local hibana deploy --entry src/index.ts --name my-api --public
+  ...
+  ✓ Deployed my-api@0.1.0
+  → http://my-api.smoke.hibana.local/
+```
+
+The platform's ingress gateway resolves `<app>.<tenant>.<base>` from the `Host`
+header, turns the request into an invoke, and returns the app's real HTTP
+response — no auth token needed (it's a public endpoint, like Cloudflare Workers).
+
+- **Opt-in, deny-by-default**: only apps you explicitly `publish` (or deploy with
+  `--public`) are reachable; everything else — and every unknown app/tenant/host —
+  returns `404`. This is *ingress* only; function *egress* stays behind the M9c
+  allowlist regardless.
+- **Server config**: the control-plane must run with `INGRESS_BASE_DOMAIN` set
+  (e.g. `hibana.local`) for the gateway to be active; unset disables it entirely.
+  Set `HIBANA_INGRESS_DOMAIN` to the same value so the CLI prints the URL.
+- **Local dev** (no wildcard DNS): send the `Host` header directly —
+  `curl -H "Host: my-api.smoke.hibana.local" http://localhost:8080/`.
 
 ## Configuration
 
@@ -66,6 +92,7 @@ Connection info comes from the environment (defaults target a local dev stack):
 | `HIBANA_TENANT` | `smoke` | Tenant slug for login |
 | `HIBANA_EMAIL` | `admin@example.com` | Login email |
 | `HIBANA_PASSWORD` | `dev-password` | Login password |
+| `HIBANA_INGRESS_DOMAIN` | — | Public ingress base domain; set to print URLs (match the server's `INGRESS_BASE_DOMAIN`) |
 
 ## Notes
 
