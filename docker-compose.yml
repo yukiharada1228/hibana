@@ -123,6 +123,22 @@ services:
       "
     restart: "no"
 
+  # --- Jaeger: 分散トレーシングの OTLP 受信 + UI（M10, §3.8）---
+  # control-plane / worker は OTEL_EXPORTER_OTLP_ENDPOINT=http://localhost:4318 を設定したときだけ
+  # ここへ span を送る（既定 off なら未使用）。UI は http://localhost:16686。
+  # all-in-one はインメモリ保存で、開発・デバッグ用途に十分（本番は永続 backend を別途）。
+  jaeger:
+    image: jaegertracing/all-in-one:1.60
+    container_name: faas-jaeger
+    environment:
+      # OTLP 受信を有効化する（4317=gRPC / 4318=HTTP）。本 repo は HTTP/protobuf exporter を使う。
+      COLLECTOR_OTLP_ENABLED: "true"
+    ports:
+      - "127.0.0.1:16686:16686" # Web UI
+      - "127.0.0.1:4318:4318"   # OTLP over HTTP（exporter の向き先）
+      - "127.0.0.1:4317:4317"   # OTLP over gRPC（使わないが標準ポートとして開けておく）
+    restart: unless-stopped
+
 volumes:
   faas-postgres-data:
   faas-nats-data:

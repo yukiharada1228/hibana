@@ -58,7 +58,13 @@ async fn main() -> anyhow::Result<()> {
     let log_format = std::env::var("LOG_FORMAT")
         .map(|v| v.trim().to_string())
         .unwrap_or_else(|_| "text".to_string());
-    init_tracing(&log_format);
+    // M10 (§3.8): OTel は opt-in（OTEL_EXPORTER_OTLP_ENDPOINT 設定時のみ）。未設定なら M4a の
+    // fmt/json ログのみで挙動不変。guard は main の最後まで保持して終了時に span を flush する。
+    let _otel_guard = faas_shared::otel::init_tracing(
+        &log_format,
+        "info,faas_control_plane=debug",
+        "faas-control-plane",
+    );
 
     // `--migrate-only`: 起動時マイグレーションと同じ冪等ロジック（baseline + pending）を流して exit。
     // `make migrate` から呼ばれる入口。`Config::from_env()` を経由しないため、BOOTSTRAP_ADMIN_TOKEN /
@@ -921,36 +927,6 @@ async fn assert_non_privileged_runtime_role(pool: &sqlx::PgPool) -> anyhow::Resu
     }
     tracing::info!(role = %rolname, "runtime DB role is non-privileged (RLS enforced)");
     Ok(())
-}
-
-/// `tracing` を初期化する。`log_format` が "json" の時は構造化 JSON を吐く（M4a, §3.8）。
-///
-/// 既定（"text" / 未設定）は従来どおりの人間可読フォーマット。`json` 経路では
-/// `tracing_subscriber::fmt().json().flatten_event(true)` で event フィールド（`execution_id` など）を
-/// トップレベルにフラット化し、集約基盤の検索が楽になるようにする。span フィールドも一緒に出る
-/// ように `with_current_span(true)` を有効化する（後続スライスで invoke ハンドラに開く
-/// `info_span!("invoke", execution_id=..., tenant_id=...)` の値が各イベントに付くようにする）。
-///
-/// `EnvFilter::try_from_default_env()` は `RUST_LOG` 由来。未設定時は info + 自分のクレートを
-/// debug、にしてあるが（既存挙動）、JSON 経路でも同じ既定にする（運用切替で意図しない静音化を
-/// 起こさないため）。
-fn init_tracing(log_format: &str) {
-    use tracing_subscriber::{fmt, EnvFilter};
-    let filter = EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| EnvFilter::new("info,faas_control_plane=debug"));
-    if log_format.eq_ignore_ascii_case("json") {
-        fmt()
-            .with_env_filter(filter)
-            .json()
-            // event フィールドをトップレベル化（{"execution_id": ..., "message": ...}）。
-            .flatten_event(true)
-            // 現在の span をイベントに添える（execution_id を span 経由で全ログに自動付与する）。
-            .with_current_span(true)
-            .with_span_list(false)
-            .init();
-    } else {
-        fmt().with_env_filter(filter).init();
-    }
 }
 
 #[cfg(test)]

@@ -353,23 +353,6 @@ fn env_u64(key: &str, default: u64) -> anyhow::Result<u64> {
     }
 }
 
-/// `tracing` を初期化する。control-plane と同じ規約: `LOG_FORMAT=json` で構造化 JSON。
-fn init_tracing(log_format: &str) {
-    use tracing_subscriber::{fmt, EnvFilter};
-    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
-    if log_format.eq_ignore_ascii_case("json") {
-        fmt()
-            .with_env_filter(filter)
-            .json()
-            .flatten_event(true)
-            .with_current_span(true)
-            .with_span_list(false)
-            .init();
-    } else {
-        fmt().with_env_filter(filter).init();
-    }
-}
-
 /// ドレイン状態（M8 §4.6）。「立ったら二度と降りない」ラッチ。
 ///
 /// `Notify` 側は **`notify_waiters` ではなく `notify_one` を使わない**（複数の lane ループが
@@ -547,7 +530,9 @@ async fn main() -> anyhow::Result<()> {
     let log_format = std::env::var("LOG_FORMAT")
         .map(|v| v.trim().to_string())
         .unwrap_or_else(|_| "text".to_string());
-    init_tracing(&log_format);
+    // M10 (§3.8): OTel は opt-in（OTEL_EXPORTER_OTLP_ENDPOINT 設定時のみ）。未設定なら M4a の
+    // fmt/json ログのみで挙動不変。guard は main の最後まで保持して終了時に span を flush する。
+    let _otel_guard = faas_shared::otel::init_tracing(&log_format, "info", "faas-worker");
 
     let settings = Settings::from_env()?;
 
@@ -1151,14 +1136,29 @@ async fn lane_loop(
             let inflight = InflightGuard::new(&worker.metrics);
             let worker = Arc::clone(&worker);
             let payload = msg.payload.clone();
+            // M10 (§3.8): CP が publish 時に載せた W3C traceparent を取り出し、この実行の span を
+            // CP の invoke span の子にする。ヘッダが無い / OTel 無効なら親無し（無害）。
+            let parent_cx = msg
+                .headers
+                .as_ref()
+                .map(faas_shared::otel::extract_trace_context);
             tokio::spawn(async move {
+                use tracing::Instrument as _;
                 // permit と gauge は **タスクの寿命に束ねる**。こう書くと、`handle_payload` が
                 // panic してもタスクのスタック巻き戻しで Drop が走り、クレジットも gauge も
                 // 必ず戻る。素の `inc()` / `dec()` だと panic 経路で gauge が単調増加し、
                 // ドレイン（§4.6）が「in-flight が 0 にならない」と誤認して必ず失敗する。
                 let _permit = permit;
                 let _inflight = inflight;
-                let published = worker.handle_payload(&payload).await;
+                // handle_payload の #[instrument] span を、この process span（= CP の子）の下に置く。
+                let process_span = tracing::info_span!("worker.process");
+                if let Some(cx) = parent_cx {
+                    faas_shared::otel::set_span_parent(&process_span, cx);
+                }
+                let published = worker
+                    .handle_payload(&payload)
+                    .instrument(process_span)
+                    .await;
                 if published {
                     if let Err(e) = msg.ack().await {
                         warn!(error = %e, "failed to ack message after publishing result");

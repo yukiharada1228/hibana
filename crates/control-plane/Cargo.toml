@@ -71,6 +71,12 @@ thiserror = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 
+# M10 (§3.8): 分散トレーシング。opt-in（OTEL_EXPORTER_OTLP_ENDPOINT 設定時のみ）。
+opentelemetry = { workspace = true }
+opentelemetry_sdk = { workspace = true }
+opentelemetry-otlp = { workspace = true }
+tracing-opentelemetry = { workspace = true }
+
 # 観測（M4a, §3.8）。Prometheus /metrics で使う TextEncoder + Registry。
 prometheus = { workspace = true }
 
