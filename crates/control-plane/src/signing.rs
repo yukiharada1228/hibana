@@ -308,6 +308,101 @@ fn std_base64_decode(input: &str) -> Option<Vec<u8>> {
     Some(out)
 }
 
+// ---------------------------------------------------------------------------
+// M9a: Component 署名検証（§6.2 / §15 M9）
+// ---------------------------------------------------------------------------
+
+/// Component 署名の検証失敗理由（audit detail の `reason` に載せる安定文字列）。生の鍵・署名は含まない。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ComponentSigError {
+    /// 署名（base64url）が復号できない / 64 バイトでない。
+    BadSignatureEncoding,
+    /// 登録公開鍵が復号できない / 32 バイトでない。
+    BadPublicKey,
+    /// どの登録鍵でも検証に通らなかった。
+    NoMatchingKey,
+}
+
+impl ComponentSigError {
+    pub fn reason(&self) -> &'static str {
+        match self {
+            Self::BadSignatureEncoding => "bad_signature_encoding",
+            Self::BadPublicKey => "bad_public_key",
+            Self::NoMatchingKey => "no_matching_key",
+        }
+    }
+}
+
+impl std::fmt::Display for ComponentSigError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.reason())
+    }
+}
+
+/// wasm 本体の `wasm_sha256`（16 進小文字文字列）に対する detached Ed25519 署名を、
+/// テナントが登録した**いずれかの**公開鍵（active / retired）で検証する（§6.2 M9a）。
+///
+/// - 署名対象は本体そのものではなく **sha256 のバイト列**（検証パイプラインが算出済みの
+///   16 進文字列をそのまま UTF-8 バイトとして署名する。ダイジェストのテキスト表現に対して
+///   署名することで、テナント側の署名ツールが `sha256_hex` だけを見て署名できる）。
+/// - 複数鍵を順に試し、1 つでも通れば OK（ローテーション対応。retired 鍵でも検証は通す）。
+/// - 生の署名 / 公開鍵はログにも戻り値にも載せない（理由ラベルのみ）。
+///
+/// `keys` は `(key_id, public_key_b64url)` の列。`signature_b64url` はテナントが付けた署名。
+pub fn verify_component_signature(
+    sha256_hex: &str,
+    signature_b64url: &str,
+    keys: &[(String, String)],
+) -> Result<(), ComponentSigError> {
+    let sig_bytes =
+        b64url_decode(signature_b64url).ok_or(ComponentSigError::BadSignatureEncoding)?;
+    let sig_arr: [u8; 64] = sig_bytes
+        .as_slice()
+        .try_into()
+        .map_err(|_| ComponentSigError::BadSignatureEncoding)?;
+    let signature = Signature::from_bytes(&sig_arr);
+
+    let message = sha256_hex.as_bytes();
+
+    // 公開鍵の復号に失敗した鍵は「壊れた登録」なので、その鍵だけスキップして他を試す。
+    // 1 つも登録鍵が復号できなければ BadPublicKey、復号はできたが全て検証失敗なら NoMatchingKey。
+    let mut any_usable_key = false;
+    for (_key_id, pk_b64) in keys {
+        let Some(pk_bytes) = b64url_decode(pk_b64) else {
+            continue;
+        };
+        let Ok(pk_arr): Result<[u8; 32], _> = pk_bytes.as_slice().try_into() else {
+            continue;
+        };
+        let Ok(vk) = VerifyingKey::from_bytes(&pk_arr) else {
+            continue;
+        };
+        any_usable_key = true;
+        if vk.verify_strict(message, &signature).is_ok() {
+            return Ok(());
+        }
+    }
+
+    if !any_usable_key {
+        return Err(ComponentSigError::BadPublicKey);
+    }
+    Err(ComponentSigError::NoMatchingKey)
+}
+
+/// 登録用の公開鍵文字列（base64url, パディング無し, 32 バイト）を検証する。
+///
+/// admin が鍵を登録するときの入力バリデーション。復号できて 32 バイトかつ Ed25519 の
+/// 妥当な点であることまで確認する（後で検証時に確実に使える鍵だけを DB に入れる）。
+pub fn validate_public_key_b64url(public_key: &str) -> Result<(), ComponentSigError> {
+    let bytes = b64url_decode(public_key).ok_or(ComponentSigError::BadPublicKey)?;
+    let arr: [u8; 32] = bytes
+        .as_slice()
+        .try_into()
+        .map_err(|_| ComponentSigError::BadPublicKey)?;
+    VerifyingKey::from_bytes(&arr).map_err(|_| ComponentSigError::BadPublicKey)?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -328,6 +423,82 @@ mod tests {
             iat: 1_700_000_000,
             exp,
         }
+    }
+
+    // --- M9a: Component 署名検証 ---
+
+    /// テスト用に (public_key_b64url, sha256_hex に対する署名 b64url) を作る。
+    fn sign_component(seed: [u8; 32], sha256_hex: &str) -> (String, String) {
+        let sk = SigningKey::from_bytes(&seed);
+        let vk = sk.verifying_key();
+        let sig = sk.sign(sha256_hex.as_bytes());
+        (b64url_encode(vk.as_bytes()), b64url_encode(&sig.to_bytes()))
+    }
+
+    #[test]
+    fn component_signature_roundtrip() {
+        let sha = "abcd1234".repeat(8); // 64 hex chars
+        let (pk, sig) = sign_component([9u8; 32], &sha);
+        assert!(verify_component_signature(&sha, &sig, &[("k1".into(), pk)]).is_ok());
+    }
+
+    #[test]
+    fn component_signature_rejects_wrong_digest() {
+        let (pk, sig) = sign_component([9u8; 32], &"a".repeat(64));
+        // 別のダイジェストに対しては通らない（本体を差し替えたら検出される）。
+        let err =
+            verify_component_signature(&"b".repeat(64), &sig, &[("k1".into(), pk)]).unwrap_err();
+        assert_eq!(err, ComponentSigError::NoMatchingKey);
+    }
+
+    #[test]
+    fn component_signature_rejects_wrong_key() {
+        let sha = "c".repeat(64);
+        let (_pk_real, sig) = sign_component([9u8; 32], &sha);
+        let (pk_other, _) = sign_component([1u8; 32], &sha);
+        // 別の鍵で検証しようとすると通らない。
+        let err = verify_component_signature(&sha, &sig, &[("k1".into(), pk_other)]).unwrap_err();
+        assert_eq!(err, ComponentSigError::NoMatchingKey);
+    }
+
+    #[test]
+    fn component_signature_tries_all_keys_incl_retired() {
+        let sha = "d".repeat(64);
+        let (pk_real, sig) = sign_component([9u8; 32], &sha);
+        let (pk_other, _) = sign_component([2u8; 32], &sha);
+        // 正しい鍵が 2 番目でも見つかる（ローテーション: 複数鍵を順に試す）。
+        assert!(verify_component_signature(
+            &sha,
+            &sig,
+            &[("old".into(), pk_other), ("new".into(), pk_real)],
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn component_signature_bad_encodings() {
+        let sha = "e".repeat(64);
+        let (pk, _) = sign_component([9u8; 32], &sha);
+        // 署名が壊れている。
+        assert_eq!(
+            verify_component_signature(&sha, "!!!not-b64!!!", &[("k1".into(), pk.clone())]),
+            Err(ComponentSigError::BadSignatureEncoding)
+        );
+        // 登録鍵が全部壊れている。
+        let (_pk, sig) = sign_component([9u8; 32], &sha);
+        assert_eq!(
+            verify_component_signature(&sha, &sig, &[("k1".into(), "not-a-key".into())]),
+            Err(ComponentSigError::BadPublicKey)
+        );
+    }
+
+    #[test]
+    fn public_key_validation() {
+        let sk = SigningKey::from_bytes(&[5u8; 32]);
+        let pk = b64url_encode(sk.verifying_key().as_bytes());
+        assert!(validate_public_key_b64url(&pk).is_ok());
+        assert!(validate_public_key_b64url("short").is_err());
+        assert!(validate_public_key_b64url(&b64url_encode(&[0u8; 10])).is_err());
     }
 
     /// sign -> verify の往復が一致する。
