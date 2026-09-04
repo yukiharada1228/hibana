@@ -106,6 +106,13 @@ const DEFAULT_SCALE_MAX_WORKERS: u64 = 4;
 const DEFAULT_SCALE_IN_COOLDOWN_SECS: u64 = 60;
 /// シグナル陳腐化の閾値（秒）。poll 周期 5 秒の 6 倍。
 const DEFAULT_SCALE_SIGNAL_STALE_SECS: u64 = 30;
+/// lane gauge に `lane` ラベルを付けるか（§6.2）。
+///
+/// 既定 true。`lane` ラベルの系列数は `min(テナント数, MAX_DEDICATED_LANES) + 1` で**有界**
+/// （既定 65）なので、`faas_tenant_invoke_total` のような「テナント数 × ルート数」の積とは
+/// 性質が違う。それでも**テナント数と一緒に伸びる軸**であることに変わりはないので、
+/// 運用者が上限を制御できる逃げ道を用意する。
+const DEFAULT_METRICS_LANE_LABELS: bool = true;
 
 /// `.env.example` に置く既知プレースホルダ。**この値のまま起動させない**（下記 MUST）。
 ///
@@ -275,6 +282,8 @@ pub struct Config {
     pub scale_in_cooldown_secs: u64,
     /// シグナルがこの秒数より古くなったら信用しない。
     pub scale_signal_stale_secs: u64,
+    /// lane gauge に `lane` ラベルを付けるか。false なら `"aggregate"` 1 値に畳む（§6.2）。
+    pub metrics_lane_labels: bool,
 
     // --- 観測 (M4a, §3.8) ---
     /// ログ整形（"text" 既定 / "json"）。`json` のとき `tracing_subscriber::fmt().json()` を
@@ -499,6 +508,7 @@ impl Config {
                 "SCALE_SIGNAL_STALE_SECS",
                 DEFAULT_SCALE_SIGNAL_STALE_SECS,
             )?,
+            metrics_lane_labels: env_bool("METRICS_LANE_LABELS", DEFAULT_METRICS_LANE_LABELS),
             log_format: env_or("LOG_FORMAT", "text"),
         };
 
@@ -550,6 +560,7 @@ impl Config {
     /// M8 (§3.7): lane provisioning の設定束を組み立てる。
     pub fn lanes(&self) -> crate::state::LaneConfig {
         crate::state::LaneConfig {
+            metrics_lane_labels: self.metrics_lane_labels,
             enabled: self.tenant_lanes_enabled,
             max_dedicated: self.max_dedicated_lanes,
             ack_pending_headroom: self.lane_ack_pending_headroom,

@@ -73,6 +73,8 @@ pub struct LaneConfig {
     pub max_deliver: u64,
     /// 再配送 backoff（秒）。
     pub backoff_secs: Vec<u64>,
+    /// lane gauge に `lane` ラベルを付けるか（§6.2）。false なら `"aggregate"` 1 値に畳む。
+    pub metrics_lane_labels: bool,
 }
 
 /// admission 制御のパラメータ束（M3d, §8）。`Config` のグローバル既定から派生し、
@@ -382,6 +384,11 @@ impl AppState {
     /// テナント別 lane が有効か。
     pub fn tenant_lanes_enabled(&self) -> bool {
         self.inner.lanes.enabled
+    }
+
+    /// lane gauge に `lane` ラベルを付けるか（§6.2）。
+    pub fn metrics_lane_labels(&self) -> bool {
+        self.inner.lanes.metrics_lane_labels
     }
 
     /// 専有 lane の上限数。

@@ -603,7 +603,10 @@ cp .env.example .env
 > **M8 で worker から CP へ所有移管**。consumer を作るのが CP になったため）/
 > `SCALE_POLL_INTERVAL_SECS`（既定 **0 = ポーラを spawn しない**。`.env.example` は 5）/
 > `SCALE_JOBS_PER_WORKER`（既定 32）/ `SCALE_MIN_WORKERS`（既定 1。0 で scale-to-zero を許可）/
-> `SCALE_MAX_WORKERS`（既定 4）/ `SCALE_IN_COOLDOWN_SECS`（既定 60）/ `SCALE_SIGNAL_STALE_SECS`（既定 30）。
+> `SCALE_MAX_WORKERS`（既定 4）/ `SCALE_IN_COOLDOWN_SECS`（既定 60）/ `SCALE_SIGNAL_STALE_SECS`（既定 30）/
+> `METRICS_LANE_LABELS`（既定 true。`faas_lane_*` の `lane` ラベルを付けるか。false で `"aggregate"`
+> 1 値に畳む。系列数は `min(テナント数, MAX_DEDICATED_LANES) + 1` で有界だが、**テナント数と
+> 一緒に伸びる軸**ではあるので逃げ道を用意してある）。
 >
 > **worker** が読むもの: `WORKER_MAX_CONCURRENCY`（既定 32。**プロセス全体**の同時実行上限）/
 > `WORKER_LANE_CONCURRENCY`（既定 4。consumer metadata が読めないときのフォールバック）/

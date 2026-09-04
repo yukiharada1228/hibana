@@ -44,6 +44,9 @@ pub const META_TENANT_ID: &str = "faas_tenant_id";
 pub const META_LANE_CONCURRENCY: &str = "faas_lane_concurrency";
 pub const META_LANE_KIND: &str = "faas_lane_kind";
 
+/// `METRICS_LANE_LABELS=false` のときに `lane` ラベルを畳む先の値（§6.2）。
+const LANE_LABEL_AGGREGATE: &str = "aggregate";
+
 /// 1 本の lane consumer の「あるべき姿」。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DesiredLane {
@@ -620,15 +623,38 @@ pub async fn run_backlog_poller(state: AppState, interval_secs: u64) {
                 // lane が消えたら系列も消す（reaper の kid gauge と同じ理由で reset してから set）。
                 m.lane_pending_messages.reset();
                 m.lane_ack_pending.reset();
+
+                // §6.2: `lane` ラベルの系列数は `min(テナント数, MAX_DEDICATED_LANES) + 1` で
+                // 有界（既定 65）なので、`faas_tenant_invoke_total` のような
+                // 「テナント数 × ルート数」の積とは性質が違う。それでも**テナント数と一緒に
+                // 伸びる軸**ではあるので、運用者が畳める逃げ道を用意する。
+                // 畳んだときも系列を消さず `"aggregate"` 1 本に集約するのは、
+                // ダッシュボードのクエリを壊さないためである（消すと「取れていない」と
+                // 「0 だった」の区別がつかなくなる）。
+                let labelled = state.metrics_lane_labels();
                 let mut backlog: u64 = 0;
+                let (mut agg_pending, mut agg_ack) = (0i64, 0i64);
                 for d in &depths {
-                    m.lane_pending_messages
-                        .with_label_values(&[d.name.as_str()])
-                        .set(d.num_pending as i64);
-                    m.lane_ack_pending
-                        .with_label_values(&[d.name.as_str()])
-                        .set(d.num_ack_pending as i64);
+                    if labelled {
+                        m.lane_pending_messages
+                            .with_label_values(&[d.name.as_str()])
+                            .set(d.num_pending as i64);
+                        m.lane_ack_pending
+                            .with_label_values(&[d.name.as_str()])
+                            .set(d.num_ack_pending as i64);
+                    } else {
+                        agg_pending += d.num_pending as i64;
+                        agg_ack += d.num_ack_pending as i64;
+                    }
                     backlog += d.num_pending + d.num_ack_pending;
+                }
+                if !labelled {
+                    m.lane_pending_messages
+                        .with_label_values(&[LANE_LABEL_AGGREGATE])
+                        .set(agg_pending);
+                    m.lane_ack_pending
+                        .with_label_values(&[LANE_LABEL_AGGREGATE])
+                        .set(agg_ack);
                 }
                 let decision = state.observe_backlog(backlog, depths.len());
                 m.scale_backlog.set(backlog as i64);
