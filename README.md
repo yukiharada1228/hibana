@@ -482,7 +482,9 @@ Prometheus の histogram を読む手段が無いからである。測れない�
 含む（M1/M2 から継続）:
 - REST: `POST /components` / `POST /invoke` / `GET /executions/{id}` / `GET /healthz`
 - wasm アップロード + 検証パイプライン（サイズ上限 → wasmparser 検証 → import 許可リスト →
-  sha256, §6.2。別プロセスサンドボックスは TODO で M4 以降）
+  sha256, §6.2）。**M9b (§6.2): 検証は control-plane 本体とは別プロセスで実行**し、悪性 wasm が
+  検証器の資源を食い潰しても被害を子プロセス 1 個に限局する（子は Linux の `RLIMIT_AS` +
+  wall-clock timeout で縛る）。`VALIDATION_TIMEOUT_SECS` / `VALIDATION_MEM_LIMIT_MB`
 - Object Storage: MinIO への本体保存と Worker への presigned GET URL（§3.4）
 - Worker: `wasm_sha256` キーの Component キャッシュ + 事前コンパイル（cwasm, §3.6）
 - バージョン管理（§6.7）: 一覧 / soft delete / `active-version` 切替（ロールバック）

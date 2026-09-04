@@ -65,6 +65,8 @@ chrono = { workspace = true }
 
 # エラー / ログ
 anyhow = { workspace = true }
+# M9b (§6.2): 検証子プロセスで setrlimit(RLIMIT_AS) を呼ぶ（Linux）。
+libc = "0.2"
 thiserror = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
