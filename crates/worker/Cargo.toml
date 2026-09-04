@@ -30,6 +30,7 @@ lru = "0.12"
 
 wasmtime = { workspace = true }
 wasmtime-wasi = { workspace = true }
+wasmtime-wasi-http = { workspace = true }
 
 serde = { workspace = true }
 serde_json = { workspace = true }

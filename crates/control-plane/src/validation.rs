@@ -85,6 +85,13 @@ const BASELINE_APPROVED_PREFIXES: &[&str] = &[
     //     ランタイムが担保する（chaos_v1 で「アップロードは通るが実行時に fs は全拒否」を実測固定する）。
     // これは「真の防御は空の WasiCtx」という M9 偵察の結論に沿った設計である。
     "wasi:filesystem/",
+    // M11 (§4.2): `wasi:http/types` **だけ**を承認する。JS/Hono Component は Request/Response を
+    // wasi:http/types のリソースとして扱うため、これが無いと JS を一切デプロイできない。
+    // **`wasi:http/outgoing-handler` は承認しない**（末尾スラッシュ無しの `wasi:http/types` 接頭辞は
+    // outgoing-handler にマッチしない）。types は in-memory の Request/Response 機構のみで、
+    // 実際の egress は outgoing-handler だが、それを import できない = 呼べないので、
+    // wasi:http 経由の egress 抜け道は生じない（egress は M9c の allowlist のまま）。
+    "wasi:http/types",
 ];
 
 /// admin が承認した capability 集合 (§4.4)。WIT import を strict matching する際の権威。

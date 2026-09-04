@@ -178,12 +178,28 @@ struct HostState {
     ctx: WasiCtx,
     table: ResourceTable,
     limits: MeteredLimits,
+    // M11 (§4.2): JS/Hono Component が Request/Response（= wasi:http/types のリソース）を
+    // 扱えるようにするための HTTP コンテキスト。**types を提供するだけ**で、outgoing-handler
+    // による egress は M9c の socket_addr_check の外にある別経路なので、検証で
+    // `wasi:http/outgoing-handler` の import を承認しないことで到達不能に保つ（下記参照）。
+    http_ctx: wasmtime_wasi_http::WasiHttpCtx,
 }
 
 // wasmtime-wasi 29: `WasiView` が `ctx()` と `table()` の両方を提供する。
 impl WasiView for HostState {
     fn ctx(&mut self) -> &mut WasiCtx {
         &mut self.ctx
+    }
+
+    fn table(&mut self) -> &mut ResourceTable {
+        &mut self.table
+    }
+}
+
+// M11: wasi:http/types を提供するための WasiHttpView。ResourceTable は WasiView と共有する。
+impl wasmtime_wasi_http::WasiHttpView for HostState {
+    fn ctx(&mut self) -> &mut wasmtime_wasi_http::WasiHttpCtx {
+        &mut self.http_ctx
     }
 
     fn table(&mut self) -> &mut ResourceTable {
@@ -1973,6 +1989,7 @@ impl Worker {
             ctx: wasi,
             table: ResourceTable::new(),
             limits: metered_limits,
+            http_ctx: wasmtime_wasi_http::WasiHttpCtx::new(),
         };
 
         let mut store = Store::new(&self.engine, host);
@@ -2013,6 +2030,13 @@ impl Worker {
         let mut linker: Linker<HostState> = Linker::new(&self.engine);
         wasmtime_wasi::add_to_linker_async(&mut linker)
             .map_err(|e| ExecError::Failed(format!("failed to link wasi: {e}")))?;
+        // M11 (§4.2): wasi:http を linker に足す。ComponentizeJS 由来の JS/Hono Component は
+        // Request/Response を wasi:http/types のリソースとして扱うため、これが無いと instantiate に失敗する。
+        // outgoing-handler もここで登録されるが、**検証が `wasi:http/outgoing-handler` の import を
+        // 承認しない**ので、どのアップロード component もそれを import できず = 呼べない
+        // （egress は M9c の allowlist / socket_addr_check のまま。wasi:http 経由の抜け道を作らない）。
+        wasmtime_wasi_http::add_only_http_to_linker_async(&mut linker)
+            .map_err(|e| ExecError::Failed(format!("failed to link wasi:http: {e}")))?;
 
         // 別 OS スレッドで epoch ticker を起動する。max_wall_time 経過で epoch を継続増分する。
         // ticker は execution 全体（instantiate + call_handle）に対して張る。

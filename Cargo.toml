@@ -122,6 +122,9 @@ ed25519-dalek = "2"
 # --- Wasm ランタイム ---
 wasmtime = { version = "29", features = ["component-model", "async", "cranelift"] }
 wasmtime-wasi = "29"
+# M11 (§4.2): JS/Hono Component が Request/Response を扱うために wasi:http/types を提供する。
+# **types のみ**を linker へ足し、outgoing-handler（egress）は足さない（egress は M9c のまま）。
+wasmtime-wasi-http = "29"
 
 # --- シリアライズ / ID / 時刻 ---
 serde = { version = "1", features = ["derive"] }

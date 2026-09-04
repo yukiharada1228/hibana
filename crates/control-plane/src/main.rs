@@ -452,7 +452,14 @@ fn build_router(state: AppState) -> Router {
         .route("/components", post(handlers::create_component))
         .route(
             "/components/{component_id}/versions",
-            post(handlers::upload_version),
+            // axum の DefaultBodyLimit（既定 2MiB）は multipart body 全体に効くため、
+            // それを超える wasm（JS/Hono コンポーネントは数 MiB〜十数 MiB）は
+            // ハンドラのストリーミング検査に届く前に弾かれてしまう。上限を
+            // MAX_WASM_UPLOAD_BYTES（+ 他フィールド用の余白 1MiB）に引き上げる。
+            // ハード上限の強制自体は upload_version 内のストリーミング検査が担う。
+            post(handlers::upload_version).layer(axum::extract::DefaultBodyLimit::max(
+                state.max_wasm_upload_bytes() as usize + 1024 * 1024,
+            )),
         )
         // POST /cron-jobs: Cron ジョブ登録 (M6b, §15。component ライフサイクル相当の Deploy スコープ)。
         .route("/cron-jobs", post(handlers::create_cron_job))
