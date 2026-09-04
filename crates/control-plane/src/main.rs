@@ -227,6 +227,7 @@ async fn main() -> anyhow::Result<()> {
         config.job_env_exchange_rate_per_min,
         config.lanes(),
         config.scale_policy(),
+        config.metrics_include_tenant_label,
     );
 
     // --- result 購読タスク ---
