@@ -1780,6 +1780,15 @@ const STUCK_EXECUTION_SWEEP_SQL: &str = "UPDATE executions \
 /// この UPDATE が打った `finished_at`（= DB の `now()`）から導出した **UTC 日**であり、`usage_rollups`
 /// の `period_start` に使う。CP 側の `Utc::now()` ではなく **同一 finalize の単一時計源**にすることで、
 /// per-execution の `finished_at` と集計の日付帰属が UTC 日境界をまたぐ瞬間にもズレない（§15 M5）。
+/// `finalize_execution` の CAS が**実際に遷移させた**ときの付随情報（no-op なら `None`）。
+#[derive(Debug, Clone, Copy)]
+pub struct FinalizeOutcome {
+    /// `usage_rollups` の集計日（`finished_at` の UTC 日）。単一時計源（§15 M5）。
+    pub period_start: NaiveDate,
+    /// `finished_at - created_at`（秒）。`execution_duration_seconds` ヒストグラムに使う（M10 follow-up）。
+    pub duration_secs: f64,
+}
+
 pub async fn finalize_execution(
     executor: impl sqlx::PgExecutor<'_>,
     tenant_id: &str,
@@ -1788,7 +1797,7 @@ pub async fn finalize_execution(
     output: Option<&Value>,
     error: Option<&Value>,
     usage: Option<&UsageMetrics>,
-) -> Result<Option<NaiveDate>, sqlx::Error> {
+) -> Result<Option<FinalizeOutcome>, sqlx::Error> {
     debug_assert!(status.is_terminal());
 
     // 計量列は nullable（BIGINT/INTEGER）。usage None のときは全て NULL バインドする。
@@ -1802,7 +1811,7 @@ pub async fn finalize_execution(
     // RETURNING を `fetch_optional` で受ける: CAS が当たれば 1 行（period_start: UTC 日）、
     // 既終端で当たらなければ 0 行（None）。rows_affected を数える代わりに、遷移有無と
     // 集計用日付を **1 ステートメント**で同時に得る（二重計上の冪等アンカーは不変）。
-    let period_start: Option<NaiveDate> = sqlx::query_scalar(FINALIZE_EXECUTION_SQL)
+    let row = sqlx::query(FINALIZE_EXECUTION_SQL)
         .bind(tenant_id)
         .bind(execution_id)
         .bind(status.as_str())
@@ -1816,7 +1825,17 @@ pub async fn finalize_execution(
         .fetch_optional(executor)
         .await?;
 
-    Ok(period_start)
+    // CAS が当たった行だけ RETURNING が返る（既終端は 0 行 = None）。二重計上の冪等アンカーは不変。
+    row.map(|r| {
+        use sqlx::Row as _;
+        Ok(FinalizeOutcome {
+            period_start: r.try_get("period_start")?,
+            // created_at より前に finished_at になることは無いが、時計の巻き戻し等で負値が来ても
+            // ヒストグラムに負を渡さないよう 0 で下限を切る。
+            duration_secs: r.try_get::<f64, _>("duration_secs")?.max(0.0),
+        })
+    })
+    .transpose()
 }
 
 /// `u64` を `i64`（Postgres BIGINT）へ飽和変換する。計量は呼び出し側で `ResourceLimits` 上限に
@@ -1981,7 +2000,8 @@ const FINALIZE_EXECUTION_SQL: &str = "UPDATE executions \
          output_bytes = $9, invocation_count = $10 \
      WHERE tenant_id = $1 AND id = $2 \
        AND status NOT IN ('succeeded', 'failed', 'timeout') \
-     RETURNING (finished_at AT TIME ZONE 'UTC')::date AS period_start";
+     RETURNING (finished_at AT TIME ZONE 'UTC')::date AS period_start, \
+               EXTRACT(EPOCH FROM (finished_at - created_at))::float8 AS duration_secs";
 
 // ---------------------------------------------------------------------------
 // 認証・認可: users / api_tokens (§3.3 / §6.0)

@@ -732,17 +732,25 @@ async fn commit_finalize_and_release(
     //     succeeded/failed/timeout_count のみが status から計上される（リソース指標は 0 加算）。
     //     period_start は finalize_execution が RETURNING した `finished_at` 由来の UTC 日であり、
     //     per-execution の finished_at と同一時計源なので日境界をまたいでも乖離しない（CP の Utc::now() は使わない）。
-    if let Some(period_start) = finalized {
+    if let Some(outcome) = finalized {
         let usage_for_rollup = usage.unwrap_or_default();
         crate::db::upsert_usage_rollup(
             &mut *tx,
             tenant,
             component_id,
-            period_start,
+            outcome.period_start,
             status,
             &usage_for_rollup,
         )
         .await?;
+
+        // M10 follow-up (§3.8): CAS が実際に遷移させたときだけ実行時間を observe する
+        // （created_at→finished_at の**サーバ時計**。再配送 / 既終端では二重計上しない）。
+        state
+            .metrics()
+            .execution_duration_seconds
+            .with_label_values(&[status.as_str()])
+            .observe(outcome.duration_secs);
     }
 
     tx.commit().await?;
