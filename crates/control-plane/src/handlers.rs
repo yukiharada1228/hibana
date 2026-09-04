@@ -1779,6 +1779,138 @@ pub async fn create_tenant(
 }
 
 // ---------------------------------------------------------------------------
+// M10 follow-up: テナント status / quotas の platform 管理 API（§8 / §9）
+//
+// **create_tenant と同じ bootstrap トークン gate**（= platform-admin。テナント admin ではない）。
+// これらは任意テナントを対象にする cross-tenant 操作なので、principal.tenant_id ではなく path の
+// {tenant_id} を対象にし、認証はテナント admin スコープではなく bootstrap トークンで行う
+// （テナント自身が自分の suspend 解除やクォータ引き上げをできてはならない）。
+// ルータの**認証 middleware の外**（create_tenant と同じ非認証グループ）へマウントする。
+// ---------------------------------------------------------------------------
+
+/// リクエストから bootstrap トークンを取り出して照合する（platform-admin gate）。不一致は Unauthorized。
+fn require_bootstrap_admin(headers: &HeaderMap, state: &AppState) -> Result<(), FaasError> {
+    let provided = headers
+        .get(AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.strip_prefix("Bearer "))
+        .map(str::trim)
+        .unwrap_or("");
+    if bootstrap_token_matches(provided, state.bootstrap_admin_token()) {
+        Ok(())
+    } else {
+        Err(FaasError::Unauthorized)
+    }
+}
+
+#[derive(Debug, Deserialize)]
+pub struct SetTenantStatusRequest {
+    /// "active" | "suspended"。
+    pub status: String,
+}
+
+/// PUT /admin/tenants/{tenant_id}/status — テナントを suspend / 再有効化する（platform admin）。
+pub async fn set_tenant_status(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(tenant_id): Path<String>,
+    JsonBody(req): JsonBody<SetTenantStatusRequest>,
+) -> Result<impl IntoResponse, AppError> {
+    require_bootstrap_admin(&headers, &state)?;
+
+    let status = req.status.trim();
+    if status != "active" && status != "suspended" {
+        return Err(
+            FaasError::InvalidRequest("status must be 'active' or 'suspended'".into()).into(),
+        );
+    }
+
+    if !db::set_tenant_status(state.pool(), &tenant_id, status).await? {
+        return Err(FaasError::NotFound(format!("tenant '{tenant_id}'")).into());
+    }
+
+    // 監査は当該テナント GUC 下で書く（audit_logs は FORCE RLS）。
+    let mut tx = state.pool().begin().await?;
+    db::set_tenant_guc(&mut tx, &tenant_id).await?;
+    db::insert_audit_log(
+        &mut *tx,
+        &tenant_id,
+        None,
+        "tenant_status_updated",
+        Some(&tenant_id),
+        Some(&json!({ "status": status })),
+    )
+    .await?;
+    tx.commit().await?;
+
+    tracing::info!(%tenant_id, status, "tenant status updated");
+    Ok(Json(json!({ "tenant_id": tenant_id, "status": status })))
+}
+
+#[derive(Debug, Deserialize)]
+pub struct SetTenantQuotasRequest {
+    #[serde(default)]
+    pub invoke_rate_per_sec: Option<u64>,
+    #[serde(default)]
+    pub invoke_burst: Option<u64>,
+    #[serde(default)]
+    pub max_concurrent_executions: Option<u64>,
+    #[serde(default)]
+    pub lane_concurrency: Option<u64>,
+}
+
+/// PUT /admin/tenants/{tenant_id}/quotas — クォータ上書きを全置換する（platform admin, §8）。
+///
+/// 省略 / null のフィールドは「グローバル既定を継承」を意味する（`load_tenant_status_and_quotas`
+/// が緩く解釈する）。ここでは known フィールドだけを正規化して保存し、未知キーが混入した
+/// JSONB を作らない。実効値は admission 側で推奨上限にクランプされる（`AdmissionConfig::resolve_for_tenant`）
+/// ので、ここでは範囲チェックはせず「保存できる形」だけを保証する。
+pub async fn set_tenant_quotas(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(tenant_id): Path<String>,
+    JsonBody(req): JsonBody<SetTenantQuotasRequest>,
+) -> Result<impl IntoResponse, AppError> {
+    require_bootstrap_admin(&headers, &state)?;
+
+    // Some のフィールドだけを持つ正規化 JSON を作る（None は入れない = 既定継承）。
+    let mut obj = serde_json::Map::new();
+    if let Some(v) = req.invoke_rate_per_sec {
+        obj.insert("invoke_rate_per_sec".into(), json!(v));
+    }
+    if let Some(v) = req.invoke_burst {
+        obj.insert("invoke_burst".into(), json!(v));
+    }
+    if let Some(v) = req.max_concurrent_executions {
+        obj.insert("max_concurrent_executions".into(), json!(v));
+    }
+    if let Some(v) = req.lane_concurrency {
+        obj.insert("lane_concurrency".into(), json!(v));
+    }
+    let quotas = Value::Object(obj);
+
+    if !db::set_tenant_quotas(state.pool(), &tenant_id, &quotas).await? {
+        return Err(FaasError::NotFound(format!("tenant '{tenant_id}'")).into());
+    }
+
+    let mut tx = state.pool().begin().await?;
+    db::set_tenant_guc(&mut tx, &tenant_id).await?;
+    db::insert_audit_log(
+        &mut *tx,
+        &tenant_id,
+        None,
+        "tenant_quotas_updated",
+        Some(&tenant_id),
+        Some(&quotas),
+    )
+    .await?;
+    tx.commit().await?;
+
+    tracing::info!(%tenant_id, quotas = %quotas, "tenant quotas updated");
+    Ok(Json(json!({ "tenant_id": tenant_id, "quotas": quotas })))
+}
+
+// ---------------------------------------------------------------------------
 // POST /tenants/{id}/users — テナント内ユーザ作成 (§3.3)
 // ---------------------------------------------------------------------------
 

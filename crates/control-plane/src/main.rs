@@ -596,6 +596,17 @@ fn build_router(state: AppState) -> Router {
         .route("/metrics", get(handlers::metrics))
         .route("/auth/login", post(login::login))
         .route("/admin/tenants", post(handlers::create_tenant))
+        // M10 follow-up: テナント status / quotas の platform 管理（bootstrap トークン gate。
+        // create_tenant と同じ**非認証グループ**に置き、ハンドラ内で bootstrap トークンを照合する。
+        // テナント admin スコープではない —— テナント自身が自分を再有効化 / 増枠できてはならない）。
+        .route(
+            "/admin/tenants/{tenant_id}/status",
+            put(handlers::set_tenant_status),
+        )
+        .route(
+            "/admin/tenants/{tenant_id}/quotas",
+            put(handlers::set_tenant_quotas),
+        )
         .merge(protected)
         // M10 follow-up (§3.8): HTTP リクエストメトリクスを observe する。TraceLayer より内側に
         // 置くことで、routing 済み（MatchedPath が extensions に載った状態）で method/route/status を
