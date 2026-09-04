@@ -67,6 +67,15 @@ async fn main() -> anyhow::Result<()> {
         return run_migrate_only().await;
     }
 
+    // M9b (§6.2): `--validate-stdin` は wasm 検証を **別プロセス**で行う子プロセスの入口。
+    // control-plane 本体（親）が `spawn_validation_child` からこのフラグ付きで自分自身を起動する。
+    // stdin から wasm を読み、結果 JSON を stdout に書いて exit する。Config::from_env() を
+    // 経由しない（検証に必要なのは stdin のバイト列だけで、DB/NATS/鍵は要らない）。
+    // 子プロセスは先頭で RLIMIT_AS を張り、悪性 wasm による OOM を自分 1 個に限局する。
+    if std::env::args().any(|a| a == validation::VALIDATE_STDIN_FLAG) {
+        return validation::run_validate_stdin();
+    }
+
     // M8-1 (§3.4): `--recreate-invoke-stream` は invoke stream を WorkQueue retention で作り直す。
     // retention は NATS で**作成後に変更できない**ため、M8 以前の `Limits` stream が残っている環境では
     // 削除して作り直すしかない。手作業の手順書にすると「未消化 0 の確認」を飛ばす事故が起きるので、

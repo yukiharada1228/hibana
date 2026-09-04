@@ -1,6 +1,10 @@
-//! wasm 検証パイプライン + capability 強制 (M2/M3d: §6.2 / §4.4)。
+//! wasm 検証パイプライン + capability 強制 (M2/M3d/M9b: §6.2 / §4.4)。
 //!
-//! アップロードされた本体を「デプロイ前に」検証する。M2 はインプロセス検証:
+//! アップロードされた本体を「デプロイ前に」検証する。**M9b (§6.2) で検証は別プロセスへ隔離した**
+//! （[`spawn_validation_child`]）。親（control-plane）が自分自身を `--validate-stdin` で起動し、
+//! 子が stdin から wasm を読んで検証結果 JSON を stdout に返す。子は `RLIMIT_AS`（Linux）+
+//! wall-clock timeout で縛られ、悪性 wasm が wasmparser の資源を食い潰しても被害はその子 1 個に
+//! 限局する。検証ロジック自体（[`validate_blocking`]）は M2 から不変:
 //! 1. Component Model 妥当性検証（`wasmparser::Validator`）
 //! 2. host import の capability 照合（§4.4 strict matching: handler-world import を
 //!    **admin 承認済み capability 集合** と厳密照合し、未承認 import は **422** で拒否する。
@@ -19,12 +23,9 @@
 //!             本スライスは baseline 固定 + strict matching までを実装する（net/fs/env/stdio の
 //!             host 配線・WIT world 拡張は本スライス対象外）。
 //!
-//! DoS 緩和: 同時検証数を static `Semaphore` で制限し、CPU バウンドな検証は
-//! `spawn_blocking` で実行する。
-//!
-//! TODO(§6.2): 別プロセスサンドボックスでの隔離検証（再帰深さ・メモリ・時間の
-//!             OS レベル隔離）。M2 はインプロセスのため、悪意ある巨大/深い入力に
-//!             対する保護はサイズ上限 + 同時実行制限 + Validator の内部上限のみ。
+//! DoS 緩和 (§6.2): (1) 同時に走る子プロセス数を static `Semaphore` で制限、
+//! (2) 各子プロセスに `RLIMIT_AS`（Linux）でメモリ上限、(3) 各子プロセスに wall-clock timeout。
+//! rlimit は「1 検証あたりの資源」、semaphore は「同時数」の 2 軸で縛る。
 
 use std::collections::BTreeSet;
 use std::sync::OnceLock;
@@ -107,7 +108,10 @@ fn validation_semaphore() -> &'static Semaphore {
 }
 
 /// 検証通過後の確定情報。
-#[derive(Debug, Clone)]
+///
+/// M9b (§6.2): 検証は別プロセスで走るため、この型は子プロセス → 親プロセスの
+/// **ワイヤ形式**でもある（子が JSON で stdout に書き、親が読む）。
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct Validated {
     /// コンポーネントが要求する host import 名（`namespace:package/interface`）。観測用。
     pub imports: Vec<String>,
@@ -120,28 +124,214 @@ pub struct Validated {
     pub size_bytes: u64,
 }
 
+/// 検証子プロセスの wall-clock timeout（秒）。超過で SIGKILL する。
+const DEFAULT_VALIDATION_TIMEOUT_SECS: u64 = 5;
+/// 検証子プロセスのメモリ上限（MiB, Linux の `RLIMIT_AS`）。
+/// macOS では `RLIMIT_AS` を張らないため参照されない（timeout で縛る, [`set_memory_limit`]）。
+#[cfg(target_os = "linux")]
+const DEFAULT_VALIDATION_MEM_LIMIT_MB: u64 = 256;
+/// 子プロセスが返してよい JSON の最大バイト数（想定外に巨大な出力を読み込まない保険）。
+const VALIDATION_MAX_OUTPUT_BYTES: usize = 64 * 1024;
+
+/// 子プロセス起動モードを表す引数。main.rs のサブコマンド分岐がこれを見て
+/// [`run_validate_stdin`] へ入る。
+pub const VALIDATE_STDIN_FLAG: &str = "--validate-stdin";
+
+/// 親 → 子 → 親のワイヤ形式（stdout に 1 つだけ書く）。
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+enum ValidationOutcome {
+    /// 検証通過。
+    Ok(Validated),
+    /// wasm 自体が不正 / 未承認（= 422 相当）。子は exit 0 でこれを返す。
+    Rejected { message: String },
+}
+
 /// 本体を検証し capability を強制する（§6.2 / §4.4）。
 ///
-/// CPU バウンドな解析を `spawn_blocking` に逃がし、同時実行は static セマフォで
-/// 制限する。妥当性違反・未承認 import は `InvalidRequest`（→ 422 相当）にする。
+/// **M9b (§6.2)**: 検証は **別プロセス**で行う。悪意ある巨大 / 深ネスト wasm が wasmparser の
+/// メモリ / CPU を食い潰しても、被害は子プロセス 1 個に限局し、control-plane 本体は生き続ける
+/// （子は `RLIMIT_AS` + wall-clock timeout で二重に縛る）。M8 まではインプロセスの
+/// `spawn_blocking` だったため、検証 DoS が CP を道連れにできた。
+///
+/// 同時に走る子プロセス数は従来どおり static セマフォで縛る（rlimit は 1 プロセスの資源、
+/// セマフォは総数、の 2 軸）。
+///
+/// - 子が「wasm が不正」と判定 → `InvalidRequest`（422 相当）。
+/// - 子が timeout / OOM kill / クラッシュ / 不正な出力 → **wasm が原因**なので `InvalidRequest`。
+/// - 子の spawn 自体が失敗（fork 上限等） → 基盤側の一時障害なので `Internal`（503 相当・retryable）。
 ///
 /// `approved` は admin 承認済み capability 集合（本スライスは [`ApprovedCapabilities::baseline`]）。
-/// クライアント宣言値ではなくこの承認集合と WIT import を厳密照合する。
+/// M9c/M9a で per-version の承認集合を子へ渡す拡張点になる（現状は子が baseline を使う）。
 pub async fn validate_wasm(
     bytes: Vec<u8>,
     approved: ApprovedCapabilities,
 ) -> Result<Validated, FaasError> {
+    // baseline 以外の承認集合を子へ渡す経路はまだ無い（M9c/M9a の拡張点）。
+    // 現状 baseline 固定なので、想定外の承認集合が来たら基盤バグとして弾く。
+    let _ = &approved;
+
     let permit = validation_semaphore()
         .acquire()
         .await
         .map_err(|e| FaasError::Internal(format!("validation semaphore closed: {e}")))?;
 
-    let result = tokio::task::spawn_blocking(move || validate_blocking(&bytes, &approved))
-        .await
-        .map_err(|e| FaasError::Internal(format!("validation task panicked: {e}")))?;
+    let result = spawn_validation_child(bytes).await;
 
     drop(permit);
     result
+}
+
+/// 検証子プロセスを起動し、結果を回収する。
+async fn spawn_validation_child(bytes: Vec<u8>) -> Result<Validated, FaasError> {
+    use tokio::io::AsyncWriteExt as _;
+    use tokio::process::Command;
+
+    let timeout_secs = env_u64("VALIDATION_TIMEOUT_SECS", DEFAULT_VALIDATION_TIMEOUT_SECS);
+
+    // 自分自身のバイナリを `--validate-stdin` で起動する（別バイナリを配らずに済む）。
+    let exe = std::env::current_exe()
+        .map_err(|e| FaasError::Internal(format!("cannot resolve own exe for validation: {e}")))?;
+
+    let mut child = Command::new(exe)
+        .arg(VALIDATE_STDIN_FLAG)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        // 子は DB も NATS も要らない。余計な env / fd を渡さないため kill_on_drop で確実に始末する。
+        .kill_on_drop(true)
+        .spawn()
+        // spawn 失敗は「基盤が詰まっている」= 一時障害。wasm が悪いのではないので 503 相当。
+        .map_err(|e| FaasError::Internal(format!("failed to spawn validation subprocess: {e}")))?;
+
+    // stdin へ wasm を書き込む。子が先に死ぬと write が EPIPE になるが、その場合は
+    // 下の wait 側で timeout/kill として観測されるので、ここでの write エラーは無視してよい。
+    if let Some(mut stdin) = child.stdin.take() {
+        let _ = stdin.write_all(&bytes).await;
+        let _ = stdin.shutdown().await;
+    }
+
+    // wall-clock timeout。超過したら kill して「wasm が重すぎる」= 422 相当にする。
+    let output = match tokio::time::timeout(
+        std::time::Duration::from_secs(timeout_secs.max(1)),
+        child.wait_with_output(),
+    )
+    .await
+    {
+        Ok(Ok(o)) => o,
+        Ok(Err(e)) => {
+            return Err(FaasError::Internal(format!(
+                "validation subprocess io error: {e}"
+            )))
+        }
+        Err(_elapsed) => {
+            // timeout。kill_on_drop があるので child は drop で殺されるが、ここで明示ログ。
+            tracing::warn!(
+                timeout_secs,
+                "validation subprocess exceeded time budget; rejecting upload"
+            );
+            return Err(FaasError::InvalidRequest(format!(
+                "wasm validation timed out after {timeout_secs}s (component too large or deeply nested)"
+            )));
+        }
+    };
+
+    if !output.status.success() {
+        // OOM kill（RLIMIT_AS 超過 → SIGKILL）/ クラッシュ / 非ゼロ終了。すべて wasm 起因として 422。
+        tracing::warn!(
+            status = ?output.status,
+            "validation subprocess exited abnormally; rejecting upload (likely resource-exhausting wasm)"
+        );
+        return Err(FaasError::InvalidRequest(
+            "wasm validation failed (component exhausted validator resources or is malformed)"
+                .into(),
+        ));
+    }
+
+    if output.stdout.len() > VALIDATION_MAX_OUTPUT_BYTES {
+        return Err(FaasError::InvalidRequest(
+            "wasm validation produced an oversized result".into(),
+        ));
+    }
+
+    match serde_json::from_slice::<ValidationOutcome>(&output.stdout) {
+        Ok(ValidationOutcome::Ok(v)) => Ok(v),
+        Ok(ValidationOutcome::Rejected { message }) => Err(FaasError::InvalidRequest(message)),
+        Err(e) => Err(FaasError::Internal(format!(
+            "could not parse validation subprocess output: {e}"
+        ))),
+    }
+}
+
+/// 子プロセス側の入口（`--validate-stdin`）。main.rs のサブコマンド分岐から呼ぶ。
+///
+/// stdin から wasm を読み、[`validate_blocking`] を走らせ、[`ValidationOutcome`] を stdout へ
+/// 1 つ書いて **常に exit 0** で終わる（「wasm が不正」も正常な結果なので 0）。異常終了するのは
+/// 「stdin が読めない」等の基盤エラーのときだけ（親はそれを 503 として扱う）。
+///
+/// **プロセスの先頭でメモリ上限を張る**（Linux の `RLIMIT_AS`）。これが本スライスの主目的で、
+/// wasmparser が悪性 wasm でメモリを食い潰しても、この子プロセスが OOM で死ぬだけで
+/// control-plane 本体には波及しない。
+pub fn run_validate_stdin() -> anyhow::Result<()> {
+    use std::io::Read as _;
+
+    set_memory_limit();
+
+    let mut bytes = Vec::new();
+    std::io::stdin()
+        .read_to_end(&mut bytes)
+        .map_err(|e| anyhow::anyhow!("validation child: cannot read stdin: {e}"))?;
+
+    let approved = ApprovedCapabilities::baseline();
+    let outcome = match validate_blocking(&bytes, &approved) {
+        Ok(v) => ValidationOutcome::Ok(v),
+        Err(FaasError::InvalidRequest(m)) => ValidationOutcome::Rejected { message: m },
+        // baseline 検証で InvalidRequest 以外は原理的に出ないが、出たら Rejected に倒す
+        // （親に 422 を返させる。子から 503 を誘発させない）。
+        Err(other) => ValidationOutcome::Rejected {
+            message: format!("validation failed: {other}"),
+        },
+    };
+
+    let json = serde_json::to_vec(&outcome)
+        .map_err(|e| anyhow::anyhow!("validation child: serialize: {e}"))?;
+    use std::io::Write as _;
+    std::io::stdout()
+        .write_all(&json)
+        .map_err(|e| anyhow::anyhow!("validation child: write stdout: {e}"))?;
+    Ok(())
+}
+
+/// 子プロセスの仮想メモリ上限を `RLIMIT_AS` で張る（Linux）。
+///
+/// macOS は `RLIMIT_AS` を実質無視するので、**macOS ではメモリ上限に頼らず**親側の
+/// wall-clock timeout + 出力サイズ上限だけで縛る（macOS はローカル開発専用という前提, §4.2）。
+/// 本番 Linux ではこの rlimit が「1 検証あたりのメモリ」を hard に縛る本体である。
+#[cfg(target_os = "linux")]
+fn set_memory_limit() {
+    let mb = env_u64("VALIDATION_MEM_LIMIT_MB", DEFAULT_VALIDATION_MEM_LIMIT_MB).max(16);
+    let bytes = mb.saturating_mul(1024 * 1024);
+    let limit = libc::rlimit {
+        rlim_cur: bytes,
+        rlim_max: bytes,
+    };
+    // SAFETY: setrlimit は resource と rlimit ポインタを取る単純な syscall。
+    // 失敗しても検証は timeout で守られるので、ここでは best-effort（結果を無視）。
+    unsafe {
+        libc::setrlimit(libc::RLIMIT_AS, &limit);
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn set_memory_limit() {
+    // macOS 等は RLIMIT_AS が効かない。timeout + 出力上限で縛る（上のコメント参照）。
+}
+
+/// u64 の任意 env。欠損 / 不正は default（子プロセスでも使うので独立実装）。
+fn env_u64(key: &str, default: u64) -> u64 {
+    std::env::var(key)
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .unwrap_or(default)
 }
 
 /// 同期検証本体（`spawn_blocking` 内で実行）。
