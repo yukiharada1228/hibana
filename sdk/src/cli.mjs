@@ -192,7 +192,7 @@ async function cmdDeploy(args) {
   step("Building TypeScript → WebAssembly Component");
   const work = await mkdtemp(join(tmpdir(), "hibana-deploy-"));
   const outWasm = join(work, "component.wasm");
-  await buildComponent({ entry, out: outWasm, world: "handler" });
+  await buildComponent({ entry, out: outWasm });
   const wasm = await readFile(outWasm);
   await rm(work, { recursive: true, force: true });
   stepDone();

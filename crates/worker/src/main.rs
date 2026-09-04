@@ -83,9 +83,16 @@ use sqlx::postgres::PgPoolOptions;
 use sqlx::PgPool;
 use tokio::time::Instant;
 use tracing::{error, info, warn};
+use bytes::Bytes;
+use http_body_util::{BodyExt, Full};
 use wasmtime::component::{Component, Linker};
 use wasmtime::{Config, Engine, ResourceLimiter, Store, StoreLimits, StoreLimitsBuilder};
 use wasmtime_wasi::{ResourceTable, WasiCtx, WasiCtxBuilder, WasiView};
+// M11-5 (§4.2): wasi:http/incoming-handler の native 実行に使う。
+use wasmtime_wasi_http::bindings::http::types::Scheme;
+use wasmtime_wasi_http::bindings::ProxyPre;
+use wasmtime_wasi_http::body::HyperOutgoingBody;
+use wasmtime_wasi_http::WasiHttpView as _;
 
 use bindings::Handler;
 
@@ -2069,17 +2076,82 @@ impl Worker {
         // ホスト経過時間込みの総時間で wall-clock 上限をかぶせる二重防御。タイムアウト時は
         // future が drop され、worker task は次の job へ進む（Wasmtime ランタイムは Store と
         // ともに drop される）。
+        // M11-5 (§4.2): world 種別を判定する。native HTTP（incoming-handler）なら
+        // input エンベロープから実 HTTP リクエストを組み、response-outparam を用意する
+        // （store が必要なので exec_future の前に済ませる）。bytes world は従来どおり。
+        let native_http = self.exports_incoming_handler(&component);
+        let native_setup = if native_http {
+            let req = envelope_to_request(&input)
+                .map_err(|e| ExecError::Failed(format!("bad ingress request: {e}")))?;
+            let (sender, receiver) = tokio::sync::oneshot::channel();
+            let req_res = store
+                .data_mut()
+                .new_incoming_request(Scheme::Http, req)
+                .map_err(|e| ExecError::Failed(format!("new_incoming_request: {e}")))?;
+            let out = store
+                .data_mut()
+                .new_response_outparam(sender)
+                .map_err(|e| ExecError::Failed(format!("new_response_outparam: {e}")))?;
+            Some((req_res, out, receiver))
+        } else {
+            None
+        };
+
         let exec_timeout = limits.max_execution_time();
         let exec_future = async {
             // TODO(§3.6): 将来最適化として、ここを `InstancePre` による事前
             // インスタンス化（リンク済み Component を再利用）や Pooling アロケータへ
             // 引き上げ、coldstart をさらに短縮する。今回は Component キャッシュ +
             // 事前コンパイル (cwasm) までを実装範囲とする。
-            let instance = Handler::instantiate_async(&mut store, &component, &linker)
-                .await
-                .map_err(|e| ExecError::Failed(format!("failed to instantiate handler: {e}")))?;
-            // handle 呼び出し (async)。epoch 中断時は Err(trap) になる。
-            Ok::<_, ExecError>(instance.call_handle(&mut store, &input).await)
+            if let Some((req_res, out, receiver)) = native_setup {
+                // --- native HTTP: wasi:http/incoming-handler を駆動する ---
+                let ipre = linker
+                    .instantiate_pre(&component)
+                    .map_err(|e| ExecError::Failed(format!("instantiate_pre: {e}")))?;
+                let ppre = ProxyPre::new(ipre)
+                    .map_err(|e| ExecError::Failed(format!("not a proxy component: {e}")))?;
+                let proxy = ppre
+                    .instantiate_async(&mut store)
+                    .await
+                    .map_err(|e| ExecError::Failed(format!("failed to instantiate proxy: {e}")))?;
+
+                // call_handle と response 読み取りを同時駆動する。guest は handle 中に
+                // response-outparam.set() で応答を送り、本体を output-stream へ書く。本体が
+                // buffer 上限を超えるとき、handle は consumer が読むまで back-pressure で
+                // ブロックしうるため、join で本体収集を並行させてデッドロックを避ける。
+                let call = proxy
+                    .wasi_http_incoming_handler()
+                    .call_handle(&mut store, req_res, out);
+                let recv = async {
+                    match receiver.await {
+                        Ok(Ok(resp)) => Some(response_to_envelope(resp).await),
+                        _ => None,
+                    }
+                };
+                let (call_res, recv_res) = tokio::join!(call, recv);
+
+                // call_res の trap は既存の分類（fuel/epoch/wasm trap）に載せるため
+                // `Err(wasmtime::Error)` として素通しする。応答が set されなければ失敗扱い。
+                let call_result: std::result::Result<
+                    std::result::Result<Vec<u8>, bindings::HandlerError>,
+                    anyhow::Error,
+                > = match call_res {
+                    Err(e) => Err(e),
+                    Ok(()) => match recv_res {
+                        Some(Ok(bytes)) => Ok(Ok(bytes)),
+                        Some(Err(e)) => Err(anyhow!("failed to encode response: {e}")),
+                        None => Err(anyhow!("guest did not set a response")),
+                    },
+                };
+                Ok::<_, ExecError>(call_result)
+            } else {
+                // --- bytes world: faas:component/handler の handle を呼ぶ（従来） ---
+                let instance = Handler::instantiate_async(&mut store, &component, &linker)
+                    .await
+                    .map_err(|e| ExecError::Failed(format!("failed to instantiate handler: {e}")))?;
+                // handle 呼び出し (async)。epoch 中断時は Err(trap) になる。
+                Ok::<_, ExecError>(instance.call_handle(&mut store, &input).await)
+            }
         };
 
         let timed = tokio::time::timeout(exec_timeout, exec_future).await;
@@ -2165,6 +2237,16 @@ impl Worker {
                 serde_json::Value::Array(bytes.into_iter().map(serde_json::Value::from).collect())
             }
         }
+    }
+
+    /// M11-5 (§4.2): この component が `wasi:http/incoming-handler` を export しているか
+    /// （= native HTTP component）。export 名で判定する。false なら従来の bytes world
+    /// （`faas:component/handler` の `handle`）として実行する。
+    fn exports_incoming_handler(&self, component: &Component) -> bool {
+        component
+            .component_type()
+            .exports(&self.engine)
+            .any(|(name, _)| name.starts_with("wasi:http/incoming-handler"))
     }
 
     // ------------------------------------------------------------------------
@@ -2458,6 +2540,91 @@ fn fuel_consumed(set: u64, remaining: u64, fuel_enabled: bool) -> u64 {
 /// `u128` のミリ秒が `u64` を超える非現実的なケースでは `u64::MAX` に飽和させる。
 fn duration_to_millis(d: Duration) -> u64 {
     d.as_millis().min(u64::MAX as u128) as u64
+}
+
+// ============================================================================
+// M11-5 (§4.2): native HTTP（wasi:http/incoming-handler）の request/response 変換
+// ============================================================================
+//
+// invoke の input バイト列は HTTP エンベロープ JSON（gateway / CLI が組む
+// `{method, path, query, headers, body, bodyBase64}`）。これを host 側で実 HTTP
+// リクエストへ組み、guest（Hono 等）の incoming-handler を駆動する。応答は同じく
+// エンベロープ JSON `{status, headers, body, bodyBase64}` にして返す（= 従来 adapter.js が
+// JS 内でやっていた変換を host=Rust へ移しただけ。gateway / CLI から見た contract は不変）。
+// binary body は base64url（Rust/JS 同一スキームの `faas_shared::b64url_*`）。
+
+type ReqBody = http_body_util::combinators::BoxBody<Bytes, hyper::Error>;
+
+/// request エンベロープ JSON → `hyper::Request`。
+fn envelope_to_request(input: &[u8]) -> anyhow::Result<hyper::Request<ReqBody>> {
+    let env: serde_json::Value = serde_json::from_slice(input)
+        .map_err(|e| anyhow!("ingress input is not a request envelope: {e}"))?;
+    let method = env.get("method").and_then(|v| v.as_str()).unwrap_or("GET");
+    let path = env.get("path").and_then(|v| v.as_str()).unwrap_or("/");
+    let query = env.get("query").and_then(|v| v.as_str()).unwrap_or("");
+    let uri = format!("http://hibana.local{path}{query}");
+
+    let mut builder = hyper::Request::builder().method(method).uri(uri);
+    if let Some(hs) = env.get("headers").and_then(|v| v.as_object()) {
+        for (k, v) in hs {
+            if let Some(vs) = v.as_str() {
+                builder = builder.header(k, vs);
+            }
+        }
+    }
+
+    let body_bytes: Vec<u8> = match env.get("body") {
+        Some(serde_json::Value::String(s)) => {
+            let b64 = env
+                .get("bodyBase64")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            if b64 {
+                faas_shared::b64url_decode(s).unwrap_or_default()
+            } else {
+                s.clone().into_bytes()
+            }
+        }
+        _ => Vec::new(),
+    };
+    let body = Full::new(Bytes::from(body_bytes))
+        .map_err(|e| match e {})
+        .boxed();
+    builder
+        .body(body)
+        .map_err(|e| anyhow!("failed to build request: {e}"))
+}
+
+/// `hyper::Response` → response エンベロープ JSON バイト列。
+async fn response_to_envelope(resp: hyper::Response<HyperOutgoingBody>) -> anyhow::Result<Vec<u8>> {
+    let status = resp.status().as_u16();
+    let mut headers = serde_json::Map::new();
+    for (k, v) in resp.headers().iter() {
+        if let Ok(s) = v.to_str() {
+            headers.insert(k.as_str().to_string(), serde_json::Value::String(s.to_string()));
+        }
+    }
+    let body = resp
+        .into_body()
+        .collect()
+        .await
+        .map_err(|e| anyhow!("failed to read guest response body: {e}"))?
+        .to_bytes();
+
+    let (body_val, b64) = match std::str::from_utf8(&body) {
+        Ok(s) => (serde_json::Value::String(s.to_string()), false),
+        Err(_) => (
+            serde_json::Value::String(faas_shared::b64url_encode(&body)),
+            true,
+        ),
+    };
+
+    let mut env = serde_json::Map::new();
+    env.insert("status".into(), serde_json::Value::from(status));
+    env.insert("headers".into(), serde_json::Value::Object(headers));
+    env.insert("body".into(), body_val);
+    env.insert("bodyBase64".into(), serde_json::Value::Bool(b64));
+    Ok(serde_json::to_vec(&serde_json::Value::Object(env))?)
 }
 
 // ============================================================================

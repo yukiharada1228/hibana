@@ -32,6 +32,13 @@ wasmtime = { workspace = true }
 wasmtime-wasi = { workspace = true }
 wasmtime-wasi-http = { workspace = true }
 
+# M11-5 (§4.2): wasi:http/incoming-handler の native component を駆動するために、
+# host 側で HTTP リクエスト/レスポンスを組み立てる（wasmtime-wasi-http の new_incoming_request /
+# ProxyPre が hyper 型を要求する）。
+hyper = "1"
+http-body-util = "0.1"
+bytes = "1"
+
 serde = { workspace = true }
 serde_json = { workspace = true }
 chrono = { workspace = true }
@@ -51,8 +58,3 @@ tracing-opentelemetry = { workspace = true }
 axum = { workspace = true }
 prometheus = { workspace = true }
 
-[dev-dependencies]
-hyper = "1"
-http-body-util = "0.1"
-bytes = "1"
-anyhow = { workspace = true }

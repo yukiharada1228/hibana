@@ -1,4 +1,9 @@
-# M11-5 スパイク: wasi:http/incoming-handler ネイティブ実行（結論つき）
+# M11-5: wasi:http/incoming-handler ネイティブ実行
+
+> **状態: 実装済み**（本ブランチ）。SDK は native ビルドへ、worker は dual-path（native/bytes）へ、
+> validation は depth-0 import 収集へ。以下はスパイク時の検証記録＋設計根拠。
+
+## スパイク結論（実装の土台）
 
 ## 問い
 

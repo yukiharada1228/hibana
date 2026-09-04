@@ -433,18 +433,39 @@ fn match_capabilities(
 fn collect_component_imports(bytes: &[u8]) -> Result<Vec<ComponentImport>, FaasError> {
     let mut imports = Vec::new();
 
+    // **最外殻コンポーネントの import だけ**を集める（= host 境界）。`parse_all` は
+    // ネストしたモジュール/コンポーネントのセクションも平坦に流すため、内部コンポーネントの
+    // **内部 import**（親の instantiation で満たされ host からは配線されない）まで拾ってしまう。
+    // それらは host capability ではないので許可リスト照合の対象にしてはならない。
+    // 例: componentize-js 0.19.3（wasi:http proxy 経路）が生む component は、内部コンポーネントに
+    // `handle` 関数 import を持つ —— これは incoming-handler の内部配線であって host import ではない。
+    // nest 深さを ModuleSection/ComponentSection(+1) と End(-1) で数え、depth==0 のときだけ集める。
+    let mut depth: i32 = 0;
+
     for payload in Parser::new(0).parse_all(bytes) {
         let payload =
             payload.map_err(|e| FaasError::InvalidRequest(format!("parse error: {e}")))?;
-        if let Payload::ComponentImportSection(section) = payload {
-            for import in section {
-                let import =
-                    import.map_err(|e| FaasError::InvalidRequest(format!("parse error: {e}")))?;
-                imports.push(ComponentImport {
-                    name: import.name.0.to_string(),
-                    type_only: matches!(import.ty, ComponentTypeRef::Type(_)),
-                });
+        match payload {
+            // ネスト単位に入る（後続ペイロードは内部のもの）。
+            Payload::ModuleSection { .. } | Payload::ComponentSection { .. } => {
+                depth += 1;
             }
+            // 現在の単位の終わり。最外殻の End で depth は負になりうるが害はない。
+            Payload::End(_) => {
+                depth -= 1;
+            }
+            // host 境界（最外殻）の import section のみ照合対象にする。
+            Payload::ComponentImportSection(section) if depth == 0 => {
+                for import in section {
+                    let import = import
+                        .map_err(|e| FaasError::InvalidRequest(format!("parse error: {e}")))?;
+                    imports.push(ComponentImport {
+                        name: import.name.0.to_string(),
+                        type_only: matches!(import.ty, ComponentTypeRef::Type(_)),
+                    });
+                }
+            }
+            _ => {}
         }
     }
 

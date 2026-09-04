@@ -29,20 +29,27 @@ Hello from Hono on Hibana 🔥
 
 ## How it works
 
-Your Hono app uses the Web-standard `Request`/`Response`, which
-[StarlingMonkey](https://github.com/bytecodealliance/StarlingMonkey) backs with
-`wasi:http/types`. The build bundles your app + an adapter with esbuild, then
-`jco componentize` produces a Component implementing the platform world:
+Your Hono app is compiled to a **native `wasi:http` component** — it exports
+`wasi:http/incoming-handler`, the standard WASI HTTP world. The build bundles your
+app with a one-line `fetch`-event shim and Hono via esbuild, then `jco componentize`
+produces the component:
 
 ```wit
-handle: func(input: list<u8>) -> result<list<u8>, handler-error>
+world http {
+  export wasi:http/incoming-handler@0.2.3;
+}
 ```
 
-The adapter bridges that sync bytes-in/bytes-out contract to
-`app.fetch(Request) -> Response` via an HTTP-envelope JSON (`method`/`path`/
-`headers`/`body`; binary bodies are base64). `--disable http` drops
+[StarlingMonkey](https://github.com/bytecodealliance/StarlingMonkey) wires the
+`fetch` event straight to `incoming-handler`, so the platform's worker hands your
+app a real `Request` and gets a real `Response` back — **no adapter, no JSON
+envelope, no base64** at the app layer. `--disable http` drops
 `wasi:http/outgoing-handler`, so a deployed component **cannot** make outbound
 requests through `wasi:http` — egress stays behind the platform's M9c allowlist.
+
+> The worker runs both worlds: native `wasi:http` components (Hono, and any
+> language's HTTP framework) and the older bytes-in/bytes-out `handle` world used
+> by queue/cron/event/chain functions.
 
 ## Commands
 
