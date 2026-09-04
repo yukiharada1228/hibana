@@ -597,9 +597,42 @@ fn build_router(state: AppState) -> Router {
         .route("/auth/login", post(login::login))
         .route("/admin/tenants", post(handlers::create_tenant))
         .merge(protected)
+        // M10 follow-up (§3.8): HTTP リクエストメトリクスを observe する。TraceLayer より内側に
+        // 置くことで、routing 済み（MatchedPath が extensions に載った状態）で method/route/status を
+        // 拾える。**path はルートテンプレート**（`/components/{id}/versions`）を使い、生 URI の
+        // ID でカーディナリティを爆発させない。
+        .layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            http_metrics_middleware,
+        ))
         .layer(TraceLayer::new_for_http())
         .layer(CorsLayer::permissive())
         .with_state(state)
+}
+
+/// HTTP リクエストの件数（`faas_http_requests_total`）と処理時間
+/// （`faas_http_request_duration_seconds`）を observe する middleware（M4a のメトリクスを配線）。
+///
+/// カーディナリティ対策として `path` は **MatchedPath**（ルートテンプレート）を使う。ルートに
+/// マッチしなかった（404 等）リクエストは 1 つの `<unmatched>` に畳んで、任意 URI による
+/// 系列の無限増殖を防ぐ。
+async fn http_metrics_middleware(
+    axum::extract::State(state): axum::extract::State<AppState>,
+    req: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    let method = req.method().as_str().to_owned();
+    let path = req
+        .extensions()
+        .get::<axum::extract::MatchedPath>()
+        .map(|m| m.as_str().to_owned())
+        .unwrap_or_else(|| "<unmatched>".to_owned());
+    let start = std::time::Instant::now();
+    let resp = next.run(req).await;
+    state
+        .metrics()
+        .observe_http(&method, &path, resp.status().as_u16(), start.elapsed());
+    resp
 }
 
 /// invoke を JetStream へ publish するための stream を冪等に用意する (M3c, §6.6)。

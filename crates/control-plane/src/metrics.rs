@@ -25,11 +25,12 @@
 //! 留める。後続スライスで HTTP request 単位の duration や reaper の周期ヒストグラムなどを
 //! 追加する余地を残す（registry はプロセス共有なので追加登録だけで拡張できる）。
 //!
-//! 注: 一部のメトリクス（http_requests_total / http_request_duration_seconds /
-//! execution_duration_seconds、`observe_http` / `observe_secs` ヘルパ）は本スライスでは
-//! 計装点を呼ばない（後続スライスの middleware と finalize-時計算が消費する）。dead-code 警告は
-//! モジュール限定で許可する: 登録解除すると Prometheus exposition の安定性が下がる（dashboards
-//! が break する）ので、登録した時点で /metrics に固定で見えるようにしておく。
+//! 注: M10 follow-up で計装点を配線した。`http_requests_total` / `http_request_duration_seconds`
+//! は `main.rs` の `http_metrics_middleware`（`observe_http`）が、`execution_duration_seconds` は
+//! subscriber の finalize（CAS が実際に遷移させたときだけ、created_at→finished_at のサーバ時計）が
+//! observe する。`observe_secs` ヘルパは現状呼び出し点が無いので dead-code 許可を残す
+//! （登録解除すると Prometheus exposition の系列が消えて dashboards が break するため、
+//! ヘルパも含め登録・定義は維持する）。
 #![allow(dead_code)]
 
 use std::sync::Arc;
