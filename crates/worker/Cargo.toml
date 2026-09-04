@@ -50,3 +50,9 @@ tracing-opentelemetry = { workspace = true }
 # ルータ層のみ使うため tower-http は worker では不要（最小依存）。
 axum = { workspace = true }
 prometheus = { workspace = true }
+
+[dev-dependencies]
+hyper = "1"
+http-body-util = "0.1"
+bytes = "1"
+anyhow = { workspace = true }
