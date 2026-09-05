@@ -71,6 +71,8 @@ unless you pass `--allow-egress`).
 | `hibana invoke <app> [METHOD] [PATH] [--body '<str>'] [--header k:v]` | Call a deployed app; renders the HTTP response |
 | `hibana publish <app>` / `hibana unpublish <app>` | Turn the public URL on/off (deny-by-default) |
 | `hibana secret set <app> <NAME> <VALUE>` | Set a per-function secret (M7c) |
+| `hibana config set <app> KEY=VALUE ...` | Set plaintext config values (merged) |
+| `hibana grant-env <app> <version> NAME ...` | Approve which env names the app may read (admin; all-replace) |
 | `hibana rollback <app> [version]` | One-click rollback to the previous stable version (M7) |
 | `hibana logs <execution_id>` | Fetch a single execution record |
 
@@ -98,6 +100,29 @@ response — no auth token needed (it's a public endpoint, like Cloudflare Worke
   Set `HIBANA_INGRESS_DOMAIN` to the same value so the CLI prints the URL.
 - **Local dev** (no wildcard DNS): send the `Host` header directly —
   `curl -H "Host: my-api.smoke.hibana.local" http://localhost:8080/`.
+
+## Config & secrets
+
+Your app reads config and secrets as **`c.env`** (Workers-style, the 2nd arg to
+`fetch`) or **`process.env`**:
+
+```ts
+const app = new Hono<{ Bindings: { API_KEY: string } }>();
+app.get("/", (c) => fetch("https://api.example.com", {
+  headers: { authorization: `Bearer ${c.env.API_KEY}` },
+}));
+```
+
+Two steps (the platform separates *setting a value* from *approving the name*):
+
+```console
+$ hibana secret set my-api API_KEY sk-...      # or: hibana config set my-api FOO=bar
+$ hibana grant-env my-api 0.1.0 API_KEY FOO    # admin approves injectable names (all-replace)
+```
+
+Only approved names are injected. Under the hood the worker passes them to your
+component out-of-band and the SDK exposes them as `c.env` / `process.env` — they
+are **not** visible as request headers to your handler.
 
 ## `hibana dev` is a faithful preview
 

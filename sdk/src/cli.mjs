@@ -395,6 +395,58 @@ async function cmdSecret(args) {
     json: { value },
   });
   ok(`secret ${bold(key)} set on ${name} (version ${r.version})`);
+  console.log(
+    dim(
+      `  Approve it so the app can read it:  hibana grant-env ${name} <version> ${key}`,
+    ),
+  );
+}
+
+async function cmdConfig(args) {
+  const [sub, name, ...pairs] = args;
+  if (sub !== "set" || !name || pairs.length === 0)
+    die("usage: hibana config set <app> KEY=VALUE [KEY=VALUE ...]");
+  const cfg = config();
+  const token = await login(cfg);
+  const id = await resolveComponentId(cfg, token, name);
+  if (!id) die(`no such component: ${name}`);
+  // 既存の config を GET してマージ（PUT は全置換なので消さないため）。
+  let env = {};
+  try {
+    const cur = await api(cfg, "GET", `/components/${id}/config`, { token });
+    if (cur && cur.env) env = { ...cur.env };
+  } catch {}
+  for (const p of pairs) {
+    const i = p.indexOf("=");
+    if (i <= 0) die(`bad pair (want KEY=VALUE): ${p}`);
+    env[p.slice(0, i)] = p.slice(i + 1);
+  }
+  await api(cfg, "PUT", `/components/${id}/config`, { token, json: { env } });
+  ok(`config set on ${name}: ${bold(pairs.map((p) => p.split("=")[0]).join(", "))}`);
+  console.log(
+    dim(
+      `  Approve names so the app can read them:  hibana grant-env ${name} <version> ${Object.keys(env).join(" ")}`,
+    ),
+  );
+}
+
+// admin: この version が受け取れる env 名を承認する（M7b/M9: 値の設定=deploy と名前の承認=admin を分離）。
+// capabilities.env は**全置換**なので、注入したい名前を一度に全部列挙すること。
+async function cmdGrantEnv(args) {
+  const { pos } = parseFlags(args);
+  const [name, version, ...names] = pos;
+  if (!name || !version || names.length === 0)
+    die("usage: hibana grant-env <app> <version> NAME [NAME ...]   (all-replace)");
+  const cfg = config();
+  const token = await login(cfg);
+  const id = await resolveComponentId(cfg, token, name);
+  if (!id) die(`no such component: ${name}`);
+  await api(cfg, "PUT", `/components/${id}/versions/${version}/capabilities`, {
+    token,
+    json: { env: names },
+  });
+  ok(`granted env on ${name}@${version}: ${bold(names.join(", "))}`);
+  console.log(dim(`  Read them in Hono via c.env.NAME (or process.env.NAME).`));
 }
 
 async function cmdRollback(args) {
@@ -435,6 +487,8 @@ function usage() {
       `  hibana publish   <app>        make reachable at <app>.<tenant>.<base>\n` +
       `  hibana unpublish <app>        disable public ingress\n` +
       `  hibana secret    set <app> <NAME> <VALUE>\n` +
+      `  hibana config    set <app> KEY=VALUE ...\n` +
+      `  hibana grant-env <app> <version> NAME ...   approve env names the app can read (c.env)\n` +
       `  hibana rollback  <app> [version]\n` +
       `  hibana logs      <execution_id>\n`,
   );
@@ -449,6 +503,8 @@ async function main() {
       case "invoke": return await cmdInvoke(rest);
       case "publish": return await cmdPublish(rest, true);
       case "unpublish": return await cmdPublish(rest, false);
+      case "config": return await cmdConfig(rest);
+      case "grant-env": return await cmdGrantEnv(rest);
       case "secret": return await cmdSecret(rest);
       case "rollback": return await cmdRollback(rest);
       case "logs": return await cmdLogs(rest);

@@ -2170,8 +2170,29 @@ impl Worker {
         // （store が必要なので exec_future の前に済ませる）。bytes world は従来どおり。
         let native_http = self.exports_incoming_handler(&component);
         let native_setup = if native_http {
-            let req = envelope_to_request(&input)
+            let mut req = envelope_to_request(&input)
                 .map_err(|e| ExecError::Failed(format!("bad ingress request: {e}")))?;
+            // M11-9 (§3.5/§4.6): config/secret（built_env）を native component に届ける。
+            // StarlingMonkey 0.19.3 は wasi:cli/environment を JS へ公開しないため、env 経由では
+            // 読めない。そこで **worker が権威的に** `x-hibana-env`（base64url(JSON) の env マップ）を
+            // リクエストヘッダへ注入し、SDK の fetch shim が `process.env` に載せてから剥がす。
+            // クライアント由来の同名ヘッダは**必ず除去してから**セットする（注入攻撃の遮断）。
+            req.headers_mut()
+                .remove(hyper::header::HeaderName::from_static("x-hibana-env"));
+            if !built_env.pairs.is_empty() {
+                let map: serde_json::Map<String, serde_json::Value> = built_env
+                    .pairs
+                    .iter()
+                    .map(|(k, v)| (k.clone(), serde_json::Value::String(v.clone())))
+                    .collect();
+                let json = serde_json::to_vec(&serde_json::Value::Object(map))
+                    .map_err(|e| ExecError::Failed(format!("env encode: {e}")))?;
+                let encoded = faas_shared::b64url_encode(&json);
+                if let Ok(hv) = hyper::header::HeaderValue::from_str(&encoded) {
+                    req.headers_mut()
+                        .insert(hyper::header::HeaderName::from_static("x-hibana-env"), hv);
+                }
+            }
             let (sender, receiver) = tokio::sync::oneshot::channel();
             let req_res = store
                 .data_mut()
