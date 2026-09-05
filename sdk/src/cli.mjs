@@ -36,6 +36,8 @@ function die(msg) {
   process.exit(1);
 }
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+// 実行が未終端か（pending も running も「まだ」）。終端は succeeded/failed/timeout。
+const nonTerminal = (s) => s === "pending" || s === "running";
 
 // ---- 設定 / 認証 ----------------------------------------------------------
 function config() {
@@ -75,9 +77,9 @@ async function warmUp(cfg, token, name) {
       token,
       json: { component: name, input: { method: "GET", path: "/" } },
     });
-    if (r.status === "pending" && r.execution_id) {
+    if (nonTerminal(r.status) && r.execution_id) {
       const started = Date.now();
-      while (r.status === "pending" && Date.now() - started < 90_000) {
+      while (nonTerminal(r.status) && Date.now() - started < 90_000) {
         await sleep(600);
         r = await api(cfg, "GET", `/executions/${r.execution_id}`, { token });
       }
@@ -296,9 +298,9 @@ async function cmdInvoke(args) {
   // 同期 invoke はサーバ側 SYNC_REPLY_TIMEOUT_MS（既定 5s）を超えると 202 pending に縮退する。
   // 初回はコンポーネントの precompile（JS は十数 MiB）で 5s を超えがちなので、pending の間は
   // GET /executions/{id} を最大 60s ポーリングして終端を待つ。
-  if (r.status === "pending" && r.execution_id) {
+  if (nonTerminal(r.status) && r.execution_id) {
     const started = Date.now();
-    while (r.status === "pending" && Date.now() - started < 60_000) {
+    while (nonTerminal(r.status) && Date.now() - started < 60_000) {
       await sleep(600);
       r = await api(cfg, "GET", `/executions/${r.execution_id}`, { token });
     }

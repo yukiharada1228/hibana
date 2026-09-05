@@ -106,6 +106,17 @@ const PULL_BATCH: usize = 16;
 /// hit 経路が coldstart 短縮の主経路。容量超過時は最古を退避する。
 const COMPONENT_CACHE_CAP: usize = 64;
 
+/// M11-6 (§6.6): 実行中に送る in-progress ack（`AckKind::Progress`）の間隔。
+///
+/// consumer の再配送 backoff（CP 側 `BACKOFF_SECS`、既定 `[5, 15, 60]`）では **最初の配送の
+/// ack 期限が `backoff[0]`（既定 5s）** になる。12-13MiB の JS/Hono component の cold precompile は
+/// これを超えるため、heartbeat が無いと「処理中なのに ack 期限切れ → 再配送 → 二重 precompile」で
+/// cold start が数倍に伸びる（実測: 1 回 ~5-6s の precompile が +5s/+15s の再配送で 20-30s 化）。
+/// 実行中はこの間隔で Progress を送り、その都度期限を延長して spurious な再配送を止める。
+/// worker が死ねば heartbeat も止まり、期限超過で正しく再配送される（stuck 救済は不変）。
+/// **`backoff[0]` より十分小さく保つこと**（既定 3s < 5s）。
+const ACK_PROGRESS_INTERVAL: Duration = Duration::from_secs(3);
+
 // M8-3: `MAX_ACK_PENDING`（全テナント合算の固定値 1000）はここから削除された。
 // consumer の作成者が control-plane へ移り、`max_ack_pending` は **lane（= テナント）ごとに**
 // `max_concurrent_executions + headroom` から導出されるようになったため（§8 / §3.5）。
@@ -1178,10 +1189,30 @@ async fn lane_loop(
                 if let Some(cx) = parent_cx {
                     faas_shared::otel::set_span_parent(&process_span, cx);
                 }
-                let published = worker
-                    .handle_payload(&payload)
-                    .instrument(process_span)
-                    .await;
+                // M11-6 (§6.6): 実行中は `AckKind::Progress` を定期送出して ack 期限を延ばす。
+                // cold precompile が再配送 backoff[0]（既定 5s）を超えても「処理中」を server に伝え、
+                // spurious な再配送＝二重 precompile を止める。handle_payload は msg を触らない
+                // （&payload のみ）ので、同じ &msg で Progress と最終 ack を送れる。
+                let published = {
+                    let fut = worker.handle_payload(&payload).instrument(process_span);
+                    tokio::pin!(fut);
+                    let mut hb = tokio::time::interval(ACK_PROGRESS_INTERVAL);
+                    // 初回 tick は即時なので捨て、次回（+interval）から送る。
+                    hb.tick().await;
+                    loop {
+                        tokio::select! {
+                            res = &mut fut => break res,
+                            _ = hb.tick() => {
+                                if let Err(e) = msg
+                                    .ack_with(async_nats::jetstream::AckKind::Progress)
+                                    .await
+                                {
+                                    warn!(error = %e, "failed to send in-progress ack; job may be redelivered");
+                                }
+                            }
+                        }
+                    }
+                };
                 if published {
                     if let Err(e) = msg.ack().await {
                         warn!(error = %e, "failed to ack message after publishing result");
@@ -1834,9 +1865,16 @@ impl Worker {
         let bytes = self.download_wasm(&job.wasm_url).await?;
         self.verify_sha256(&bytes, sha)?;
 
-        let cwasm = self
-            .engine
-            .precompile_component(&bytes)
+        // M11-6 (§6.6): precompile は cranelift による CPU バウンドの同期処理で、12-13MiB の
+        // JS/Hono component では ~5s かかる。async タスク内で直接回すと **その間 tokio ワーカ
+        // スレッドを占有して yield せず**、in-progress ack のハートビート（`tokio::select!` の
+        // タイマ腕）も他タスクも回らない。結果、ack 期限（backoff[0]=5s）が切れて再配送 → 二重
+        // precompile になる。`spawn_blocking` に逃がして async 側を yield させ、precompile 中も
+        // ハートビートが飛ぶ（＝再配送されない）ようにする。
+        let engine = self.engine.clone();
+        let cwasm = tokio::task::spawn_blocking(move || engine.precompile_component(&bytes))
+            .await
+            .map_err(|e| ExecError::Failed(format!("precompile join error: {e}")))?
             .map_err(|e| ExecError::Failed(format!("precompile_component failed: {e}")))?;
 
         // アトミックに書き込む (tmp -> rename)。失敗しても実行自体は続行する。
