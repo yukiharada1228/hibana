@@ -64,7 +64,34 @@ Both worker shapes work — Hono `export default app` **and** plain
 | `env.MY_VAR` / secrets | `c.env.MY_VAR` / `env.MY_VAR` | ✅ |
 | `[[kv_namespaces]]` → `env.KV.get/put/delete/list` | ✅ | Postgres-backed, tenant-scoped |
 | `[[r2_buckets]]` → `env.BUCKET.get/put/head/delete/list` | ✅ | MinIO/S3-backed (worker stays keyless) |
-| D1, Durable Objects, Queues | — | ❌ not available yet |
+| `[[d1_databases]]` → `env.DB.prepare/bind/all/first/run/batch/exec` | ✅ | real SQLite, per-tenant, single-writer |
+| Durable Objects, Queues | — | ❌ not available yet |
+
+### D1
+
+```toml
+[[d1_databases]]
+binding = "DB"
+database_name = "app-db"
+```
+
+```ts
+await c.env.DB.exec("CREATE TABLE IF NOT EXISTS users(id INTEGER PRIMARY KEY, name TEXT)");
+await c.env.DB.prepare("INSERT INTO users(name) VALUES (?)").bind("alice").run();
+const { results } = await c.env.DB.prepare("SELECT * FROM users").all();
+const one = await c.env.DB.prepare("SELECT * FROM users WHERE id=?").bind(1).first();
+await c.env.DB.batch([stmt1, stmt2]); // atomic
+```
+
+Each database is a **real, isolated SQLite** persisted per `(tenant, name)`. A
+Postgres **session advisory lock** makes access single-writer — concurrent
+executions touching the same DB serialize — and the DB is loaded once per request
+and saved at the end. Guest SQL is sandboxed with a SQLite authorizer that denies
+`ATTACH`/extension loading, so it can never reach the filesystem or the platform's
+own database. `hibana dev` uses Node's `node:sqlite` (in-memory).
+
+> This request-scoped resident model is the stateful foundation; the same
+> advisory-lock + persist pattern is what Durable Objects/Queues will build on.
 
 ### KV
 

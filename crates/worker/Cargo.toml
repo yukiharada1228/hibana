@@ -29,6 +29,9 @@ sha2 = { workspace = true }
 lru = "0.12"
 # M11-6 (§6.6): sha ごとの precompile single-flight ロック用（stampede 防止）。
 dashmap = { workspace = true }
+# M14 (D1): 隔離 SQLite（bundled = システム依存なし）。guest の任意 SQL は authorizer で
+# ATTACH/load_extension を拒否して sandbox 化する。
+rusqlite = { version = "0.32", features = ["bundled", "hooks"] }
 
 wasmtime = { workspace = true }
 wasmtime-wasi = { workspace = true }

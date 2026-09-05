@@ -61,6 +61,7 @@
 //! トラップ分類: epoch 中断 / 時間超過 → `timeout`、fuel 超過 → `failed`（§4.3）。
 
 mod bindings;
+mod d1;
 mod env;
 mod metrics;
 
@@ -215,10 +216,14 @@ struct HostState {
     cp_internal_url: String,
     job_token: String,
     http: reqwest::Client,
+    // M14: D1 バインディング。実行中に開いた D1 セッション（db 名 → 常駐 SQLite）。実行末に flush。
+    d1_sessions: Arc<tokio::sync::Mutex<std::collections::HashMap<String, d1::D1Session>>>,
 }
 
 /// M12: KV バインディングの内部ホスト名。guest の fetch がこの host のときだけ KV として処理する。
 const KV_INTERNAL_HOST: &str = "kv.hibana.internal";
+/// M14: D1 バインディングの内部ホスト名。
+const D1_INTERNAL_HOST: &str = "d1.hibana.internal";
 /// M13: R2 バインディングの内部ホスト名（同じく send_request で横取り）。
 const R2_INTERNAL_HOST: &str = "r2.hibana.internal";
 /// M13: R2 オブジェクトの上限（MVP は Postgres bytea 保持のため控えめに）。
@@ -268,6 +273,15 @@ impl wasmtime_wasi_http::WasiHttpView for HostState {
             let token = self.job_token.clone();
             let handle = wasmtime_wasi::runtime::spawn(async move {
                 Ok(handle_r2_request(http, cp, token, request).await)
+            });
+            return Ok(wasmtime_wasi_http::types::HostFutureIncomingResponse::pending(handle));
+        }
+        if request.uri().host() == Some(D1_INTERNAL_HOST) {
+            let pool = self.pool.clone();
+            let tenant = self.tenant_id.clone();
+            let sessions = Arc::clone(&self.d1_sessions);
+            let handle = wasmtime_wasi::runtime::spawn(async move {
+                Ok(handle_d1_request(pool, tenant, sessions, request).await)
             });
             return Ok(wasmtime_wasi_http::types::HostFutureIncomingResponse::pending(handle));
         }
@@ -645,7 +659,18 @@ async fn main() -> anyhow::Result<()> {
 
     info!("connecting to Postgres");
     let pool = PgPoolOptions::new()
-        .max_connections(8)
+        .max_connections(32)
+        // M14 (D1): D1 セッションは実行の間 advisory lock を握った接続を保持する。接続が pool へ
+        // 戻る際に **必ず advisory lock を全解放**しておく（flush 忘れ・panic・timeout でロックが
+        // 漏れて次実行が固まるのを構造的に防ぐ backstop）。lock を握らない接続には無害。
+        .after_release(|conn, _meta| {
+            Box::pin(async move {
+                sqlx::query("SELECT pg_advisory_unlock_all()")
+                    .execute(conn)
+                    .await?;
+                Ok(true)
+            })
+        })
         .connect(&settings.database_url)
         .await
         .context("failed to connect to Postgres")?;
@@ -2124,6 +2149,11 @@ impl Worker {
             });
         }
 
+        // M14: D1 セッション置き場（実行中に db 名→常駐 SQLite を溜め、実行末に flush）。
+        let d1_sessions: Arc<
+            tokio::sync::Mutex<std::collections::HashMap<String, d1::D1Session>>,
+        > = Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new()));
+
         let wasi = wasi_builder.build();
         let host = HostState {
             ctx: wasi,
@@ -2136,6 +2166,7 @@ impl Worker {
             cp_internal_url: self.control_plane_internal_url.clone(),
             job_token,
             http: self.http.clone(),
+            d1_sessions: Arc::clone(&d1_sessions),
         };
 
         let mut store = Store::new(&self.engine, host);
@@ -2330,6 +2361,17 @@ impl Worker {
                 self.metrics
                     .guest_stderr_dropped_bytes_total
                     .inc_by(dropped);
+            }
+        }
+
+        // M14: D1 セッションを flush（save + advisory lock 解放）。実行成否に関わらず必ず行う。
+        // これで次に同じ DB を触る実行がロックを取得でき、書き込みが永続化される。
+        {
+            let mut m = d1_sessions.lock().await;
+            for (name, sess) in m.drain() {
+                if let Err(e) = sess.flush().await {
+                    warn!(db = %name, error = %e, "d1: flush failed (data may be lost for this db)");
+                }
             }
         }
 
@@ -3240,6 +3282,89 @@ async fn handle_r2_request(
             r2_response(200, vec![("content-type", "application/json".into())], bytes)
         }
         _ => r2_response(404, vec![], b"unknown r2 op".to_vec()),
+    }
+}
+
+// ============================================================================
+// M14: D1 バインディング。guest の `env.DB.*`（d1.hibana.internal への fetch）を、実行中に常駐する
+// D1Session（隔離 SQLite + advisory lock）へ中継する。セッションは実行末に run_component が flush。
+// ============================================================================
+async fn handle_d1_request(
+    pool: PgPool,
+    tenant: String,
+    sessions: Arc<tokio::sync::Mutex<std::collections::HashMap<String, d1::D1Session>>>,
+    request: hyper::Request<HyperOutgoingBody>,
+) -> Result<
+    wasmtime_wasi_http::types::IncomingResponse,
+    wasmtime_wasi_http::bindings::http::types::ErrorCode,
+> {
+    let d1_err = |status: u16, msg: &str| {
+        let body = serde_json::to_vec(&serde_json::json!({ "error": msg })).unwrap_or_default();
+        kv_response(status, "application/json", body)
+    };
+
+    let (parts, body) = request.into_parts();
+    let path = parts.uri.path().to_string();
+    let q = parts.uri.query().map(parse_query).unwrap_or_default();
+    let db = q.get("db").cloned().unwrap_or_default();
+    if db.is_empty() {
+        return d1_err(400, "missing db");
+    }
+    let body_bytes = match body.collect().await {
+        Ok(b) => b.to_bytes(),
+        Err(_) => return d1_err(400, "read body failed"),
+    };
+    let payload: serde_json::Value = serde_json::from_slice(&body_bytes).unwrap_or(serde_json::Value::Null);
+
+    // 実行中このセッションを常駐させる（初回に open = advisory lock + load）。
+    let mut map = sessions.lock().await;
+    if !map.contains_key(&db) {
+        match d1::D1Session::open(&pool, &tenant, &db).await {
+            Ok(s) => {
+                map.insert(db.clone(), s);
+            }
+            Err(e) => return d1_err(500, &e),
+        }
+    }
+    let sess = map.get_mut(&db).expect("d1 session just inserted");
+
+    let result = match path.as_str() {
+        "/v1/d1/query" => {
+            let sql = payload.get("sql").and_then(|v| v.as_str()).unwrap_or("").to_string();
+            let params = payload
+                .get("params")
+                .and_then(|v| v.as_array())
+                .cloned()
+                .unwrap_or_default();
+            sess.query(sql, params).await
+        }
+        "/v1/d1/batch" => {
+            let stmts: Vec<(String, Vec<serde_json::Value>)> = payload
+                .get("statements")
+                .and_then(|v| v.as_array())
+                .map(|arr| {
+                    arr.iter()
+                        .map(|s| {
+                            (
+                                s.get("sql").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+                                s.get("params").and_then(|v| v.as_array()).cloned().unwrap_or_default(),
+                            )
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+            sess.batch(stmts).await
+        }
+        "/v1/d1/exec" => {
+            let sql = payload.get("sql").and_then(|v| v.as_str()).unwrap_or("").to_string();
+            sess.exec(sql).await
+        }
+        _ => Err("unknown d1 op".to_string()),
+    };
+
+    match result {
+        Ok(v) => kv_response(200, "application/json", serde_json::to_vec(&v).unwrap_or_default()),
+        Err(e) => d1_err(400, &e),
     }
 }
 

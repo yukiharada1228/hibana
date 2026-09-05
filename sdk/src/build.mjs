@@ -53,13 +53,15 @@ function run(cmd, args) {
   });
 }
 
-export async function buildComponent({ entry, out, wit, world, kv, r2 }) {
+export async function buildComponent({ entry, out, wit, world, kv, r2, d1 }) {
   wit = wit || DEFAULT_WIT;
   world = world || "http";
   // kv: [{ binding, id }]（wrangler の kv_namespaces）。binding→namespace を shim に焼き込む。
   const kvBindings = Array.isArray(kv) ? kv : [];
   // r2: [{ binding, bucket_name }]（wrangler の r2_buckets）。
   const r2Bindings = Array.isArray(r2) ? r2 : [];
+  // d1: [{ binding, database_name }]（wrangler の d1_databases）。
+  const d1Bindings = Array.isArray(d1) ? d1 : [];
   const entryAbs = resolve(process.cwd(), entry);
   const outAbs = resolve(process.cwd(), out);
   const witAbs = resolve(process.cwd(), wit);
@@ -111,6 +113,8 @@ export async function buildComponent({ entry, out, wit, world, kv, r2 }) {
         `  for (const [__b, __ns] of __KV) env[__b] = __kvClient(__ns);`,
         `  const __R2 = ${JSON.stringify(r2Bindings.map((b) => [b.binding, b.bucket_name || b.binding]))};`,
         `  for (const [__b, __bk] of __R2) env[__b] = __r2Client(__bk);`,
+        `  const __D1 = ${JSON.stringify(d1Bindings.map((b) => [b.binding, b.database_name || b.binding]))};`,
+        `  for (const [__b, __dn] of __D1) env[__b] = __d1Client(__dn);`,
         // Workers 互換: fetch(request, env, ctx)。ctx は no-op stub（waitUntil/passThroughOnException）。
         `  const ctx = { waitUntil() {}, passThroughOnException() {} };`,
         `  event.respondWith(app.fetch(request, env, ctx));`,
@@ -204,6 +208,42 @@ export async function buildComponent({ entry, out, wit, world, kv, r2 }) {
         `      if (!r.ok) throw new Error("R2 list failed: " + r.status);`,
         `      const j = await r.json();`,
         `      return { objects: (j.objects || []).map((o) => ({ key: o.key, size: o.size, etag: o.etag })), truncated: false };`,
+        `    },`,
+        `  };`,
+        `}`,
+        // Workers D1 互換の最小 client（prepare/bind/all/first/run/raw, batch, exec）。
+        `function __d1Client(db) {`,
+        `  const base = "http://d1.hibana.internal/v1/d1";`,
+        `  const e = encodeURIComponent;`,
+        `  async function q(sql, params) {`,
+        `    const r = await fetch(base + "/query?db=" + e(db), { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ sql, params }) });`,
+        `    const j = await r.json();`,
+        `    if (!r.ok) throw new Error((j && j.error) || ("D1 error " + r.status));`,
+        `    return j;`,
+        `  }`,
+        `  function prepare(sql) {`,
+        `    const st = { __sql: sql, __params: [] };`,
+        `    st.bind = (...a) => { st.__params = a; return st; };`,
+        `    st.all = async () => await q(sql, st.__params);`,
+        `    st.first = async (col) => { const j = await q(sql, st.__params); const row = j.results && j.results[0]; if (row == null) return null; return col ? row[col] : row; };`,
+        `    st.run = async () => { const j = await q(sql, st.__params); return { success: j.success, meta: j.meta }; };`,
+        `    st.raw = async () => { const j = await q(sql, st.__params); return (j.results || []).map((o) => Object.values(o)); };`,
+        `    return st;`,
+        `  }`,
+        `  return {`,
+        `    prepare,`,
+        `    async batch(stmts) {`,
+        `      const statements = (stmts || []).map((s) => ({ sql: s.__sql, params: s.__params || [] }));`,
+        `      const r = await fetch(base + "/batch?db=" + e(db), { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ statements }) });`,
+        `      const j = await r.json();`,
+        `      if (!r.ok) throw new Error((j && j.error) || ("D1 batch error " + r.status));`,
+        `      return j;`,
+        `    },`,
+        `    async exec(sql) {`,
+        `      const r = await fetch(base + "/exec?db=" + e(db), { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ sql }) });`,
+        `      const j = await r.json();`,
+        `      if (!r.ok) throw new Error((j && j.error) || ("D1 exec error " + r.status));`,
+        `      return j;`,
         `    },`,
         `  };`,
         `}`,

@@ -142,6 +142,12 @@ async function loadProjectConfig() {
             .filter((b) => b && b.binding)
             .map((b) => ({ binding: b.binding, bucket_name: b.bucket_name || b.binding }))
         : [],
+      // Workers: [[d1_databases]] { binding, database_name }。
+      d1: Array.isArray(raw.d1_databases)
+        ? raw.d1_databases
+            .filter((b) => b && b.binding)
+            .map((b) => ({ binding: b.binding, database_name: b.database_name || b.binding }))
+        : [],
       // hibana 固有（wrangler には無い）。
       public: h.public ?? false,
       egress: Array.isArray(h.egress) ? h.egress : [],
@@ -308,7 +314,13 @@ async function cmdDeploy(args) {
   step("Building TypeScript → WebAssembly Component");
   const work = await mkdtemp(join(tmpdir(), "hibana-deploy-"));
   const outWasm = join(work, "component.wasm");
-  await buildComponent({ entry, out: outWasm, kv: proj?.kv || [], r2: proj?.r2 || [] });
+  await buildComponent({
+    entry,
+    out: outWasm,
+    kv: proj?.kv || [],
+    r2: proj?.r2 || [],
+    d1: proj?.d1 || [],
+  });
   const wasm = await readFile(outWasm);
   await rm(work, { recursive: true, force: true });
   stepDone();
@@ -555,6 +567,41 @@ function memR2Client(store) {
   };
 }
 
+// dev 用の in-memory D1（node:sqlite。非永続）。Workers D1 API のサブセット。
+function memD1Client(sqlite) {
+  function prepare(sql) {
+    const st = { __sql: sql, __params: [] };
+    st.bind = (...a) => {
+      st.__params = a;
+      return st;
+    };
+    st.all = async () => ({ results: sqlite.prepare(sql).all(...st.__params), success: true, meta: {} });
+    st.first = async (col) => {
+      const row = sqlite.prepare(sql).get(...st.__params);
+      if (row == null) return null;
+      return col ? row[col] : row;
+    };
+    st.run = async () => {
+      const info = sqlite.prepare(sql).run(...st.__params);
+      return { success: true, meta: { changes: info.changes, last_row_id: info.lastInsertRowid } };
+    };
+    st.raw = async () => sqlite.prepare(sql).all(...st.__params).map((o) => Object.values(o));
+    return st;
+  }
+  return {
+    prepare,
+    async batch(stmts) {
+      const out = [];
+      for (const s of stmts || []) out.push(await prepare(s.__sql).bind(...(s.__params || [])).all());
+      return out;
+    },
+    async exec(sql) {
+      sqlite.exec(sql);
+      return { success: true };
+    },
+  };
+}
+
 async function cmdDev(args) {
   const { flags } = parseFlags(args);
   const proj = await loadProjectConfig();
@@ -566,6 +613,19 @@ async function cmdDev(args) {
   const devEnv = { ...(proj?.vars || {}) };
   for (const b of proj?.kv || []) devEnv[b.binding] = memKvClient(new Map());
   for (const b of proj?.r2 || []) devEnv[b.binding] = memR2Client(new Map());
+  if ((proj?.d1 || []).length) {
+    try {
+      const { DatabaseSync } = await import("node:sqlite");
+      for (const b of proj.d1) devEnv[b.binding] = memD1Client(new DatabaseSync(":memory:"));
+    } catch {
+      for (const b of proj.d1)
+        devEnv[b.binding] = {
+          prepare() {
+            throw new Error("D1 in dev needs Node's node:sqlite (Node 22.5+; run with a newer Node)");
+          },
+        };
+    }
+  }
 
   // 本番の native component は `--disable http` で **outbound egress を一切持たない**。
   // dev（Node）は既定で fetch できてしまい「dev では外部 API を叩けるが本番で落ちる」ズレを
