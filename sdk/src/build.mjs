@@ -101,7 +101,9 @@ export async function buildComponent({ entry, out, wit, world }) {
         `  }`,
         `  globalThis.process = globalThis.process || {};`,
         `  globalThis.process.env = env;`,
-        `  event.respondWith(app.fetch(request, env));`,
+        // Workers 互換: fetch(request, env, ctx)。ctx は no-op stub（waitUntil/passThroughOnException）。
+        `  const ctx = { waitUntil() {}, passThroughOnException() {} };`,
+        `  event.respondWith(app.fetch(request, env, ctx));`,
         `});`,
         "",
       ].join("\n"),

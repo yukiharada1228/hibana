@@ -413,6 +413,12 @@ fn build_router(state: AppState) -> Router {
             get(handlers::list_versions),
         )
         .route("/executions/{id}", get(handlers::get_execution))
+        // GET /components/{id}/versions/{version}/capabilities: 現在の承認 env 名 / egress 先を返す
+        // （M11-9。値は返さない。CLI が全置換 PUT 前にマージするための読み取り）。
+        .route(
+            "/components/{component_id}/versions/{version}/capabilities",
+            get(handlers::get_capabilities),
+        )
         // GET /usage: テナント利用量参照 (M5, §15 / §6.0)。principal.tenant_id を権威化し
         // cross-tenant path を持たない（/tenants/{id}/usage の IDOR 面を作らない）。
         .route("/usage", get(handlers::get_usage))

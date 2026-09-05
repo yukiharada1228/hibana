@@ -89,6 +89,95 @@ async function warmUp(cfg, token, name) {
   }
 }
 
+// ---- Workers 互換: wrangler.toml / wrangler.jsonc をプロジェクト設定として読む ----------
+function stripJsonComments(s) {
+  // ブロックコメントと行コメント（http:// のような `:` 直後の // は残す簡易ヒューリスティック）。
+  return s
+    .replace(/\/\*[\s\S]*?\*\//g, "")
+    .replace(/(^|[^:])\/\/.*$/gm, "$1");
+}
+
+async function loadProjectConfig() {
+  const files = [
+    "wrangler.toml",
+    "wrangler.jsonc",
+    "wrangler.json",
+    "hibana.toml",
+    "hibana.jsonc",
+    "hibana.json",
+  ];
+  for (const f of files) {
+    let text;
+    try {
+      text = await readFile(f, "utf8");
+    } catch {
+      continue;
+    }
+    let raw;
+    try {
+      if (f.endsWith(".toml")) {
+        const { parse } = await import("smol-toml");
+        raw = parse(text);
+      } else {
+        raw = JSON.parse(stripJsonComments(text));
+      }
+    } catch (e) {
+      die(`failed to parse ${f}: ${e.message || e}`);
+    }
+    const h = raw.hibana || {};
+    return {
+      file: f,
+      name: raw.name,
+      main: raw.main, // Workers: entry module
+      vars: raw.vars && typeof raw.vars === "object" ? raw.vars : {},
+      // hibana 固有（wrangler には無い）。
+      public: h.public ?? false,
+      egress: Array.isArray(h.egress) ? h.egress : [],
+      ingressDomain: h.ingress_domain,
+    };
+  }
+  return null;
+}
+
+// version の承認 env 名リストに names を **追加**（GET でマージ → PUT 全置換）。replace=true で全置換。
+async function grantEnvMerged(cfg, token, id, version, names, replace = false) {
+  let existing = [];
+  if (!replace) {
+    try {
+      const cur = await api(
+        cfg,
+        "GET",
+        `/components/${id}/versions/${version}/capabilities`,
+        { token },
+      );
+      existing = (cur && cur.env) || [];
+    } catch {}
+  }
+  const merged = [...new Set([...existing, ...names])];
+  await api(cfg, "PUT", `/components/${id}/versions/${version}/capabilities`, {
+    token,
+    json: { env: merged },
+  });
+  return merged;
+}
+
+// component の現在の active version 文字列を解決する（secret/config の自動 grant 用）。
+async function resolveActiveVersion(cfg, token, id) {
+  const list = await api(cfg, "GET", "/components", { token });
+  const arr = Array.isArray(list) ? list : list.components || [];
+  const comp = arr.find((c) => c.component_id === id);
+  const activeId = comp && comp.active_version_id;
+  if (!activeId) return null;
+  try {
+    const vs = await api(cfg, "GET", `/components/${id}/versions`, { token });
+    const varr = Array.isArray(vs) ? vs : vs.versions || [];
+    const hit = varr.find((v) => v.version_id === activeId);
+    return hit ? hit.version : null;
+  } catch {
+    return null;
+  }
+}
+
 async function api(cfg, method, path, { token, json, form } = {}) {
   const headers = {};
   if (token) headers["authorization"] = `Bearer ${token}`;
@@ -189,12 +278,20 @@ async function loadApp(entry) {
 // ---- commands -------------------------------------------------------------
 async function cmdDeploy(args) {
   const { flags } = parseFlags(args);
-  const entry = flags.entry || "src/index.ts";
-  const name = flags.name || "app";
-  const version = flags.version || "0.1.0";
+  // Workers 互換: フラグが無ければ wrangler.toml / wrangler.jsonc を読む。
+  const proj = await loadProjectConfig();
+  const entry = flags.entry || proj?.main || "src/index.ts";
+  const name = flags.name || proj?.name || "app";
+  // Workers 流儀: deploy ごとに新しい版を作る。明示指定が無ければ単調増加する版を採番
+  // （固定版だと再 deploy で "version already exists" になる）。semver の patch に unix 秒を使う。
+  const version = flags.version || `0.0.${Math.floor(Date.now() / 1000)}`;
+  const isPublic = flags.public || proj?.public || false;
   const cfg = config();
+  if (proj?.ingressDomain && !cfg.ingressDomain) cfg.ingressDomain = proj.ingressDomain;
 
-  console.log(bold(`\nDeploying ${name} → ${cfg.url}\n`));
+  console.log(bold(`\nDeploying ${name} → ${cfg.url}`));
+  if (proj) console.log(dim(`  (config: ${proj.file})`));
+  console.log("");
 
   step("Building TypeScript → WebAssembly Component");
   const work = await mkdtemp(join(tmpdir(), "hibana-deploy-"));
@@ -207,6 +304,20 @@ async function cmdDeploy(args) {
   step("Authenticating");
   const token = await login(cfg);
   const id = await ensureComponent(cfg, token, name);
+  // 前 active version の承認 env 名を引き継ぐ（redeploy で secret の grant を失わないため）。
+  let inheritedEnv = [];
+  const prevVersion = await resolveActiveVersion(cfg, token, id);
+  if (prevVersion) {
+    try {
+      const caps = await api(
+        cfg,
+        "GET",
+        `/components/${id}/versions/${prevVersion}/capabilities`,
+        { token },
+      );
+      inheritedEnv = (caps && caps.env) || [];
+    } catch {}
+  }
   stepDone();
 
   step(`Uploading version ${version}`);
@@ -234,8 +345,40 @@ async function cmdDeploy(args) {
   await warmUp(cfg, token, name);
   stepDone();
 
+  // Workers 互換: wrangler.toml の [vars] を config 値としてマージ設定。
+  const varNames = proj ? Object.keys(proj.vars) : [];
+  if (varNames.length) {
+    step(`Applying ${varNames.length} config var(s)`);
+    let env = {};
+    try {
+      const cur = await api(cfg, "GET", `/components/${id}/config`, { token });
+      if (cur && cur.env) env = { ...cur.env };
+    } catch {}
+    env = { ...env, ...proj.vars };
+    await api(cfg, "PUT", `/components/${id}/config`, { token, json: { env } });
+    stepDone();
+  }
+  // この version が読める env 名 = 引き継ぎ（前 version の secret 等）∪ 今回の config vars。
+  // 承認は per-version なので、新 version にも必ず付け直す（付けないと redeploy で読めなくなる）。
+  const grantNames = [...new Set([...inheritedEnv, ...varNames])];
+  if (grantNames.length) {
+    step(`Approving ${grantNames.length} env name(s)`);
+    await grantEnvMerged(cfg, token, id, version, grantNames, true);
+    stepDone();
+  }
+
+  // hibana 固有: egress allowlist を承認。
+  if (proj && proj.egress.length) {
+    step(`Approving egress (${proj.egress.length})`);
+    await api(cfg, "PUT", `/components/${id}/versions/${version}/capabilities/egress`, {
+      token,
+      json: { allow_outbound: proj.egress },
+    });
+    stepDone();
+  }
+
   let published = false;
-  if (flags.public) {
+  if (isPublic) {
     step("Publishing (public ingress)");
     await setIngress(cfg, token, name, true);
     published = true;
@@ -380,12 +523,33 @@ async function cmdDev(args) {
   });
 }
 
+function readStdin() {
+  return new Promise((res) => {
+    let d = "";
+    process.stdin.setEncoding("utf8");
+    process.stdin.on("data", (c) => (d += c));
+    process.stdin.on("end", () => res(d.replace(/\r?\n$/, "")));
+  });
+}
+
+// Workers 互換: `secret put <app> <NAME>`（値は stdin）/ `secret set <app> <NAME> <VALUE>`。
 async function cmdSecret(args) {
-  const [sub, name, key, ...rest] = args;
-  if (sub !== "set" || !name || !key)
-    die("usage: hibana secret set <app> <NAME> <VALUE>");
-  const value = rest.join(" ");
-  if (!value) die("secret value is empty");
+  const { pos } = parseFlags(args);
+  const [sub, name, key, ...rest] = pos;
+  if ((sub !== "set" && sub !== "put") || !name || !key)
+    die(
+      "usage: hibana secret put <app> <NAME>   (value from stdin)\n" +
+        "       hibana secret set <app> <NAME> <VALUE>",
+    );
+  let value;
+  if (sub === "put") {
+    value = process.stdin.isTTY ? "" : await readStdin();
+    if (!value)
+      die("empty value — pipe it:  echo -n <value> | hibana secret put <app> <NAME>");
+  } else {
+    value = rest.join(" ");
+    if (!value) die("secret value is empty");
+  }
   const cfg = config();
   const token = await login(cfg);
   const id = await resolveComponentId(cfg, token, name);
@@ -395,57 +559,65 @@ async function cmdSecret(args) {
     json: { value },
   });
   ok(`secret ${bold(key)} set on ${name} (version ${r.version})`);
-  console.log(
-    dim(
-      `  Approve it so the app can read it:  hibana grant-env ${name} <version> ${key}`,
-    ),
-  );
+  // Workers 互換: すぐ使えるよう active version へ自動承認（best-effort）。
+  const v = await resolveActiveVersion(cfg, token, id);
+  if (v) {
+    await grantEnvMerged(cfg, token, id, v, [key]);
+    console.log(dim(`  granted on ${name}@${v} → read via c.env.${key}`));
+  } else {
+    console.log(dim(`  approve it:  hibana grant-env ${name} <version> ${key}`));
+  }
 }
 
 async function cmdConfig(args) {
-  const [sub, name, ...pairs] = args;
+  const { pos } = parseFlags(args);
+  const [sub, name, ...pairs] = pos;
   if (sub !== "set" || !name || pairs.length === 0)
     die("usage: hibana config set <app> KEY=VALUE [KEY=VALUE ...]");
   const cfg = config();
   const token = await login(cfg);
   const id = await resolveComponentId(cfg, token, name);
   if (!id) die(`no such component: ${name}`);
-  // 既存の config を GET してマージ（PUT は全置換なので消さないため）。
+  // 既存 config を GET してマージ（PUT は全置換なので消さない）。
   let env = {};
   try {
     const cur = await api(cfg, "GET", `/components/${id}/config`, { token });
     if (cur && cur.env) env = { ...cur.env };
   } catch {}
+  const setNames = [];
   for (const p of pairs) {
     const i = p.indexOf("=");
     if (i <= 0) die(`bad pair (want KEY=VALUE): ${p}`);
     env[p.slice(0, i)] = p.slice(i + 1);
+    setNames.push(p.slice(0, i));
   }
   await api(cfg, "PUT", `/components/${id}/config`, { token, json: { env } });
-  ok(`config set on ${name}: ${bold(pairs.map((p) => p.split("=")[0]).join(", "))}`);
-  console.log(
-    dim(
-      `  Approve names so the app can read them:  hibana grant-env ${name} <version> ${Object.keys(env).join(" ")}`,
-    ),
-  );
+  ok(`config set on ${name}: ${bold(setNames.join(", "))}`);
+  const v = await resolveActiveVersion(cfg, token, id);
+  if (v) {
+    await grantEnvMerged(cfg, token, id, v, setNames);
+    console.log(dim(`  granted on ${name}@${v} → read via c.env`));
+  } else {
+    console.log(dim(`  approve:  hibana grant-env ${name} <version> ${setNames.join(" ")}`));
+  }
 }
 
-// admin: この version が受け取れる env 名を承認する（M7b/M9: 値の設定=deploy と名前の承認=admin を分離）。
-// capabilities.env は**全置換**なので、注入したい名前を一度に全部列挙すること。
+// admin: この version が受け取れる env 名を承認する（M7b/M9: 値の設定と名前の承認を分離）。
+// 既定は **追加**（GET でマージ）。--replace で全置換。
 async function cmdGrantEnv(args) {
-  const { pos } = parseFlags(args);
+  const { flags, pos } = parseFlags(args);
   const [name, version, ...names] = pos;
   if (!name || !version || names.length === 0)
-    die("usage: hibana grant-env <app> <version> NAME [NAME ...]   (all-replace)");
+    die("usage: hibana grant-env <app> <version> NAME [NAME ...] [--replace]");
   const cfg = config();
   const token = await login(cfg);
   const id = await resolveComponentId(cfg, token, name);
   if (!id) die(`no such component: ${name}`);
-  await api(cfg, "PUT", `/components/${id}/versions/${version}/capabilities`, {
-    token,
-    json: { env: names },
-  });
-  ok(`granted env on ${name}@${version}: ${bold(names.join(", "))}`);
+  const merged = await grantEnvMerged(cfg, token, id, version, names, !!flags.replace);
+  ok(
+    `granted env on ${name}@${version}: ${bold(merged.join(", "))}` +
+      (flags.replace ? dim(" (replaced)") : ""),
+  );
   console.log(dim(`  Read them in Hono via c.env.NAME (or process.env.NAME).`));
 }
 
@@ -481,16 +653,16 @@ async function cmdLogs(args) {
 function usage() {
   console.log(
     `${bold("hibana")} — write a Hono app, ship it as a WebAssembly Component\n\n` +
+      `  Reads wrangler.toml / wrangler.jsonc (name, main, [vars]) when flags are omitted.\n\n` +
       `  hibana deploy    [--entry src/index.ts] [--name <app>] [--version 0.1.0] [--public]\n` +
-      `  hibana dev       [--entry src/index.ts] [--port 8787]\n` +
+      `  hibana dev       [--entry src/index.ts] [--port 8787] [--allow-egress]\n` +
       `  hibana invoke    <app> [METHOD] [PATH] [--body '<str>'] [--header k:v]\n` +
-      `  hibana publish   <app>        make reachable at <app>.<tenant>.<base>\n` +
-      `  hibana unpublish <app>        disable public ingress\n` +
-      `  hibana secret    set <app> <NAME> <VALUE>\n` +
+      `  hibana publish   <app>   |   hibana unpublish <app>\n` +
+      `  hibana secret    put <app> <NAME>   (stdin)  |  set <app> <NAME> <VALUE>\n` +
       `  hibana config    set <app> KEY=VALUE ...\n` +
-      `  hibana grant-env <app> <version> NAME ...   approve env names the app can read (c.env)\n` +
+      `  hibana grant-env <app> <version> NAME ... [--replace]   approve names → c.env\n` +
       `  hibana rollback  <app> [version]\n` +
-      `  hibana logs      <execution_id>\n`,
+      `  hibana logs|tail <execution_id>\n`,
   );
 }
 
@@ -507,7 +679,8 @@ async function main() {
       case "grant-env": return await cmdGrantEnv(rest);
       case "secret": return await cmdSecret(rest);
       case "rollback": return await cmdRollback(rest);
-      case "logs": return await cmdLogs(rest);
+      case "logs":
+      case "tail": return await cmdLogs(rest); // `tail` = wrangler 互換エイリアス
       case undefined:
       case "help":
       case "--help":

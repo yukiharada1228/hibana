@@ -27,6 +27,46 @@ content-type: text/plain;charset=UTF-8
 Hello from Hono on Hibana 🔥
 ```
 
+## Cloudflare Workers compatibility
+
+Hibana aims to feel like Wrangler. A `wrangler.toml` (or `wrangler.jsonc`) drives
+`hibana deploy` with no flags:
+
+```toml
+name = "my-worker"
+main = "src/index.ts"
+compatibility_date = "2024-01-01"   # accepted, no-op (single runtime)
+
+[vars]
+GREETING = "Hello"
+
+[hibana]                            # hibana-specific (not in wrangler.toml)
+public = true
+egress = ["api.example.com:443"]
+```
+
+```console
+$ hibana deploy        # reads wrangler.toml: build → upload → vars → egress → publish
+```
+
+Both worker shapes work — Hono `export default app` **and** plain
+`export default { fetch(request, env, ctx) }`. Bindings arrive as `env` /
+`c.env` (and `process.env`); `ctx.waitUntil` is a no-op stub.
+
+| Wrangler | Hibana | Notes |
+|---|---|---|
+| `wrangler deploy` | `hibana deploy` | reads `wrangler.toml`; auto-versions each deploy |
+| `wrangler dev` | `hibana dev` | faithful preview (see below) |
+| `wrangler secret put NAME` | `hibana secret put <app> NAME` | value from stdin; auto-approved |
+| `wrangler tail` | `hibana tail <execution_id>` | single execution (no live stream yet) |
+| `wrangler rollback` | `hibana rollback <app>` | one-click to previous version |
+| `[vars]` | `[vars]` | applied + approved on deploy |
+| `env.MY_VAR` / secrets | `c.env.MY_VAR` / `env.MY_VAR` | ✅ |
+| `[[kv_namespaces]]`, D1, R2, DO, Queues | — | ❌ not available (no backing stores yet) |
+
+Secrets set with `hibana secret put` persist across redeploys (each new version
+inherits the previous version's approved names).
+
 ## How it works
 
 Your Hono app is compiled to a **native `wasi:http` component** — it exports
