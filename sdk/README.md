@@ -65,7 +65,35 @@ Both worker shapes work — Hono `export default app` **and** plain
 | `[[kv_namespaces]]` → `env.KV.get/put/delete/list` | ✅ | Postgres-backed, tenant-scoped |
 | `[[r2_buckets]]` → `env.BUCKET.get/put/head/delete/list` | ✅ | MinIO/S3-backed (worker stays keyless) |
 | `[[d1_databases]]` → `env.DB.prepare/bind/all/first/run/batch/exec` | ✅ | real SQLite, per-tenant, single-writer |
-| Durable Objects, Queues | — | ❌ not available yet |
+| `[[queues.producers]]` / `[[queues.consumers]]` → `env.Q.send` + `queue()` | ✅ | on the JetStream pipeline (retries/DLQ) |
+| Durable Objects | — | ❌ not available yet |
+
+### Queues
+
+```toml
+[[queues.producers]]
+binding = "MY_QUEUE"
+queue = "tasks"
+[[queues.consumers]]
+queue = "tasks"
+```
+
+```ts
+const app = new Hono();
+app.post("/enqueue", async (c) => { await c.env.MY_QUEUE.send({ hello: "world" }); return c.text("queued"); });
+export default {
+  fetch: (req, env, ctx) => app.fetch(req, env, ctx),
+  async queue(batch, env) {
+    for (const m of batch.messages) console.log(m.body); // process; throw to retry the whole batch
+  },
+};
+```
+
+`send` / `sendBatch` enqueue messages as **consumer invocations on the same
+JetStream pipeline** that powers HTTP/cron — so retries, backoff, and the
+dead-letter path come for free. A consumer that throws fails the execution and is
+retried (then dead-lettered after `MAX_DELIVER`). `hibana dev` loops producers
+straight into your `queue()` handler in-process.
 
 ### D1
 

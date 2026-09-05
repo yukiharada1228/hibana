@@ -19,7 +19,11 @@ use faas_shared::FaasError;
 const JOB_TOKEN_HEADER: &str = "x-hibana-job-token";
 
 /// job_token を検証してテナントを得る（claim 由来。exp + テナント停止も確認）。
-async fn tenant_from_token(state: &AppState, headers: &HeaderMap) -> Result<String, AppError> {
+/// M15: queue の内部エンドポイントでも再利用するため pub(crate)。
+pub(crate) async fn tenant_from_token(
+    state: &AppState,
+    headers: &HeaderMap,
+) -> Result<String, AppError> {
     let token = headers
         .get(JOB_TOKEN_HEADER)
         .and_then(|v| v.to_str().ok())

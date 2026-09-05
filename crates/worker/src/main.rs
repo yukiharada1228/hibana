@@ -224,6 +224,8 @@ struct HostState {
 const KV_INTERNAL_HOST: &str = "kv.hibana.internal";
 /// M14: D1 バインディングの内部ホスト名。
 const D1_INTERNAL_HOST: &str = "d1.hibana.internal";
+/// M15: Queues producer の内部ホスト名。
+const QUEUE_INTERNAL_HOST: &str = "queue.hibana.internal";
 /// M13: R2 バインディングの内部ホスト名（同じく send_request で横取り）。
 const R2_INTERNAL_HOST: &str = "r2.hibana.internal";
 /// M13: R2 オブジェクトの上限（MVP は Postgres bytea 保持のため控えめに）。
@@ -282,6 +284,15 @@ impl wasmtime_wasi_http::WasiHttpView for HostState {
             let sessions = Arc::clone(&self.d1_sessions);
             let handle = wasmtime_wasi::runtime::spawn(async move {
                 Ok(handle_d1_request(pool, tenant, sessions, request).await)
+            });
+            return Ok(wasmtime_wasi_http::types::HostFutureIncomingResponse::pending(handle));
+        }
+        if request.uri().host() == Some(QUEUE_INTERNAL_HOST) {
+            let http = self.http.clone();
+            let cp = self.cp_internal_url.clone();
+            let token = self.job_token.clone();
+            let handle = wasmtime_wasi::runtime::spawn(async move {
+                Ok(handle_queue_request(http, cp, token, request).await)
             });
             return Ok(wasmtime_wasi_http::types::HostFutureIncomingResponse::pending(handle));
         }
@@ -3366,6 +3377,54 @@ async fn handle_d1_request(
         Ok(v) => kv_response(200, "application/json", serde_json::to_vec(&v).unwrap_or_default()),
         Err(e) => d1_err(400, &e),
     }
+}
+
+// ============================================================================
+// M15: Queues producer。guest の `env.QUEUE.send()`（queue.hibana.internal への fetch）を
+// CP 内部 `/internal/queue/send` へ中継する（consumer invoke の enqueue は CP が行う）。
+// ============================================================================
+async fn handle_queue_request(
+    http: reqwest::Client,
+    cp_url: String,
+    job_token: String,
+    request: hyper::Request<HyperOutgoingBody>,
+) -> Result<
+    wasmtime_wasi_http::types::IncomingResponse,
+    wasmtime_wasi_http::bindings::http::types::ErrorCode,
+> {
+    use wasmtime_wasi_http::bindings::http::types::ErrorCode;
+    let neterr = |_e| ErrorCode::InternalError(Some("queue: control-plane call failed".to_string()));
+
+    let (parts, body) = request.into_parts();
+    let q = parts.uri.query().map(parse_query).unwrap_or_default();
+    let queue = q.get("q").cloned().unwrap_or_default();
+    if queue.is_empty() {
+        return kv_response(400, "text/plain", b"missing q".to_vec());
+    }
+    let body_bytes = body
+        .collect()
+        .await
+        .map_err(|_| ErrorCode::InternalError(Some("queue: read body".into())))?
+        .to_bytes();
+    let payload: serde_json::Value =
+        serde_json::from_slice(&body_bytes).unwrap_or(serde_json::json!({ "messages": [] }));
+    let messages = payload
+        .get("messages")
+        .cloned()
+        .unwrap_or(serde_json::Value::Array(vec![]));
+
+    let send_body = serde_json::json!({ "queue": queue, "messages": messages });
+    let resp = http
+        .post(format!("{}/internal/queue/send", cp_url.trim_end_matches('/')))
+        .header("x-hibana-job-token", &job_token)
+        .json(&send_body)
+        .send()
+        .await
+        .map_err(neterr)?;
+    let status = resp.status().as_u16();
+    let rbody = resp.bytes().await.map_err(neterr)?.to_vec();
+    let out_status = if status < 300 { 200 } else { status };
+    kv_response(out_status, "application/json", rbody)
 }
 
 /// `hyper::Response` → response エンベロープ JSON バイト列。

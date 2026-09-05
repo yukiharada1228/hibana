@@ -53,7 +53,7 @@ function run(cmd, args) {
   });
 }
 
-export async function buildComponent({ entry, out, wit, world, kv, r2, d1 }) {
+export async function buildComponent({ entry, out, wit, world, kv, r2, d1, queueProducers: qp }) {
   wit = wit || DEFAULT_WIT;
   world = world || "http";
   // kv: [{ binding, id }]（wrangler の kv_namespaces）。binding→namespace を shim に焼き込む。
@@ -62,6 +62,8 @@ export async function buildComponent({ entry, out, wit, world, kv, r2, d1 }) {
   const r2Bindings = Array.isArray(r2) ? r2 : [];
   // d1: [{ binding, database_name }]（wrangler の d1_databases）。
   const d1Bindings = Array.isArray(d1) ? d1 : [];
+  // queues.producers: [{ binding, queue }]（wrangler の [[queues.producers]]）。
+  const queueProducers = Array.isArray(qp) ? qp : [];
   const entryAbs = resolve(process.cwd(), entry);
   const outAbs = resolve(process.cwd(), out);
   const witAbs = resolve(process.cwd(), wit);
@@ -115,10 +117,38 @@ export async function buildComponent({ entry, out, wit, world, kv, r2, d1 }) {
         `  for (const [__b, __bk] of __R2) env[__b] = __r2Client(__bk);`,
         `  const __D1 = ${JSON.stringify(d1Bindings.map((b) => [b.binding, b.database_name || b.binding]))};`,
         `  for (const [__b, __dn] of __D1) env[__b] = __d1Client(__dn);`,
+        `  const __Q = ${JSON.stringify(queueProducers.map((b) => [b.binding, b.queue || b.binding]))};`,
+        `  for (const [__b, __qn] of __Q) env[__b] = __queueClient(__qn);`,
         // Workers 互換: fetch(request, env, ctx)。ctx は no-op stub（waitUntil/passThroughOnException）。
         `  const ctx = { waitUntil() {}, passThroughOnException() {} };`,
+        // M15: queue consumer 配送は POST /__hibana/queue。app.queue(batch) へ dispatch する。
+        // 失敗（throw）は respondWith を reject させ、実行失敗＝JetStream が再試行/DLQ する。
+        `  const __url = new URL(request.url);`,
+        `  if (__url.pathname === "/__hibana/queue") {`,
+        `    event.respondWith((async () => {`,
+        `      if (typeof app.queue !== "function") return new Response("no queue() handler", { status: 500 });`,
+        `      const p = await request.json();`,
+        `      const messages = (p.messages || []).map((body, i) => ({ id: String(i), timestamp: new Date(), attempts: 1, body, ack() {}, retry() {} }));`,
+        `      const batch = { queue: p.queue, messages, ackAll() {}, retryAll() {} };`,
+        `      await app.queue(batch, env, ctx);`,
+        `      return new Response("ok");`,
+        `    })());`,
+        `    return;`,
+        `  }`,
         `  event.respondWith(app.fetch(request, env, ctx));`,
         `});`,
+        // Queues producer client（send / sendBatch）。
+        `function __queueClient(queue) {`,
+        `  const e = encodeURIComponent;`,
+        `  async function post(messages) {`,
+        `    const r = await fetch("http://queue.hibana.internal/send?q=" + e(queue), { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ messages }) });`,
+        `    if (!r.ok) throw new Error("queue send failed: " + r.status);`,
+        `  }`,
+        `  return {`,
+        `    async send(body) { await post([body]); },`,
+        `    async sendBatch(msgs) { await post((msgs || []).map((m) => (m && m.body !== undefined) ? m.body : m)); },`,
+        `  };`,
+        `}`,
         // Workers KV 互換の最小 client（get/put/delete/list）。
         `function __kvClient(ns) {`,
         `  const base = "http://kv.hibana.internal/v1/kv";`,

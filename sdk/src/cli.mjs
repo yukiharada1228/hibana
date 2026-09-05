@@ -148,6 +148,15 @@ async function loadProjectConfig() {
             .filter((b) => b && b.binding)
             .map((b) => ({ binding: b.binding, database_name: b.database_name || b.binding }))
         : [],
+      // Workers: [[queues.producers]] { binding, queue } / [[queues.consumers]] { queue }。
+      queueProducers: Array.isArray(raw.queues?.producers)
+        ? raw.queues.producers
+            .filter((p) => p && p.binding)
+            .map((p) => ({ binding: p.binding, queue: p.queue || p.binding }))
+        : [],
+      queueConsumers: Array.isArray(raw.queues?.consumers)
+        ? raw.queues.consumers.filter((c) => c && c.queue).map((c) => c.queue)
+        : [],
       // hibana 固有（wrangler には無い）。
       public: h.public ?? false,
       egress: Array.isArray(h.egress) ? h.egress : [],
@@ -320,6 +329,7 @@ async function cmdDeploy(args) {
     kv: proj?.kv || [],
     r2: proj?.r2 || [],
     d1: proj?.d1 || [],
+    queueProducers: proj?.queueProducers || [],
   });
   const wasm = await readFile(outWasm);
   await rm(work, { recursive: true, force: true });
@@ -388,6 +398,16 @@ async function cmdDeploy(args) {
   if (grantNames.length) {
     step(`Approving ${grantNames.length} env name(s)`);
     await grantEnvMerged(cfg, token, id, version, grantNames, true);
+    stepDone();
+  }
+
+  // M15: queue consumer 登録（[[queues.consumers]]）。
+  if (proj && proj.queueConsumers && proj.queueConsumers.length) {
+    step(`Registering ${proj.queueConsumers.length} queue consumer(s)`);
+    await api(cfg, "PUT", `/components/${id}/queue-consumers`, {
+      token,
+      json: { queues: proj.queueConsumers },
+    });
     stepDone();
   }
 
@@ -625,6 +645,26 @@ async function cmdDev(args) {
           },
         };
     }
+  }
+  // dev の Queues producer: consumer が同じ app なら **loopback** で app.queue を直接呼ぶ
+  // （ローカルで producer→consumer を丸ごと試せる。非永続・即時）。
+  const devCtx = { waitUntil() {}, passThroughOnException() {} };
+  const toBatch = (queue, bodies) => ({
+    queue,
+    messages: bodies.map((body, i) => ({ id: String(i), timestamp: new Date(), attempts: 1, body, ack() {}, retry() {} })),
+    ackAll() {},
+    retryAll() {},
+  });
+  for (const p of proj?.queueProducers || []) {
+    devEnv[p.binding] = {
+      async send(body) {
+        if (typeof app.queue === "function") await app.queue(toBatch(p.queue, [body]), devEnv, devCtx);
+      },
+      async sendBatch(msgs) {
+        const bodies = (msgs || []).map((m) => (m && m.body !== undefined ? m.body : m));
+        if (typeof app.queue === "function") await app.queue(toBatch(p.queue, bodies), devEnv, devCtx);
+      },
+    };
   }
 
   // 本番の native component は `--disable http` で **outbound egress を一切持たない**。

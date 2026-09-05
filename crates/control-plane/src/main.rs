@@ -20,6 +20,7 @@ mod enqueue;
 mod error;
 mod extract;
 mod handlers;
+mod handlers_queue;
 mod handlers_r2;
 mod handlers_secrets;
 mod ingress;
@@ -401,6 +402,8 @@ fn build_internal_router(state: AppState) -> Router {
                 .layer(axum::extract::DefaultBodyLimit::max(32 * 1024 * 1024)),
         )
         .route("/internal/r2/list", get(handlers_r2::list_objects))
+        // M15: producer からのメッセージを consumer invoke として enqueue する（internal のみ）。
+        .route("/internal/queue/send", post(handlers_queue::queue_send))
         .with_state(state)
 }
 
@@ -485,6 +488,11 @@ fn build_router(state: AppState) -> Router {
         .route(
             "/components/{component_id}/ingress",
             put(handlers::set_component_ingress),
+        )
+        // M15: queue consumer 登録（deploy が [[queues.consumers]] を反映）。
+        .route(
+            "/components/{component_id}/queue-consumers",
+            put(handlers_queue::register_consumers),
         )
         // POST /cron-jobs: Cron ジョブ登録 (M6b, §15。component ライフサイクル相当の Deploy スコープ)。
         .route("/cron-jobs", post(handlers::create_cron_job))
