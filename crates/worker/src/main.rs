@@ -197,10 +197,14 @@ struct HostState {
     table: ResourceTable,
     limits: MeteredLimits,
     // M11 (§4.2): JS/Hono Component が Request/Response（= wasi:http/types のリソース）を
-    // 扱えるようにするための HTTP コンテキスト。**types を提供するだけ**で、outgoing-handler
-    // による egress は M9c の socket_addr_check の外にある別経路なので、検証で
-    // `wasi:http/outgoing-handler` の import を承認しないことで到達不能に保つ（下記参照）。
+    // 扱えるようにするための HTTP コンテキスト。
     http_ctx: wasmtime_wasi_http::WasiHttpCtx,
+    // M11-8 (§4.4): `wasi:http/outgoing-handler`（fetch）の egress allowlist。
+    // 解決済み `host:port`（SocketAddr）の集合。**空 = egress 全拒否**（deny-by-default）。
+    // `WasiHttpView::send_request` をこの集合で gate する（下記実装参照）。wasi:sockets 側の
+    // `socket_addr_check` と同じ M9c モデルを wasi:http にも適用し、宛先を承認済み IP に限定＋
+    // SSRF hard-deny を最優先する。
+    allowed_addrs: Arc<std::collections::HashSet<std::net::SocketAddr>>,
 }
 
 // wasmtime-wasi 29: `WasiView` が `ctx()` と `table()` の両方を提供する。
@@ -222,6 +226,21 @@ impl wasmtime_wasi_http::WasiHttpView for HostState {
 
     fn table(&mut self) -> &mut ResourceTable {
         &mut self.table
+    }
+
+    // M11-8 (§4.4): outgoing HTTP（fetch）を allowlist で gate する。既定の send_request は
+    // `TcpStream::connect(authority)` で **socket_addr_check を通らず** 任意の宛先へ出てしまう
+    // （SSRF 穴）。ここで override し、宛先を「承認済みかつ hard-deny でない解決済み IP」に限定する。
+    fn send_request(
+        &mut self,
+        request: hyper::Request<wasmtime_wasi_http::body::HyperOutgoingBody>,
+        config: wasmtime_wasi_http::types::OutgoingRequestConfig,
+    ) -> wasmtime_wasi_http::HttpResult<wasmtime_wasi_http::types::HostFutureIncomingResponse> {
+        let allowed = Arc::clone(&self.allowed_addrs);
+        let handle = wasmtime_wasi::runtime::spawn(async move {
+            Ok(gated_send_request(request, config, allowed).await)
+        });
+        Ok(wasmtime_wasi_http::types::HostFutureIncomingResponse::pending(handle))
     }
 }
 
@@ -2032,8 +2051,11 @@ impl Worker {
         // 全 egress を塞いでいる。したがって allowlist が空のときは**ネットワークを一切触らない**
         // （builder を素のままにして deny-all を維持する）。非空のときだけ TCP を開け、
         // socket_addr_check で「解決済み allowlist に一致し、かつ hard-deny でない」宛先だけ通す。
-        if !allowed_addrs.is_empty() {
-            let allowed = std::sync::Arc::new(allowed_addrs);
+        // M11-8: 解決済み allowlist を Arc で 1 つ持ち、wasi:sockets（socket_addr_check）と
+        // wasi:http（HostState.send_request）の**両 egress 経路で同じ集合を使う**。空 = 両方 deny。
+        let allowed_arc = std::sync::Arc::new(allowed_addrs);
+        if !allowed_arc.is_empty() {
+            let allowed = std::sync::Arc::clone(&allowed_arc);
             wasi_builder.allow_tcp(true);
             // UDP は用途が無く攻撃面だけ増えるので開けない。
             wasi_builder.allow_udp(false);
@@ -2063,6 +2085,7 @@ impl Worker {
             table: ResourceTable::new(),
             limits: metered_limits,
             http_ctx: wasmtime_wasi_http::WasiHttpCtx::new(),
+            allowed_addrs: allowed_arc,
         };
 
         let mut store = Store::new(&self.engine, host);
@@ -2659,6 +2682,124 @@ fn envelope_to_request(input: &[u8]) -> anyhow::Result<hyper::Request<ReqBody>> 
     builder
         .body(body)
         .map_err(|e| anyhow!("failed to build request: {e}"))
+}
+
+/// M11-8 (§4.4): `wasi:http/outgoing-handler`（guest の fetch）を allowlist で gate して送る。
+///
+/// **セキュリティ要点**: 既定の `default_send_request` は `TcpStream::connect(authority)` で
+/// socket_addr_check を通らず任意宛先へ出てしまう。ここでは M9c と同じモデルで gate する:
+///  1. `allowed`（解決済み承認先 host:port）が空なら **全拒否**（deny-by-default）。
+///  2. 宛先ホストを自分で解決し、各 IP を **hard-deny 最優先**（private/loopback/metadata 等）で
+///     落とし、承認集合に一致する IP だけを選ぶ（DNS rebinding 対策: 承認済み IP に固定接続）。
+///  3. reqwest の `resolve(host, ip)` でその **確定 IP に固定**して接続する（SNI/Host は元のホスト名の
+///     ままなので TLS も成立）。任意宛先へは出られない。
+/// 本体は簡潔さのためバッファリングする（typical な API 呼び出し向け。巨大ストリームは非対象）。
+async fn gated_send_request(
+    request: hyper::Request<HyperOutgoingBody>,
+    config: wasmtime_wasi_http::types::OutgoingRequestConfig,
+    allowed: Arc<std::collections::HashSet<std::net::SocketAddr>>,
+) -> Result<wasmtime_wasi_http::types::IncomingResponse, wasmtime_wasi_http::bindings::http::types::ErrorCode>
+{
+    use wasmtime_wasi_http::bindings::http::types::ErrorCode;
+
+    // 1. deny-by-default。
+    if allowed.is_empty() {
+        return Err(ErrorCode::HttpRequestDenied);
+    }
+
+    let (parts, body) = request.into_parts();
+    let use_tls = config.use_tls;
+    let host = match parts.uri.host() {
+        Some(h) => h.to_string(),
+        None => return Err(ErrorCode::HttpRequestUriInvalid),
+    };
+    let port = parts
+        .uri
+        .port_u16()
+        .unwrap_or(if use_tls { 443 } else { 80 });
+
+    // 2. 解決 → hard-deny 除外 → 承認済み IP を 1 つ選ぶ。
+    let mut pinned: Option<std::net::SocketAddr> = None;
+    match tokio::net::lookup_host((host.as_str(), port)).await {
+        Ok(addrs) => {
+            for addr in addrs {
+                if faas_shared::egress::is_hard_denied(addr.ip()) {
+                    continue;
+                }
+                if allowed.contains(&addr) {
+                    pinned = Some(addr);
+                    break;
+                }
+            }
+        }
+        Err(_) => return Err(ErrorCode::HttpRequestDenied),
+    }
+    let pinned = match pinned {
+        Some(a) => a,
+        // 承認集合に一致する到達可能 IP が無い = 拒否。
+        None => return Err(ErrorCode::HttpRequestDenied),
+    };
+
+    // 3. リクエスト本体をバッファ。
+    let body_bytes = body
+        .collect()
+        .await
+        .map_err(|_| ErrorCode::HttpRequestBodySize(None))?
+        .to_bytes();
+
+    // 4. reqwest で **確定 IP に固定**して送る（TLS は reqwest/rustls が処理。SNI=ホスト名）。
+    let scheme = if use_tls { "https" } else { "http" };
+    let path = parts
+        .uri
+        .path_and_query()
+        .map(|p| p.as_str())
+        .unwrap_or("/");
+    let url = format!("{scheme}://{host}:{port}{path}");
+    let client = reqwest::Client::builder()
+        .resolve(&host, pinned)
+        .connect_timeout(config.connect_timeout)
+        .build()
+        .map_err(|e| ErrorCode::InternalError(Some(format!("client build: {e}"))))?;
+
+    let mut rb = client
+        .request(parts.method.clone(), url.as_str())
+        .body(body_bytes.to_vec());
+    for (k, v) in parts.headers.iter() {
+        // Host は reqwest が URL から付ける。二重指定を避ける。
+        if k == hyper::header::HOST {
+            continue;
+        }
+        rb = rb.header(k.clone(), v.clone());
+    }
+    let resp = rb
+        .send()
+        .await
+        .map_err(|e| ErrorCode::InternalError(Some(format!("egress send failed: {e}"))))?;
+
+    // 5. reqwest レスポンス → hyper::Response<HyperIncomingBody>（バッファ）。
+    let status = resp.status();
+    let headers = resp.headers().clone();
+    let resp_body = resp
+        .bytes()
+        .await
+        .map_err(|_| ErrorCode::HttpResponseBodySize(None))?;
+
+    let mut builder = hyper::Response::builder().status(status);
+    if let Some(h) = builder.headers_mut() {
+        *h = headers;
+    }
+    let hy_body = Full::new(resp_body)
+        .map_err(|e| match e {})
+        .boxed();
+    let resp = builder
+        .body(hy_body)
+        .map_err(|e| ErrorCode::InternalError(Some(format!("resp build: {e}"))))?;
+
+    Ok(wasmtime_wasi_http::types::IncomingResponse {
+        resp,
+        worker: None,
+        between_bytes_timeout: config.between_bytes_timeout,
+    })
 }
 
 /// `hyper::Response` → response エンベロープ JSON バイト列。

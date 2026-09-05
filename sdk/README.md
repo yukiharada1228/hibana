@@ -43,9 +43,20 @@ world http {
 [StarlingMonkey](https://github.com/bytecodealliance/StarlingMonkey) wires the
 `fetch` event straight to `incoming-handler`, so the platform's worker hands your
 app a real `Request` and gets a real `Response` back — **no adapter, no JSON
-envelope, no base64** at the app layer. `--disable http` drops
-`wasi:http/outgoing-handler`, so a deployed component **cannot** make outbound
-requests through `wasi:http` — egress stays behind the platform's M9c allowlist.
+envelope, no base64** at the app layer.
+
+**Outbound `fetch` (egress)** is deny-by-default and gated by an admin-approved
+allowlist (the M9c model). A deployed app can only reach hosts explicitly approved
+for its version; everything else — and any private/loopback/metadata IP (SSRF
+hard-deny) — is refused. Approve hosts with:
+
+```
+PUT /components/{id}/versions/{version}/capabilities/egress
+    {"allow_outbound": ["api.example.com:443"]}
+```
+
+With no approved hosts, `fetch()` fails (matching `hibana dev`, which blocks it
+unless you pass `--allow-egress`).
 
 > The worker runs both worlds: native `wasi:http` components (Hono, and any
 > language's HTTP framework) and the older bytes-in/bytes-out `handle` world used

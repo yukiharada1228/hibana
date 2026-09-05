@@ -85,13 +85,16 @@ const BASELINE_APPROVED_PREFIXES: &[&str] = &[
     //     ランタイムが担保する（chaos_v1 で「アップロードは通るが実行時に fs は全拒否」を実測固定する）。
     // これは「真の防御は空の WasiCtx」という M9 偵察の結論に沿った設計である。
     "wasi:filesystem/",
-    // M11 (§4.2): `wasi:http/types` **だけ**を承認する。JS/Hono Component は Request/Response を
-    // wasi:http/types のリソースとして扱うため、これが無いと JS を一切デプロイできない。
-    // **`wasi:http/outgoing-handler` は承認しない**（末尾スラッシュ無しの `wasi:http/types` 接頭辞は
-    // outgoing-handler にマッチしない）。types は in-memory の Request/Response 機構のみで、
-    // 実際の egress は outgoing-handler だが、それを import できない = 呼べないので、
-    // wasi:http 経由の egress 抜け道は生じない（egress は M9c の allowlist のまま）。
+    // M11 (§4.2): `wasi:http/types`。JS/Hono Component は Request/Response を wasi:http/types の
+    // リソースとして扱うため必須。
     "wasi:http/types",
+    // M11-8 (§4.4): `wasi:http/outgoing-handler`（guest の fetch = egress）。
+    // **import は許すが実際の egress は runtime で gate する** —— これは `wasi:sockets/` と同じ
+    // M9c モデル（「import できる」ことと「到達できる」ことを分離）。worker は
+    // `WasiHttpView::send_request` を per-component の allowlist（解決済み host:port）で gate し、
+    // 空 allowlist = 全拒否（deny-by-default）、非空でも SSRF hard-deny を最優先して承認済み IP に
+    // 固定接続する。したがってこの import を baseline で許しても egress の抜け道にはならない。
+    "wasi:http/outgoing-handler",
 ];
 
 /// admin が承認した capability 集合 (§4.4)。WIT import を strict matching する際の権威。

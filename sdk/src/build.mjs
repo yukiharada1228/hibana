@@ -94,7 +94,10 @@ export async function buildComponent({ entry, out, wit, world }) {
       logLevel: "warning",
     });
 
-    // 3. jco componentize（--disable http: egress を落とす。incoming は残る）。
+    // 3. jco componentize。
+    //    M11-8 (§4.4): `--disable http` は付けない —— outgoing-handler（guest の fetch）を残す。
+    //    egress の抑止はビルド時ではなく **runtime の allowlist**（worker の send_request gate）で
+    //    行う。allowlist が空なら全拒否なので、既定では従来どおり fetch は不可（deny-by-default）。
     const jco = resolve(SDK_ROOT, "node_modules", ".bin", "jco");
     await run(jco, [
       "componentize",
@@ -103,8 +106,6 @@ export async function buildComponent({ entry, out, wit, world }) {
       witAbs,
       "--world-name",
       world,
-      "--disable",
-      "http",
       "--out",
       outAbs,
     ]);
