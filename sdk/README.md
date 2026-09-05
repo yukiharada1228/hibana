@@ -63,7 +63,7 @@ Both worker shapes work — Hono `export default app` **and** plain
 | `[vars]` | `[vars]` | applied + approved on deploy |
 | `env.MY_VAR` / secrets | `c.env.MY_VAR` / `env.MY_VAR` | ✅ |
 | `[[kv_namespaces]]` → `env.KV.get/put/delete/list` | ✅ | Postgres-backed, tenant-scoped |
-| `[[r2_buckets]]` → `env.BUCKET.get/put/head/delete/list` | ✅ | Postgres-backed MVP (25 MiB cap) |
+| `[[r2_buckets]]` → `env.BUCKET.get/put/head/delete/list` | ✅ | MinIO/S3-backed (worker stays keyless) |
 | D1, Durable Objects, Queues | — | ❌ not available yet |
 
 ### KV
@@ -102,10 +102,11 @@ const obj = await c.env.MEDIA.get(key); // .text() / .json() / .arrayBuffer(), .
 ```
 
 `put` / `get` / `head` / `delete` / `list({ prefix, limit })` are supported, with
-`httpMetadata.contentType` and `customMetadata`. Same tenant isolation as KV.
-**MVP note:** objects are stored in Postgres with a 25 MiB cap; a MinIO-backed R2
-(via CP-presigned URLs, keeping the worker keyless) is the production path — the
-`env.BUCKET` API stays the same.
+`httpMetadata.contentType` and `customMetadata`. Objects are stored in the
+platform's **MinIO/S3** under `r2/{tenant}/{bucket}/{key}`. The worker stays
+**keyless** — R2 I/O is proxied through a control-plane internal endpoint that
+authenticates the job token and does the S3 op for the caller's tenant, so a
+component can only reach its own tenant's objects. `hibana dev` uses in-memory R2.
 
 Secrets set with `hibana secret put` persist across redeploys (each new version
 inherits the previous version's approved names).

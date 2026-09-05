@@ -20,6 +20,7 @@ mod enqueue;
 mod error;
 mod extract;
 mod handlers;
+mod handlers_r2;
 mod handlers_secrets;
 mod ingress;
 mod lanes;
@@ -390,6 +391,16 @@ fn build_internal_router(state: AppState) -> Router {
     Router::new()
         .route("/internal/job-env", post(handlers_secrets::job_env))
         .route("/internal/scale", get(handlers::internal_scale))
+        // M13: R2 バインディングの本体 I/O（worker keyless のため CP が S3 を代行）。
+        // internal listener のみ。認証は job_token（handlers_r2 内で検証）。
+        .route(
+            "/internal/r2/object",
+            get(handlers_r2::get_object)
+                .put(handlers_r2::put_object)
+                .delete(handlers_r2::delete_object)
+                .layer(axum::extract::DefaultBodyLimit::max(32 * 1024 * 1024)),
+        )
+        .route("/internal/r2/list", get(handlers_r2::list_objects))
         .with_state(state)
 }
 

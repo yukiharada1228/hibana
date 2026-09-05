@@ -210,6 +210,11 @@ struct HostState {
     // （RLS で cross-tenant 不可能）。pool は worker から複製。
     pool: PgPool,
     tenant_id: String,
+    // M13: R2 バインディング用。worker は keyless（S3 資格情報なし）なので、R2 の実 I/O は CP 内部
+    // エンドポイント経由で MinIO に代行させる。認証は job_token（CP 署名。テナントは claim 由来）。
+    cp_internal_url: String,
+    job_token: String,
+    http: reqwest::Client,
 }
 
 /// M12: KV バインディングの内部ホスト名。guest の fetch がこの host のときだけ KV として処理する。
@@ -258,10 +263,11 @@ impl wasmtime_wasi_http::WasiHttpView for HostState {
             return Ok(wasmtime_wasi_http::types::HostFutureIncomingResponse::pending(handle));
         }
         if request.uri().host() == Some(R2_INTERNAL_HOST) {
-            let pool = self.pool.clone();
-            let tenant = self.tenant_id.clone();
+            let http = self.http.clone();
+            let cp = self.cp_internal_url.clone();
+            let token = self.job_token.clone();
             let handle = wasmtime_wasi::runtime::spawn(async move {
-                Ok(handle_r2_request(pool, tenant, request).await)
+                Ok(handle_r2_request(http, cp, token, request).await)
             });
             return Ok(wasmtime_wasi_http::types::HostFutureIncomingResponse::pending(handle));
         }
@@ -1751,6 +1757,7 @@ impl Worker {
             built_env,
             allowed_addrs,
             job.tenant_id.clone(),
+            job.job_token.clone(),
         )
         .await
     }
@@ -2042,6 +2049,7 @@ impl Worker {
         built_env: env::BuiltEnv,
         allowed_addrs: std::collections::HashSet<std::net::SocketAddr>,
         tenant_id: String,
+        job_token: String,
     ) -> std::result::Result<(serde_json::Value, UsageMetrics), ExecError> {
         // StoreLimits: max_memory を適用する (§4.3)。
         let store_limits = StoreLimitsBuilder::new()
@@ -2125,6 +2133,9 @@ impl Worker {
             allowed_addrs: allowed_arc,
             pool: self.pool.clone(),
             tenant_id,
+            cp_internal_url: self.control_plane_internal_url.clone(),
+            job_token,
+            http: self.http.clone(),
         };
 
         let mut store = Store::new(&self.engine, host);
@@ -3092,40 +3103,60 @@ fn r2_response(
     })
 }
 
-/// メタデータ行からレスポンスヘッダ集合を作る。
-fn r2_meta_headers(
-    key: &str,
-    content_type: Option<String>,
-    size: i64,
-    etag: &str,
-    custom_meta: &serde_json::Value,
-) -> Vec<(&'static str, String)> {
-    let mut h = vec![
-        ("x-r2-key", key.to_string()),
-        ("x-r2-size", size.to_string()),
-        ("x-r2-etag", etag.to_string()),
-        (
-            "x-r2-meta",
-            faas_shared::b64url_encode(custom_meta.to_string().as_bytes()),
-        ),
-    ];
-    if let Some(ct) = content_type {
-        h.push(("content-type", ct));
+/// CP 内部 R2 応答（メタはヘッダ、get のみ body）を guest 応答へ写す。
+async fn cp_r2_to_guest(
+    resp: reqwest::Response,
+    include_body: bool,
+) -> Result<
+    wasmtime_wasi_http::types::IncomingResponse,
+    wasmtime_wasi_http::bindings::http::types::ErrorCode,
+> {
+    use wasmtime_wasi_http::bindings::http::types::ErrorCode;
+    let status = resp.status().as_u16();
+    let h = resp.headers().clone();
+    let get = |n: &str| h.get(n).and_then(|v| v.to_str().ok()).map(|s| s.to_string());
+    let mut extra: Vec<(&'static str, String)> = Vec::new();
+    if let Some(v) = get("x-r2-key") {
+        extra.push(("x-r2-key", v));
     }
-    h
+    if let Some(v) = get("x-r2-size") {
+        extra.push(("x-r2-size", v));
+    }
+    if let Some(v) = get("x-r2-etag") {
+        extra.push(("x-r2-etag", v));
+    }
+    if let Some(v) = get("x-r2-meta") {
+        extra.push(("x-r2-meta", v));
+    }
+    // CP は content-type を x-r2-content-type で返す。guest には実 content-type として渡す
+    // （SDK の __r2meta は content-type から httpMetadata.contentType を読む）。
+    if let Some(v) = get("x-r2-content-type") {
+        extra.push(("content-type", v));
+    }
+    let body = if include_body {
+        resp.bytes()
+            .await
+            .map_err(|_| ErrorCode::InternalError(Some("r2: read cp body".into())))?
+            .to_vec()
+    } else {
+        Vec::new()
+    };
+    r2_response(status, extra, body)
 }
 
+/// guest の `env.BUCKET.*`（r2.hibana.internal への fetch）を CP 内部 R2 エンドポイントへ中継する。
+/// worker は keyless なので S3 は CP が代行する。認証は job_token（CP 署名。テナントは claim 由来）。
 async fn handle_r2_request(
-    pool: PgPool,
-    tenant_id: String,
+    http: reqwest::Client,
+    cp_url: String,
+    job_token: String,
     request: hyper::Request<HyperOutgoingBody>,
 ) -> Result<
     wasmtime_wasi_http::types::IncomingResponse,
     wasmtime_wasi_http::bindings::http::types::ErrorCode,
 > {
-    use sqlx::Row as _;
     use wasmtime_wasi_http::bindings::http::types::ErrorCode;
-    let dberr = |_e| ErrorCode::InternalError(Some("r2: db error".to_string()));
+    let neterr = |_e| ErrorCode::InternalError(Some("r2: control-plane call failed".to_string()));
 
     let (parts, body) = request.into_parts();
     let path = parts.uri.path().to_string();
@@ -3135,141 +3166,81 @@ async fn handle_r2_request(
     if bucket.is_empty() {
         return r2_response(400, vec![], b"missing bucket".to_vec());
     }
+    let base = format!("{}/internal/r2", cp_url.trim_end_matches('/'));
 
-    let mut tx = pool.begin().await.map_err(dberr)?;
-    sqlx::query("SELECT set_config('app.tenant_id', $1, true)")
-        .bind(&tenant_id)
-        .execute(&mut *tx)
-        .await
-        .map_err(dberr)?;
-
-    let out = match (parts.method.as_str(), path.as_str()) {
-        ("GET", "/v1/r2") => {
-            let head_only = q.get("head").map(|v| v == "1").unwrap_or(false);
-            let row = sqlx::query(
-                "SELECT value, content_type, size, etag, custom_meta FROM r2_objects \
-                 WHERE tenant_id=$1 AND bucket=$2 AND key=$3",
-            )
-            .bind(&tenant_id)
-            .bind(&bucket)
-            .bind(&key)
-            .fetch_optional(&mut *tx)
-            .await
-            .map_err(dberr)?;
-            match row {
-                None => r2_response(404, vec![], Vec::new()),
-                Some(r) => {
-                    let ct: Option<String> = r.try_get("content_type").ok();
-                    let size: i64 = r.try_get("size").map_err(dberr)?;
-                    let etag: String = r.try_get("etag").map_err(dberr)?;
-                    let meta: serde_json::Value =
-                        r.try_get("custom_meta").unwrap_or(serde_json::Value::Null);
-                    let headers = r2_meta_headers(&key, ct, size, &etag, &meta);
-                    let value: Vec<u8> = if head_only {
-                        Vec::new()
-                    } else {
-                        r.try_get("value").map_err(dberr)?
-                    };
-                    r2_response(200, headers, value)
-                }
-            }
-        }
+    match (parts.method.as_str(), path.as_str()) {
         ("PUT", "/v1/r2") => {
-            let bytes = body
+            let val = body
                 .collect()
                 .await
                 .map_err(|_| ErrorCode::InternalError(Some("r2: read body".into())))?
-                .to_bytes();
-            if bytes.len() > R2_MAX_OBJECT_BYTES {
-                return r2_response(413, vec![], b"object too large".to_vec());
-            }
-            let val = bytes.to_vec();
-            let ct: Option<String> = parts
+                .to_bytes()
+                .to_vec();
+            let mut rb = http
+                .put(format!("{base}/object"))
+                .header("x-hibana-job-token", &job_token)
+                .header("x-r2-bucket", &bucket)
+                .header("x-r2-key", &key)
+                .body(val);
+            if let Some(ct) = parts
                 .headers
                 .get(hyper::header::CONTENT_TYPE)
                 .and_then(|v| v.to_str().ok())
-                .map(|s| s.to_string());
-            let meta: serde_json::Value = parts
-                .headers
-                .get("x-r2-meta")
-                .and_then(|v| v.to_str().ok())
-                .and_then(faas_shared::b64url_decode)
-                .and_then(|b| serde_json::from_slice(&b).ok())
-                .unwrap_or_else(|| serde_json::json!({}));
-            let etag = hex_encode(&Sha256::digest(&val));
-            let size = val.len() as i64;
-            sqlx::query(
-                "INSERT INTO r2_objects (tenant_id,bucket,key,value,content_type,custom_meta,size,etag,uploaded_at) \
-                 VALUES ($1,$2,$3,$4,$5,$6,$7,$8, now()) \
-                 ON CONFLICT (tenant_id,bucket,key) DO UPDATE SET \
-                   value=EXCLUDED.value, content_type=EXCLUDED.content_type, \
-                   custom_meta=EXCLUDED.custom_meta, size=EXCLUDED.size, etag=EXCLUDED.etag, uploaded_at=now()",
-            )
-            .bind(&tenant_id)
-            .bind(&bucket)
-            .bind(&key)
-            .bind(&val)
-            .bind(&ct)
-            .bind(&meta)
-            .bind(size)
-            .bind(&etag)
-            .execute(&mut *tx)
-            .await
-            .map_err(dberr)?;
-            r2_response(200, r2_meta_headers(&key, ct, size, &etag, &meta), Vec::new())
+            {
+                rb = rb.header("x-r2-content-type", ct);
+            }
+            if let Some(m) = parts.headers.get("x-r2-meta").and_then(|v| v.to_str().ok()) {
+                rb = rb.header("x-r2-meta", m);
+            }
+            let resp = rb.send().await.map_err(neterr)?;
+            cp_r2_to_guest(resp, false).await
+        }
+        ("GET", "/v1/r2") => {
+            let head_only = q.get("head").map(|v| v == "1").unwrap_or(false);
+            let mut rb = http
+                .get(format!("{base}/object"))
+                .header("x-hibana-job-token", &job_token)
+                .header("x-r2-bucket", &bucket)
+                .header("x-r2-key", &key);
+            if head_only {
+                rb = rb.header("x-r2-head", "1");
+            }
+            let resp = rb.send().await.map_err(neterr)?;
+            if resp.status().as_u16() == 404 {
+                return r2_response(404, vec![], Vec::new());
+            }
+            cp_r2_to_guest(resp, !head_only).await
         }
         ("DELETE", "/v1/r2") => {
-            sqlx::query("DELETE FROM r2_objects WHERE tenant_id=$1 AND bucket=$2 AND key=$3")
-                .bind(&tenant_id)
-                .bind(&bucket)
-                .bind(&key)
-                .execute(&mut *tx)
+            let _ = http
+                .delete(format!("{base}/object"))
+                .header("x-hibana-job-token", &job_token)
+                .header("x-r2-bucket", &bucket)
+                .header("x-r2-key", &key)
+                .send()
                 .await
-                .map_err(dberr)?;
+                .map_err(neterr)?;
             r2_response(204, vec![], Vec::new())
         }
         ("GET", "/v1/r2/list") => {
             let prefix = q.get("prefix").cloned().unwrap_or_default();
-            let limit: i64 = q
-                .get("limit")
-                .and_then(|s| s.parse().ok())
-                .unwrap_or(1000)
-                .clamp(1, 1000);
-            let pat = format!(
-                "{}%",
-                prefix.replace('\\', "\\\\").replace('%', "\\%").replace('_', "\\_")
-            );
-            let rows = sqlx::query(
-                "SELECT key, size, etag FROM r2_objects \
-                 WHERE tenant_id=$1 AND bucket=$2 AND key LIKE $3 \
-                 ORDER BY key LIMIT $4",
-            )
-            .bind(&tenant_id)
-            .bind(&bucket)
-            .bind(&pat)
-            .bind(limit)
-            .fetch_all(&mut *tx)
-            .await
-            .map_err(dberr)?;
-            let objs: Vec<serde_json::Value> = rows
-                .iter()
-                .map(|r| {
-                    serde_json::json!({
-                        "key": r.try_get::<String,_>("key").unwrap_or_default(),
-                        "size": r.try_get::<i64,_>("size").unwrap_or(0),
-                        "etag": r.try_get::<String,_>("etag").unwrap_or_default(),
-                    })
-                })
-                .collect();
-            let json = serde_json::to_vec(&serde_json::json!({ "objects": objs }))
-                .map_err(|e| ErrorCode::InternalError(Some(format!("r2 list: {e}"))))?;
-            r2_response(200, vec![("content-type", "application/json".into())], json)
+            let limit = q.get("limit").cloned().unwrap_or_default();
+            let mut rb = http
+                .get(format!("{base}/list"))
+                .header("x-hibana-job-token", &job_token)
+                .header("x-r2-bucket", &bucket);
+            if !prefix.is_empty() {
+                rb = rb.header("x-r2-prefix", prefix);
+            }
+            if !limit.is_empty() {
+                rb = rb.header("x-r2-limit", limit);
+            }
+            let resp = rb.send().await.map_err(neterr)?;
+            let bytes = resp.bytes().await.map_err(neterr)?.to_vec();
+            r2_response(200, vec![("content-type", "application/json".into())], bytes)
         }
         _ => r2_response(404, vec![], b"unknown r2 op".to_vec()),
-    };
-
-    tx.commit().await.map_err(dberr)?;
-    out
+    }
 }
 
 /// `hyper::Response` → response エンベロープ JSON バイト列。
