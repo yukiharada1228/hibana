@@ -56,7 +56,7 @@ requests through `wasi:http` — egress stays behind the platform's M9c allowlis
 | Command | Description |
 |---|---|
 | `hibana deploy [--entry src/index.ts] [--name <app>] [--version 0.1.0] [--public]` | Build → upload → activate → warm up (→ publish, with `--public`) |
-| `hibana dev [--entry src/index.ts] [--port 8787]` | Run the Hono app natively on localhost for fast iteration |
+| `hibana dev [--entry src/index.ts] [--port 8787] [--allow-egress]` | Run the app on localhost — a faithful preview of the Wasm runtime |
 | `hibana invoke <app> [METHOD] [PATH] [--body '<str>'] [--header k:v]` | Call a deployed app; renders the HTTP response |
 | `hibana publish <app>` / `hibana unpublish <app>` | Turn the public URL on/off (deny-by-default) |
 | `hibana secret set <app> <NAME> <VALUE>` | Set a per-function secret (M7c) |
@@ -88,6 +88,19 @@ response — no auth token needed (it's a public endpoint, like Cloudflare Worke
 - **Local dev** (no wildcard DNS): send the `Host` header directly —
   `curl -H "Host: my-api.smoke.hibana.local" http://localhost:8080/`.
 
+## `hibana dev` is a faithful preview
+
+`hibana dev` runs your app in Node for instant iteration, but constrains it to
+match the Wasm runtime so you catch divergences early:
+
+- **Same bundling as deploy** (`platform: neutral`): importing a Node built-in
+  (`node:fs`, etc.) fails in `dev` exactly as it would fail the production build.
+- **No outbound `fetch`**: native components have no egress, so `dev` blocks
+  `fetch()` too. Pass `--allow-egress` to bypass locally when you knowingly need
+  it during development.
+
+Keep app code to Web-standard + Hono APIs and `dev` behaves like production.
+
 ## Configuration
 
 Connection info comes from the environment (defaults target a local dev stack):
@@ -103,9 +116,8 @@ Connection info comes from the environment (defaults target a local dev stack):
 
 ## Notes
 
-- The first invoke of a freshly deployed component precompiles a ~13 MiB module,
-  which can exceed the control-plane's 5 s sync-reply window; `hibana invoke`
-  transparently polls `GET /executions/{id}` until the run is terminal.
-- `hibana dev` runs your app in Node (not Wasm) so iteration is instant; deploy
-  runs it as a Component. Keep app code to Web-standard + Hono APIs so both paths
-  behave the same.
+- The first invoke of a freshly deployed component precompiles a ~13 MiB module.
+  `hibana deploy` warms it once so the returned URL is fast; `hibana invoke` polls
+  `GET /executions/{id}` until the run is terminal (handling `running`, not just
+  `pending`). The worker sends in-progress acks during precompile and dedups
+  concurrent compiles of the same module (no redelivery storm / stampede).

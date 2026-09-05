@@ -160,6 +160,9 @@ function parseFlags(args) {
 }
 
 // ---- Hono app をローカルにロード（esbuild で TS→ESM して import）-----------
+// **本番ビルド（build.mjs）と同じ解決規則**（platform:neutral / conditions）で束ねる。
+// こうすると Node 組み込み（node:fs 等）への import は dev でも本番と同様に解決失敗し、
+// 「dev では動くが本番でビルドできない」ズレを最小化する（dev を忠実なプレビューにする）。
 async function loadApp(entry) {
   const { build } = await import("esbuild");
   const work = await mkdtemp(join(tmpdir(), "hibana-dev-"));
@@ -168,8 +171,10 @@ async function loadApp(entry) {
     entryPoints: [resolve(process.cwd(), entry)],
     bundle: true,
     format: "esm",
-    platform: "node",
+    platform: "neutral",
     target: "es2022",
+    mainFields: ["module", "main"],
+    conditions: ["import", "default"],
     outfile,
     logLevel: "warning",
   });
@@ -323,6 +328,20 @@ async function cmdDev(args) {
   const entry = flags.entry || "src/index.ts";
   const port = Number(flags.port || 8787);
   let app = await loadApp(entry);
+
+  // 本番の native component は `--disable http` で **outbound egress を一切持たない**。
+  // dev（Node）は既定で fetch できてしまい「dev では外部 API を叩けるが本番で落ちる」ズレを
+  // 生む。忠実なプレビューにするため dev でも outbound fetch を塞ぐ（app が Response/Request を
+  // 構築するのは別 API なので影響しない）。--allow-egress で明示的に緩められる。
+  if (!flags["allow-egress"]) {
+    globalThis.fetch = async () => {
+      throw new Error(
+        "outbound fetch() is disabled on Hibana (native components have no egress). " +
+          "Run `hibana dev --allow-egress` to bypass locally.",
+      );
+    };
+  }
+
   const server = createServer(async (req, res) => {
     try {
       const url = `http://${req.headers.host || "localhost"}${req.url}`;
@@ -351,7 +370,13 @@ async function cmdDev(args) {
   });
   server.listen(port, () => {
     ok(`hibana dev on ${bold(`http://localhost:${port}`)}  ${dim(`(${entry})`)}`);
-    console.log(dim("  Ctrl-C to stop. Runs your Hono app natively for fast iteration."));
+    console.log(
+      dim(
+        "  Faithful preview: Web-standard + Hono only (no Node built-ins), no outbound fetch.\n" +
+          "  Runs in Node for fast iteration; deploy runs the same app as a wasi:http component.\n" +
+          "  Ctrl-C to stop.",
+      ),
+    );
   });
 }
 
