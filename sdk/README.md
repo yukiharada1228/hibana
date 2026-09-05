@@ -66,7 +66,41 @@ Both worker shapes work — Hono `export default app` **and** plain
 | `[[r2_buckets]]` → `env.BUCKET.get/put/head/delete/list` | ✅ | MinIO/S3-backed (worker stays keyless) |
 | `[[d1_databases]]` → `env.DB.prepare/bind/all/first/run/batch/exec` | ✅ | real SQLite, per-tenant, single-writer |
 | `[[queues.producers]]` / `[[queues.consumers]]` → `env.Q.send` + `queue()` | ✅ | on the JetStream pipeline (retries/DLQ) |
-| Durable Objects | — | ❌ not available yet |
+| `[[durable_objects.bindings]]` → `env.DO.idFromName/get().fetch()` | ✅ | durable `ctx.storage` + global single-writer (see caveats) |
+
+### Durable Objects
+
+```toml
+[[durable_objects.bindings]]
+name = "COUNTER"
+class_name = "Counter"
+```
+
+```ts
+import { DurableObject } from "cloudflare:workers";
+export class Counter extends DurableObject {
+  async fetch(req: Request) {
+    let n = (await this.ctx.storage.get<number>("n")) ?? 0;
+    n++; await this.ctx.storage.put("n", n);
+    return new Response(String(n));
+  }
+}
+// in your Hono app:
+const stub = c.env.COUNTER.get(c.env.COUNTER.idFromName("room-1"));
+return stub.fetch(req);
+```
+
+`idFromName` / `newUniqueId` / `get(id).fetch()` and `ctx.storage`
+(`get`/`put`/`delete`/`list`) are supported. Each object id is a **global
+single-writer**: a Postgres advisory lock on `(tenant, class, id)` serializes all
+access across the fleet, and `ctx.storage` is durable (per-tenant). `hibana dev`
+runs objects in-process with in-memory storage.
+
+> **Subset.** This is a per-invocation activation model: durable storage +
+> serialization (the core coordination guarantee), suitable for counters, locks,
+> and per-entity state. In-memory state does **not** persist between calls, and
+> WebSocket hibernation / alarms are not yet implemented — those need a resident
+> placement runtime (a future milestone).
 
 ### Queues
 

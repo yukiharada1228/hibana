@@ -20,7 +20,7 @@ import { buildComponent } from "./build.mjs";
 import { readFile, mkdtemp, rm } from "node:fs/promises";
 import { createServer } from "node:http";
 import { tmpdir } from "node:os";
-import { join, resolve } from "node:path";
+import { dirname, join, resolve } from "node:path";
 import { pathToFileURL } from "node:url";
 
 // ---- 出力ヘルパ -----------------------------------------------------------
@@ -157,6 +157,12 @@ async function loadProjectConfig() {
       queueConsumers: Array.isArray(raw.queues?.consumers)
         ? raw.queues.consumers.filter((c) => c && c.queue).map((c) => c.queue)
         : [],
+      // Workers: [[durable_objects.bindings]] { name, class_name }。
+      durableObjects: Array.isArray(raw.durable_objects?.bindings)
+        ? raw.durable_objects.bindings
+            .filter((b) => b && b.name)
+            .map((b) => ({ name: b.name, class_name: b.class_name || b.name }))
+        : [],
       // hibana 固有（wrangler には無い）。
       public: h.public ?? false,
       egress: Array.isArray(h.egress) ? h.egress : [],
@@ -281,6 +287,8 @@ function parseFlags(args) {
 // 「dev では動くが本番でビルドできない」ズレを最小化する（dev を忠実なプレビューにする）。
 async function loadApp(entry) {
   const { build } = await import("esbuild");
+  const { fileURLToPath } = await import("node:url");
+  const shimPath = resolve(dirname(fileURLToPath(import.meta.url)), "cf-workers-shim.js");
   const work = await mkdtemp(join(tmpdir(), "hibana-dev-"));
   const outfile = join(work, "app.mjs");
   await build({
@@ -291,6 +299,7 @@ async function loadApp(entry) {
     target: "es2022",
     mainFields: ["module", "main"],
     conditions: ["import", "default"],
+    alias: { "cloudflare:workers": shimPath },
     outfile,
     logLevel: "warning",
   });
@@ -299,7 +308,7 @@ async function loadApp(entry) {
   const app = mod.default?.fetch ? mod.default : mod.app || mod.default;
   if (!app || typeof app.fetch !== "function")
     throw new Error(`${entry} must \`export default\` a Hono app`);
-  return app;
+  return { app, mod };
 }
 
 // ---- commands -------------------------------------------------------------
@@ -330,6 +339,7 @@ async function cmdDeploy(args) {
     r2: proj?.r2 || [],
     d1: proj?.d1 || [],
     queueProducers: proj?.queueProducers || [],
+    durableObjects: proj?.durableObjects || [],
   });
   const wasm = await readFile(outWasm);
   await rm(work, { recursive: true, force: true });
@@ -627,7 +637,7 @@ async function cmdDev(args) {
   const proj = await loadProjectConfig();
   const entry = flags.entry || proj?.main || "src/index.ts";
   const port = Number(flags.port || 8787);
-  let app = await loadApp(entry);
+  const { app, mod } = await loadApp(entry);
 
   // dev の env（c.env）: wrangler.toml の [vars] + in-memory KV / R2 バインディング。
   const devEnv = { ...(proj?.vars || {}) };
@@ -663,6 +673,39 @@ async function cmdDev(args) {
       async sendBatch(msgs) {
         const bodies = (msgs || []).map((m) => (m && m.body !== undefined ? m.body : m));
         if (typeof app.queue === "function") await app.queue(toBatch(p.queue, bodies), devEnv, devCtx);
+      },
+    };
+  }
+  // dev の Durable Objects: in-memory storage（Map）+ クラスを直接 new。非永続・単一プロセス。
+  const devDoStores = new Map(); // "class/id" -> Map(key->value)
+  const devDoStorage = (cls, id) => {
+    const k = cls + "/" + id;
+    if (!devDoStores.has(k)) devDoStores.set(k, new Map());
+    const m = devDoStores.get(k);
+    return {
+      async get(key) { return m.has(key) ? m.get(key) : undefined; },
+      async put(key, value) { m.set(key, value); },
+      async delete(key) { return m.delete(key); },
+      async list() { return new Map(m); },
+    };
+  };
+  for (const b of proj?.durableObjects || []) {
+    const Cls = mod[b.class_name];
+    const mkId = (s) => ({ __id: String(s), toString: () => String(s), name: String(s) });
+    devEnv[b.name] = {
+      idFromName: (n) => mkId(n),
+      idFromString: (s) => mkId(s),
+      newUniqueId: () => mkId("u_" + Math.random().toString(36).slice(2)),
+      get(id) {
+        const idStr = (id && id.__id) || String(id);
+        return {
+          id: mkId(idStr),
+          async fetch(req) {
+            if (!Cls) throw new Error("DO class not exported: " + b.class_name);
+            const inst = new Cls({ id: mkId(idStr), storage: devDoStorage(b.class_name, idStr) }, devEnv);
+            return await inst.fetch(typeof req === "string" ? new Request(req) : req);
+          },
+        };
       },
     };
   }

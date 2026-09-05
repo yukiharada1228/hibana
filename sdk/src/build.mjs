@@ -53,7 +53,7 @@ function run(cmd, args) {
   });
 }
 
-export async function buildComponent({ entry, out, wit, world, kv, r2, d1, queueProducers: qp }) {
+export async function buildComponent({ entry, out, wit, world, kv, r2, d1, queueProducers: qp, durableObjects: dob }) {
   wit = wit || DEFAULT_WIT;
   world = world || "http";
   // kv: [{ binding, id }]（wrangler の kv_namespaces）。binding→namespace を shim に焼き込む。
@@ -64,6 +64,8 @@ export async function buildComponent({ entry, out, wit, world, kv, r2, d1, queue
   const d1Bindings = Array.isArray(d1) ? d1 : [];
   // queues.producers: [{ binding, queue }]（wrangler の [[queues.producers]]）。
   const queueProducers = Array.isArray(qp) ? qp : [];
+  // durable_objects: [{ name, class_name }]（wrangler の [[durable_objects.bindings]]）。
+  const doBindings = Array.isArray(dob) ? dob : [];
   const entryAbs = resolve(process.cwd(), entry);
   const outAbs = resolve(process.cwd(), out);
   const witAbs = resolve(process.cwd(), wit);
@@ -77,7 +79,7 @@ export async function buildComponent({ entry, out, wit, world, kv, r2, d1, queue
     await writeFile(
       shim,
       [
-        `import _app from ${JSON.stringify(entryAbs)};`,
+        `import _app, * as _mod from ${JSON.stringify(entryAbs)};`,
         // default export の相互運用（app / {default: app} / {fetch} を吸収）。
         `const app = _app && _app.fetch ? _app : (_app && _app.default) ? _app.default : _app;`,
         `if (!app || typeof app.fetch !== "function") {`,
@@ -119,6 +121,8 @@ export async function buildComponent({ entry, out, wit, world, kv, r2, d1, queue
         `  for (const [__b, __dn] of __D1) env[__b] = __d1Client(__dn);`,
         `  const __Q = ${JSON.stringify(queueProducers.map((b) => [b.binding, b.queue || b.binding]))};`,
         `  for (const [__b, __qn] of __Q) env[__b] = __queueClient(__qn);`,
+        `  const __DO = ${JSON.stringify(doBindings.map((b) => [b.name, b.class_name || b.name]))};`,
+        `  for (const [__b, __cn] of __DO) env[__b] = __doNamespace(__cn, env);`,
         // Workers 互換: fetch(request, env, ctx)。ctx は no-op stub（waitUntil/passThroughOnException）。
         `  const ctx = { waitUntil() {}, passThroughOnException() {} };`,
         // M15: queue consumer 配送は POST /__hibana/queue。app.queue(batch) へ dispatch する。
@@ -147,6 +151,42 @@ export async function buildComponent({ entry, out, wit, world, kv, r2, d1, queue
         `  return {`,
         `    async send(body) { await post([body]); },`,
         `    async sendBatch(msgs) { await post((msgs || []).map((m) => (m && m.body !== undefined) ? m.body : m)); },`,
+        `  };`,
+        `}`,
+        // Durable Objects（同一コンポーネント内クラス）。storage は KV 名前空間 __do:class:id を再利用。
+        // stub.fetch は最初に do.hibana.internal/lock で (class,id) を直列化してからクラスの fetch を呼ぶ。
+        `function __doStorage(className, id) {`,
+        `  const kv = __kvClient("__do:" + className + ":" + id);`,
+        `  const self = {`,
+        `    async get(key) { const s = await kv.get(key); return s == null ? undefined : JSON.parse(s); },`,
+        `    async put(key, value) { await kv.put(key, JSON.stringify(value === undefined ? null : value)); },`,
+        `    async delete(key) { await kv.delete(key); return true; },`,
+        `    async list(opts) { const r = await kv.list(opts); const m = new Map(); for (const k of r.keys) m.set(k.name, await self.get(k.name)); return m; },`,
+        `  };`,
+        `  return self;`,
+        `}`,
+        `function __doNamespace(className, env) {`,
+        `  const Cls = _mod[className];`,
+        `  const e = encodeURIComponent;`,
+        `  const mkId = (s) => ({ __id: String(s), toString() { return String(s); }, name: String(s) });`,
+        `  function stub(idStr) {`,
+        `    return {`,
+        `      id: mkId(idStr),`,
+        `      async fetch(req) {`,
+        `        if (!Cls) throw new Error("Durable Object class not exported: " + className);`,
+        `        await fetch("http://do.hibana.internal/lock?class=" + e(className) + "&id=" + e(idStr));`,
+        `        const ctx = { id: mkId(idStr), storage: __doStorage(className, idStr) };`,
+        `        const inst = new Cls(ctx, env);`,
+        `        const request = typeof req === "string" ? new Request(req) : req;`,
+        `        return await inst.fetch(request);`,
+        `      },`,
+        `    };`,
+        `  }`,
+        `  return {`,
+        `    idFromName(name) { return mkId(name); },`,
+        `    idFromString(s) { return mkId(s); },`,
+        `    newUniqueId() { return mkId("u_" + Date.now().toString(36) + Math.random().toString(36).slice(2)); },`,
+        `    get(id) { return stub((id && id.__id) || String(id)); },`,
         `  };`,
         `}`,
         // Workers KV 互換の最小 client（get/put/delete/list）。
@@ -291,6 +331,8 @@ export async function buildComponent({ entry, out, wit, world, kv, r2, d1, queue
       target: "es2022",
       mainFields: ["module", "main"],
       conditions: ["import", "default"],
+      // M16: `import { DurableObject } from "cloudflare:workers"` を SDK の shim へ解決する。
+      alias: { "cloudflare:workers": resolve(__dirname, "cf-workers-shim.js") },
       outfile: bundle,
       logLevel: "warning",
     });

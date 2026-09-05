@@ -218,6 +218,13 @@ struct HostState {
     http: reqwest::Client,
     // M14: D1 バインディング。実行中に開いた D1 セッション（db 名 → 常駐 SQLite）。実行末に flush。
     d1_sessions: Arc<tokio::sync::Mutex<std::collections::HashMap<String, d1::D1Session>>>,
+    // M16: Durable Objects の単一書き手ロック。実行中に触った (class/id) → advisory lock を握った
+    // 接続。実行末に drop（pool の after_release が unlock）。cross-fleet の直列化を担う。
+    do_locks: Arc<
+        tokio::sync::Mutex<
+            std::collections::HashMap<String, sqlx::pool::PoolConnection<sqlx::Postgres>>,
+        >,
+    >,
 }
 
 /// M12: KV バインディングの内部ホスト名。guest の fetch がこの host のときだけ KV として処理する。
@@ -226,6 +233,8 @@ const KV_INTERNAL_HOST: &str = "kv.hibana.internal";
 const D1_INTERNAL_HOST: &str = "d1.hibana.internal";
 /// M15: Queues producer の内部ホスト名。
 const QUEUE_INTERNAL_HOST: &str = "queue.hibana.internal";
+/// M16: Durable Objects のロック取得用 内部ホスト名（storage は KV を再利用）。
+const DO_INTERNAL_HOST: &str = "do.hibana.internal";
 /// M13: R2 バインディングの内部ホスト名（同じく send_request で横取り）。
 const R2_INTERNAL_HOST: &str = "r2.hibana.internal";
 /// M13: R2 オブジェクトの上限（MVP は Postgres bytea 保持のため控えめに）。
@@ -293,6 +302,15 @@ impl wasmtime_wasi_http::WasiHttpView for HostState {
             let token = self.job_token.clone();
             let handle = wasmtime_wasi::runtime::spawn(async move {
                 Ok(handle_queue_request(http, cp, token, request).await)
+            });
+            return Ok(wasmtime_wasi_http::types::HostFutureIncomingResponse::pending(handle));
+        }
+        if request.uri().host() == Some(DO_INTERNAL_HOST) {
+            let pool = self.pool.clone();
+            let tenant = self.tenant_id.clone();
+            let locks = Arc::clone(&self.do_locks);
+            let handle = wasmtime_wasi::runtime::spawn(async move {
+                Ok(handle_do_lock(pool, tenant, locks, request).await)
             });
             return Ok(wasmtime_wasi_http::types::HostFutureIncomingResponse::pending(handle));
         }
@@ -2164,6 +2182,12 @@ impl Worker {
         let d1_sessions: Arc<
             tokio::sync::Mutex<std::collections::HashMap<String, d1::D1Session>>,
         > = Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new()));
+        // M16: DO の advisory lock を握った接続置き場（実行末に drop → after_release で unlock）。
+        let do_locks: Arc<
+            tokio::sync::Mutex<
+                std::collections::HashMap<String, sqlx::pool::PoolConnection<sqlx::Postgres>>,
+            >,
+        > = Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new()));
 
         let wasi = wasi_builder.build();
         let host = HostState {
@@ -2178,6 +2202,7 @@ impl Worker {
             job_token,
             http: self.http.clone(),
             d1_sessions: Arc::clone(&d1_sessions),
+            do_locks: Arc::clone(&do_locks),
         };
 
         let mut store = Store::new(&self.engine, host);
@@ -2384,6 +2409,11 @@ impl Worker {
                     warn!(db = %name, error = %e, "d1: flush failed (data may be lost for this db)");
                 }
             }
+        }
+        // M16: DO ロックを解放（接続を drop → pool の after_release が pg_advisory_unlock_all）。
+        {
+            let mut m = do_locks.lock().await;
+            m.clear();
         }
 
         match timed {
@@ -3425,6 +3455,61 @@ async fn handle_queue_request(
     let rbody = resp.bytes().await.map_err(neterr)?.to_vec();
     let out_status = if status < 300 { 200 } else { status };
     kv_response(out_status, "application/json", rbody)
+}
+
+// ============================================================================
+// M16: Durable Objects の単一書き手ロック。`stub.fetch()` の最初に shim が
+// `do.hibana.internal/lock?class=&id=` を叩くと、この (tenant,class,id) の advisory lock を取得して
+// 実行の間保持する（同じ DO を触る他実行は待つ＝グローバル直列化）。storage は KV 名前空間を再利用。
+// ロックは実行末に drop（pool の after_release が unlock）。
+// ============================================================================
+async fn handle_do_lock(
+    pool: PgPool,
+    tenant: String,
+    locks: Arc<
+        tokio::sync::Mutex<
+            std::collections::HashMap<String, sqlx::pool::PoolConnection<sqlx::Postgres>>,
+        >,
+    >,
+    request: hyper::Request<HyperOutgoingBody>,
+) -> Result<
+    wasmtime_wasi_http::types::IncomingResponse,
+    wasmtime_wasi_http::bindings::http::types::ErrorCode,
+> {
+    use wasmtime_wasi_http::bindings::http::types::ErrorCode;
+    let err = |_e| ErrorCode::InternalError(Some("do: lock failed".to_string()));
+    let q = request.uri().query().map(parse_query).unwrap_or_default();
+    let class = q.get("class").cloned().unwrap_or_default();
+    let id = q.get("id").cloned().unwrap_or_default();
+    if class.is_empty() || id.is_empty() {
+        return kv_response(400, "text/plain", b"missing class/id".to_vec());
+    }
+    let map_key = format!("{class}/{id}");
+    // (tenant,class,id) の安定 advisory lock キー（FNV-1a）。
+    let mut h: u64 = 0xcbf29ce484222325;
+    for b in tenant
+        .bytes()
+        .chain(b"/do/".iter().copied())
+        .chain(class.bytes())
+        .chain(b"/".iter().copied())
+        .chain(id.bytes())
+    {
+        h ^= b as u64;
+        h = h.wrapping_mul(0x100000001b3);
+    }
+    let key = h as i64;
+
+    let mut m = locks.lock().await;
+    if !m.contains_key(&map_key) {
+        let mut conn = pool.acquire().await.map_err(err)?;
+        sqlx::query("SELECT pg_advisory_lock($1)")
+            .bind(key)
+            .execute(&mut *conn)
+            .await
+            .map_err(err)?;
+        m.insert(map_key, conn);
+    }
+    kv_response(200, "text/plain", b"locked".to_vec())
 }
 
 /// `hyper::Response` → response エンベロープ JSON バイト列。
