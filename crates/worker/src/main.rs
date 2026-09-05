@@ -205,7 +205,15 @@ struct HostState {
     // `socket_addr_check` と同じ M9c モデルを wasi:http にも適用し、宛先を承認済み IP に限定＋
     // SSRF hard-deny を最優先する。
     allowed_addrs: Arc<std::collections::HashSet<std::net::SocketAddr>>,
+    // M12: KV バインディング用。guest が `http://kv.hibana.internal/...` へ fetch すると
+    // send_request が egress せず **この tenant_id で** Postgres の kv_entries を直接操作する
+    // （RLS で cross-tenant 不可能）。pool は worker から複製。
+    pool: PgPool,
+    tenant_id: String,
 }
+
+/// M12: KV バインディングの内部ホスト名。guest の fetch がこの host のときだけ KV として処理する。
+const KV_INTERNAL_HOST: &str = "kv.hibana.internal";
 
 // wasmtime-wasi 29: `WasiView` が `ctx()` と `table()` の両方を提供する。
 impl WasiView for HostState {
@@ -236,6 +244,15 @@ impl wasmtime_wasi_http::WasiHttpView for HostState {
         request: hyper::Request<wasmtime_wasi_http::body::HyperOutgoingBody>,
         config: wasmtime_wasi_http::types::OutgoingRequestConfig,
     ) -> wasmtime_wasi_http::HttpResult<wasmtime_wasi_http::types::HostFutureIncomingResponse> {
+        // M12: KV バインディングは内部ホスト。egress せず、このジョブの tenant で Postgres を叩く。
+        if request.uri().host() == Some(KV_INTERNAL_HOST) {
+            let pool = self.pool.clone();
+            let tenant = self.tenant_id.clone();
+            let handle = wasmtime_wasi::runtime::spawn(async move {
+                Ok(handle_kv_request(pool, tenant, request).await)
+            });
+            return Ok(wasmtime_wasi_http::types::HostFutureIncomingResponse::pending(handle));
+        }
         let allowed = Arc::clone(&self.allowed_addrs);
         let handle = wasmtime_wasi::runtime::spawn(async move {
             Ok(gated_send_request(request, config, allowed).await)
@@ -1715,8 +1732,15 @@ impl Worker {
             .resolve_egress_allowlist(&resolved.allow_outbound)
             .await;
 
-        self.run_component(component, input_bytes, limits, built_env, allowed_addrs)
-            .await
+        self.run_component(
+            component,
+            input_bytes,
+            limits,
+            built_env,
+            allowed_addrs,
+            job.tenant_id.clone(),
+        )
+        .await
     }
 
     /// egress allowlist の各 `host:port` を解決し、**hard-deny でない** IP:port の集合を返す。
@@ -2005,6 +2029,7 @@ impl Worker {
         limits: ResourceLimits,
         built_env: env::BuiltEnv,
         allowed_addrs: std::collections::HashSet<std::net::SocketAddr>,
+        tenant_id: String,
     ) -> std::result::Result<(serde_json::Value, UsageMetrics), ExecError> {
         // StoreLimits: max_memory を適用する (§4.3)。
         let store_limits = StoreLimitsBuilder::new()
@@ -2086,6 +2111,8 @@ impl Worker {
             limits: metered_limits,
             http_ctx: wasmtime_wasi_http::WasiHttpCtx::new(),
             allowed_addrs: allowed_arc,
+            pool: self.pool.clone(),
+            tenant_id,
         };
 
         let mut store = Store::new(&self.engine, host);
@@ -2821,6 +2848,204 @@ async fn gated_send_request(
         worker: None,
         between_bytes_timeout: config.between_bytes_timeout,
     })
+}
+
+// ============================================================================
+// M12: KV バインディング（Workers KV 互換）。guest の `env.KV.get/put/delete/list` は
+// `http://kv.hibana.internal/...` への fetch になり、ここで egress せず Postgres を叩く。
+// **tenant_id はジョブ由来**（guest は指定不可）。RLS で cross-tenant は構造的に不可能。
+// namespace は tenant 内パーティション（tenant 内 component 間の境界ではない）。
+// ============================================================================
+
+fn percent_decode(s: &str) -> String {
+    let b = s.as_bytes();
+    let mut out = Vec::with_capacity(b.len());
+    let hex = |c: u8| (c as char).to_digit(16);
+    let mut i = 0;
+    while i < b.len() {
+        match b[i] {
+            b'%' if i + 2 < b.len() => match (hex(b[i + 1]), hex(b[i + 2])) {
+                (Some(hi), Some(lo)) => {
+                    out.push((hi * 16 + lo) as u8);
+                    i += 3;
+                }
+                _ => {
+                    out.push(b[i]);
+                    i += 1;
+                }
+            },
+            b'+' => {
+                out.push(b' ');
+                i += 1;
+            }
+            c => {
+                out.push(c);
+                i += 1;
+            }
+        }
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+fn parse_query(q: &str) -> std::collections::HashMap<String, String> {
+    let mut m = std::collections::HashMap::new();
+    for pair in q.split('&').filter(|s| !s.is_empty()) {
+        let (k, v) = match pair.split_once('=') {
+            Some((k, v)) => (k, v),
+            None => (pair, ""),
+        };
+        m.insert(percent_decode(k), percent_decode(v));
+    }
+    m
+}
+
+/// KV 応答（status + body bytes）を IncomingResponse に組む。
+fn kv_response(
+    status: u16,
+    content_type: &str,
+    body: Vec<u8>,
+) -> Result<
+    wasmtime_wasi_http::types::IncomingResponse,
+    wasmtime_wasi_http::bindings::http::types::ErrorCode,
+> {
+    use wasmtime_wasi_http::bindings::http::types::ErrorCode;
+    let resp = hyper::Response::builder()
+        .status(status)
+        .header(hyper::header::CONTENT_TYPE, content_type)
+        .body(Full::new(Bytes::from(body)).map_err(|e| match e {}).boxed())
+        .map_err(|e| ErrorCode::InternalError(Some(format!("kv resp: {e}"))))?;
+    Ok(wasmtime_wasi_http::types::IncomingResponse {
+        resp,
+        worker: None,
+        between_bytes_timeout: Duration::from_secs(60),
+    })
+}
+
+async fn handle_kv_request(
+    pool: PgPool,
+    tenant_id: String,
+    request: hyper::Request<HyperOutgoingBody>,
+) -> Result<
+    wasmtime_wasi_http::types::IncomingResponse,
+    wasmtime_wasi_http::bindings::http::types::ErrorCode,
+> {
+    use sqlx::Row as _;
+    use wasmtime_wasi_http::bindings::http::types::ErrorCode;
+    let dberr = |_e| ErrorCode::InternalError(Some("kv: db error".to_string()));
+
+    let (parts, body) = request.into_parts();
+    let path = parts.uri.path().to_string();
+    let q = parts.uri.query().map(parse_query).unwrap_or_default();
+    let ns = q.get("ns").cloned().unwrap_or_default();
+    let key = q.get("key").cloned().unwrap_or_default();
+    if ns.is_empty() {
+        return kv_response(400, "text/plain", b"missing ns".to_vec());
+    }
+
+    // ジョブの tenant を GUC に設定した tx（FORCE RLS 下で cross-tenant を構造的に排除）。
+    let mut tx = pool.begin().await.map_err(dberr)?;
+    sqlx::query("SELECT set_config('app.tenant_id', $1, true)")
+        .bind(&tenant_id)
+        .execute(&mut *tx)
+        .await
+        .map_err(dberr)?;
+
+    let method = parts.method;
+    let out = match (method.as_str(), path.as_str()) {
+        ("GET", "/v1/kv") => {
+            let row = sqlx::query(
+                "SELECT value FROM kv_entries \
+                 WHERE tenant_id=$1 AND namespace=$2 AND key=$3 \
+                   AND (expires_at IS NULL OR expires_at > now())",
+            )
+            .bind(&tenant_id)
+            .bind(&ns)
+            .bind(&key)
+            .fetch_optional(&mut *tx)
+            .await
+            .map_err(dberr)?;
+            match row {
+                Some(r) => {
+                    let v: Vec<u8> = r.try_get("value").map_err(dberr)?;
+                    kv_response(200, "application/octet-stream", v)
+                }
+                None => kv_response(404, "text/plain", Vec::new()),
+            }
+        }
+        ("PUT", "/v1/kv") => {
+            let val = body
+                .collect()
+                .await
+                .map_err(|_| ErrorCode::InternalError(Some("kv: read body".into())))?
+                .to_bytes()
+                .to_vec();
+            let ttl: Option<i64> = q.get("ttl").and_then(|s| s.parse().ok()).filter(|t| *t > 0);
+            sqlx::query(
+                "INSERT INTO kv_entries (tenant_id, namespace, key, value, expires_at, updated_at) \
+                 VALUES ($1,$2,$3,$4, \
+                    CASE WHEN $5::bigint IS NULL THEN NULL \
+                         ELSE now() + make_interval(secs => $5::bigint) END, now()) \
+                 ON CONFLICT (tenant_id, namespace, key) \
+                 DO UPDATE SET value=EXCLUDED.value, expires_at=EXCLUDED.expires_at, updated_at=now()",
+            )
+            .bind(&tenant_id)
+            .bind(&ns)
+            .bind(&key)
+            .bind(&val)
+            .bind(ttl)
+            .execute(&mut *tx)
+            .await
+            .map_err(dberr)?;
+            kv_response(204, "text/plain", Vec::new())
+        }
+        ("DELETE", "/v1/kv") => {
+            sqlx::query("DELETE FROM kv_entries WHERE tenant_id=$1 AND namespace=$2 AND key=$3")
+                .bind(&tenant_id)
+                .bind(&ns)
+                .bind(&key)
+                .execute(&mut *tx)
+                .await
+                .map_err(dberr)?;
+            kv_response(204, "text/plain", Vec::new())
+        }
+        ("GET", "/v1/kv/list") => {
+            let prefix = q.get("prefix").cloned().unwrap_or_default();
+            let limit: i64 = q
+                .get("limit")
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(1000)
+                .clamp(1, 1000);
+            // LIKE の特殊文字を無効化してから prefix 一致にする。
+            let pat = format!(
+                "{}%",
+                prefix.replace('\\', "\\\\").replace('%', "\\%").replace('_', "\\_")
+            );
+            let rows = sqlx::query(
+                "SELECT key FROM kv_entries \
+                 WHERE tenant_id=$1 AND namespace=$2 AND key LIKE $3 \
+                   AND (expires_at IS NULL OR expires_at > now()) \
+                 ORDER BY key LIMIT $4",
+            )
+            .bind(&tenant_id)
+            .bind(&ns)
+            .bind(&pat)
+            .bind(limit)
+            .fetch_all(&mut *tx)
+            .await
+            .map_err(dberr)?;
+            let keys: Vec<String> = rows
+                .iter()
+                .filter_map(|r| r.try_get::<String, _>("key").ok())
+                .collect();
+            let json = serde_json::to_vec(&serde_json::json!({ "keys": keys }))
+                .map_err(|e| ErrorCode::InternalError(Some(format!("kv list: {e}"))))?;
+            kv_response(200, "application/json", json)
+        }
+        _ => kv_response(404, "text/plain", b"unknown kv op".to_vec()),
+    };
+
+    tx.commit().await.map_err(dberr)?;
+    out
 }
 
 /// `hyper::Response` → response エンベロープ JSON バイト列。

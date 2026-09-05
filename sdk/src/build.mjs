@@ -53,9 +53,11 @@ function run(cmd, args) {
   });
 }
 
-export async function buildComponent({ entry, out, wit, world }) {
+export async function buildComponent({ entry, out, wit, world, kv }) {
   wit = wit || DEFAULT_WIT;
   world = world || "http";
+  // kv: [{ binding, id }]（wrangler の kv_namespaces）。binding→namespace を shim に焼き込む。
+  const kvBindings = Array.isArray(kv) ? kv : [];
   const entryAbs = resolve(process.cwd(), entry);
   const outAbs = resolve(process.cwd(), out);
   const witAbs = resolve(process.cwd(), wit);
@@ -101,10 +103,47 @@ export async function buildComponent({ entry, out, wit, world }) {
         `  }`,
         `  globalThis.process = globalThis.process || {};`,
         `  globalThis.process.env = env;`,
+        // M12: KV バインディング（Workers KV 互換）。env.<binding> = kv.hibana.internal への client。
+        // worker の send_request が egress せず Postgres で処理する（tenant はジョブ由来）。
+        `  const __KV = ${JSON.stringify(kvBindings.map((b) => [b.binding, b.id || b.binding]))};`,
+        `  for (const [__b, __ns] of __KV) env[__b] = __kvClient(__ns);`,
         // Workers 互換: fetch(request, env, ctx)。ctx は no-op stub（waitUntil/passThroughOnException）。
         `  const ctx = { waitUntil() {}, passThroughOnException() {} };`,
         `  event.respondWith(app.fetch(request, env, ctx));`,
         `});`,
+        // Workers KV 互換の最小 client（get/put/delete/list）。
+        `function __kvClient(ns) {`,
+        `  const base = "http://kv.hibana.internal/v1/kv";`,
+        `  const e = encodeURIComponent;`,
+        `  return {`,
+        `    async get(key, type) {`,
+        `      const r = await fetch(base + "?ns=" + e(ns) + "&key=" + e(key));`,
+        `      if (r.status === 404) return null;`,
+        `      if (!r.ok) throw new Error("KV get failed: " + r.status);`,
+        `      if (type === "json") return await r.json();`,
+        `      if (type === "arrayBuffer") return await r.arrayBuffer();`,
+        `      return await r.text();`,
+        `    },`,
+        `    async put(key, value, opts) {`,
+        `      const ttl = opts && opts.expirationTtl ? "&ttl=" + opts.expirationTtl : "";`,
+        `      const body = (value instanceof ArrayBuffer || ArrayBuffer.isView(value)) ? value : String(value);`,
+        `      const r = await fetch(base + "?ns=" + e(ns) + "&key=" + e(key) + ttl, { method: "PUT", body });`,
+        `      if (!r.ok) throw new Error("KV put failed: " + r.status);`,
+        `    },`,
+        `    async delete(key) {`,
+        `      const r = await fetch(base + "?ns=" + e(ns) + "&key=" + e(key), { method: "DELETE" });`,
+        `      if (!r.ok) throw new Error("KV delete failed: " + r.status);`,
+        `    },`,
+        `    async list(opts) {`,
+        `      const p = opts && opts.prefix ? "&prefix=" + e(opts.prefix) : "";`,
+        `      const l = opts && opts.limit ? "&limit=" + opts.limit : "";`,
+        `      const r = await fetch(base + "/list?ns=" + e(ns) + p + l);`,
+        `      if (!r.ok) throw new Error("KV list failed: " + r.status);`,
+        `      const j = await r.json();`,
+        `      return { keys: (j.keys || []).map((name) => ({ name })), list_complete: true, cursor: "" };`,
+        `    },`,
+        `  };`,
+        `}`,
         "",
       ].join("\n"),
     );

@@ -130,6 +130,12 @@ async function loadProjectConfig() {
       name: raw.name,
       main: raw.main, // Workers: entry module
       vars: raw.vars && typeof raw.vars === "object" ? raw.vars : {},
+      // Workers: [[kv_namespaces]] { binding, id }。id 省略時は binding を namespace に使う。
+      kv: Array.isArray(raw.kv_namespaces)
+        ? raw.kv_namespaces
+            .filter((k) => k && k.binding)
+            .map((k) => ({ binding: k.binding, id: k.id || k.binding }))
+        : [],
       // hibana 固有（wrangler には無い）。
       public: h.public ?? false,
       egress: Array.isArray(h.egress) ? h.egress : [],
@@ -296,7 +302,7 @@ async function cmdDeploy(args) {
   step("Building TypeScript → WebAssembly Component");
   const work = await mkdtemp(join(tmpdir(), "hibana-deploy-"));
   const outWasm = join(work, "component.wasm");
-  await buildComponent({ entry, out: outWasm });
+  await buildComponent({ entry, out: outWasm, kv: proj?.kv || [] });
   const wasm = await readFile(outWasm);
   await rm(work, { recursive: true, force: true });
   stepDone();
@@ -466,11 +472,42 @@ async function cmdInvoke(args) {
   console.log(out.bodyBase64 ? `(base64) ${out.body}` : out.body ?? "");
 }
 
+// dev 用の in-memory KV（非永続。本番は Postgres）。Workers KV API のサブセット。
+function memKvClient(store) {
+  return {
+    async get(key, type) {
+      const v = store.get(key);
+      if (v == null) return null;
+      return type === "json" ? JSON.parse(v) : v;
+    },
+    async put(key, value) {
+      store.set(key, typeof value === "string" ? value : Buffer.from(value).toString());
+    },
+    async delete(key) {
+      store.delete(key);
+    },
+    async list(opts) {
+      const pre = (opts && opts.prefix) || "";
+      const lim = (opts && opts.limit) || 1000;
+      const keys = [...store.keys()]
+        .filter((k) => k.startsWith(pre))
+        .slice(0, lim)
+        .map((name) => ({ name }));
+      return { keys, list_complete: true, cursor: "" };
+    },
+  };
+}
+
 async function cmdDev(args) {
   const { flags } = parseFlags(args);
-  const entry = flags.entry || "src/index.ts";
+  const proj = await loadProjectConfig();
+  const entry = flags.entry || proj?.main || "src/index.ts";
   const port = Number(flags.port || 8787);
   let app = await loadApp(entry);
+
+  // dev の env（c.env）: wrangler.toml の [vars] + in-memory KV バインディング。
+  const devEnv = { ...(proj?.vars || {}) };
+  for (const b of proj?.kv || []) devEnv[b.binding] = memKvClient(new Map());
 
   // 本番の native component は `--disable http` で **outbound egress を一切持たない**。
   // dev（Node）は既定で fetch できてしまい「dev では外部 API を叩けるが本番で落ちる」ズレを
@@ -499,7 +536,8 @@ async function cmdDev(args) {
         headers: req.headers,
         body,
       });
-      const r = await app.fetch(request);
+      const ctx = { waitUntil() {}, passThroughOnException() {} };
+      const r = await app.fetch(request, devEnv, ctx);
       res.statusCode = r.status;
       r.headers.forEach((v, k) => res.setHeader(k, v));
       const buf = Buffer.from(await r.arrayBuffer());

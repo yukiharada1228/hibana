@@ -62,7 +62,27 @@ Both worker shapes work — Hono `export default app` **and** plain
 | `wrangler rollback` | `hibana rollback <app>` | one-click to previous version |
 | `[vars]` | `[vars]` | applied + approved on deploy |
 | `env.MY_VAR` / secrets | `c.env.MY_VAR` / `env.MY_VAR` | ✅ |
-| `[[kv_namespaces]]`, D1, R2, DO, Queues | — | ❌ not available (no backing stores yet) |
+| `[[kv_namespaces]]` → `env.KV.get/put/delete/list` | ✅ | Postgres-backed, tenant-scoped |
+| D1, R2, Durable Objects, Queues | — | ❌ not available yet |
+
+### KV
+
+```toml
+[[kv_namespaces]]
+binding = "CACHE"
+id = "my-cache"   # namespace (partition within your tenant)
+```
+
+```ts
+app.get("/cache/:k", async (c) => (await c.env.CACHE.get(c.req.param("k"))) ?? c.notFound());
+app.put("/cache/:k", async (c) => { await c.env.CACHE.put(c.req.param("k"), await c.req.text(), { expirationTtl: 3600 }); return c.text("ok"); });
+```
+
+`get` / `put` (with `expirationTtl`) / `delete` / `list({ prefix, limit })` are
+supported. Values persist in the platform's Postgres, isolated **per tenant** by
+row-level security — a component can never read another tenant's data. Namespaces
+partition data within a tenant (they are not a security boundary between your own
+components). `hibana dev` uses a non-persistent in-memory KV.
 
 Secrets set with `hibana secret put` persist across redeploys (each new version
 inherits the previous version's approved names).
