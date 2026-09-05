@@ -27,6 +27,8 @@ reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"
 sha2 = { workspace = true }
 # --- in-memory Component キャッシュ (§3.6)。
 lru = "0.12"
+# M11-6 (§6.6): sha ごとの precompile single-flight ロック用（stampede 防止）。
+dashmap = { workspace = true }
 
 wasmtime = { workspace = true }
 wasmtime-wasi = { workspace = true }

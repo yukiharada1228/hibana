@@ -659,6 +659,7 @@ async fn main() -> anyhow::Result<()> {
         http,
         wasm_cache_dir: settings.wasm_cache_dir,
         cache,
+        inflight_precompile: dashmap::DashMap::new(),
         metrics: worker_metrics,
         control_plane_internal_url: settings.control_plane_internal_url.clone(),
         job_env_fetch_timeout: Duration::from_millis(settings.job_env_fetch_timeout_ms),
@@ -1453,6 +1454,10 @@ struct Worker {
     /// in-memory Component キャッシュ。`wasm_sha256` -> 解決済み `Component` (§3.6)。
     /// hit なら即実行でき、coldstart を短縮できる主経路。
     cache: Mutex<LruCache<String, Arc<Component>>>,
+    /// M11-6 (§6.6): sha ごとの precompile single-flight ロック。同一 sha の cold invoke が
+    /// 同時に来ても precompile を 1 回に集約する（N×23s の stampede を防ぐ）。値は per-sha の
+    /// async Mutex。load 完了後にエントリを消してマップ肥大を防ぐ（遅延した待機側は cache hit で返る）。
+    inflight_precompile: dashmap::DashMap<String, Arc<tokio::sync::Mutex<()>>>,
     /// 観測メトリクス（M4a, §3.8）。LRU / cwasm のキャッシュヒット率、execute 時間、終端化件数。
     metrics: Arc<metrics::Metrics>,
     /// M7c (§4.6): CP の内部専用エンドポイント URL（secret 引き換え先）。
@@ -1822,9 +1827,29 @@ impl Worker {
     ) -> std::result::Result<Arc<Component>, ExecError> {
         let sha = &job.wasm_sha256;
 
-        // a. in-memory LRU hit。
+        // a. in-memory LRU hit（ロック外の高速経路。hit では single-flight の競合を一切踏まない）。
         if let Some(component) = self.cache_get(sha) {
             // M4a (§3.8): LRU hit を計上。
+            self.metrics
+                .wasmtime_component_cache_hits_total
+                .with_label_values(&["lru"])
+                .inc();
+            return Ok(component);
+        }
+
+        // M11-6 (§6.6): single-flight。miss した sha について per-sha ロックを取り、同一 sha の
+        // 同時 cold invoke が **precompile を二重に走らせない**ようにする（N×23s の stampede 防止）。
+        // 待たされた側はロック取得後の double-check で cache hit を引いて即返る。
+        let lock = self
+            .inflight_precompile
+            .entry(sha.clone())
+            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+            .clone();
+        let _flight = lock.lock().await;
+
+        // double-check: 待っている間に別の holder が cache を埋めたかもしれない。
+        if let Some(component) = self.cache_get(sha) {
+            self.inflight_precompile.remove(sha);
             self.metrics
                 .wasmtime_component_cache_hits_total
                 .with_label_values(&["lru"])
@@ -1843,6 +1868,7 @@ impl Worker {
                 Ok(component) => {
                     let component = Arc::new(component);
                     self.cache_put(sha.clone(), Arc::clone(&component));
+                    self.inflight_precompile.remove(sha);
                     // M4a (§3.8): cwasm hit を計上。
                     self.metrics
                         .wasmtime_component_cache_hits_total
@@ -1889,6 +1915,8 @@ impl Worker {
 
         // d. in-memory LRU に格納する。
         self.cache_put(sha.clone(), Arc::clone(&component));
+        // single-flight エントリを解放（待機側は double-check で cache hit を引く）。
+        self.inflight_precompile.remove(sha);
         Ok(component)
     }
 
