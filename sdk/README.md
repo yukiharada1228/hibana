@@ -63,7 +63,8 @@ Both worker shapes work — Hono `export default app` **and** plain
 | `[vars]` | `[vars]` | applied + approved on deploy |
 | `env.MY_VAR` / secrets | `c.env.MY_VAR` / `env.MY_VAR` | ✅ |
 | `[[kv_namespaces]]` → `env.KV.get/put/delete/list` | ✅ | Postgres-backed, tenant-scoped |
-| D1, R2, Durable Objects, Queues | — | ❌ not available yet |
+| `[[r2_buckets]]` → `env.BUCKET.get/put/head/delete/list` | ✅ | Postgres-backed MVP (25 MiB cap) |
+| D1, Durable Objects, Queues | — | ❌ not available yet |
 
 ### KV
 
@@ -83,6 +84,28 @@ supported. Values persist in the platform's Postgres, isolated **per tenant** by
 row-level security — a component can never read another tenant's data. Namespaces
 partition data within a tenant (they are not a security boundary between your own
 components). `hibana dev` uses a non-persistent in-memory KV.
+
+### R2
+
+```toml
+[[r2_buckets]]
+binding = "MEDIA"
+bucket_name = "media"
+```
+
+```ts
+await c.env.MEDIA.put(key, value, {
+  httpMetadata: { contentType: "image/png" },
+  customMetadata: { owner: "yuki" },
+});
+const obj = await c.env.MEDIA.get(key); // .text() / .json() / .arrayBuffer(), .size, .etag, .httpMetadata, .customMetadata
+```
+
+`put` / `get` / `head` / `delete` / `list({ prefix, limit })` are supported, with
+`httpMetadata.contentType` and `customMetadata`. Same tenant isolation as KV.
+**MVP note:** objects are stored in Postgres with a 25 MiB cap; a MinIO-backed R2
+(via CP-presigned URLs, keeping the worker keyless) is the production path — the
+`env.BUCKET` API stays the same.
 
 Secrets set with `hibana secret put` persist across redeploys (each new version
 inherits the previous version's approved names).

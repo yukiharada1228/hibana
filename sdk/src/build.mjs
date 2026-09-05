@@ -53,11 +53,13 @@ function run(cmd, args) {
   });
 }
 
-export async function buildComponent({ entry, out, wit, world, kv }) {
+export async function buildComponent({ entry, out, wit, world, kv, r2 }) {
   wit = wit || DEFAULT_WIT;
   world = world || "http";
   // kv: [{ binding, id }]（wrangler の kv_namespaces）。binding→namespace を shim に焼き込む。
   const kvBindings = Array.isArray(kv) ? kv : [];
+  // r2: [{ binding, bucket_name }]（wrangler の r2_buckets）。
+  const r2Bindings = Array.isArray(r2) ? r2 : [];
   const entryAbs = resolve(process.cwd(), entry);
   const outAbs = resolve(process.cwd(), out);
   const witAbs = resolve(process.cwd(), wit);
@@ -107,6 +109,8 @@ export async function buildComponent({ entry, out, wit, world, kv }) {
         // worker の send_request が egress せず Postgres で処理する（tenant はジョブ由来）。
         `  const __KV = ${JSON.stringify(kvBindings.map((b) => [b.binding, b.id || b.binding]))};`,
         `  for (const [__b, __ns] of __KV) env[__b] = __kvClient(__ns);`,
+        `  const __R2 = ${JSON.stringify(r2Bindings.map((b) => [b.binding, b.bucket_name || b.binding]))};`,
+        `  for (const [__b, __bk] of __R2) env[__b] = __r2Client(__bk);`,
         // Workers 互換: fetch(request, env, ctx)。ctx は no-op stub（waitUntil/passThroughOnException）。
         `  const ctx = { waitUntil() {}, passThroughOnException() {} };`,
         `  event.respondWith(app.fetch(request, env, ctx));`,
@@ -141,6 +145,65 @@ export async function buildComponent({ entry, out, wit, world, kv }) {
         `      if (!r.ok) throw new Error("KV list failed: " + r.status);`,
         `      const j = await r.json();`,
         `      return { keys: (j.keys || []).map((name) => ({ name })), list_complete: true, cursor: "" };`,
+        `    },`,
+        `  };`,
+        `}`,
+        // base64url encode（x-r2-meta 用。カスタムメタは任意文字を含むためヘッダに base64url で載せる）。
+        `const __B64E = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";`,
+        `function __b64urlEnc(str) {`,
+        `  const b = new TextEncoder().encode(str); let o = "";`,
+        `  for (let i = 0; i < b.length; i += 3) {`,
+        `    const b0 = b[i], b1 = i+1 < b.length ? b[i+1] : 0, b2 = i+2 < b.length ? b[i+2] : 0;`,
+        `    o += __B64E[b0 >> 2]; o += __B64E[((b0 & 3) << 4) | (b1 >> 4)];`,
+        `    if (i+1 < b.length) o += __B64E[((b1 & 15) << 2) | (b2 >> 6)];`,
+        `    if (i+2 < b.length) o += __B64E[b2 & 63];`,
+        `  }`,
+        `  return o;`,
+        `}`,
+        // Workers R2 互換の最小 client（put/get/head/delete/list）。
+        `function __r2meta(h) {`,
+        `  let cm = {}; try { const m = h.get("x-r2-meta"); if (m) cm = JSON.parse(__b64urlToString(m)); } catch {}`,
+        `  return { key: h.get("x-r2-key"), size: Number(h.get("x-r2-size") || 0), etag: h.get("x-r2-etag"),`,
+        `           httpMetadata: { contentType: h.get("content-type") || undefined }, customMetadata: cm };`,
+        `}`,
+        `function __r2Client(bucket) {`,
+        `  const base = "http://r2.hibana.internal/v1/r2";`,
+        `  const e = encodeURIComponent;`,
+        `  return {`,
+        `    async put(key, value, opts) {`,
+        `      const headers = {};`,
+        `      if (opts && opts.httpMetadata && opts.httpMetadata.contentType) headers["content-type"] = opts.httpMetadata.contentType;`,
+        `      if (opts && opts.customMetadata) headers["x-r2-meta"] = __b64urlEnc(JSON.stringify(opts.customMetadata));`,
+        `      const b = (value instanceof ArrayBuffer || ArrayBuffer.isView(value)) ? value : String(value);`,
+        `      const r = await fetch(base + "?bucket=" + e(bucket) + "&key=" + e(key), { method: "PUT", headers, body: b });`,
+        `      if (!r.ok) throw new Error("R2 put failed: " + r.status);`,
+        `      return __r2meta(r.headers);`,
+        `    },`,
+        `    async get(key) {`,
+        `      const r = await fetch(base + "?bucket=" + e(bucket) + "&key=" + e(key));`,
+        `      if (r.status === 404) return null;`,
+        `      if (!r.ok) throw new Error("R2 get failed: " + r.status);`,
+        `      const buf = await r.arrayBuffer(); const meta = __r2meta(r.headers);`,
+        `      return Object.assign(meta, { body: buf, arrayBuffer: async () => buf,`,
+        `        text: async () => new TextDecoder().decode(buf),`,
+        `        json: async () => JSON.parse(new TextDecoder().decode(buf)) });`,
+        `    },`,
+        `    async head(key) {`,
+        `      const r = await fetch(base + "?bucket=" + e(bucket) + "&key=" + e(key) + "&head=1");`,
+        `      if (r.status === 404) return null; if (!r.ok) throw new Error("R2 head failed: " + r.status);`,
+        `      return __r2meta(r.headers);`,
+        `    },`,
+        `    async delete(key) {`,
+        `      const r = await fetch(base + "?bucket=" + e(bucket) + "&key=" + e(key), { method: "DELETE" });`,
+        `      if (!r.ok && r.status !== 404) throw new Error("R2 delete failed: " + r.status);`,
+        `    },`,
+        `    async list(opts) {`,
+        `      const p = opts && opts.prefix ? "&prefix=" + e(opts.prefix) : "";`,
+        `      const l = opts && opts.limit ? "&limit=" + opts.limit : "";`,
+        `      const r = await fetch(base + "/list?bucket=" + e(bucket) + p + l);`,
+        `      if (!r.ok) throw new Error("R2 list failed: " + r.status);`,
+        `      const j = await r.json();`,
+        `      return { objects: (j.objects || []).map((o) => ({ key: o.key, size: o.size, etag: o.etag })), truncated: false };`,
         `    },`,
         `  };`,
         `}`,

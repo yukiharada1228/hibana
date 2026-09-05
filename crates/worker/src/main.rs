@@ -214,6 +214,10 @@ struct HostState {
 
 /// M12: KV バインディングの内部ホスト名。guest の fetch がこの host のときだけ KV として処理する。
 const KV_INTERNAL_HOST: &str = "kv.hibana.internal";
+/// M13: R2 バインディングの内部ホスト名（同じく send_request で横取り）。
+const R2_INTERNAL_HOST: &str = "r2.hibana.internal";
+/// M13: R2 オブジェクトの上限（MVP は Postgres bytea 保持のため控えめに）。
+const R2_MAX_OBJECT_BYTES: usize = 25 * 1024 * 1024;
 
 // wasmtime-wasi 29: `WasiView` が `ctx()` と `table()` の両方を提供する。
 impl WasiView for HostState {
@@ -244,12 +248,20 @@ impl wasmtime_wasi_http::WasiHttpView for HostState {
         request: hyper::Request<wasmtime_wasi_http::body::HyperOutgoingBody>,
         config: wasmtime_wasi_http::types::OutgoingRequestConfig,
     ) -> wasmtime_wasi_http::HttpResult<wasmtime_wasi_http::types::HostFutureIncomingResponse> {
-        // M12: KV バインディングは内部ホスト。egress せず、このジョブの tenant で Postgres を叩く。
+        // M12/M13: KV / R2 バインディングは内部ホスト。egress せず、このジョブの tenant で Postgres を叩く。
         if request.uri().host() == Some(KV_INTERNAL_HOST) {
             let pool = self.pool.clone();
             let tenant = self.tenant_id.clone();
             let handle = wasmtime_wasi::runtime::spawn(async move {
                 Ok(handle_kv_request(pool, tenant, request).await)
+            });
+            return Ok(wasmtime_wasi_http::types::HostFutureIncomingResponse::pending(handle));
+        }
+        if request.uri().host() == Some(R2_INTERNAL_HOST) {
+            let pool = self.pool.clone();
+            let tenant = self.tenant_id.clone();
+            let handle = wasmtime_wasi::runtime::spawn(async move {
+                Ok(handle_r2_request(pool, tenant, request).await)
             });
             return Ok(wasmtime_wasi_http::types::HostFutureIncomingResponse::pending(handle));
         }
@@ -3042,6 +3054,218 @@ async fn handle_kv_request(
             kv_response(200, "application/json", json)
         }
         _ => kv_response(404, "text/plain", b"unknown kv op".to_vec()),
+    };
+
+    tx.commit().await.map_err(dberr)?;
+    out
+}
+
+// ============================================================================
+// M13: R2 バインディング（Workers R2 互換, オブジェクトストレージ）。KV と同じく
+// `http://r2.hibana.internal/...` を send_request が横取りし、ジョブの tenant で
+// r2_objects（Postgres bytea, RLS）を操作する。MVP は Postgres 保持（worker keyless 維持）。
+// ============================================================================
+
+/// R2 応答を組む。`extra` は追加ヘッダ（メタデータ）。
+fn r2_response(
+    status: u16,
+    extra: Vec<(&'static str, String)>,
+    body: Vec<u8>,
+) -> Result<
+    wasmtime_wasi_http::types::IncomingResponse,
+    wasmtime_wasi_http::bindings::http::types::ErrorCode,
+> {
+    use wasmtime_wasi_http::bindings::http::types::ErrorCode;
+    let mut b = hyper::Response::builder().status(status);
+    for (k, v) in extra {
+        if let Ok(val) = hyper::header::HeaderValue::from_str(&v) {
+            b = b.header(k, val);
+        }
+    }
+    let resp = b
+        .body(Full::new(Bytes::from(body)).map_err(|e| match e {}).boxed())
+        .map_err(|e| ErrorCode::InternalError(Some(format!("r2 resp: {e}"))))?;
+    Ok(wasmtime_wasi_http::types::IncomingResponse {
+        resp,
+        worker: None,
+        between_bytes_timeout: Duration::from_secs(60),
+    })
+}
+
+/// メタデータ行からレスポンスヘッダ集合を作る。
+fn r2_meta_headers(
+    key: &str,
+    content_type: Option<String>,
+    size: i64,
+    etag: &str,
+    custom_meta: &serde_json::Value,
+) -> Vec<(&'static str, String)> {
+    let mut h = vec![
+        ("x-r2-key", key.to_string()),
+        ("x-r2-size", size.to_string()),
+        ("x-r2-etag", etag.to_string()),
+        (
+            "x-r2-meta",
+            faas_shared::b64url_encode(custom_meta.to_string().as_bytes()),
+        ),
+    ];
+    if let Some(ct) = content_type {
+        h.push(("content-type", ct));
+    }
+    h
+}
+
+async fn handle_r2_request(
+    pool: PgPool,
+    tenant_id: String,
+    request: hyper::Request<HyperOutgoingBody>,
+) -> Result<
+    wasmtime_wasi_http::types::IncomingResponse,
+    wasmtime_wasi_http::bindings::http::types::ErrorCode,
+> {
+    use sqlx::Row as _;
+    use wasmtime_wasi_http::bindings::http::types::ErrorCode;
+    let dberr = |_e| ErrorCode::InternalError(Some("r2: db error".to_string()));
+
+    let (parts, body) = request.into_parts();
+    let path = parts.uri.path().to_string();
+    let q = parts.uri.query().map(parse_query).unwrap_or_default();
+    let bucket = q.get("bucket").cloned().unwrap_or_default();
+    let key = q.get("key").cloned().unwrap_or_default();
+    if bucket.is_empty() {
+        return r2_response(400, vec![], b"missing bucket".to_vec());
+    }
+
+    let mut tx = pool.begin().await.map_err(dberr)?;
+    sqlx::query("SELECT set_config('app.tenant_id', $1, true)")
+        .bind(&tenant_id)
+        .execute(&mut *tx)
+        .await
+        .map_err(dberr)?;
+
+    let out = match (parts.method.as_str(), path.as_str()) {
+        ("GET", "/v1/r2") => {
+            let head_only = q.get("head").map(|v| v == "1").unwrap_or(false);
+            let row = sqlx::query(
+                "SELECT value, content_type, size, etag, custom_meta FROM r2_objects \
+                 WHERE tenant_id=$1 AND bucket=$2 AND key=$3",
+            )
+            .bind(&tenant_id)
+            .bind(&bucket)
+            .bind(&key)
+            .fetch_optional(&mut *tx)
+            .await
+            .map_err(dberr)?;
+            match row {
+                None => r2_response(404, vec![], Vec::new()),
+                Some(r) => {
+                    let ct: Option<String> = r.try_get("content_type").ok();
+                    let size: i64 = r.try_get("size").map_err(dberr)?;
+                    let etag: String = r.try_get("etag").map_err(dberr)?;
+                    let meta: serde_json::Value =
+                        r.try_get("custom_meta").unwrap_or(serde_json::Value::Null);
+                    let headers = r2_meta_headers(&key, ct, size, &etag, &meta);
+                    let value: Vec<u8> = if head_only {
+                        Vec::new()
+                    } else {
+                        r.try_get("value").map_err(dberr)?
+                    };
+                    r2_response(200, headers, value)
+                }
+            }
+        }
+        ("PUT", "/v1/r2") => {
+            let bytes = body
+                .collect()
+                .await
+                .map_err(|_| ErrorCode::InternalError(Some("r2: read body".into())))?
+                .to_bytes();
+            if bytes.len() > R2_MAX_OBJECT_BYTES {
+                return r2_response(413, vec![], b"object too large".to_vec());
+            }
+            let val = bytes.to_vec();
+            let ct: Option<String> = parts
+                .headers
+                .get(hyper::header::CONTENT_TYPE)
+                .and_then(|v| v.to_str().ok())
+                .map(|s| s.to_string());
+            let meta: serde_json::Value = parts
+                .headers
+                .get("x-r2-meta")
+                .and_then(|v| v.to_str().ok())
+                .and_then(faas_shared::b64url_decode)
+                .and_then(|b| serde_json::from_slice(&b).ok())
+                .unwrap_or_else(|| serde_json::json!({}));
+            let etag = hex_encode(&Sha256::digest(&val));
+            let size = val.len() as i64;
+            sqlx::query(
+                "INSERT INTO r2_objects (tenant_id,bucket,key,value,content_type,custom_meta,size,etag,uploaded_at) \
+                 VALUES ($1,$2,$3,$4,$5,$6,$7,$8, now()) \
+                 ON CONFLICT (tenant_id,bucket,key) DO UPDATE SET \
+                   value=EXCLUDED.value, content_type=EXCLUDED.content_type, \
+                   custom_meta=EXCLUDED.custom_meta, size=EXCLUDED.size, etag=EXCLUDED.etag, uploaded_at=now()",
+            )
+            .bind(&tenant_id)
+            .bind(&bucket)
+            .bind(&key)
+            .bind(&val)
+            .bind(&ct)
+            .bind(&meta)
+            .bind(size)
+            .bind(&etag)
+            .execute(&mut *tx)
+            .await
+            .map_err(dberr)?;
+            r2_response(200, r2_meta_headers(&key, ct, size, &etag, &meta), Vec::new())
+        }
+        ("DELETE", "/v1/r2") => {
+            sqlx::query("DELETE FROM r2_objects WHERE tenant_id=$1 AND bucket=$2 AND key=$3")
+                .bind(&tenant_id)
+                .bind(&bucket)
+                .bind(&key)
+                .execute(&mut *tx)
+                .await
+                .map_err(dberr)?;
+            r2_response(204, vec![], Vec::new())
+        }
+        ("GET", "/v1/r2/list") => {
+            let prefix = q.get("prefix").cloned().unwrap_or_default();
+            let limit: i64 = q
+                .get("limit")
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(1000)
+                .clamp(1, 1000);
+            let pat = format!(
+                "{}%",
+                prefix.replace('\\', "\\\\").replace('%', "\\%").replace('_', "\\_")
+            );
+            let rows = sqlx::query(
+                "SELECT key, size, etag FROM r2_objects \
+                 WHERE tenant_id=$1 AND bucket=$2 AND key LIKE $3 \
+                 ORDER BY key LIMIT $4",
+            )
+            .bind(&tenant_id)
+            .bind(&bucket)
+            .bind(&pat)
+            .bind(limit)
+            .fetch_all(&mut *tx)
+            .await
+            .map_err(dberr)?;
+            let objs: Vec<serde_json::Value> = rows
+                .iter()
+                .map(|r| {
+                    serde_json::json!({
+                        "key": r.try_get::<String,_>("key").unwrap_or_default(),
+                        "size": r.try_get::<i64,_>("size").unwrap_or(0),
+                        "etag": r.try_get::<String,_>("etag").unwrap_or_default(),
+                    })
+                })
+                .collect();
+            let json = serde_json::to_vec(&serde_json::json!({ "objects": objs }))
+                .map_err(|e| ErrorCode::InternalError(Some(format!("r2 list: {e}"))))?;
+            r2_response(200, vec![("content-type", "application/json".into())], json)
+        }
+        _ => r2_response(404, vec![], b"unknown r2 op".to_vec()),
     };
 
     tx.commit().await.map_err(dberr)?;

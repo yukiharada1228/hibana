@@ -136,6 +136,12 @@ async function loadProjectConfig() {
             .filter((k) => k && k.binding)
             .map((k) => ({ binding: k.binding, id: k.id || k.binding }))
         : [],
+      // Workers: [[r2_buckets]] { binding, bucket_name }。
+      r2: Array.isArray(raw.r2_buckets)
+        ? raw.r2_buckets
+            .filter((b) => b && b.binding)
+            .map((b) => ({ binding: b.binding, bucket_name: b.bucket_name || b.binding }))
+        : [],
       // hibana 固有（wrangler には無い）。
       public: h.public ?? false,
       egress: Array.isArray(h.egress) ? h.egress : [],
@@ -302,7 +308,7 @@ async function cmdDeploy(args) {
   step("Building TypeScript → WebAssembly Component");
   const work = await mkdtemp(join(tmpdir(), "hibana-deploy-"));
   const outWasm = join(work, "component.wasm");
-  await buildComponent({ entry, out: outWasm, kv: proj?.kv || [] });
+  await buildComponent({ entry, out: outWasm, kv: proj?.kv || [], r2: proj?.r2 || [] });
   const wasm = await readFile(outWasm);
   await rm(work, { recursive: true, force: true });
   stepDone();
@@ -498,6 +504,57 @@ function memKvClient(store) {
   };
 }
 
+// dev 用の in-memory R2（非永続）。Workers R2 API のサブセット。
+function memR2Client(store) {
+  const toBuf = (v) =>
+    typeof v === "string" ? Buffer.from(v) : Buffer.from(v);
+  return {
+    async put(key, value, opts) {
+      const buf = toBuf(value);
+      store.set(key, {
+        buf,
+        size: buf.length,
+        etag: String(buf.length),
+        httpMetadata: (opts && opts.httpMetadata) || {},
+        customMetadata: (opts && opts.customMetadata) || {},
+      });
+      return { key, size: buf.length };
+    },
+    async get(key) {
+      const o = store.get(key);
+      if (!o) return null;
+      const ab = o.buf.buffer.slice(o.buf.byteOffset, o.buf.byteOffset + o.buf.length);
+      return {
+        key,
+        size: o.size,
+        etag: o.etag,
+        httpMetadata: o.httpMetadata,
+        customMetadata: o.customMetadata,
+        body: ab,
+        arrayBuffer: async () => ab,
+        text: async () => o.buf.toString("utf8"),
+        json: async () => JSON.parse(o.buf.toString("utf8")),
+      };
+    },
+    async head(key) {
+      const o = store.get(key);
+      return o ? { key, size: o.size, etag: o.etag, httpMetadata: o.httpMetadata, customMetadata: o.customMetadata } : null;
+    },
+    async delete(key) {
+      store.delete(key);
+    },
+    async list(opts) {
+      const pre = (opts && opts.prefix) || "";
+      const lim = (opts && opts.limit) || 1000;
+      const objects = [...store.entries()]
+        .filter(([k]) => k.startsWith(pre))
+        .slice(0, lim)
+        .map(([key, o]) => ({ key, size: o.size, etag: o.etag }));
+      return { objects, truncated: false };
+    },
+  };
+}
+
 async function cmdDev(args) {
   const { flags } = parseFlags(args);
   const proj = await loadProjectConfig();
@@ -505,9 +562,10 @@ async function cmdDev(args) {
   const port = Number(flags.port || 8787);
   let app = await loadApp(entry);
 
-  // dev の env（c.env）: wrangler.toml の [vars] + in-memory KV バインディング。
+  // dev の env（c.env）: wrangler.toml の [vars] + in-memory KV / R2 バインディング。
   const devEnv = { ...(proj?.vars || {}) };
   for (const b of proj?.kv || []) devEnv[b.binding] = memKvClient(new Map());
+  for (const b of proj?.r2 || []) devEnv[b.binding] = memR2Client(new Map());
 
   // 本番の native component は `--disable http` で **outbound egress を一切持たない**。
   // dev（Node）は既定で fetch できてしまい「dev では外部 API を叩けるが本番で落ちる」ズレを
