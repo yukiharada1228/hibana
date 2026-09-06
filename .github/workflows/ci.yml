@@ -108,10 +108,16 @@ jobs:
       HIBANA_EMAIL: admin@example.com
       HIBANA_PASSWORD: dev-password
       HIBANA_INGRESS_DOMAIN: hibana.local
+      REQ_TIMEOUT: "25"
+      READY_TRIES: "15"
     steps:
       - uses: actions/checkout@v4
 
       - uses: Swatinem/rust-cache@v2
+        with:
+          # release ビルドは重い。smoke が失敗してもキャッシュを保存し、次回ビルドを高速化する。
+          cache-on-failure: true
+          key: smoke-release
 
       - uses: actions/setup-node@v4
         with:

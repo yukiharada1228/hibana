@@ -48,10 +48,11 @@ echo "==> deploy all-bindings ($GATEWAY, *.${TENANT}.${HIBANA_INGRESS_DOMAIN})"
 ( cd "$APP_DIR" && HIBANA_INGRESS_DOMAIN="$HIBANA_INGRESS_DOMAIN" node "$CLI" deploy )
 
 # 冷起動（初回 precompile）と single-shot アサートのレースを避けるため、"/" が応答するまで待つ。
+# 応答しないまま READY_TRIES 回超えたら諦めて先へ進む（asserts が FAIL を出しログ dump に繋げる）。
 echo "==> wait for app readiness"
-for _ in $(seq 1 30); do
+for _ in $(seq 1 "${READY_TRIES:-12}"); do
   [ "$(get /)" = "all-bindings hello" ] && { green "ready"; break; }
-  sleep 1
+  sleep 2
 done
 
 echo "==> assert synchronous bindings"
