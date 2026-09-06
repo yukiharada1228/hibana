@@ -237,7 +237,8 @@ const QUEUE_INTERNAL_HOST: &str = "queue.hibana.internal";
 const DO_INTERNAL_HOST: &str = "do.hibana.internal";
 /// M13: R2 バインディングの内部ホスト名（同じく send_request で横取り）。
 const R2_INTERNAL_HOST: &str = "r2.hibana.internal";
-/// M13: R2 オブジェクトの上限（MVP は Postgres bytea 保持のため控えめに）。
+/// M13: R2 PUT オブジェクトの上限。worker は body を一括バッファして CP へ中継するため、
+/// 過大オブジェクトはメモリ保護のためここで 413 に落とす（ストリーミングは将来対応）。
 const R2_MAX_OBJECT_BYTES: usize = 25 * 1024 * 1024;
 
 // wasmtime-wasi 29: `WasiView` が `ctx()` と `table()` の両方を提供する。
@@ -2095,6 +2096,7 @@ impl Worker {
     ///   （wall-time / execution_time 超過の `timeout` とは別物。決定性が要件の component に
     ///   限り fuel を有効化し、暴走中の fuel 切れは「リソース超過」として失敗扱い）。
     ///   `None` のときは fuel を **無効化** する（後述のため `u64::MAX` 相当を流し込むダミー）。
+    #[allow(clippy::too_many_arguments)]
     async fn run_component(
         &self,
         component: Arc<Component>,
@@ -2847,6 +2849,7 @@ fn envelope_to_request(input: &[u8]) -> anyhow::Result<hyper::Request<ReqBody>> 
 ///     落とし、承認集合に一致する IP だけを選ぶ（DNS rebinding 対策: 承認済み IP に固定接続）。
 ///  3. reqwest の `resolve(host, ip)` でその **確定 IP に固定**して接続する（SNI/Host は元のホスト名の
 ///     ままなので TLS も成立）。任意宛先へは出られない。
+///
 /// 本体は簡潔さのためバッファリングする（typical な API 呼び出し向け。巨大ストリームは非対象）。
 async fn gated_send_request(
     request: hyper::Request<HyperOutgoingBody>,
@@ -3259,6 +3262,9 @@ async fn handle_r2_request(
                 .map_err(|_| ErrorCode::InternalError(Some("r2: read body".into())))?
                 .to_bytes()
                 .to_vec();
+            if val.len() > R2_MAX_OBJECT_BYTES {
+                return r2_response(413, vec![], b"object too large".to_vec());
+            }
             let mut rb = http
                 .put(format!("{base}/object"))
                 .header("x-hibana-job-token", &job_token)
@@ -3500,14 +3506,14 @@ async fn handle_do_lock(
     let key = h as i64;
 
     let mut m = locks.lock().await;
-    if !m.contains_key(&map_key) {
+    if let std::collections::hash_map::Entry::Vacant(slot) = m.entry(map_key) {
         let mut conn = pool.acquire().await.map_err(err)?;
         sqlx::query("SELECT pg_advisory_lock($1)")
             .bind(key)
             .execute(&mut *conn)
             .await
             .map_err(err)?;
-        m.insert(map_key, conn);
+        slot.insert(conn);
     }
     kv_response(200, "text/plain", b"locked".to_vec())
 }
