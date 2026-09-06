@@ -1,0 +1,14 @@
+# Deploy with: cd examples/worker && hibana deploy
+name = "my-worker"
+main = "src/index.ts"
+compatibility_date = "2024-01-01"
+
+# Plaintext config, available as c.env / process.env (Workers-style [vars]).
+[vars]
+GREETING = "Hello from Hibana"
+
+# Hibana-specific (not part of wrangler.toml):
+[hibana]
+public = true                     # publish at <name>.<tenant>.<base>
+ingress_domain = "hibana.local"   # match the server's INGRESS_BASE_DOMAIN
+egress = []                       # approved outbound hosts, e.g. ["api.example.com:443"]

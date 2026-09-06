@@ -85,6 +85,16 @@ const BASELINE_APPROVED_PREFIXES: &[&str] = &[
     //     ランタイムが担保する（chaos_v1 で「アップロードは通るが実行時に fs は全拒否」を実測固定する）。
     // これは「真の防御は空の WasiCtx」という M9 偵察の結論に沿った設計である。
     "wasi:filesystem/",
+    // M11 (§4.2): `wasi:http/types`。JS/Hono Component は Request/Response を wasi:http/types の
+    // リソースとして扱うため必須。
+    "wasi:http/types",
+    // M11-8 (§4.4): `wasi:http/outgoing-handler`（guest の fetch = egress）。
+    // **import は許すが実際の egress は runtime で gate する** —— これは `wasi:sockets/` と同じ
+    // M9c モデル（「import できる」ことと「到達できる」ことを分離）。worker は
+    // `WasiHttpView::send_request` を per-component の allowlist（解決済み host:port）で gate し、
+    // 空 allowlist = 全拒否（deny-by-default）、非空でも SSRF hard-deny を最優先して承認済み IP に
+    // 固定接続する。したがってこの import を baseline で許しても egress の抜け道にはならない。
+    "wasi:http/outgoing-handler",
 ];
 
 /// admin が承認した capability 集合 (§4.4)。WIT import を strict matching する際の権威。
@@ -426,18 +436,39 @@ fn match_capabilities(
 fn collect_component_imports(bytes: &[u8]) -> Result<Vec<ComponentImport>, FaasError> {
     let mut imports = Vec::new();
 
+    // **最外殻コンポーネントの import だけ**を集める（= host 境界）。`parse_all` は
+    // ネストしたモジュール/コンポーネントのセクションも平坦に流すため、内部コンポーネントの
+    // **内部 import**（親の instantiation で満たされ host からは配線されない）まで拾ってしまう。
+    // それらは host capability ではないので許可リスト照合の対象にしてはならない。
+    // 例: componentize-js 0.19.3（wasi:http proxy 経路）が生む component は、内部コンポーネントに
+    // `handle` 関数 import を持つ —— これは incoming-handler の内部配線であって host import ではない。
+    // nest 深さを ModuleSection/ComponentSection(+1) と End(-1) で数え、depth==0 のときだけ集める。
+    let mut depth: i32 = 0;
+
     for payload in Parser::new(0).parse_all(bytes) {
         let payload =
             payload.map_err(|e| FaasError::InvalidRequest(format!("parse error: {e}")))?;
-        if let Payload::ComponentImportSection(section) = payload {
-            for import in section {
-                let import =
-                    import.map_err(|e| FaasError::InvalidRequest(format!("parse error: {e}")))?;
-                imports.push(ComponentImport {
-                    name: import.name.0.to_string(),
-                    type_only: matches!(import.ty, ComponentTypeRef::Type(_)),
-                });
+        match payload {
+            // ネスト単位に入る（後続ペイロードは内部のもの）。
+            Payload::ModuleSection { .. } | Payload::ComponentSection { .. } => {
+                depth += 1;
             }
+            // 現在の単位の終わり。最外殻の End で depth は負になりうるが害はない。
+            Payload::End(_) => {
+                depth -= 1;
+            }
+            // host 境界（最外殻）の import section のみ照合対象にする。
+            Payload::ComponentImportSection(section) if depth == 0 => {
+                for import in section {
+                    let import = import
+                        .map_err(|e| FaasError::InvalidRequest(format!("parse error: {e}")))?;
+                    imports.push(ComponentImport {
+                        name: import.name.0.to_string(),
+                        type_only: matches!(import.ty, ComponentTypeRef::Type(_)),
+                    });
+                }
+            }
+            _ => {}
         }
     }
 

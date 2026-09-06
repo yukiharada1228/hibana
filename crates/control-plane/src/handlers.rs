@@ -3228,6 +3228,43 @@ pub struct RollbackVersionResponse {
     pub canary_cleared: bool,
 }
 
+/// M11 (§4.2): 公開 HTTP ingress の opt-in を切り替えるリクエスト。
+#[derive(Debug, Deserialize)]
+pub struct SetIngressRequest {
+    /// true で `<app>.<tenant>.<base>` の公開 URL から到達可能にする（既定 false = deny-by-default）。
+    pub enabled: bool,
+}
+
+#[derive(Debug, Serialize)]
+pub struct SetIngressResponse {
+    pub component_id: String,
+    pub ingress_enabled: bool,
+}
+
+/// PUT /components/{id}/ingress — 公開 HTTP ingress の opt-in を切り替える (M11, §4.2)。
+///
+/// Deploy スコープ（component ライフサイクル相当）。deny-by-default なので、公開 URL から
+/// 到達させたい component は明示的にこれを true にする必要がある。egress とは無関係。
+pub async fn set_component_ingress(
+    State(state): State<AppState>,
+    principal: Principal,
+    Path(component_id): Path<String>,
+    JsonBody(req): JsonBody<SetIngressRequest>,
+) -> Result<impl IntoResponse, AppError> {
+    let tenant = &principal.tenant_id;
+    let mut tx = state.pool().begin().await?;
+    db::set_tenant_guc(&mut tx, tenant).await?;
+    let updated = db::set_component_ingress(&mut *tx, tenant, &component_id, req.enabled).await?;
+    if !updated {
+        return Err(FaasError::NotFound(format!("component '{component_id}'")).into());
+    }
+    tx.commit().await?;
+    Ok(Json(SetIngressResponse {
+        component_id,
+        ingress_enabled: req.enabled,
+    }))
+}
+
 /// POST /components/{id}/rollback — ワンクリック rollback（canary 破棄 + 直前 stable へ復帰）。
 ///
 /// **保証の境界**: 版は enqueue 時点で JobMessage と job_token claim に焼き込まれるため、
@@ -3418,6 +3455,46 @@ pub struct ApproveCapabilityEnvResponse {
     pub version: String,
     pub version_id: String,
     pub env: Vec<String>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct GetCapabilitiesResponse {
+    pub component_id: String,
+    pub version: String,
+    /// 注入が承認された env 名（M7b/M9c）。
+    pub env: Vec<String>,
+    /// 承認された egress 先（host:port, M9c）。
+    pub net_allow_outbound: Vec<String>,
+}
+
+/// GET /components/{id}/versions/{version}/capabilities — 現在の承認内容を返す（Read）。
+///
+/// **値は返さない**（env の名前と egress 先のみ）。CLI が「既存を保ったまま名前を足す」
+/// マージのために読む用途（承認 PUT は全置換なので、GET してマージしてから PUT する）。
+pub async fn get_capabilities(
+    State(state): State<AppState>,
+    principal: Principal,
+    Path((component_id, version)): Path<(String, String)>,
+) -> Result<impl IntoResponse, AppError> {
+    let tenant = &principal.tenant_id;
+    let mut tx = state.pool().begin().await?;
+    db::set_tenant_guc(&mut tx, tenant).await?;
+    let version_id = db::find_version_id(&mut *tx, tenant, &component_id, &version)
+        .await?
+        .ok_or_else(|| {
+            FaasError::NotFound(format!("version '{version}' of component '{component_id}'"))
+        })?;
+    let current = db::version_capabilities(&mut *tx, tenant, &version_id)
+        .await?
+        .unwrap_or(Value::Null);
+    tx.commit().await?;
+    let caps = validation::parse_capabilities(&current);
+    Ok(Json(GetCapabilitiesResponse {
+        component_id,
+        version,
+        env: caps.env.into_iter().collect(),
+        net_allow_outbound: caps.net_allow_outbound.into_iter().collect(),
+    }))
 }
 
 /// PUT /components/{id}/versions/{version}/capabilities — env 許可リストを承認する（admin）。

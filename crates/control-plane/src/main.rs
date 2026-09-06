@@ -20,7 +20,10 @@ mod enqueue;
 mod error;
 mod extract;
 mod handlers;
+mod handlers_queue;
+mod handlers_r2;
 mod handlers_secrets;
+mod ingress;
 mod lanes;
 mod login;
 mod metrics;
@@ -228,6 +231,7 @@ async fn main() -> anyhow::Result<()> {
         config.lanes(),
         config.scale_policy(),
         config.metrics_include_tenant_label,
+        config.ingress_base_domain.clone(),
     );
 
     // --- result 購読タスク ---
@@ -388,6 +392,18 @@ fn build_internal_router(state: AppState) -> Router {
     Router::new()
         .route("/internal/job-env", post(handlers_secrets::job_env))
         .route("/internal/scale", get(handlers::internal_scale))
+        // M13: R2 バインディングの本体 I/O（worker keyless のため CP が S3 を代行）。
+        // internal listener のみ。認証は job_token（handlers_r2 内で検証）。
+        .route(
+            "/internal/r2/object",
+            get(handlers_r2::get_object)
+                .put(handlers_r2::put_object)
+                .delete(handlers_r2::delete_object)
+                .layer(axum::extract::DefaultBodyLimit::max(32 * 1024 * 1024)),
+        )
+        .route("/internal/r2/list", get(handlers_r2::list_objects))
+        // M15: producer からのメッセージを consumer invoke として enqueue する（internal のみ）。
+        .route("/internal/queue/send", post(handlers_queue::queue_send))
         .with_state(state)
 }
 
@@ -411,6 +427,12 @@ fn build_router(state: AppState) -> Router {
             get(handlers::list_versions),
         )
         .route("/executions/{id}", get(handlers::get_execution))
+        // GET /components/{id}/versions/{version}/capabilities: 現在の承認 env 名 / egress 先を返す
+        // （M11-9。値は返さない。CLI が全置換 PUT 前にマージするための読み取り）。
+        .route(
+            "/components/{component_id}/versions/{version}/capabilities",
+            get(handlers::get_capabilities),
+        )
         // GET /usage: テナント利用量参照 (M5, §15 / §6.0)。principal.tenant_id を権威化し
         // cross-tenant path を持たない（/tenants/{id}/usage の IDOR 面を作らない）。
         .route("/usage", get(handlers::get_usage))
@@ -452,7 +474,25 @@ fn build_router(state: AppState) -> Router {
         .route("/components", post(handlers::create_component))
         .route(
             "/components/{component_id}/versions",
-            post(handlers::upload_version),
+            // axum の DefaultBodyLimit（既定 2MiB）は multipart body 全体に効くため、
+            // それを超える wasm（JS/Hono コンポーネントは数 MiB〜十数 MiB）は
+            // ハンドラのストリーミング検査に届く前に弾かれてしまう。上限を
+            // MAX_WASM_UPLOAD_BYTES（+ 他フィールド用の余白 1MiB）に引き上げる。
+            // ハード上限の強制自体は upload_version 内のストリーミング検査が担う。
+            post(handlers::upload_version).layer(axum::extract::DefaultBodyLimit::max(
+                state.max_wasm_upload_bytes() as usize + 1024 * 1024,
+            )),
+        )
+        // PUT /components/{id}/ingress: 公開 HTTP ingress の opt-in 切り替え (M11, §4.2。
+        // component ライフサイクル相当の Deploy スコープ)。
+        .route(
+            "/components/{component_id}/ingress",
+            put(handlers::set_component_ingress),
+        )
+        // M15: queue consumer 登録（deploy が [[queues.consumers]] を反映）。
+        .route(
+            "/components/{component_id}/queue-consumers",
+            put(handlers_queue::register_consumers),
         )
         // POST /cron-jobs: Cron ジョブ登録 (M6b, §15。component ライフサイクル相当の Deploy スコープ)。
         .route("/cron-jobs", post(handlers::create_cron_job))
@@ -609,6 +649,10 @@ fn build_router(state: AppState) -> Router {
             put(handlers::set_tenant_quotas),
         )
         .merge(protected)
+        // M11 (§4.2): 公開 HTTP ingress gateway。API ルートにマッチしなかったリクエストのうち
+        // Host が `<app>.<tenant>.<INGRESS_BASE_DOMAIN>` のものだけを gateway として処理する
+        // （それ以外は 404）。deny-by-default（ingress_enabled な component だけ到達可能）。
+        .fallback(ingress::ingress_fallback)
         // M10 follow-up (§3.8): HTTP リクエストメトリクスを observe する。TraceLayer より内側に
         // 置くことで、routing 済み（MatchedPath が extensions に載った状態）で method/route/status を
         // 拾える。**path はルートテンプレート**（`/components/{id}/versions`）を使い、生 URI の

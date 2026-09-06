@@ -605,6 +605,97 @@ pub async fn find_component_by_name(
     .transpose()
 }
 
+/// M11 (§4.2): 公開 ingress gateway 用の component 解決結果。
+/// gateway は「到達可否」だけ判定し、実際の起動は名前で通常 invoke に委ねる（id は不要）。
+pub struct IngressComponentRow {
+    /// 公開 URL から到達を許すか（deny-by-default）。
+    pub ingress_enabled: bool,
+    /// active な版（無ければ実行不可）。
+    pub active_version_id: Option<String>,
+}
+
+/// M11 (§4.2): テナント内の component を名前で引き、公開 ingress に必要な列だけ返す。
+/// FORCE RLS 下なので呼び出し側は `set_tenant_guc(tenant)` 済みの tx を渡すこと。
+pub async fn find_ingress_component(
+    executor: impl sqlx::PgExecutor<'_>,
+    tenant_id: &str,
+    name: &str,
+) -> Result<Option<IngressComponentRow>, sqlx::Error> {
+    let row = sqlx::query(
+        "SELECT ingress_enabled, active_version_id \
+         FROM components \
+         WHERE tenant_id = $1 AND name = $2 AND deleted_at IS NULL",
+    )
+    .bind(tenant_id)
+    .bind(name)
+    .fetch_optional(executor)
+    .await?;
+
+    row.map(|r| {
+        Ok(IngressComponentRow {
+            ingress_enabled: r.try_get("ingress_enabled")?,
+            active_version_id: r.try_get("active_version_id")?,
+        })
+    })
+    .transpose()
+}
+
+/// M11 (§4.2): component の公開 ingress opt-in フラグを設定する。戻り値は行が在って
+/// 更新できたか（存在しない/削除済みは false）。GUC 済み tx を渡すこと（FORCE RLS）。
+pub async fn set_component_ingress(
+    executor: impl sqlx::PgExecutor<'_>,
+    tenant_id: &str,
+    component_id: &str,
+    enabled: bool,
+) -> Result<bool, sqlx::Error> {
+    let res = sqlx::query(
+        "UPDATE components SET ingress_enabled = $3 \
+         WHERE tenant_id = $1 AND id = $2 AND deleted_at IS NULL",
+    )
+    .bind(tenant_id)
+    .bind(component_id)
+    .bind(enabled)
+    .execute(executor)
+    .await?;
+    Ok(res.rows_affected() > 0)
+}
+
+/// M15: queue の consumer component を解決する（GUC 済み tx / executor を渡すこと）。
+pub async fn find_queue_consumer(
+    executor: impl sqlx::PgExecutor<'_>,
+    tenant_id: &str,
+    queue: &str,
+) -> Result<Option<String>, sqlx::Error> {
+    let row =
+        sqlx::query("SELECT component_id FROM queue_consumers WHERE tenant_id=$1 AND queue=$2")
+            .bind(tenant_id)
+            .bind(queue)
+            .fetch_optional(executor)
+            .await?;
+    row.map(|r| r.try_get::<String, _>("component_id"))
+        .transpose()
+}
+
+/// M15: queue → component の consumer 登録（全置換 upsert）。
+pub async fn upsert_queue_consumer(
+    executor: impl sqlx::PgExecutor<'_>,
+    tenant_id: &str,
+    queue: &str,
+    component_id: &str,
+) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        "INSERT INTO queue_consumers (tenant_id, queue, component_id, updated_at) \
+         VALUES ($1,$2,$3, now()) \
+         ON CONFLICT (tenant_id, queue) DO UPDATE SET component_id=EXCLUDED.component_id, updated_at=now()",
+    )
+    .bind(tenant_id)
+    .bind(queue)
+    .bind(component_id)
+    .execute(executor)
+    .await?;
+    Ok(())
+}
+
 /// 実行を pending で INSERT する (§ /invoke)。
 ///
 /// 冪等列を持たない簡易版（`insert_pending_execution_with_provenance(.., None, None, None)`
