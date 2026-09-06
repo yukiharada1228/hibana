@@ -241,8 +241,10 @@ component can only reach its own tenant's objects. `hibana dev` uses in-memory R
 
 **`get` (download) streams** end-to-end (S3 → control-plane → worker → your
 handler) without buffering the object in memory, so large objects are cheap to
-serve. `put` (upload) is still buffered, capped at **100 MiB** — streaming uploads
-(S3 multipart) are a planned follow-up.
+serve. **`put` (upload)** streams the body through the worker to the control-plane
+without buffering it on the (multi-tenant) worker; the control-plane still buffers
+before the S3 write, so objects are capped at **100 MiB**. Fully streamed uploads
+(S3 multipart, no control-plane buffering) are a planned follow-up.
 
 Secrets set with `hibana secret put` persist across redeploys (each new version
 inherits the previous version's approved names).

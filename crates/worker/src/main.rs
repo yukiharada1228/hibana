@@ -79,7 +79,7 @@ use faas_shared::{
     ResultMessage, UsageMetrics,
 };
 use futures::StreamExt;
-use http_body_util::{BodyExt, Full, StreamBody};
+use http_body_util::{BodyExt, BodyStream, Full, StreamBody};
 use lru::LruCache;
 use sha2::{Digest, Sha256};
 use sqlx::postgres::PgPoolOptions;
@@ -3290,21 +3290,24 @@ async fn handle_r2_request(
 
     match (parts.method.as_str(), path.as_str()) {
         ("PUT", "/v1/r2") => {
-            let val = body
-                .collect()
-                .await
-                .map_err(|_| ErrorCode::InternalError(Some("r2: read body".into())))?
-                .to_bytes()
-                .to_vec();
-            if val.len() > R2_MAX_OBJECT_BYTES {
-                return r2_response(413, vec![], b"object too large".to_vec());
+            // M19b: Content-Length があれば上限を先に判定し、body は **collect せず** CP へストリーム
+            // 中継する（multi-tenant worker のホットパスで巨大オブジェクトをバッファしない）。長さ不明
+            // （chunked）時のみ従来どおりバッファする（S3 側は CP がバッファ、streaming は follow-up）。
+            let content_length = parts
+                .headers
+                .get(hyper::header::CONTENT_LENGTH)
+                .and_then(|v| v.to_str().ok())
+                .and_then(|s| s.parse::<u64>().ok());
+            if let Some(n) = content_length {
+                if n > R2_MAX_OBJECT_BYTES as u64 {
+                    return r2_response(413, vec![], b"object too large".to_vec());
+                }
             }
             let mut rb = http
                 .put(format!("{base}/object"))
                 .header("x-hibana-job-token", &job_token)
                 .header("x-r2-bucket", &bucket)
-                .header("x-r2-key", &key)
-                .body(val);
+                .header("x-r2-key", &key);
             if let Some(ct) = parts
                 .headers
                 .get(hyper::header::CONTENT_TYPE)
@@ -3315,6 +3318,29 @@ async fn handle_r2_request(
             if let Some(m) = parts.headers.get("x-r2-meta").and_then(|v| v.to_str().ok()) {
                 rb = rb.header("x-r2-meta", m);
             }
+            let rb = if let Some(n) = content_length {
+                // 既知長: guest→worker→CP を無バッファでストリームする（CL を明示）。
+                let stream = BodyStream::new(body).filter_map(|f| async move {
+                    match f {
+                        Ok(frame) => frame.into_data().ok().map(Ok),
+                        Err(e) => Some(Err(std::io::Error::other(format!("{e:?}")))),
+                    }
+                });
+                rb.header(hyper::header::CONTENT_LENGTH, n)
+                    .body(reqwest::Body::wrap_stream(stream))
+            } else {
+                // 長さ不明（chunked）: 従来どおりバッファ（上限チェック込み）。
+                let val = body
+                    .collect()
+                    .await
+                    .map_err(|_| ErrorCode::InternalError(Some("r2: read body".into())))?
+                    .to_bytes()
+                    .to_vec();
+                if val.len() > R2_MAX_OBJECT_BYTES {
+                    return r2_response(413, vec![], b"object too large".to_vec());
+                }
+                rb.body(val)
+            };
             let resp = rb.send().await.map_err(neterr)?;
             cp_r2_to_guest(resp, false).await
         }
