@@ -1,0 +1,34 @@
+# 全 Workers 互換バインディングを 1 コンポーネントで検証するスモーク用アプリ。
+# scripts/smoke.sh から deploy され、各パスの応答をアサートする。
+name = "all-bindings"
+main = "src/index.ts"
+
+[vars]
+GREETING = "hello"
+
+[[kv_namespaces]]
+binding = "CACHE"
+id = "all-cache"
+
+[[r2_buckets]]
+binding = "MEDIA"
+bucket_name = "all-media"
+
+[[d1_databases]]
+binding = "DB"
+database_name = "all-db"
+
+[[durable_objects.bindings]]
+name = "COUNTER"
+class_name = "Counter"
+
+[[queues.producers]]
+binding = "JOBS"
+queue = "all-jobs"
+
+[[queues.consumers]]
+queue = "all-jobs"
+
+[hibana]
+public = true
+ingress_domain = "hibana.local"
