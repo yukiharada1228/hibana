@@ -142,14 +142,29 @@ jobs:
         run: |
           mkdir -p "$COMPONENTS_DIR" "$WASM_CACHE_DIR"
           nohup ./target/release/control-plane > cp.log 2>&1 &
-          # gateway(:8080) が応答するまで待つ（未知 Host でも 404 を返す＝起動済み）。
-          for i in $(seq 1 60); do
-            code=$(curl -s -o /dev/null -w '%{http_code}' http://localhost:8080/ || echo 000)
-            [ "$code" != "000" ] && { echo "control-plane up (HTTP $code)"; break; }
+          # gateway(:8080) が応答する＝CP 起動完了（この時点で JetStream stream 作成済み）。
+          # curl は接続不可時に自身で "000" を出すので、`|| echo` は付けない（付けると "000" が
+          # 2 個連結され != "000" になり、CP 未起動でもループが即 break してしまう＝worker が
+          # stream 作成前に起動して get_stream 404 でクラッシュする）。
+          up=""
+          for i in $(seq 1 90); do
+            code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 3 http://localhost:8080/ || true)
+            if [ -n "$code" ] && [ "$code" != "000" ]; then up="$code"; break; fi
             sleep 1
           done
+          [ -n "$up" ] || { echo "control-plane failed to become ready"; tail -n 100 cp.log; exit 1; }
+          echo "control-plane up (HTTP $up)"
+          # worker は CP がストリームを作った後に起動する（起動順レース回避）。
           nohup ./target/release/faas-worker > worker.log 2>&1 &
-          sleep 5
+          # worker がレーン購読まで到達したことを確認（クラッシュを早期検出）。
+          ok=""
+          for i in $(seq 1 30); do
+            if grep -q "subscribing to lane" worker.log; then ok=1; break; fi
+            if grep -qiE "^Error|panic" worker.log; then break; fi
+            sleep 1
+          done
+          [ -n "$ok" ] || { echo "worker failed to subscribe"; tail -n 100 worker.log; exit 1; }
+          echo "worker subscribed"
 
       - name: Bootstrap smoke tenant
         run: |
