@@ -166,20 +166,26 @@ pub async fn get_object(
                 .into_response()),
         }
     } else {
-        match state.storage().r2_get(&full).await? {
+        // M19: 本体はメモリに載せず S3 ByteStream → axum Body へストリームする（大容量対応）。
+        match state.storage().r2_get_stream(&full).await? {
             None => Ok(StatusCode::NOT_FOUND.into_response()),
-            Some(o) => Ok((
-                StatusCode::OK,
-                meta_headers(
-                    &key,
-                    o.meta.size,
-                    &o.meta.etag,
-                    &o.meta.content_type,
-                    &o.meta.metadata,
-                ),
-                o.bytes,
-            )
-                .into_response()),
+            Some(o) => {
+                let body = axum::body::Body::from_stream(tokio_util::io::ReaderStream::new(
+                    o.body.into_async_read(),
+                ));
+                Ok((
+                    StatusCode::OK,
+                    meta_headers(
+                        &key,
+                        o.meta.size,
+                        &o.meta.etag,
+                        &o.meta.content_type,
+                        &o.meta.metadata,
+                    ),
+                    body,
+                )
+                    .into_response())
+            }
         }
     }
 }

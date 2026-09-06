@@ -410,7 +410,9 @@ fn build_internal_router(state: AppState) -> Router {
             get(handlers_r2::get_object)
                 .put(handlers_r2::put_object)
                 .delete(handlers_r2::delete_object)
-                .layer(axum::extract::DefaultBodyLimit::max(32 * 1024 * 1024)),
+                // M19: worker 側 R2_MAX_OBJECT_BYTES(100MiB) と整合。GET はストリームなので
+                // この制限は PUT（バッファ受信）にのみ効く。
+                .layer(axum::extract::DefaultBodyLimit::max(110 * 1024 * 1024)),
         )
         .route("/internal/r2/list", get(handlers_r2::list_objects))
         // M15: producer からのメッセージを consumer invoke として enqueue する（internal のみ）。
