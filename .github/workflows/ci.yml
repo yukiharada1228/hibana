@@ -3,8 +3,12 @@ name: CI
 on:
   push:
     branches: [develop, main]
+    # ドキュメントのみの変更では重い CI（特に release ビルド + e2e smoke）を回さない。
+    # 変更が全て *.md / docs/ に収まる場合だけスキップ（コードを 1 つでも含めば通常どおり実行）。
+    paths-ignore: ["**/*.md", "docs/**"]
   pull_request:
     branches: [develop, main]
+    paths-ignore: ["**/*.md", "docs/**"]
 
 env:
   CARGO_TERM_COLOR: always
