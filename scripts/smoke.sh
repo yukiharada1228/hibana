@@ -47,6 +47,13 @@ assert() {
 echo "==> deploy all-bindings ($GATEWAY, *.${TENANT}.${HIBANA_INGRESS_DOMAIN})"
 ( cd "$APP_DIR" && HIBANA_INGRESS_DOMAIN="$HIBANA_INGRESS_DOMAIN" node "$CLI" deploy )
 
+# 冷起動（初回 precompile）と single-shot アサートのレースを避けるため、"/" が応答するまで待つ。
+echo "==> wait for app readiness"
+for _ in $(seq 1 30); do
+  [ "$(get /)" = "all-bindings hello" ] && { green "ready"; break; }
+  sleep 1
+done
+
 echo "==> assert synchronous bindings"
 assert /       "all-bindings hello"
 assert /kv     "kv-ok"

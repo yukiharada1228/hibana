@@ -73,3 +73,93 @@ jobs:
           wasm-tools validate "$WASM"
           # WASI Component Model のコンポーネントであること（WIT world を持つ）を確認。
           wasm-tools component wit "$WASM"
+
+  # 全 Workers 互換バインディング（env/KV/R2/D1/DO/Queues/alarm）を実スタックで end-to-end 検証する
+  # 回帰ゲート。docker compose で PG/NATS/Redis/MinIO を起動し、control-plane + worker を立て、SDK CLI で
+  # all-bindings サンプルを deploy して scripts/smoke.sh のアサートを回す（M17/M18/M19 の回帰検出）。
+  smoke:
+    name: e2e smoke (all bindings)
+    runs-on: ubuntu-latest
+    env:
+      # control-plane / worker（.env.example と一致。SECRETS_MASTER_KEY だけ placeholder を実鍵に差替）
+      DATABASE_URL: postgres://faas_app:faas_app@localhost:5432/faas
+      MIGRATION_DATABASE_URL: postgres://faas:faas@localhost:5432/faas
+      NATS_URL: nats://localhost:4222
+      REDIS_URL: redis://localhost:6379
+      S3_ENDPOINT: http://localhost:9000
+      S3_REGION: us-east-1
+      S3_BUCKET: faas-components
+      S3_ACCESS_KEY: minioadmin
+      S3_SECRET_KEY: minioadmin
+      JOB_SIGNING_KEY: AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8
+      JOB_SIGNING_KID: k1
+      SECRETS_MASTER_KEY: "0011223344556677889900112233445566778899001122334455667788990011"
+      SECRETS_MASTER_KID: k1
+      BOOTSTRAP_ADMIN_TOKEN: dev-bootstrap-admin-token
+      CONTROL_PLANE_INTERNAL_URL: http://localhost:8081
+      INGRESS_BASE_DOMAIN: hibana.local
+      COMPONENTS_DIR: ./components
+      WASM_CACHE_DIR: ./worker-cache
+      RUST_LOG: info
+      # SDK CLI 認証（bootstrap で作る smoke テナントと一致）
+      HIBANA_URL: http://localhost:8080
+      HIBANA_TENANT: smoke
+      HIBANA_EMAIL: admin@example.com
+      HIBANA_PASSWORD: dev-password
+      HIBANA_INGRESS_DOMAIN: hibana.local
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: Swatinem/rust-cache@v2
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: sdk/package-lock.json
+
+      - name: Start services (postgres / nats / redis / minio)
+        run: |
+          docker compose up -d --wait postgres nats redis minio
+          docker compose run --rm minio-setup
+
+      - name: Build control-plane + worker
+        run: cargo build -p faas-control-plane -p faas-worker
+
+      - name: Run migrations
+        run: cargo run --quiet -p faas-control-plane -- --migrate-only
+
+      - name: Start control-plane + worker
+        run: |
+          mkdir -p "$COMPONENTS_DIR" "$WASM_CACHE_DIR"
+          nohup ./target/debug/control-plane > cp.log 2>&1 &
+          # gateway(:8080) が応答するまで待つ（未知 Host でも 404 を返す＝起動済み）。
+          for i in $(seq 1 60); do
+            code=$(curl -s -o /dev/null -w '%{http_code}' http://localhost:8080/ || echo 000)
+            [ "$code" != "000" ] && { echo "control-plane up (HTTP $code)"; break; }
+            sleep 1
+          done
+          nohup ./target/debug/faas-worker > worker.log 2>&1 &
+          sleep 5
+
+      - name: Bootstrap smoke tenant
+        run: |
+          code=$(curl -sS -o boot.json -w '%{http_code}' -X POST http://localhost:8080/admin/tenants \
+            -H "Authorization: Bearer $BOOTSTRAP_ADMIN_TOKEN" \
+            -H "Content-Type: application/json" \
+            -d '{"slug":"smoke","name":"Smoke Tenant","admin_email":"admin@example.com","admin_password":"dev-password"}')
+          echo "[$code] $(cat boot.json)"
+          test "$code" = "201"
+
+      - name: Install SDK deps
+        working-directory: sdk
+        run: npm ci
+
+      - name: Run smoke (all bindings)
+        run: ./scripts/smoke.sh
+
+      - name: Dump logs on failure
+        if: failure()
+        run: |
+          echo "===== control-plane ====="; tail -n 200 cp.log || true
+          echo "===== worker ====="; tail -n 200 worker.log || true
