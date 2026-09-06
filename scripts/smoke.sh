@@ -28,8 +28,8 @@ fail=0
 red() { printf '\033[31m%s\033[0m\n' "$1"; }
 green() { printf '\033[32m%s\033[0m\n' "$1"; }
 
-# get PATH -> stdout body
-get() { curl -sS "${GATEWAY}$1" -H "$HOST_HEADER"; }
+# get PATH -> stdout body（--max-time で 1 リクエストの上限を切り、cold poll でループが暴走しないように）
+get() { curl -sS --max-time "${REQ_TIMEOUT:-50}" "${GATEWAY}$1" -H "$HOST_HEADER"; }
 
 # assert PATH EXPECTED
 assert() {
@@ -46,6 +46,14 @@ assert() {
 
 echo "==> deploy all-bindings ($GATEWAY, *.${TENANT}.${HIBANA_INGRESS_DOMAIN})"
 ( cd "$APP_DIR" && HIBANA_INGRESS_DOMAIN="$HIBANA_INGRESS_DOMAIN" node "$CLI" deploy )
+
+# 冷起動（初回 precompile）と single-shot アサートのレースを避けるため、"/" が応答するまで待つ。
+# 応答しないまま READY_TRIES 回超えたら諦めて先へ進む（asserts が FAIL を出しログ dump に繋げる）。
+echo "==> wait for app readiness"
+for _ in $(seq 1 "${READY_TRIES:-12}"); do
+  [ "$(get /)" = "all-bindings hello" ] && { green "ready"; break; }
+  sleep 2
+done
 
 echo "==> assert synchronous bindings"
 assert /       "all-bindings hello"
