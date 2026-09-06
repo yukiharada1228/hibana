@@ -107,7 +107,8 @@ pub async fn queue_send(
 
     // consumer への配送は HTTP エンベロープ（POST /__hibana/queue）。shim がこの path を見て
     // app.queue(batch) へ dispatch する。body に queue 名とメッセージ群を載せる。
-    let batch_body = serde_json::json!({ "queue": req.queue, "messages": req.messages }).to_string();
+    let batch_body =
+        serde_json::json!({ "queue": req.queue, "messages": req.messages }).to_string();
     let envelope = serde_json::json!({
         "method": "POST",
         "path": "/__hibana/queue",

@@ -21,7 +21,11 @@ use sqlx::{PgPool, Postgres, Row as _};
 /// (tenant, name) → 安定した advisory lock キー（プロセス跨ぎで一致する必要があるため FNV-1a）。
 fn lock_key(tenant: &str, name: &str) -> i64 {
     let mut h: u64 = 0xcbf29ce484222325;
-    for b in tenant.bytes().chain(b"/".iter().copied()).chain(name.bytes()) {
+    for b in tenant
+        .bytes()
+        .chain(b"/".iter().copied())
+        .chain(name.bytes())
+    {
         h ^= b as u64;
         h = h.wrapping_mul(0x100000001b3);
     }
@@ -117,12 +121,14 @@ impl D1Session {
             let _ = std::fs::remove_file(&temp_path);
         }
 
-        let conn = rusqlite::Connection::open(&temp_path)
-            .map_err(|e| format!("d1: open sqlite: {e}"))?;
+        let conn =
+            rusqlite::Connection::open(&temp_path).map_err(|e| format!("d1: open sqlite: {e}"))?;
         // sandbox: ATTACH/DETACH を拒否（load_extension は既定で無効）。単一ファイルの外へ出さない。
-        conn.authorizer(Some(|ctx: rusqlite::hooks::AuthContext<'_>| match ctx.action {
-            AuthAction::Attach { .. } | AuthAction::Detach { .. } => Authorization::Deny,
-            _ => Authorization::Allow,
+        conn.authorizer(Some(|ctx: rusqlite::hooks::AuthContext<'_>| {
+            match ctx.action {
+                AuthAction::Attach { .. } | AuthAction::Detach { .. } => Authorization::Deny,
+                _ => Authorization::Allow,
+            }
         }));
 
         Ok(D1Session {
@@ -232,12 +238,12 @@ fn run_one(conn: &rusqlite::Connection, sql: &str, params: &[Value]) -> Result<V
         .map(|i| stmt.column_name(i).unwrap_or("?").to_string())
         .collect();
     let sqlite_params: Vec<rusqlite::types::Value> = params.iter().map(json_to_sqlite).collect();
-    let param_refs: Vec<&dyn rusqlite::ToSql> =
-        sqlite_params.iter().map(|v| v as &dyn rusqlite::ToSql).collect();
+    let param_refs: Vec<&dyn rusqlite::ToSql> = sqlite_params
+        .iter()
+        .map(|v| v as &dyn rusqlite::ToSql)
+        .collect();
 
-    let mut rows = stmt
-        .query(param_refs.as_slice())
-        .map_err(map_sql_err)?;
+    let mut rows = stmt.query(param_refs.as_slice()).map_err(map_sql_err)?;
     let mut results = Vec::new();
     while let Some(row) = rows.next().map_err(map_sql_err)? {
         let mut obj = Map::new();

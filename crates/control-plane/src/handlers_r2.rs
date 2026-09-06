@@ -161,7 +161,13 @@ pub async fn get_object(
             None => Ok(StatusCode::NOT_FOUND.into_response()),
             Some(o) => Ok((
                 StatusCode::OK,
-                meta_headers(&key, o.meta.size, &o.meta.etag, &o.meta.content_type, &o.meta.metadata),
+                meta_headers(
+                    &key,
+                    o.meta.size,
+                    &o.meta.etag,
+                    &o.meta.content_type,
+                    &o.meta.metadata,
+                ),
                 o.bytes,
             )
                 .into_response()),
@@ -202,13 +208,14 @@ pub async fn list_objects(
         .unwrap_or(1000);
     let strip = format!("r2/{tenant}/{bucket}/");
     let key_prefix = format!("{strip}{prefix}");
-    let items = state
-        .storage()
-        .r2_list(&key_prefix, &strip, limit)
-        .await?;
+    let items = state.storage().r2_list(&key_prefix, &strip, limit).await?;
     let objs: Vec<serde_json::Value> = items
         .iter()
         .map(|o| serde_json::json!({ "key": o.key, "size": o.size, "etag": o.etag }))
         .collect();
-    Ok((StatusCode::OK, axum::Json(serde_json::json!({ "objects": objs }))).into_response())
+    Ok((
+        StatusCode::OK,
+        axum::Json(serde_json::json!({ "objects": objs })),
+    )
+        .into_response())
 }

@@ -150,7 +150,11 @@ pub async fn ingress_fallback(
         "succeeded" => envelope_to_http(output),
         "" | "pending" | "running" => {
             // 期限内に終端に達しなかった（超 cold / 詰まり）。
-            (StatusCode::GATEWAY_TIMEOUT, "function did not complete in time").into_response()
+            (
+                StatusCode::GATEWAY_TIMEOUT,
+                "function did not complete in time",
+            )
+                .into_response()
         }
         _ => {
             // failed / timeout。
@@ -281,9 +285,10 @@ fn envelope_to_http(output: Option<Value>) -> Response {
                         continue;
                     }
                     if let Some(vs) = v.as_str() {
-                        if let (Ok(name), Ok(val)) =
-                            (HeaderName::from_bytes(k.as_bytes()), HeaderValue::from_str(vs))
-                        {
+                        if let (Ok(name), Ok(val)) = (
+                            HeaderName::from_bytes(k.as_bytes()),
+                            HeaderValue::from_str(vs),
+                        ) {
                             builder = builder.header(name, val);
                         }
                     }

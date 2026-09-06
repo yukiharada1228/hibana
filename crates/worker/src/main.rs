@@ -72,20 +72,20 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use anyhow::{anyhow, Context as _};
+use bytes::Bytes;
 use chrono::Utc;
 use faas_shared::{
     failed_subject, result_subject, ExecutionStatus, FailedMessage, JobMessage, ResourceLimits,
     ResultMessage, UsageMetrics,
 };
 use futures::StreamExt;
+use http_body_util::{BodyExt, Full};
 use lru::LruCache;
 use sha2::{Digest, Sha256};
 use sqlx::postgres::PgPoolOptions;
 use sqlx::PgPool;
 use tokio::time::Instant;
 use tracing::{error, info, warn};
-use bytes::Bytes;
-use http_body_util::{BodyExt, Full};
 use wasmtime::component::{Component, Linker};
 use wasmtime::{Config, Engine, ResourceLimiter, Store, StoreLimits, StoreLimitsBuilder};
 use wasmtime_wasi::{ResourceTable, WasiCtx, WasiCtxBuilder, WasiView};
@@ -2181,9 +2181,8 @@ impl Worker {
         }
 
         // M14: D1 セッション置き場（実行中に db 名→常駐 SQLite を溜め、実行末に flush）。
-        let d1_sessions: Arc<
-            tokio::sync::Mutex<std::collections::HashMap<String, d1::D1Session>>,
-        > = Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new()));
+        let d1_sessions: Arc<tokio::sync::Mutex<std::collections::HashMap<String, d1::D1Session>>> =
+            Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new()));
         // M16: DO の advisory lock を握った接続置き場（実行末に drop → after_release で unlock）。
         let do_locks: Arc<
             tokio::sync::Mutex<
@@ -2377,7 +2376,9 @@ impl Worker {
                 // --- bytes world: faas:component/handler の handle を呼ぶ（従来） ---
                 let instance = Handler::instantiate_async(&mut store, &component, &linker)
                     .await
-                    .map_err(|e| ExecError::Failed(format!("failed to instantiate handler: {e}")))?;
+                    .map_err(|e| {
+                        ExecError::Failed(format!("failed to instantiate handler: {e}"))
+                    })?;
                 // handle 呼び出し (async)。epoch 中断時は Err(trap) になる。
                 Ok::<_, ExecError>(instance.call_handle(&mut store, &input).await)
             }
@@ -2855,8 +2856,10 @@ async fn gated_send_request(
     request: hyper::Request<HyperOutgoingBody>,
     config: wasmtime_wasi_http::types::OutgoingRequestConfig,
     allowed: Arc<std::collections::HashSet<std::net::SocketAddr>>,
-) -> Result<wasmtime_wasi_http::types::IncomingResponse, wasmtime_wasi_http::bindings::http::types::ErrorCode>
-{
+) -> Result<
+    wasmtime_wasi_http::types::IncomingResponse,
+    wasmtime_wasi_http::bindings::http::types::ErrorCode,
+> {
     use wasmtime_wasi_http::bindings::http::types::ErrorCode;
 
     // 1. deny-by-default。
@@ -2945,9 +2948,7 @@ async fn gated_send_request(
     if let Some(h) = builder.headers_mut() {
         *h = headers;
     }
-    let hy_body = Full::new(resp_body)
-        .map_err(|e| match e {})
-        .boxed();
+    let hy_body = Full::new(resp_body).map_err(|e| match e {}).boxed();
     let resp = builder
         .body(hy_body)
         .map_err(|e| ErrorCode::InternalError(Some(format!("resp build: {e}"))))?;
@@ -3127,7 +3128,10 @@ async fn handle_kv_request(
             // LIKE の特殊文字を無効化してから prefix 一致にする。
             let pat = format!(
                 "{}%",
-                prefix.replace('\\', "\\\\").replace('%', "\\%").replace('_', "\\_")
+                prefix
+                    .replace('\\', "\\\\")
+                    .replace('%', "\\%")
+                    .replace('_', "\\_")
             );
             let rows = sqlx::query(
                 "SELECT key FROM kv_entries \
@@ -3200,7 +3204,11 @@ async fn cp_r2_to_guest(
     use wasmtime_wasi_http::bindings::http::types::ErrorCode;
     let status = resp.status().as_u16();
     let h = resp.headers().clone();
-    let get = |n: &str| h.get(n).and_then(|v| v.to_str().ok()).map(|s| s.to_string());
+    let get = |n: &str| {
+        h.get(n)
+            .and_then(|v| v.to_str().ok())
+            .map(|s| s.to_string())
+    };
     let mut extra: Vec<(&'static str, String)> = Vec::new();
     if let Some(v) = get("x-r2-key") {
         extra.push(("x-r2-key", v));
@@ -3326,7 +3334,11 @@ async fn handle_r2_request(
             }
             let resp = rb.send().await.map_err(neterr)?;
             let bytes = resp.bytes().await.map_err(neterr)?.to_vec();
-            r2_response(200, vec![("content-type", "application/json".into())], bytes)
+            r2_response(
+                200,
+                vec![("content-type", "application/json".into())],
+                bytes,
+            )
         }
         _ => r2_response(404, vec![], b"unknown r2 op".to_vec()),
     }
@@ -3361,7 +3373,8 @@ async fn handle_d1_request(
         Ok(b) => b.to_bytes(),
         Err(_) => return d1_err(400, "read body failed"),
     };
-    let payload: serde_json::Value = serde_json::from_slice(&body_bytes).unwrap_or(serde_json::Value::Null);
+    let payload: serde_json::Value =
+        serde_json::from_slice(&body_bytes).unwrap_or(serde_json::Value::Null);
 
     // 実行中このセッションを常駐させる（初回に open = advisory lock + load）。
     let mut map = sessions.lock().await;
@@ -3377,7 +3390,11 @@ async fn handle_d1_request(
 
     let result = match path.as_str() {
         "/v1/d1/query" => {
-            let sql = payload.get("sql").and_then(|v| v.as_str()).unwrap_or("").to_string();
+            let sql = payload
+                .get("sql")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
             let params = payload
                 .get("params")
                 .and_then(|v| v.as_array())
@@ -3393,8 +3410,14 @@ async fn handle_d1_request(
                     arr.iter()
                         .map(|s| {
                             (
-                                s.get("sql").and_then(|v| v.as_str()).unwrap_or("").to_string(),
-                                s.get("params").and_then(|v| v.as_array()).cloned().unwrap_or_default(),
+                                s.get("sql")
+                                    .and_then(|v| v.as_str())
+                                    .unwrap_or("")
+                                    .to_string(),
+                                s.get("params")
+                                    .and_then(|v| v.as_array())
+                                    .cloned()
+                                    .unwrap_or_default(),
                             )
                         })
                         .collect()
@@ -3403,14 +3426,22 @@ async fn handle_d1_request(
             sess.batch(stmts).await
         }
         "/v1/d1/exec" => {
-            let sql = payload.get("sql").and_then(|v| v.as_str()).unwrap_or("").to_string();
+            let sql = payload
+                .get("sql")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
             sess.exec(sql).await
         }
         _ => Err("unknown d1 op".to_string()),
     };
 
     match result {
-        Ok(v) => kv_response(200, "application/json", serde_json::to_vec(&v).unwrap_or_default()),
+        Ok(v) => kv_response(
+            200,
+            "application/json",
+            serde_json::to_vec(&v).unwrap_or_default(),
+        ),
         Err(e) => d1_err(400, &e),
     }
 }
@@ -3429,7 +3460,8 @@ async fn handle_queue_request(
     wasmtime_wasi_http::bindings::http::types::ErrorCode,
 > {
     use wasmtime_wasi_http::bindings::http::types::ErrorCode;
-    let neterr = |_e| ErrorCode::InternalError(Some("queue: control-plane call failed".to_string()));
+    let neterr =
+        |_e| ErrorCode::InternalError(Some("queue: control-plane call failed".to_string()));
 
     let (parts, body) = request.into_parts();
     let q = parts.uri.query().map(parse_query).unwrap_or_default();
@@ -3451,7 +3483,10 @@ async fn handle_queue_request(
 
     let send_body = serde_json::json!({ "queue": queue, "messages": messages });
     let resp = http
-        .post(format!("{}/internal/queue/send", cp_url.trim_end_matches('/')))
+        .post(format!(
+            "{}/internal/queue/send",
+            cp_url.trim_end_matches('/')
+        ))
         .header("x-hibana-job-token", &job_token)
         .json(&send_body)
         .send()
@@ -3524,7 +3559,10 @@ async fn response_to_envelope(resp: hyper::Response<HyperOutgoingBody>) -> anyho
     let mut headers = serde_json::Map::new();
     for (k, v) in resp.headers().iter() {
         if let Ok(s) = v.to_str() {
-            headers.insert(k.as_str().to_string(), serde_json::Value::String(s.to_string()));
+            headers.insert(
+                k.as_str().to_string(),
+                serde_json::Value::String(s.to_string()),
+            );
         }
     }
     let body = resp

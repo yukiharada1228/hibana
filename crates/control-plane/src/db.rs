@@ -666,14 +666,14 @@ pub async fn find_queue_consumer(
     tenant_id: &str,
     queue: &str,
 ) -> Result<Option<String>, sqlx::Error> {
-    let row = sqlx::query(
-        "SELECT component_id FROM queue_consumers WHERE tenant_id=$1 AND queue=$2",
-    )
-    .bind(tenant_id)
-    .bind(queue)
-    .fetch_optional(executor)
-    .await?;
-    row.map(|r| r.try_get::<String, _>("component_id")).transpose()
+    let row =
+        sqlx::query("SELECT component_id FROM queue_consumers WHERE tenant_id=$1 AND queue=$2")
+            .bind(tenant_id)
+            .bind(queue)
+            .fetch_optional(executor)
+            .await?;
+    row.map(|r| r.try_get::<String, _>("component_id"))
+        .transpose()
 }
 
 /// M15: queue → component の consumer 登録（全置換 upsert）。
