@@ -161,8 +161,8 @@ jobs:
       - name: Run smoke (all bindings)
         run: ./scripts/smoke.sh
 
-      - name: Dump logs on failure
-        if: failure()
+      - name: Dump control-plane + worker logs
+        if: always()
         run: |
           echo "===== control-plane ====="; tail -n 200 cp.log || true
           echo "===== worker ====="; tail -n 200 worker.log || true
