@@ -80,6 +80,7 @@ jobs:
   smoke:
     name: e2e smoke (all bindings)
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     env:
       # control-plane / worker（.env.example と一致。SECRETS_MASTER_KEY だけ placeholder を実鍵に差替）
       DATABASE_URL: postgres://faas_app:faas_app@localhost:5432/faas
@@ -123,23 +124,25 @@ jobs:
           docker compose up -d --wait postgres nats redis minio
           docker compose run --rm minio-setup
 
-      - name: Build control-plane + worker
-        run: cargo build -p faas-control-plane -p faas-worker
+      # release ビルド: debug の wasmtime は 12MiB JS コンポーネントの precompile が CI(2core) で
+      # 極端に遅く gate が実用にならないため、CP/worker は --release で立てる（precompile が高速化）。
+      - name: Build control-plane + worker (release)
+        run: cargo build --release -p faas-control-plane -p faas-worker
 
       - name: Run migrations
-        run: cargo run --quiet -p faas-control-plane -- --migrate-only
+        run: ./target/release/control-plane --migrate-only
 
       - name: Start control-plane + worker
         run: |
           mkdir -p "$COMPONENTS_DIR" "$WASM_CACHE_DIR"
-          nohup ./target/debug/control-plane > cp.log 2>&1 &
+          nohup ./target/release/control-plane > cp.log 2>&1 &
           # gateway(:8080) が応答するまで待つ（未知 Host でも 404 を返す＝起動済み）。
           for i in $(seq 1 60); do
             code=$(curl -s -o /dev/null -w '%{http_code}' http://localhost:8080/ || echo 000)
             [ "$code" != "000" ] && { echo "control-plane up (HTTP $code)"; break; }
             sleep 1
           done
-          nohup ./target/debug/faas-worker > worker.log 2>&1 &
+          nohup ./target/release/faas-worker > worker.log 2>&1 &
           sleep 5
 
       - name: Bootstrap smoke tenant
