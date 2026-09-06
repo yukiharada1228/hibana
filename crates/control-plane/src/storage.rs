@@ -123,4 +123,182 @@ impl Storage {
 
         Ok(req.uri().to_string())
     }
+
+    // --- M13: R2 バインディング（オブジェクトストレージ）本体。worker は keyless なので、
+    //     R2 の実 I/O は CP が S3 クライアントで代行する（worker→CP 内部→MinIO）。
+    //     キーは呼び出し側が `r2/{tenant}/{bucket}/{key}` を構築して渡す（tenant 境界）。
+
+    /// R2 オブジェクトを保存する（content-type + カスタムメタデータつき）。
+    pub async fn r2_put(
+        &self,
+        key: &str,
+        bytes: Vec<u8>,
+        content_type: Option<&str>,
+        metadata: std::collections::HashMap<String, String>,
+    ) -> Result<R2Meta, FaasError> {
+        let etag = format!("\"{}\"", hex_sha256(&bytes));
+        let size = bytes.len() as i64;
+        let mut req = self
+            .client
+            .put_object()
+            .bucket(&self.bucket)
+            .key(key)
+            .body(ByteStream::from(bytes))
+            .set_metadata(Some(metadata.clone()));
+        if let Some(ct) = content_type {
+            req = req.content_type(ct);
+        }
+        req.send()
+            .await
+            .map_err(|e| FaasError::Internal(format!("s3 r2_put failed: {e}")))?;
+        Ok(R2Meta {
+            size,
+            etag,
+            content_type: content_type.map(|s| s.to_string()),
+            metadata,
+        })
+    }
+
+    /// R2 オブジェクトを取得する（本体 + メタデータ）。存在しなければ `None`。
+    pub async fn r2_get(&self, key: &str) -> Result<Option<R2Object>, FaasError> {
+        let resp = match self
+            .client
+            .get_object()
+            .bucket(&self.bucket)
+            .key(key)
+            .send()
+            .await
+        {
+            Ok(r) => r,
+            Err(e) => {
+                let se = e.into_service_error();
+                if se.is_no_such_key() {
+                    return Ok(None);
+                }
+                return Err(FaasError::Internal(format!("s3 r2_get failed: {se}")));
+            }
+        };
+        let content_type = resp.content_type().map(|s| s.to_string());
+        let etag = resp.e_tag().map(|s| s.to_string()).unwrap_or_default();
+        let metadata = resp.metadata().cloned().unwrap_or_default();
+        let bytes = resp
+            .body
+            .collect()
+            .await
+            .map_err(|e| FaasError::Internal(format!("s3 r2_get read body: {e}")))?
+            .into_bytes()
+            .to_vec();
+        let size = bytes.len() as i64;
+        Ok(Some(R2Object {
+            bytes,
+            meta: R2Meta {
+                size,
+                etag,
+                content_type,
+                metadata,
+            },
+        }))
+    }
+
+    /// R2 オブジェクトのメタデータのみ取得する（本体を読まない）。存在しなければ `None`。
+    pub async fn r2_head(&self, key: &str) -> Result<Option<R2Meta>, FaasError> {
+        match self
+            .client
+            .head_object()
+            .bucket(&self.bucket)
+            .key(key)
+            .send()
+            .await
+        {
+            Ok(r) => Ok(Some(R2Meta {
+                size: r.content_length().unwrap_or(0),
+                etag: r.e_tag().map(|s| s.to_string()).unwrap_or_default(),
+                content_type: r.content_type().map(|s| s.to_string()),
+                metadata: r.metadata().cloned().unwrap_or_default(),
+            })),
+            Err(e) => {
+                let se = e.into_service_error();
+                if se.is_not_found() {
+                    Ok(None)
+                } else {
+                    Err(FaasError::Internal(format!("s3 r2_head failed: {se}")))
+                }
+            }
+        }
+    }
+
+    /// R2 オブジェクトを削除する（存在しなくても成功扱い）。
+    pub async fn r2_delete(&self, key: &str) -> Result<(), FaasError> {
+        self.client
+            .delete_object()
+            .bucket(&self.bucket)
+            .key(key)
+            .send()
+            .await
+            .map_err(|e| FaasError::Internal(format!("s3 r2_delete failed: {e}")))?;
+        Ok(())
+    }
+
+    /// R2 の prefix 一覧（key/size/etag）。`key_prefix` は `r2/{tenant}/{bucket}/` まで。
+    /// 戻り値の key は `strip` を取り除いた相対キー。
+    pub async fn r2_list(
+        &self,
+        key_prefix: &str,
+        strip: &str,
+        limit: i32,
+    ) -> Result<Vec<R2ListItem>, FaasError> {
+        let resp = self
+            .client
+            .list_objects_v2()
+            .bucket(&self.bucket)
+            .prefix(key_prefix)
+            .max_keys(limit.clamp(1, 1000))
+            .send()
+            .await
+            .map_err(|e| FaasError::Internal(format!("s3 r2_list failed: {e}")))?;
+        let mut out = Vec::new();
+        for obj in resp.contents() {
+            let full = obj.key().unwrap_or_default();
+            let rel = full.strip_prefix(strip).unwrap_or(full).to_string();
+            out.push(R2ListItem {
+                key: rel,
+                size: obj.size().unwrap_or(0),
+                etag: obj.e_tag().map(|s| s.to_string()).unwrap_or_default(),
+            });
+        }
+        Ok(out)
+    }
+}
+
+/// R2 オブジェクトのメタデータ。
+#[derive(Debug, Clone)]
+pub struct R2Meta {
+    pub size: i64,
+    pub etag: String,
+    pub content_type: Option<String>,
+    pub metadata: std::collections::HashMap<String, String>,
+}
+
+/// R2 オブジェクト（本体 + メタデータ）。
+pub struct R2Object {
+    pub bytes: Vec<u8>,
+    pub meta: R2Meta,
+}
+
+/// R2 list の 1 件。
+pub struct R2ListItem {
+    pub key: String,
+    pub size: i64,
+    pub etag: String,
+}
+
+fn hex_sha256(bytes: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    let d = Sha256::digest(bytes);
+    let mut s = String::with_capacity(64);
+    for b in d {
+        use std::fmt::Write as _;
+        let _ = write!(s, "{b:02x}");
+    }
+    s
 }

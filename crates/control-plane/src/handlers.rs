@@ -3457,6 +3457,46 @@ pub struct ApproveCapabilityEnvResponse {
     pub env: Vec<String>,
 }
 
+#[derive(Debug, Serialize)]
+pub struct GetCapabilitiesResponse {
+    pub component_id: String,
+    pub version: String,
+    /// 注入が承認された env 名（M7b/M9c）。
+    pub env: Vec<String>,
+    /// 承認された egress 先（host:port, M9c）。
+    pub net_allow_outbound: Vec<String>,
+}
+
+/// GET /components/{id}/versions/{version}/capabilities — 現在の承認内容を返す（Read）。
+///
+/// **値は返さない**（env の名前と egress 先のみ）。CLI が「既存を保ったまま名前を足す」
+/// マージのために読む用途（承認 PUT は全置換なので、GET してマージしてから PUT する）。
+pub async fn get_capabilities(
+    State(state): State<AppState>,
+    principal: Principal,
+    Path((component_id, version)): Path<(String, String)>,
+) -> Result<impl IntoResponse, AppError> {
+    let tenant = &principal.tenant_id;
+    let mut tx = state.pool().begin().await?;
+    db::set_tenant_guc(&mut tx, tenant).await?;
+    let version_id = db::find_version_id(&mut *tx, tenant, &component_id, &version)
+        .await?
+        .ok_or_else(|| {
+            FaasError::NotFound(format!("version '{version}' of component '{component_id}'"))
+        })?;
+    let current = db::version_capabilities(&mut *tx, tenant, &version_id)
+        .await?
+        .unwrap_or(Value::Null);
+    tx.commit().await?;
+    let caps = validation::parse_capabilities(&current);
+    Ok(Json(GetCapabilitiesResponse {
+        component_id,
+        version,
+        env: caps.env.into_iter().collect(),
+        net_allow_outbound: caps.net_allow_outbound.into_iter().collect(),
+    }))
+}
+
 /// PUT /components/{id}/versions/{version}/capabilities — env 許可リストを承認する（admin）。
 ///
 /// `imports`（strict matching の結果）は受け付けない。あれは検証パイプラインが決める値であり、

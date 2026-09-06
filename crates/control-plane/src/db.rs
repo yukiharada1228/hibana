@@ -660,6 +660,42 @@ pub async fn set_component_ingress(
     Ok(res.rows_affected() > 0)
 }
 
+/// M15: queue の consumer component を解決する（GUC 済み tx / executor を渡すこと）。
+pub async fn find_queue_consumer(
+    executor: impl sqlx::PgExecutor<'_>,
+    tenant_id: &str,
+    queue: &str,
+) -> Result<Option<String>, sqlx::Error> {
+    let row = sqlx::query(
+        "SELECT component_id FROM queue_consumers WHERE tenant_id=$1 AND queue=$2",
+    )
+    .bind(tenant_id)
+    .bind(queue)
+    .fetch_optional(executor)
+    .await?;
+    row.map(|r| r.try_get::<String, _>("component_id")).transpose()
+}
+
+/// M15: queue → component の consumer 登録（全置換 upsert）。
+pub async fn upsert_queue_consumer(
+    executor: impl sqlx::PgExecutor<'_>,
+    tenant_id: &str,
+    queue: &str,
+    component_id: &str,
+) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        "INSERT INTO queue_consumers (tenant_id, queue, component_id, updated_at) \
+         VALUES ($1,$2,$3, now()) \
+         ON CONFLICT (tenant_id, queue) DO UPDATE SET component_id=EXCLUDED.component_id, updated_at=now()",
+    )
+    .bind(tenant_id)
+    .bind(queue)
+    .bind(component_id)
+    .execute(executor)
+    .await?;
+    Ok(())
+}
+
 /// 実行を pending で INSERT する (§ /invoke)。
 ///
 /// 冪等列を持たない簡易版（`insert_pending_execution_with_provenance(.., None, None, None)`

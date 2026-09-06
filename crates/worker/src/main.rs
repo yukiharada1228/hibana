@@ -61,6 +61,7 @@
 //! トラップ分類: epoch 中断 / 時間超過 → `timeout`、fuel 超過 → `failed`（§4.3）。
 
 mod bindings;
+mod d1;
 mod env;
 mod metrics;
 
@@ -83,9 +84,16 @@ use sqlx::postgres::PgPoolOptions;
 use sqlx::PgPool;
 use tokio::time::Instant;
 use tracing::{error, info, warn};
+use bytes::Bytes;
+use http_body_util::{BodyExt, Full};
 use wasmtime::component::{Component, Linker};
 use wasmtime::{Config, Engine, ResourceLimiter, Store, StoreLimits, StoreLimitsBuilder};
 use wasmtime_wasi::{ResourceTable, WasiCtx, WasiCtxBuilder, WasiView};
+// M11-5 (§4.2): wasi:http/incoming-handler の native 実行に使う。
+use wasmtime_wasi_http::bindings::http::types::Scheme;
+use wasmtime_wasi_http::bindings::ProxyPre;
+use wasmtime_wasi_http::body::HyperOutgoingBody;
+use wasmtime_wasi_http::WasiHttpView as _;
 
 use bindings::Handler;
 
@@ -98,6 +106,17 @@ const PULL_BATCH: usize = 16;
 /// in-memory Component LRU キャッシュの最大エントリ数 (§3.6)。
 /// hit 経路が coldstart 短縮の主経路。容量超過時は最古を退避する。
 const COMPONENT_CACHE_CAP: usize = 64;
+
+/// M11-6 (§6.6): 実行中に送る in-progress ack（`AckKind::Progress`）の間隔。
+///
+/// consumer の再配送 backoff（CP 側 `BACKOFF_SECS`、既定 `[5, 15, 60]`）では **最初の配送の
+/// ack 期限が `backoff[0]`（既定 5s）** になる。12-13MiB の JS/Hono component の cold precompile は
+/// これを超えるため、heartbeat が無いと「処理中なのに ack 期限切れ → 再配送 → 二重 precompile」で
+/// cold start が数倍に伸びる（実測: 1 回 ~5-6s の precompile が +5s/+15s の再配送で 20-30s 化）。
+/// 実行中はこの間隔で Progress を送り、その都度期限を延長して spurious な再配送を止める。
+/// worker が死ねば heartbeat も止まり、期限超過で正しく再配送される（stuck 救済は不変）。
+/// **`backoff[0]` より十分小さく保つこと**（既定 3s < 5s）。
+const ACK_PROGRESS_INTERVAL: Duration = Duration::from_secs(3);
 
 // M8-3: `MAX_ACK_PENDING`（全テナント合算の固定値 1000）はここから削除された。
 // consumer の作成者が control-plane へ移り、`max_ack_pending` は **lane（= テナント）ごとに**
@@ -179,11 +198,47 @@ struct HostState {
     table: ResourceTable,
     limits: MeteredLimits,
     // M11 (§4.2): JS/Hono Component が Request/Response（= wasi:http/types のリソース）を
-    // 扱えるようにするための HTTP コンテキスト。**types を提供するだけ**で、outgoing-handler
-    // による egress は M9c の socket_addr_check の外にある別経路なので、検証で
-    // `wasi:http/outgoing-handler` の import を承認しないことで到達不能に保つ（下記参照）。
+    // 扱えるようにするための HTTP コンテキスト。
     http_ctx: wasmtime_wasi_http::WasiHttpCtx,
+    // M11-8 (§4.4): `wasi:http/outgoing-handler`（fetch）の egress allowlist。
+    // 解決済み `host:port`（SocketAddr）の集合。**空 = egress 全拒否**（deny-by-default）。
+    // `WasiHttpView::send_request` をこの集合で gate する（下記実装参照）。wasi:sockets 側の
+    // `socket_addr_check` と同じ M9c モデルを wasi:http にも適用し、宛先を承認済み IP に限定＋
+    // SSRF hard-deny を最優先する。
+    allowed_addrs: Arc<std::collections::HashSet<std::net::SocketAddr>>,
+    // M12: KV バインディング用。guest が `http://kv.hibana.internal/...` へ fetch すると
+    // send_request が egress せず **この tenant_id で** Postgres の kv_entries を直接操作する
+    // （RLS で cross-tenant 不可能）。pool は worker から複製。
+    pool: PgPool,
+    tenant_id: String,
+    // M13: R2 バインディング用。worker は keyless（S3 資格情報なし）なので、R2 の実 I/O は CP 内部
+    // エンドポイント経由で MinIO に代行させる。認証は job_token（CP 署名。テナントは claim 由来）。
+    cp_internal_url: String,
+    job_token: String,
+    http: reqwest::Client,
+    // M14: D1 バインディング。実行中に開いた D1 セッション（db 名 → 常駐 SQLite）。実行末に flush。
+    d1_sessions: Arc<tokio::sync::Mutex<std::collections::HashMap<String, d1::D1Session>>>,
+    // M16: Durable Objects の単一書き手ロック。実行中に触った (class/id) → advisory lock を握った
+    // 接続。実行末に drop（pool の after_release が unlock）。cross-fleet の直列化を担う。
+    do_locks: Arc<
+        tokio::sync::Mutex<
+            std::collections::HashMap<String, sqlx::pool::PoolConnection<sqlx::Postgres>>,
+        >,
+    >,
 }
+
+/// M12: KV バインディングの内部ホスト名。guest の fetch がこの host のときだけ KV として処理する。
+const KV_INTERNAL_HOST: &str = "kv.hibana.internal";
+/// M14: D1 バインディングの内部ホスト名。
+const D1_INTERNAL_HOST: &str = "d1.hibana.internal";
+/// M15: Queues producer の内部ホスト名。
+const QUEUE_INTERNAL_HOST: &str = "queue.hibana.internal";
+/// M16: Durable Objects のロック取得用 内部ホスト名（storage は KV を再利用）。
+const DO_INTERNAL_HOST: &str = "do.hibana.internal";
+/// M13: R2 バインディングの内部ホスト名（同じく send_request で横取り）。
+const R2_INTERNAL_HOST: &str = "r2.hibana.internal";
+/// M13: R2 オブジェクトの上限（MVP は Postgres bytea 保持のため控えめに）。
+const R2_MAX_OBJECT_BYTES: usize = 25 * 1024 * 1024;
 
 // wasmtime-wasi 29: `WasiView` が `ctx()` と `table()` の両方を提供する。
 impl WasiView for HostState {
@@ -204,6 +259,66 @@ impl wasmtime_wasi_http::WasiHttpView for HostState {
 
     fn table(&mut self) -> &mut ResourceTable {
         &mut self.table
+    }
+
+    // M11-8 (§4.4): outgoing HTTP（fetch）を allowlist で gate する。既定の send_request は
+    // `TcpStream::connect(authority)` で **socket_addr_check を通らず** 任意の宛先へ出てしまう
+    // （SSRF 穴）。ここで override し、宛先を「承認済みかつ hard-deny でない解決済み IP」に限定する。
+    fn send_request(
+        &mut self,
+        request: hyper::Request<wasmtime_wasi_http::body::HyperOutgoingBody>,
+        config: wasmtime_wasi_http::types::OutgoingRequestConfig,
+    ) -> wasmtime_wasi_http::HttpResult<wasmtime_wasi_http::types::HostFutureIncomingResponse> {
+        // M12/M13: KV / R2 バインディングは内部ホスト。egress せず、このジョブの tenant で Postgres を叩く。
+        if request.uri().host() == Some(KV_INTERNAL_HOST) {
+            let pool = self.pool.clone();
+            let tenant = self.tenant_id.clone();
+            let handle = wasmtime_wasi::runtime::spawn(async move {
+                Ok(handle_kv_request(pool, tenant, request).await)
+            });
+            return Ok(wasmtime_wasi_http::types::HostFutureIncomingResponse::pending(handle));
+        }
+        if request.uri().host() == Some(R2_INTERNAL_HOST) {
+            let http = self.http.clone();
+            let cp = self.cp_internal_url.clone();
+            let token = self.job_token.clone();
+            let handle = wasmtime_wasi::runtime::spawn(async move {
+                Ok(handle_r2_request(http, cp, token, request).await)
+            });
+            return Ok(wasmtime_wasi_http::types::HostFutureIncomingResponse::pending(handle));
+        }
+        if request.uri().host() == Some(D1_INTERNAL_HOST) {
+            let pool = self.pool.clone();
+            let tenant = self.tenant_id.clone();
+            let sessions = Arc::clone(&self.d1_sessions);
+            let handle = wasmtime_wasi::runtime::spawn(async move {
+                Ok(handle_d1_request(pool, tenant, sessions, request).await)
+            });
+            return Ok(wasmtime_wasi_http::types::HostFutureIncomingResponse::pending(handle));
+        }
+        if request.uri().host() == Some(QUEUE_INTERNAL_HOST) {
+            let http = self.http.clone();
+            let cp = self.cp_internal_url.clone();
+            let token = self.job_token.clone();
+            let handle = wasmtime_wasi::runtime::spawn(async move {
+                Ok(handle_queue_request(http, cp, token, request).await)
+            });
+            return Ok(wasmtime_wasi_http::types::HostFutureIncomingResponse::pending(handle));
+        }
+        if request.uri().host() == Some(DO_INTERNAL_HOST) {
+            let pool = self.pool.clone();
+            let tenant = self.tenant_id.clone();
+            let locks = Arc::clone(&self.do_locks);
+            let handle = wasmtime_wasi::runtime::spawn(async move {
+                Ok(handle_do_lock(pool, tenant, locks, request).await)
+            });
+            return Ok(wasmtime_wasi_http::types::HostFutureIncomingResponse::pending(handle));
+        }
+        let allowed = Arc::clone(&self.allowed_addrs);
+        let handle = wasmtime_wasi::runtime::spawn(async move {
+            Ok(gated_send_request(request, config, allowed).await)
+        });
+        Ok(wasmtime_wasi_http::types::HostFutureIncomingResponse::pending(handle))
     }
 }
 
@@ -573,7 +688,18 @@ async fn main() -> anyhow::Result<()> {
 
     info!("connecting to Postgres");
     let pool = PgPoolOptions::new()
-        .max_connections(8)
+        .max_connections(32)
+        // M14 (D1): D1 セッションは実行の間 advisory lock を握った接続を保持する。接続が pool へ
+        // 戻る際に **必ず advisory lock を全解放**しておく（flush 忘れ・panic・timeout でロックが
+        // 漏れて次実行が固まるのを構造的に防ぐ backstop）。lock を握らない接続には無害。
+        .after_release(|conn, _meta| {
+            Box::pin(async move {
+                sqlx::query("SELECT pg_advisory_unlock_all()")
+                    .execute(conn)
+                    .await?;
+                Ok(true)
+            })
+        })
         .connect(&settings.database_url)
         .await
         .context("failed to connect to Postgres")?;
@@ -641,6 +767,7 @@ async fn main() -> anyhow::Result<()> {
         http,
         wasm_cache_dir: settings.wasm_cache_dir,
         cache,
+        inflight_precompile: dashmap::DashMap::new(),
         metrics: worker_metrics,
         control_plane_internal_url: settings.control_plane_internal_url.clone(),
         job_env_fetch_timeout: Duration::from_millis(settings.job_env_fetch_timeout_ms),
@@ -1171,10 +1298,30 @@ async fn lane_loop(
                 if let Some(cx) = parent_cx {
                     faas_shared::otel::set_span_parent(&process_span, cx);
                 }
-                let published = worker
-                    .handle_payload(&payload)
-                    .instrument(process_span)
-                    .await;
+                // M11-6 (§6.6): 実行中は `AckKind::Progress` を定期送出して ack 期限を延ばす。
+                // cold precompile が再配送 backoff[0]（既定 5s）を超えても「処理中」を server に伝え、
+                // spurious な再配送＝二重 precompile を止める。handle_payload は msg を触らない
+                // （&payload のみ）ので、同じ &msg で Progress と最終 ack を送れる。
+                let published = {
+                    let fut = worker.handle_payload(&payload).instrument(process_span);
+                    tokio::pin!(fut);
+                    let mut hb = tokio::time::interval(ACK_PROGRESS_INTERVAL);
+                    // 初回 tick は即時なので捨て、次回（+interval）から送る。
+                    hb.tick().await;
+                    loop {
+                        tokio::select! {
+                            res = &mut fut => break res,
+                            _ = hb.tick() => {
+                                if let Err(e) = msg
+                                    .ack_with(async_nats::jetstream::AckKind::Progress)
+                                    .await
+                                {
+                                    warn!(error = %e, "failed to send in-progress ack; job may be redelivered");
+                                }
+                            }
+                        }
+                    }
+                };
                 if published {
                     if let Err(e) = msg.ack().await {
                         warn!(error = %e, "failed to ack message after publishing result");
@@ -1415,6 +1562,10 @@ struct Worker {
     /// in-memory Component キャッシュ。`wasm_sha256` -> 解決済み `Component` (§3.6)。
     /// hit なら即実行でき、coldstart を短縮できる主経路。
     cache: Mutex<LruCache<String, Arc<Component>>>,
+    /// M11-6 (§6.6): sha ごとの precompile single-flight ロック。同一 sha の cold invoke が
+    /// 同時に来ても precompile を 1 回に集約する（N×23s の stampede を防ぐ）。値は per-sha の
+    /// async Mutex。load 完了後にエントリを消してマップ肥大を防ぐ（遅延した待機側は cache hit で返る）。
+    inflight_precompile: dashmap::DashMap<String, Arc<tokio::sync::Mutex<()>>>,
     /// 観測メトリクス（M4a, §3.8）。LRU / cwasm のキャッシュヒット率、execute 時間、終端化件数。
     metrics: Arc<metrics::Metrics>,
     /// M7c (§4.6): CP の内部専用エンドポイント URL（secret 引き換え先）。
@@ -1653,8 +1804,16 @@ impl Worker {
             .resolve_egress_allowlist(&resolved.allow_outbound)
             .await;
 
-        self.run_component(component, input_bytes, limits, built_env, allowed_addrs)
-            .await
+        self.run_component(
+            component,
+            input_bytes,
+            limits,
+            built_env,
+            allowed_addrs,
+            job.tenant_id.clone(),
+            job.job_token.clone(),
+        )
+        .await
     }
 
     /// egress allowlist の各 `host:port` を解決し、**hard-deny でない** IP:port の集合を返す。
@@ -1784,9 +1943,29 @@ impl Worker {
     ) -> std::result::Result<Arc<Component>, ExecError> {
         let sha = &job.wasm_sha256;
 
-        // a. in-memory LRU hit。
+        // a. in-memory LRU hit（ロック外の高速経路。hit では single-flight の競合を一切踏まない）。
         if let Some(component) = self.cache_get(sha) {
             // M4a (§3.8): LRU hit を計上。
+            self.metrics
+                .wasmtime_component_cache_hits_total
+                .with_label_values(&["lru"])
+                .inc();
+            return Ok(component);
+        }
+
+        // M11-6 (§6.6): single-flight。miss した sha について per-sha ロックを取り、同一 sha の
+        // 同時 cold invoke が **precompile を二重に走らせない**ようにする（N×23s の stampede 防止）。
+        // 待たされた側はロック取得後の double-check で cache hit を引いて即返る。
+        let lock = self
+            .inflight_precompile
+            .entry(sha.clone())
+            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+            .clone();
+        let _flight = lock.lock().await;
+
+        // double-check: 待っている間に別の holder が cache を埋めたかもしれない。
+        if let Some(component) = self.cache_get(sha) {
+            self.inflight_precompile.remove(sha);
             self.metrics
                 .wasmtime_component_cache_hits_total
                 .with_label_values(&["lru"])
@@ -1805,6 +1984,7 @@ impl Worker {
                 Ok(component) => {
                     let component = Arc::new(component);
                     self.cache_put(sha.clone(), Arc::clone(&component));
+                    self.inflight_precompile.remove(sha);
                     // M4a (§3.8): cwasm hit を計上。
                     self.metrics
                         .wasmtime_component_cache_hits_total
@@ -1827,9 +2007,16 @@ impl Worker {
         let bytes = self.download_wasm(&job.wasm_url).await?;
         self.verify_sha256(&bytes, sha)?;
 
-        let cwasm = self
-            .engine
-            .precompile_component(&bytes)
+        // M11-6 (§6.6): precompile は cranelift による CPU バウンドの同期処理で、12-13MiB の
+        // JS/Hono component では ~5s かかる。async タスク内で直接回すと **その間 tokio ワーカ
+        // スレッドを占有して yield せず**、in-progress ack のハートビート（`tokio::select!` の
+        // タイマ腕）も他タスクも回らない。結果、ack 期限（backoff[0]=5s）が切れて再配送 → 二重
+        // precompile になる。`spawn_blocking` に逃がして async 側を yield させ、precompile 中も
+        // ハートビートが飛ぶ（＝再配送されない）ようにする。
+        let engine = self.engine.clone();
+        let cwasm = tokio::task::spawn_blocking(move || engine.precompile_component(&bytes))
+            .await
+            .map_err(|e| ExecError::Failed(format!("precompile join error: {e}")))?
             .map_err(|e| ExecError::Failed(format!("precompile_component failed: {e}")))?;
 
         // アトミックに書き込む (tmp -> rename)。失敗しても実行自体は続行する。
@@ -1844,6 +2031,8 @@ impl Worker {
 
         // d. in-memory LRU に格納する。
         self.cache_put(sha.clone(), Arc::clone(&component));
+        // single-flight エントリを解放（待機側は double-check で cache hit を引く）。
+        self.inflight_precompile.remove(sha);
         Ok(component)
     }
 
@@ -1913,6 +2102,8 @@ impl Worker {
         limits: ResourceLimits,
         built_env: env::BuiltEnv,
         allowed_addrs: std::collections::HashSet<std::net::SocketAddr>,
+        tenant_id: String,
+        job_token: String,
     ) -> std::result::Result<(serde_json::Value, UsageMetrics), ExecError> {
         // StoreLimits: max_memory を適用する (§4.3)。
         let store_limits = StoreLimitsBuilder::new()
@@ -1959,8 +2150,11 @@ impl Worker {
         // 全 egress を塞いでいる。したがって allowlist が空のときは**ネットワークを一切触らない**
         // （builder を素のままにして deny-all を維持する）。非空のときだけ TCP を開け、
         // socket_addr_check で「解決済み allowlist に一致し、かつ hard-deny でない」宛先だけ通す。
-        if !allowed_addrs.is_empty() {
-            let allowed = std::sync::Arc::new(allowed_addrs);
+        // M11-8: 解決済み allowlist を Arc で 1 つ持ち、wasi:sockets（socket_addr_check）と
+        // wasi:http（HostState.send_request）の**両 egress 経路で同じ集合を使う**。空 = 両方 deny。
+        let allowed_arc = std::sync::Arc::new(allowed_addrs);
+        if !allowed_arc.is_empty() {
+            let allowed = std::sync::Arc::clone(&allowed_arc);
             wasi_builder.allow_tcp(true);
             // UDP は用途が無く攻撃面だけ増えるので開けない。
             wasi_builder.allow_udp(false);
@@ -1984,12 +2178,31 @@ impl Worker {
             });
         }
 
+        // M14: D1 セッション置き場（実行中に db 名→常駐 SQLite を溜め、実行末に flush）。
+        let d1_sessions: Arc<
+            tokio::sync::Mutex<std::collections::HashMap<String, d1::D1Session>>,
+        > = Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new()));
+        // M16: DO の advisory lock を握った接続置き場（実行末に drop → after_release で unlock）。
+        let do_locks: Arc<
+            tokio::sync::Mutex<
+                std::collections::HashMap<String, sqlx::pool::PoolConnection<sqlx::Postgres>>,
+            >,
+        > = Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new()));
+
         let wasi = wasi_builder.build();
         let host = HostState {
             ctx: wasi,
             table: ResourceTable::new(),
             limits: metered_limits,
             http_ctx: wasmtime_wasi_http::WasiHttpCtx::new(),
+            allowed_addrs: allowed_arc,
+            pool: self.pool.clone(),
+            tenant_id,
+            cp_internal_url: self.control_plane_internal_url.clone(),
+            job_token,
+            http: self.http.clone(),
+            d1_sessions: Arc::clone(&d1_sessions),
+            do_locks: Arc::clone(&do_locks),
         };
 
         let mut store = Store::new(&self.engine, host);
@@ -2069,17 +2282,103 @@ impl Worker {
         // ホスト経過時間込みの総時間で wall-clock 上限をかぶせる二重防御。タイムアウト時は
         // future が drop され、worker task は次の job へ進む（Wasmtime ランタイムは Store と
         // ともに drop される）。
+        // M11-5 (§4.2): world 種別を判定する。native HTTP（incoming-handler）なら
+        // input エンベロープから実 HTTP リクエストを組み、response-outparam を用意する
+        // （store が必要なので exec_future の前に済ませる）。bytes world は従来どおり。
+        let native_http = self.exports_incoming_handler(&component);
+        let native_setup = if native_http {
+            let mut req = envelope_to_request(&input)
+                .map_err(|e| ExecError::Failed(format!("bad ingress request: {e}")))?;
+            // M11-9 (§3.5/§4.6): config/secret（built_env）を native component に届ける。
+            // StarlingMonkey 0.19.3 は wasi:cli/environment を JS へ公開しないため、env 経由では
+            // 読めない。そこで **worker が権威的に** `x-hibana-env`（base64url(JSON) の env マップ）を
+            // リクエストヘッダへ注入し、SDK の fetch shim が `process.env` に載せてから剥がす。
+            // クライアント由来の同名ヘッダは**必ず除去してから**セットする（注入攻撃の遮断）。
+            req.headers_mut()
+                .remove(hyper::header::HeaderName::from_static("x-hibana-env"));
+            if !built_env.pairs.is_empty() {
+                let map: serde_json::Map<String, serde_json::Value> = built_env
+                    .pairs
+                    .iter()
+                    .map(|(k, v)| (k.clone(), serde_json::Value::String(v.clone())))
+                    .collect();
+                let json = serde_json::to_vec(&serde_json::Value::Object(map))
+                    .map_err(|e| ExecError::Failed(format!("env encode: {e}")))?;
+                let encoded = faas_shared::b64url_encode(&json);
+                if let Ok(hv) = hyper::header::HeaderValue::from_str(&encoded) {
+                    req.headers_mut()
+                        .insert(hyper::header::HeaderName::from_static("x-hibana-env"), hv);
+                }
+            }
+            let (sender, receiver) = tokio::sync::oneshot::channel();
+            let req_res = store
+                .data_mut()
+                .new_incoming_request(Scheme::Http, req)
+                .map_err(|e| ExecError::Failed(format!("new_incoming_request: {e}")))?;
+            let out = store
+                .data_mut()
+                .new_response_outparam(sender)
+                .map_err(|e| ExecError::Failed(format!("new_response_outparam: {e}")))?;
+            Some((req_res, out, receiver))
+        } else {
+            None
+        };
+
         let exec_timeout = limits.max_execution_time();
         let exec_future = async {
             // TODO(§3.6): 将来最適化として、ここを `InstancePre` による事前
             // インスタンス化（リンク済み Component を再利用）や Pooling アロケータへ
             // 引き上げ、coldstart をさらに短縮する。今回は Component キャッシュ +
             // 事前コンパイル (cwasm) までを実装範囲とする。
-            let instance = Handler::instantiate_async(&mut store, &component, &linker)
-                .await
-                .map_err(|e| ExecError::Failed(format!("failed to instantiate handler: {e}")))?;
-            // handle 呼び出し (async)。epoch 中断時は Err(trap) になる。
-            Ok::<_, ExecError>(instance.call_handle(&mut store, &input).await)
+            if let Some((req_res, out, receiver)) = native_setup {
+                // --- native HTTP: wasi:http/incoming-handler を駆動する ---
+                let ipre = linker
+                    .instantiate_pre(&component)
+                    .map_err(|e| ExecError::Failed(format!("instantiate_pre: {e}")))?;
+                let ppre = ProxyPre::new(ipre)
+                    .map_err(|e| ExecError::Failed(format!("not a proxy component: {e}")))?;
+                let proxy = ppre
+                    .instantiate_async(&mut store)
+                    .await
+                    .map_err(|e| ExecError::Failed(format!("failed to instantiate proxy: {e}")))?;
+
+                // call_handle と response 読み取りを同時駆動する。guest は handle 中に
+                // response-outparam.set() で応答を送り、本体を output-stream へ書く。本体が
+                // buffer 上限を超えるとき、handle は consumer が読むまで back-pressure で
+                // ブロックしうるため、join で本体収集を並行させてデッドロックを避ける。
+                let call = proxy
+                    .wasi_http_incoming_handler()
+                    .call_handle(&mut store, req_res, out);
+                let recv = async {
+                    match receiver.await {
+                        Ok(Ok(resp)) => Some(response_to_envelope(resp).await),
+                        _ => None,
+                    }
+                };
+                let (call_res, recv_res) = tokio::join!(call, recv);
+
+                // call_res の trap は既存の分類（fuel/epoch/wasm trap）に載せるため
+                // `Err(wasmtime::Error)` として素通しする。応答が set されなければ失敗扱い。
+                let call_result: std::result::Result<
+                    std::result::Result<Vec<u8>, bindings::HandlerError>,
+                    anyhow::Error,
+                > = match call_res {
+                    Err(e) => Err(e),
+                    Ok(()) => match recv_res {
+                        Some(Ok(bytes)) => Ok(Ok(bytes)),
+                        Some(Err(e)) => Err(anyhow!("failed to encode response: {e}")),
+                        None => Err(anyhow!("guest did not set a response")),
+                    },
+                };
+                Ok::<_, ExecError>(call_result)
+            } else {
+                // --- bytes world: faas:component/handler の handle を呼ぶ（従来） ---
+                let instance = Handler::instantiate_async(&mut store, &component, &linker)
+                    .await
+                    .map_err(|e| ExecError::Failed(format!("failed to instantiate handler: {e}")))?;
+                // handle 呼び出し (async)。epoch 中断時は Err(trap) になる。
+                Ok::<_, ExecError>(instance.call_handle(&mut store, &input).await)
+            }
         };
 
         let timed = tokio::time::timeout(exec_timeout, exec_future).await;
@@ -2099,6 +2398,22 @@ impl Worker {
                     .guest_stderr_dropped_bytes_total
                     .inc_by(dropped);
             }
+        }
+
+        // M14: D1 セッションを flush（save + advisory lock 解放）。実行成否に関わらず必ず行う。
+        // これで次に同じ DB を触る実行がロックを取得でき、書き込みが永続化される。
+        {
+            let mut m = d1_sessions.lock().await;
+            for (name, sess) in m.drain() {
+                if let Err(e) = sess.flush().await {
+                    warn!(db = %name, error = %e, "d1: flush failed (data may be lost for this db)");
+                }
+            }
+        }
+        // M16: DO ロックを解放（接続を drop → pool の after_release が pg_advisory_unlock_all）。
+        {
+            let mut m = do_locks.lock().await;
+            m.clear();
         }
 
         match timed {
@@ -2165,6 +2480,16 @@ impl Worker {
                 serde_json::Value::Array(bytes.into_iter().map(serde_json::Value::from).collect())
             }
         }
+    }
+
+    /// M11-5 (§4.2): この component が `wasi:http/incoming-handler` を export しているか
+    /// （= native HTTP component）。export 名で判定する。false なら従来の bytes world
+    /// （`faas:component/handler` の `handle`）として実行する。
+    fn exports_incoming_handler(&self, component: &Component) -> bool {
+        component
+            .component_type()
+            .exports(&self.engine)
+            .any(|(name, _)| name.starts_with("wasi:http/incoming-handler"))
     }
 
     // ------------------------------------------------------------------------
@@ -2458,6 +2783,765 @@ fn fuel_consumed(set: u64, remaining: u64, fuel_enabled: bool) -> u64 {
 /// `u128` のミリ秒が `u64` を超える非現実的なケースでは `u64::MAX` に飽和させる。
 fn duration_to_millis(d: Duration) -> u64 {
     d.as_millis().min(u64::MAX as u128) as u64
+}
+
+// ============================================================================
+// M11-5 (§4.2): native HTTP（wasi:http/incoming-handler）の request/response 変換
+// ============================================================================
+//
+// invoke の input バイト列は HTTP エンベロープ JSON（gateway / CLI が組む
+// `{method, path, query, headers, body, bodyBase64}`）。これを host 側で実 HTTP
+// リクエストへ組み、guest（Hono 等）の incoming-handler を駆動する。応答は同じく
+// エンベロープ JSON `{status, headers, body, bodyBase64}` にして返す（= 従来 adapter.js が
+// JS 内でやっていた変換を host=Rust へ移しただけ。gateway / CLI から見た contract は不変）。
+// binary body は base64url（Rust/JS 同一スキームの `faas_shared::b64url_*`）。
+
+type ReqBody = http_body_util::combinators::BoxBody<Bytes, hyper::Error>;
+
+/// request エンベロープ JSON → `hyper::Request`。
+fn envelope_to_request(input: &[u8]) -> anyhow::Result<hyper::Request<ReqBody>> {
+    let env: serde_json::Value = serde_json::from_slice(input)
+        .map_err(|e| anyhow!("ingress input is not a request envelope: {e}"))?;
+    let method = env.get("method").and_then(|v| v.as_str()).unwrap_or("GET");
+    let path = env.get("path").and_then(|v| v.as_str()).unwrap_or("/");
+    let query = env.get("query").and_then(|v| v.as_str()).unwrap_or("");
+    let uri = format!("http://hibana.local{path}{query}");
+
+    let mut builder = hyper::Request::builder().method(method).uri(uri);
+    if let Some(hs) = env.get("headers").and_then(|v| v.as_object()) {
+        for (k, v) in hs {
+            if let Some(vs) = v.as_str() {
+                builder = builder.header(k, vs);
+            }
+        }
+    }
+
+    let body_bytes: Vec<u8> = match env.get("body") {
+        Some(serde_json::Value::String(s)) => {
+            let b64 = env
+                .get("bodyBase64")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            if b64 {
+                faas_shared::b64url_decode(s).unwrap_or_default()
+            } else {
+                s.clone().into_bytes()
+            }
+        }
+        _ => Vec::new(),
+    };
+    let body = Full::new(Bytes::from(body_bytes))
+        .map_err(|e| match e {})
+        .boxed();
+    builder
+        .body(body)
+        .map_err(|e| anyhow!("failed to build request: {e}"))
+}
+
+/// M11-8 (§4.4): `wasi:http/outgoing-handler`（guest の fetch）を allowlist で gate して送る。
+///
+/// **セキュリティ要点**: 既定の `default_send_request` は `TcpStream::connect(authority)` で
+/// socket_addr_check を通らず任意宛先へ出てしまう。ここでは M9c と同じモデルで gate する:
+///  1. `allowed`（解決済み承認先 host:port）が空なら **全拒否**（deny-by-default）。
+///  2. 宛先ホストを自分で解決し、各 IP を **hard-deny 最優先**（private/loopback/metadata 等）で
+///     落とし、承認集合に一致する IP だけを選ぶ（DNS rebinding 対策: 承認済み IP に固定接続）。
+///  3. reqwest の `resolve(host, ip)` でその **確定 IP に固定**して接続する（SNI/Host は元のホスト名の
+///     ままなので TLS も成立）。任意宛先へは出られない。
+/// 本体は簡潔さのためバッファリングする（typical な API 呼び出し向け。巨大ストリームは非対象）。
+async fn gated_send_request(
+    request: hyper::Request<HyperOutgoingBody>,
+    config: wasmtime_wasi_http::types::OutgoingRequestConfig,
+    allowed: Arc<std::collections::HashSet<std::net::SocketAddr>>,
+) -> Result<wasmtime_wasi_http::types::IncomingResponse, wasmtime_wasi_http::bindings::http::types::ErrorCode>
+{
+    use wasmtime_wasi_http::bindings::http::types::ErrorCode;
+
+    // 1. deny-by-default。
+    if allowed.is_empty() {
+        return Err(ErrorCode::HttpRequestDenied);
+    }
+
+    let (parts, body) = request.into_parts();
+    let use_tls = config.use_tls;
+    let host = match parts.uri.host() {
+        Some(h) => h.to_string(),
+        None => return Err(ErrorCode::HttpRequestUriInvalid),
+    };
+    let port = parts
+        .uri
+        .port_u16()
+        .unwrap_or(if use_tls { 443 } else { 80 });
+
+    // 2. 解決 → hard-deny 除外 → 承認済み IP を 1 つ選ぶ。
+    let mut pinned: Option<std::net::SocketAddr> = None;
+    match tokio::net::lookup_host((host.as_str(), port)).await {
+        Ok(addrs) => {
+            for addr in addrs {
+                if faas_shared::egress::is_hard_denied(addr.ip()) {
+                    continue;
+                }
+                if allowed.contains(&addr) {
+                    pinned = Some(addr);
+                    break;
+                }
+            }
+        }
+        Err(_) => return Err(ErrorCode::HttpRequestDenied),
+    }
+    let pinned = match pinned {
+        Some(a) => a,
+        // 承認集合に一致する到達可能 IP が無い = 拒否。
+        None => return Err(ErrorCode::HttpRequestDenied),
+    };
+
+    // 3. リクエスト本体をバッファ。
+    let body_bytes = body
+        .collect()
+        .await
+        .map_err(|_| ErrorCode::HttpRequestBodySize(None))?
+        .to_bytes();
+
+    // 4. reqwest で **確定 IP に固定**して送る（TLS は reqwest/rustls が処理。SNI=ホスト名）。
+    let scheme = if use_tls { "https" } else { "http" };
+    let path = parts
+        .uri
+        .path_and_query()
+        .map(|p| p.as_str())
+        .unwrap_or("/");
+    let url = format!("{scheme}://{host}:{port}{path}");
+    let client = reqwest::Client::builder()
+        .resolve(&host, pinned)
+        .connect_timeout(config.connect_timeout)
+        .build()
+        .map_err(|e| ErrorCode::InternalError(Some(format!("client build: {e}"))))?;
+
+    let mut rb = client
+        .request(parts.method.clone(), url.as_str())
+        .body(body_bytes.to_vec());
+    for (k, v) in parts.headers.iter() {
+        // Host は reqwest が URL から付ける。二重指定を避ける。
+        if k == hyper::header::HOST {
+            continue;
+        }
+        rb = rb.header(k.clone(), v.clone());
+    }
+    let resp = rb
+        .send()
+        .await
+        .map_err(|e| ErrorCode::InternalError(Some(format!("egress send failed: {e}"))))?;
+
+    // 5. reqwest レスポンス → hyper::Response<HyperIncomingBody>（バッファ）。
+    let status = resp.status();
+    let headers = resp.headers().clone();
+    let resp_body = resp
+        .bytes()
+        .await
+        .map_err(|_| ErrorCode::HttpResponseBodySize(None))?;
+
+    let mut builder = hyper::Response::builder().status(status);
+    if let Some(h) = builder.headers_mut() {
+        *h = headers;
+    }
+    let hy_body = Full::new(resp_body)
+        .map_err(|e| match e {})
+        .boxed();
+    let resp = builder
+        .body(hy_body)
+        .map_err(|e| ErrorCode::InternalError(Some(format!("resp build: {e}"))))?;
+
+    Ok(wasmtime_wasi_http::types::IncomingResponse {
+        resp,
+        worker: None,
+        between_bytes_timeout: config.between_bytes_timeout,
+    })
+}
+
+// ============================================================================
+// M12: KV バインディング（Workers KV 互換）。guest の `env.KV.get/put/delete/list` は
+// `http://kv.hibana.internal/...` への fetch になり、ここで egress せず Postgres を叩く。
+// **tenant_id はジョブ由来**（guest は指定不可）。RLS で cross-tenant は構造的に不可能。
+// namespace は tenant 内パーティション（tenant 内 component 間の境界ではない）。
+// ============================================================================
+
+fn percent_decode(s: &str) -> String {
+    let b = s.as_bytes();
+    let mut out = Vec::with_capacity(b.len());
+    let hex = |c: u8| (c as char).to_digit(16);
+    let mut i = 0;
+    while i < b.len() {
+        match b[i] {
+            b'%' if i + 2 < b.len() => match (hex(b[i + 1]), hex(b[i + 2])) {
+                (Some(hi), Some(lo)) => {
+                    out.push((hi * 16 + lo) as u8);
+                    i += 3;
+                }
+                _ => {
+                    out.push(b[i]);
+                    i += 1;
+                }
+            },
+            b'+' => {
+                out.push(b' ');
+                i += 1;
+            }
+            c => {
+                out.push(c);
+                i += 1;
+            }
+        }
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+fn parse_query(q: &str) -> std::collections::HashMap<String, String> {
+    let mut m = std::collections::HashMap::new();
+    for pair in q.split('&').filter(|s| !s.is_empty()) {
+        let (k, v) = match pair.split_once('=') {
+            Some((k, v)) => (k, v),
+            None => (pair, ""),
+        };
+        m.insert(percent_decode(k), percent_decode(v));
+    }
+    m
+}
+
+/// KV 応答（status + body bytes）を IncomingResponse に組む。
+fn kv_response(
+    status: u16,
+    content_type: &str,
+    body: Vec<u8>,
+) -> Result<
+    wasmtime_wasi_http::types::IncomingResponse,
+    wasmtime_wasi_http::bindings::http::types::ErrorCode,
+> {
+    use wasmtime_wasi_http::bindings::http::types::ErrorCode;
+    let resp = hyper::Response::builder()
+        .status(status)
+        .header(hyper::header::CONTENT_TYPE, content_type)
+        .body(Full::new(Bytes::from(body)).map_err(|e| match e {}).boxed())
+        .map_err(|e| ErrorCode::InternalError(Some(format!("kv resp: {e}"))))?;
+    Ok(wasmtime_wasi_http::types::IncomingResponse {
+        resp,
+        worker: None,
+        between_bytes_timeout: Duration::from_secs(60),
+    })
+}
+
+async fn handle_kv_request(
+    pool: PgPool,
+    tenant_id: String,
+    request: hyper::Request<HyperOutgoingBody>,
+) -> Result<
+    wasmtime_wasi_http::types::IncomingResponse,
+    wasmtime_wasi_http::bindings::http::types::ErrorCode,
+> {
+    use sqlx::Row as _;
+    use wasmtime_wasi_http::bindings::http::types::ErrorCode;
+    let dberr = |_e| ErrorCode::InternalError(Some("kv: db error".to_string()));
+
+    let (parts, body) = request.into_parts();
+    let path = parts.uri.path().to_string();
+    let q = parts.uri.query().map(parse_query).unwrap_or_default();
+    let ns = q.get("ns").cloned().unwrap_or_default();
+    let key = q.get("key").cloned().unwrap_or_default();
+    if ns.is_empty() {
+        return kv_response(400, "text/plain", b"missing ns".to_vec());
+    }
+
+    // ジョブの tenant を GUC に設定した tx（FORCE RLS 下で cross-tenant を構造的に排除）。
+    let mut tx = pool.begin().await.map_err(dberr)?;
+    sqlx::query("SELECT set_config('app.tenant_id', $1, true)")
+        .bind(&tenant_id)
+        .execute(&mut *tx)
+        .await
+        .map_err(dberr)?;
+
+    let method = parts.method;
+    let out = match (method.as_str(), path.as_str()) {
+        ("GET", "/v1/kv") => {
+            let row = sqlx::query(
+                "SELECT value FROM kv_entries \
+                 WHERE tenant_id=$1 AND namespace=$2 AND key=$3 \
+                   AND (expires_at IS NULL OR expires_at > now())",
+            )
+            .bind(&tenant_id)
+            .bind(&ns)
+            .bind(&key)
+            .fetch_optional(&mut *tx)
+            .await
+            .map_err(dberr)?;
+            match row {
+                Some(r) => {
+                    let v: Vec<u8> = r.try_get("value").map_err(dberr)?;
+                    kv_response(200, "application/octet-stream", v)
+                }
+                None => kv_response(404, "text/plain", Vec::new()),
+            }
+        }
+        ("PUT", "/v1/kv") => {
+            let val = body
+                .collect()
+                .await
+                .map_err(|_| ErrorCode::InternalError(Some("kv: read body".into())))?
+                .to_bytes()
+                .to_vec();
+            let ttl: Option<i64> = q.get("ttl").and_then(|s| s.parse().ok()).filter(|t| *t > 0);
+            sqlx::query(
+                "INSERT INTO kv_entries (tenant_id, namespace, key, value, expires_at, updated_at) \
+                 VALUES ($1,$2,$3,$4, \
+                    CASE WHEN $5::bigint IS NULL THEN NULL \
+                         ELSE now() + make_interval(secs => $5::bigint) END, now()) \
+                 ON CONFLICT (tenant_id, namespace, key) \
+                 DO UPDATE SET value=EXCLUDED.value, expires_at=EXCLUDED.expires_at, updated_at=now()",
+            )
+            .bind(&tenant_id)
+            .bind(&ns)
+            .bind(&key)
+            .bind(&val)
+            .bind(ttl)
+            .execute(&mut *tx)
+            .await
+            .map_err(dberr)?;
+            kv_response(204, "text/plain", Vec::new())
+        }
+        ("DELETE", "/v1/kv") => {
+            sqlx::query("DELETE FROM kv_entries WHERE tenant_id=$1 AND namespace=$2 AND key=$3")
+                .bind(&tenant_id)
+                .bind(&ns)
+                .bind(&key)
+                .execute(&mut *tx)
+                .await
+                .map_err(dberr)?;
+            kv_response(204, "text/plain", Vec::new())
+        }
+        ("GET", "/v1/kv/list") => {
+            let prefix = q.get("prefix").cloned().unwrap_or_default();
+            let limit: i64 = q
+                .get("limit")
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(1000)
+                .clamp(1, 1000);
+            // LIKE の特殊文字を無効化してから prefix 一致にする。
+            let pat = format!(
+                "{}%",
+                prefix.replace('\\', "\\\\").replace('%', "\\%").replace('_', "\\_")
+            );
+            let rows = sqlx::query(
+                "SELECT key FROM kv_entries \
+                 WHERE tenant_id=$1 AND namespace=$2 AND key LIKE $3 \
+                   AND (expires_at IS NULL OR expires_at > now()) \
+                 ORDER BY key LIMIT $4",
+            )
+            .bind(&tenant_id)
+            .bind(&ns)
+            .bind(&pat)
+            .bind(limit)
+            .fetch_all(&mut *tx)
+            .await
+            .map_err(dberr)?;
+            let keys: Vec<String> = rows
+                .iter()
+                .filter_map(|r| r.try_get::<String, _>("key").ok())
+                .collect();
+            let json = serde_json::to_vec(&serde_json::json!({ "keys": keys }))
+                .map_err(|e| ErrorCode::InternalError(Some(format!("kv list: {e}"))))?;
+            kv_response(200, "application/json", json)
+        }
+        _ => kv_response(404, "text/plain", b"unknown kv op".to_vec()),
+    };
+
+    tx.commit().await.map_err(dberr)?;
+    out
+}
+
+// ============================================================================
+// M13: R2 バインディング（Workers R2 互換, オブジェクトストレージ）。KV と同じく
+// `http://r2.hibana.internal/...` を send_request が横取りし、ジョブの tenant で
+// r2_objects（Postgres bytea, RLS）を操作する。MVP は Postgres 保持（worker keyless 維持）。
+// ============================================================================
+
+/// R2 応答を組む。`extra` は追加ヘッダ（メタデータ）。
+fn r2_response(
+    status: u16,
+    extra: Vec<(&'static str, String)>,
+    body: Vec<u8>,
+) -> Result<
+    wasmtime_wasi_http::types::IncomingResponse,
+    wasmtime_wasi_http::bindings::http::types::ErrorCode,
+> {
+    use wasmtime_wasi_http::bindings::http::types::ErrorCode;
+    let mut b = hyper::Response::builder().status(status);
+    for (k, v) in extra {
+        if let Ok(val) = hyper::header::HeaderValue::from_str(&v) {
+            b = b.header(k, val);
+        }
+    }
+    let resp = b
+        .body(Full::new(Bytes::from(body)).map_err(|e| match e {}).boxed())
+        .map_err(|e| ErrorCode::InternalError(Some(format!("r2 resp: {e}"))))?;
+    Ok(wasmtime_wasi_http::types::IncomingResponse {
+        resp,
+        worker: None,
+        between_bytes_timeout: Duration::from_secs(60),
+    })
+}
+
+/// CP 内部 R2 応答（メタはヘッダ、get のみ body）を guest 応答へ写す。
+async fn cp_r2_to_guest(
+    resp: reqwest::Response,
+    include_body: bool,
+) -> Result<
+    wasmtime_wasi_http::types::IncomingResponse,
+    wasmtime_wasi_http::bindings::http::types::ErrorCode,
+> {
+    use wasmtime_wasi_http::bindings::http::types::ErrorCode;
+    let status = resp.status().as_u16();
+    let h = resp.headers().clone();
+    let get = |n: &str| h.get(n).and_then(|v| v.to_str().ok()).map(|s| s.to_string());
+    let mut extra: Vec<(&'static str, String)> = Vec::new();
+    if let Some(v) = get("x-r2-key") {
+        extra.push(("x-r2-key", v));
+    }
+    if let Some(v) = get("x-r2-size") {
+        extra.push(("x-r2-size", v));
+    }
+    if let Some(v) = get("x-r2-etag") {
+        extra.push(("x-r2-etag", v));
+    }
+    if let Some(v) = get("x-r2-meta") {
+        extra.push(("x-r2-meta", v));
+    }
+    // CP は content-type を x-r2-content-type で返す。guest には実 content-type として渡す
+    // （SDK の __r2meta は content-type から httpMetadata.contentType を読む）。
+    if let Some(v) = get("x-r2-content-type") {
+        extra.push(("content-type", v));
+    }
+    let body = if include_body {
+        resp.bytes()
+            .await
+            .map_err(|_| ErrorCode::InternalError(Some("r2: read cp body".into())))?
+            .to_vec()
+    } else {
+        Vec::new()
+    };
+    r2_response(status, extra, body)
+}
+
+/// guest の `env.BUCKET.*`（r2.hibana.internal への fetch）を CP 内部 R2 エンドポイントへ中継する。
+/// worker は keyless なので S3 は CP が代行する。認証は job_token（CP 署名。テナントは claim 由来）。
+async fn handle_r2_request(
+    http: reqwest::Client,
+    cp_url: String,
+    job_token: String,
+    request: hyper::Request<HyperOutgoingBody>,
+) -> Result<
+    wasmtime_wasi_http::types::IncomingResponse,
+    wasmtime_wasi_http::bindings::http::types::ErrorCode,
+> {
+    use wasmtime_wasi_http::bindings::http::types::ErrorCode;
+    let neterr = |_e| ErrorCode::InternalError(Some("r2: control-plane call failed".to_string()));
+
+    let (parts, body) = request.into_parts();
+    let path = parts.uri.path().to_string();
+    let q = parts.uri.query().map(parse_query).unwrap_or_default();
+    let bucket = q.get("bucket").cloned().unwrap_or_default();
+    let key = q.get("key").cloned().unwrap_or_default();
+    if bucket.is_empty() {
+        return r2_response(400, vec![], b"missing bucket".to_vec());
+    }
+    let base = format!("{}/internal/r2", cp_url.trim_end_matches('/'));
+
+    match (parts.method.as_str(), path.as_str()) {
+        ("PUT", "/v1/r2") => {
+            let val = body
+                .collect()
+                .await
+                .map_err(|_| ErrorCode::InternalError(Some("r2: read body".into())))?
+                .to_bytes()
+                .to_vec();
+            let mut rb = http
+                .put(format!("{base}/object"))
+                .header("x-hibana-job-token", &job_token)
+                .header("x-r2-bucket", &bucket)
+                .header("x-r2-key", &key)
+                .body(val);
+            if let Some(ct) = parts
+                .headers
+                .get(hyper::header::CONTENT_TYPE)
+                .and_then(|v| v.to_str().ok())
+            {
+                rb = rb.header("x-r2-content-type", ct);
+            }
+            if let Some(m) = parts.headers.get("x-r2-meta").and_then(|v| v.to_str().ok()) {
+                rb = rb.header("x-r2-meta", m);
+            }
+            let resp = rb.send().await.map_err(neterr)?;
+            cp_r2_to_guest(resp, false).await
+        }
+        ("GET", "/v1/r2") => {
+            let head_only = q.get("head").map(|v| v == "1").unwrap_or(false);
+            let mut rb = http
+                .get(format!("{base}/object"))
+                .header("x-hibana-job-token", &job_token)
+                .header("x-r2-bucket", &bucket)
+                .header("x-r2-key", &key);
+            if head_only {
+                rb = rb.header("x-r2-head", "1");
+            }
+            let resp = rb.send().await.map_err(neterr)?;
+            if resp.status().as_u16() == 404 {
+                return r2_response(404, vec![], Vec::new());
+            }
+            cp_r2_to_guest(resp, !head_only).await
+        }
+        ("DELETE", "/v1/r2") => {
+            let _ = http
+                .delete(format!("{base}/object"))
+                .header("x-hibana-job-token", &job_token)
+                .header("x-r2-bucket", &bucket)
+                .header("x-r2-key", &key)
+                .send()
+                .await
+                .map_err(neterr)?;
+            r2_response(204, vec![], Vec::new())
+        }
+        ("GET", "/v1/r2/list") => {
+            let prefix = q.get("prefix").cloned().unwrap_or_default();
+            let limit = q.get("limit").cloned().unwrap_or_default();
+            let mut rb = http
+                .get(format!("{base}/list"))
+                .header("x-hibana-job-token", &job_token)
+                .header("x-r2-bucket", &bucket);
+            if !prefix.is_empty() {
+                rb = rb.header("x-r2-prefix", prefix);
+            }
+            if !limit.is_empty() {
+                rb = rb.header("x-r2-limit", limit);
+            }
+            let resp = rb.send().await.map_err(neterr)?;
+            let bytes = resp.bytes().await.map_err(neterr)?.to_vec();
+            r2_response(200, vec![("content-type", "application/json".into())], bytes)
+        }
+        _ => r2_response(404, vec![], b"unknown r2 op".to_vec()),
+    }
+}
+
+// ============================================================================
+// M14: D1 バインディング。guest の `env.DB.*`（d1.hibana.internal への fetch）を、実行中に常駐する
+// D1Session（隔離 SQLite + advisory lock）へ中継する。セッションは実行末に run_component が flush。
+// ============================================================================
+async fn handle_d1_request(
+    pool: PgPool,
+    tenant: String,
+    sessions: Arc<tokio::sync::Mutex<std::collections::HashMap<String, d1::D1Session>>>,
+    request: hyper::Request<HyperOutgoingBody>,
+) -> Result<
+    wasmtime_wasi_http::types::IncomingResponse,
+    wasmtime_wasi_http::bindings::http::types::ErrorCode,
+> {
+    let d1_err = |status: u16, msg: &str| {
+        let body = serde_json::to_vec(&serde_json::json!({ "error": msg })).unwrap_or_default();
+        kv_response(status, "application/json", body)
+    };
+
+    let (parts, body) = request.into_parts();
+    let path = parts.uri.path().to_string();
+    let q = parts.uri.query().map(parse_query).unwrap_or_default();
+    let db = q.get("db").cloned().unwrap_or_default();
+    if db.is_empty() {
+        return d1_err(400, "missing db");
+    }
+    let body_bytes = match body.collect().await {
+        Ok(b) => b.to_bytes(),
+        Err(_) => return d1_err(400, "read body failed"),
+    };
+    let payload: serde_json::Value = serde_json::from_slice(&body_bytes).unwrap_or(serde_json::Value::Null);
+
+    // 実行中このセッションを常駐させる（初回に open = advisory lock + load）。
+    let mut map = sessions.lock().await;
+    if !map.contains_key(&db) {
+        match d1::D1Session::open(&pool, &tenant, &db).await {
+            Ok(s) => {
+                map.insert(db.clone(), s);
+            }
+            Err(e) => return d1_err(500, &e),
+        }
+    }
+    let sess = map.get_mut(&db).expect("d1 session just inserted");
+
+    let result = match path.as_str() {
+        "/v1/d1/query" => {
+            let sql = payload.get("sql").and_then(|v| v.as_str()).unwrap_or("").to_string();
+            let params = payload
+                .get("params")
+                .and_then(|v| v.as_array())
+                .cloned()
+                .unwrap_or_default();
+            sess.query(sql, params).await
+        }
+        "/v1/d1/batch" => {
+            let stmts: Vec<(String, Vec<serde_json::Value>)> = payload
+                .get("statements")
+                .and_then(|v| v.as_array())
+                .map(|arr| {
+                    arr.iter()
+                        .map(|s| {
+                            (
+                                s.get("sql").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+                                s.get("params").and_then(|v| v.as_array()).cloned().unwrap_or_default(),
+                            )
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+            sess.batch(stmts).await
+        }
+        "/v1/d1/exec" => {
+            let sql = payload.get("sql").and_then(|v| v.as_str()).unwrap_or("").to_string();
+            sess.exec(sql).await
+        }
+        _ => Err("unknown d1 op".to_string()),
+    };
+
+    match result {
+        Ok(v) => kv_response(200, "application/json", serde_json::to_vec(&v).unwrap_or_default()),
+        Err(e) => d1_err(400, &e),
+    }
+}
+
+// ============================================================================
+// M15: Queues producer。guest の `env.QUEUE.send()`（queue.hibana.internal への fetch）を
+// CP 内部 `/internal/queue/send` へ中継する（consumer invoke の enqueue は CP が行う）。
+// ============================================================================
+async fn handle_queue_request(
+    http: reqwest::Client,
+    cp_url: String,
+    job_token: String,
+    request: hyper::Request<HyperOutgoingBody>,
+) -> Result<
+    wasmtime_wasi_http::types::IncomingResponse,
+    wasmtime_wasi_http::bindings::http::types::ErrorCode,
+> {
+    use wasmtime_wasi_http::bindings::http::types::ErrorCode;
+    let neterr = |_e| ErrorCode::InternalError(Some("queue: control-plane call failed".to_string()));
+
+    let (parts, body) = request.into_parts();
+    let q = parts.uri.query().map(parse_query).unwrap_or_default();
+    let queue = q.get("q").cloned().unwrap_or_default();
+    if queue.is_empty() {
+        return kv_response(400, "text/plain", b"missing q".to_vec());
+    }
+    let body_bytes = body
+        .collect()
+        .await
+        .map_err(|_| ErrorCode::InternalError(Some("queue: read body".into())))?
+        .to_bytes();
+    let payload: serde_json::Value =
+        serde_json::from_slice(&body_bytes).unwrap_or(serde_json::json!({ "messages": [] }));
+    let messages = payload
+        .get("messages")
+        .cloned()
+        .unwrap_or(serde_json::Value::Array(vec![]));
+
+    let send_body = serde_json::json!({ "queue": queue, "messages": messages });
+    let resp = http
+        .post(format!("{}/internal/queue/send", cp_url.trim_end_matches('/')))
+        .header("x-hibana-job-token", &job_token)
+        .json(&send_body)
+        .send()
+        .await
+        .map_err(neterr)?;
+    let status = resp.status().as_u16();
+    let rbody = resp.bytes().await.map_err(neterr)?.to_vec();
+    let out_status = if status < 300 { 200 } else { status };
+    kv_response(out_status, "application/json", rbody)
+}
+
+// ============================================================================
+// M16: Durable Objects の単一書き手ロック。`stub.fetch()` の最初に shim が
+// `do.hibana.internal/lock?class=&id=` を叩くと、この (tenant,class,id) の advisory lock を取得して
+// 実行の間保持する（同じ DO を触る他実行は待つ＝グローバル直列化）。storage は KV 名前空間を再利用。
+// ロックは実行末に drop（pool の after_release が unlock）。
+// ============================================================================
+async fn handle_do_lock(
+    pool: PgPool,
+    tenant: String,
+    locks: Arc<
+        tokio::sync::Mutex<
+            std::collections::HashMap<String, sqlx::pool::PoolConnection<sqlx::Postgres>>,
+        >,
+    >,
+    request: hyper::Request<HyperOutgoingBody>,
+) -> Result<
+    wasmtime_wasi_http::types::IncomingResponse,
+    wasmtime_wasi_http::bindings::http::types::ErrorCode,
+> {
+    use wasmtime_wasi_http::bindings::http::types::ErrorCode;
+    let err = |_e| ErrorCode::InternalError(Some("do: lock failed".to_string()));
+    let q = request.uri().query().map(parse_query).unwrap_or_default();
+    let class = q.get("class").cloned().unwrap_or_default();
+    let id = q.get("id").cloned().unwrap_or_default();
+    if class.is_empty() || id.is_empty() {
+        return kv_response(400, "text/plain", b"missing class/id".to_vec());
+    }
+    let map_key = format!("{class}/{id}");
+    // (tenant,class,id) の安定 advisory lock キー（FNV-1a）。
+    let mut h: u64 = 0xcbf29ce484222325;
+    for b in tenant
+        .bytes()
+        .chain(b"/do/".iter().copied())
+        .chain(class.bytes())
+        .chain(b"/".iter().copied())
+        .chain(id.bytes())
+    {
+        h ^= b as u64;
+        h = h.wrapping_mul(0x100000001b3);
+    }
+    let key = h as i64;
+
+    let mut m = locks.lock().await;
+    if !m.contains_key(&map_key) {
+        let mut conn = pool.acquire().await.map_err(err)?;
+        sqlx::query("SELECT pg_advisory_lock($1)")
+            .bind(key)
+            .execute(&mut *conn)
+            .await
+            .map_err(err)?;
+        m.insert(map_key, conn);
+    }
+    kv_response(200, "text/plain", b"locked".to_vec())
+}
+
+/// `hyper::Response` → response エンベロープ JSON バイト列。
+async fn response_to_envelope(resp: hyper::Response<HyperOutgoingBody>) -> anyhow::Result<Vec<u8>> {
+    let status = resp.status().as_u16();
+    let mut headers = serde_json::Map::new();
+    for (k, v) in resp.headers().iter() {
+        if let Ok(s) = v.to_str() {
+            headers.insert(k.as_str().to_string(), serde_json::Value::String(s.to_string()));
+        }
+    }
+    let body = resp
+        .into_body()
+        .collect()
+        .await
+        .map_err(|e| anyhow!("failed to read guest response body: {e}"))?
+        .to_bytes();
+
+    let (body_val, b64) = match std::str::from_utf8(&body) {
+        Ok(s) => (serde_json::Value::String(s.to_string()), false),
+        Err(_) => (
+            serde_json::Value::String(faas_shared::b64url_encode(&body)),
+            true,
+        ),
+    };
+
+    let mut env = serde_json::Map::new();
+    env.insert("status".into(), serde_json::Value::from(status));
+    env.insert("headers".into(), serde_json::Value::Object(headers));
+    env.insert("body".into(), body_val);
+    env.insert("bodyBase64".into(), serde_json::Value::Bool(b64));
+    Ok(serde_json::to_vec(&serde_json::Value::Object(env))?)
 }
 
 // ============================================================================

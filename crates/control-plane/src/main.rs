@@ -20,6 +20,8 @@ mod enqueue;
 mod error;
 mod extract;
 mod handlers;
+mod handlers_queue;
+mod handlers_r2;
 mod handlers_secrets;
 mod ingress;
 mod lanes;
@@ -390,6 +392,18 @@ fn build_internal_router(state: AppState) -> Router {
     Router::new()
         .route("/internal/job-env", post(handlers_secrets::job_env))
         .route("/internal/scale", get(handlers::internal_scale))
+        // M13: R2 バインディングの本体 I/O（worker keyless のため CP が S3 を代行）。
+        // internal listener のみ。認証は job_token（handlers_r2 内で検証）。
+        .route(
+            "/internal/r2/object",
+            get(handlers_r2::get_object)
+                .put(handlers_r2::put_object)
+                .delete(handlers_r2::delete_object)
+                .layer(axum::extract::DefaultBodyLimit::max(32 * 1024 * 1024)),
+        )
+        .route("/internal/r2/list", get(handlers_r2::list_objects))
+        // M15: producer からのメッセージを consumer invoke として enqueue する（internal のみ）。
+        .route("/internal/queue/send", post(handlers_queue::queue_send))
         .with_state(state)
 }
 
@@ -413,6 +427,12 @@ fn build_router(state: AppState) -> Router {
             get(handlers::list_versions),
         )
         .route("/executions/{id}", get(handlers::get_execution))
+        // GET /components/{id}/versions/{version}/capabilities: 現在の承認 env 名 / egress 先を返す
+        // （M11-9。値は返さない。CLI が全置換 PUT 前にマージするための読み取り）。
+        .route(
+            "/components/{component_id}/versions/{version}/capabilities",
+            get(handlers::get_capabilities),
+        )
         // GET /usage: テナント利用量参照 (M5, §15 / §6.0)。principal.tenant_id を権威化し
         // cross-tenant path を持たない（/tenants/{id}/usage の IDOR 面を作らない）。
         .route("/usage", get(handlers::get_usage))
@@ -468,6 +488,11 @@ fn build_router(state: AppState) -> Router {
         .route(
             "/components/{component_id}/ingress",
             put(handlers::set_component_ingress),
+        )
+        // M15: queue consumer 登録（deploy が [[queues.consumers]] を反映）。
+        .route(
+            "/components/{component_id}/queue-consumers",
+            put(handlers_queue::register_consumers),
         )
         // POST /cron-jobs: Cron ジョブ登録 (M6b, §15。component ライフサイクル相当の Deploy スコープ)。
         .route("/cron-jobs", post(handlers::create_cron_job))
