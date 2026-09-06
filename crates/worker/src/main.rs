@@ -307,6 +307,16 @@ impl wasmtime_wasi_http::WasiHttpView for HostState {
             return Ok(wasmtime_wasi_http::types::HostFutureIncomingResponse::pending(handle));
         }
         if request.uri().host() == Some(DO_INTERNAL_HOST) {
+            // M17: /alarm は CP 経由（set/get/delete）、それ以外（/lock）は worker が直接 Postgres で扱う。
+            if request.uri().path() == "/alarm" {
+                let http = self.http.clone();
+                let cp = self.cp_internal_url.clone();
+                let token = self.job_token.clone();
+                let handle = wasmtime_wasi::runtime::spawn(async move {
+                    Ok(handle_do_alarm(http, cp, token, request).await)
+                });
+                return Ok(wasmtime_wasi_http::types::HostFutureIncomingResponse::pending(handle));
+            }
             let pool = self.pool.clone();
             let tenant = self.tenant_id.clone();
             let locks = Arc::clone(&self.do_locks);
@@ -3494,6 +3504,76 @@ async fn handle_queue_request(
         .map_err(neterr)?;
     let status = resp.status().as_u16();
     let rbody = resp.bytes().await.map_err(neterr)?.to_vec();
+    let out_status = if status < 300 { 200 } else { status };
+    kv_response(out_status, "application/json", rbody)
+}
+
+// ============================================================================
+// M17: Durable Object alarm の set/get/delete。`ctx.storage.setAlarm/getAlarm/deleteAlarm` が
+// `do.hibana.internal/alarm` を叩くと、worker はこれを CP の internal エンドポイントへ中継する
+// （fire に要る component_id を CP が version_id から解決して alarm 行へ載せるため）。tenant は
+// job_token の claim 由来。getAlarm の 404（未設定）は status をそのまま透過して shim に伝える。
+// ============================================================================
+async fn handle_do_alarm(
+    http: reqwest::Client,
+    cp_url: String,
+    job_token: String,
+    request: hyper::Request<HyperOutgoingBody>,
+) -> Result<
+    wasmtime_wasi_http::types::IncomingResponse,
+    wasmtime_wasi_http::bindings::http::types::ErrorCode,
+> {
+    use wasmtime_wasi_http::bindings::http::types::ErrorCode;
+    let neterr =
+        |_e| ErrorCode::InternalError(Some("do-alarm: control-plane call failed".to_string()));
+
+    let (parts, body) = request.into_parts();
+    let q = parts.uri.query().map(parse_query).unwrap_or_default();
+    let class = q.get("class").cloned().unwrap_or_default();
+    let id = q.get("id").cloned().unwrap_or_default();
+    if class.is_empty() || id.is_empty() {
+        return kv_response(400, "text/plain", b"missing class/id".to_vec());
+    }
+    let base = format!("{}/internal/do/alarm", cp_url.trim_end_matches('/'));
+    let params = [("class", class.as_str()), ("id", id.as_str())];
+
+    let resp = match parts.method.as_str() {
+        "PUT" => {
+            let body_bytes = body
+                .collect()
+                .await
+                .map_err(|_| ErrorCode::InternalError(Some("do-alarm: read body".into())))?
+                .to_bytes()
+                .to_vec();
+            http.put(&base)
+                .query(&params)
+                .header("x-hibana-job-token", &job_token)
+                .header("content-type", "application/json")
+                .body(body_bytes)
+                .send()
+                .await
+        }
+        "GET" => {
+            http.get(&base)
+                .query(&params)
+                .header("x-hibana-job-token", &job_token)
+                .send()
+                .await
+        }
+        "DELETE" => {
+            http.delete(&base)
+                .query(&params)
+                .header("x-hibana-job-token", &job_token)
+                .send()
+                .await
+        }
+        _ => return kv_response(405, "text/plain", b"method not allowed".to_vec()),
+    }
+    .map_err(neterr)?;
+
+    let status = resp.status().as_u16();
+    let rbody = resp.bytes().await.map_err(neterr)?.to_vec();
+    // 204→200 に正規化しつつ、404（getAlarm 未設定）等のエラー status は透過する。
     let out_status = if status < 300 { 200 } else { status };
     kv_response(out_status, "application/json", rbody)
 }

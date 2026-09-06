@@ -147,6 +147,20 @@ export async function buildComponent({ entry, out, wit, world, kv, r2, d1, queue
         `      await app.queue(batch, env, ctx);`,
         `      return new Response("ok");`,
         `    }`,
+        // M17: DO alarm 配送は POST /__hibana/alarm {class,id}。lock を取り DO の alarm() を呼ぶ。
+        // 失敗（throw）は実行失敗＝JetStream が再試行（alarm 行は fire 時に削除済みなので再スケジュール
+        // はされない。周期化したい場合は alarm() 内で再度 setAlarm する）。
+        `    if (__url.pathname === "/__hibana/alarm") {`,
+        `      const p = await request.json();`,
+        `      const Cls = _mod[p.class];`,
+        `      if (!Cls) return new Response("Durable Object class not exported: " + p.class, { status: 500 });`,
+        `      await fetch("http://do.hibana.internal/lock?class=" + encodeURIComponent(p.class) + "&id=" + encodeURIComponent(p.id));`,
+        `      const doId = { __id: String(p.id), toString() { return String(p.id); }, name: String(p.id) };`,
+        `      const inst = new Cls({ id: doId, storage: __doStorage(p.class, p.id) }, env);`,
+        `      if (typeof inst.alarm !== "function") return new Response("no alarm() handler", { status: 500 });`,
+        `      await inst.alarm();`,
+        `      return new Response("ok");`,
+        `    }`,
         `    return app.fetch(request, env, ctx);`,
         `  })());`,
         `});`,
@@ -166,11 +180,16 @@ export async function buildComponent({ entry, out, wit, world, kv, r2, d1, queue
         // stub.fetch は最初に do.hibana.internal/lock で (class,id) を直列化してからクラスの fetch を呼ぶ。
         `function __doStorage(className, id) {`,
         `  const kv = __kvClient("__do:" + className + ":" + id);`,
+        `  const alarmUrl = "http://do.hibana.internal/alarm?class=" + encodeURIComponent(className) + "&id=" + encodeURIComponent(id);`,
         `  const self = {`,
         `    async get(key) { const s = await kv.get(key); return s == null ? undefined : JSON.parse(s); },`,
         `    async put(key, value) { await kv.put(key, JSON.stringify(value === undefined ? null : value)); },`,
         `    async delete(key) { await kv.delete(key); return true; },`,
         `    async list(opts) { const r = await kv.list(opts); const m = new Map(); for (const k of r.keys) m.set(k.name, await self.get(k.name)); return m; },`,
+        // M17: DO alarm（Workers 互換）。setAlarm(number|Date)、getAlarm()→number|null、deleteAlarm()。
+        `    async setAlarm(t) { const ms = (t instanceof Date) ? t.getTime() : Number(t); const r = await fetch(alarmUrl, { method: "PUT", headers: { "content-type": "application/json" }, body: JSON.stringify({ scheduled_at_ms: ms }) }); if (!r.ok) throw new Error("setAlarm failed: " + r.status); },`,
+        `    async getAlarm() { const r = await fetch(alarmUrl, { method: "GET" }); if (r.status === 404) return null; if (!r.ok) throw new Error("getAlarm failed: " + r.status); const j = await r.json(); return (j && typeof j.scheduled_at_ms === "number") ? j.scheduled_at_ms : null; },`,
+        `    async deleteAlarm() { const r = await fetch(alarmUrl, { method: "DELETE" }); if (!r.ok) throw new Error("deleteAlarm failed: " + r.status); },`,
         `  };`,
         `  return self;`,
         `}`,

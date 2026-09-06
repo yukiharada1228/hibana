@@ -18,12 +18,12 @@ use faas_shared::FaasError;
 
 const JOB_TOKEN_HEADER: &str = "x-hibana-job-token";
 
-/// job_token を検証してテナントを得る（claim 由来。exp + テナント停止も確認）。
-/// M15: queue の内部エンドポイントでも再利用するため pub(crate)。
-pub(crate) async fn tenant_from_token(
+/// job_token を検証して claim 全体を得る（署名・exp・テナント停止を確認）。
+/// M17: alarm 内部エンドポイントは tenant だけでなく version_id（→ component 解決）も要るため公開。
+pub(crate) async fn claims_from_token(
     state: &AppState,
     headers: &HeaderMap,
-) -> Result<String, AppError> {
+) -> Result<faas_shared::JobClaims, AppError> {
     let token = headers
         .get(JOB_TOKEN_HEADER)
         .and_then(|v| v.to_str().ok())
@@ -40,7 +40,16 @@ pub(crate) async fn tenant_from_token(
     if !crate::db::tenant_is_active(state.pool(), &claims.tenant_id).await? {
         return Err(FaasError::Forbidden.into());
     }
-    Ok(claims.tenant_id)
+    Ok(claims)
+}
+
+/// job_token を検証してテナントを得る（claim 由来。exp + テナント停止も確認）。
+/// M15: queue の内部エンドポイントでも再利用するため pub(crate)。
+pub(crate) async fn tenant_from_token(
+    state: &AppState,
+    headers: &HeaderMap,
+) -> Result<String, AppError> {
+    Ok(claims_from_token(state, headers).await?.tenant_id)
 }
 
 fn require_header(headers: &HeaderMap, name: &str) -> Result<String, AppError> {
