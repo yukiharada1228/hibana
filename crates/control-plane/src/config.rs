@@ -57,6 +57,8 @@ const DEFAULT_UPLOAD_PRESIGN_TTL_SECS: u64 = 300;
 const DEFAULT_SYNC_REPLY_TIMEOUT_MS: u64 = 5000;
 /// Cron スケジューラの due スキャン間隔（秒）。
 const DEFAULT_CRON_POLL_INTERVAL_SECS: u64 = 10;
+/// DO alarm スケジューラの due スキャン間隔（秒, M17）。alarm は秒精度で十分なので短めにする。
+const DEFAULT_ALARM_POLL_INTERVAL_SECS: u64 = 2;
 
 // --- M7 デプロイ運用 / Secrets（§10 / §15） ---
 /// 内部専用 listener の bind アドレス。`POST /internal/job-env` だけを載せる。
@@ -226,6 +228,8 @@ pub struct Config {
     pub sync_reply_timeout_ms: u64,
     /// Cron スケジューラの due スキャン間隔（秒, M6b）。main.rs が `scheduler::run` へ渡して consume する。
     pub cron_poll_interval_secs: u64,
+    /// DO alarm スケジューラの due スキャン間隔（秒, M17）。main.rs が `alarm_scheduler::run` へ渡す。
+    pub alarm_poll_interval_secs: u64,
 
     // --- M7c Secrets Manager（§10 / §15） ---
     /// 現行 KEK（32 バイト）。hex / base64url / base64。新規暗号化は常にこの鍵で行う。
@@ -473,6 +477,10 @@ impl Config {
             cron_poll_interval_secs: env_u64(
                 "CRON_POLL_INTERVAL_SECS",
                 DEFAULT_CRON_POLL_INTERVAL_SECS,
+            )?,
+            alarm_poll_interval_secs: env_u64(
+                "ALARM_POLL_INTERVAL_SECS",
+                DEFAULT_ALARM_POLL_INTERVAL_SECS,
             )?,
 
             secrets_master_key: Redacted::new(secrets_master_key),

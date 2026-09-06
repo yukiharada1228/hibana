@@ -10,6 +10,7 @@
 //! ルート / 認証 / メッセージは crates/shared の契約に厳密準拠。
 
 mod admission;
+mod alarm_scheduler;
 mod auth;
 mod authz;
 mod config;
@@ -20,6 +21,7 @@ mod enqueue;
 mod error;
 mod extract;
 mod handlers;
+mod handlers_do;
 mod handlers_queue;
 mod handlers_r2;
 mod handlers_secrets;
@@ -286,6 +288,15 @@ async fn main() -> anyhow::Result<()> {
         scheduler::run(scheduler_state, cron_poll_interval).await;
     });
 
+    // --- Durable Object alarm スケジューラタスク (M17, §11) ---
+    // cron と同型: ALARM_POLL_INTERVAL_SECS 周期で due な DO alarm を do_due_alarms()（SECURITY DEFINER）
+    // で引き、FOR UPDATE SKIP LOCKED → 行削除（one-shot）→ enqueue（origin="alarm", POST /__hibana/alarm）。
+    let alarm_state = state.clone();
+    let alarm_poll_interval = config.alarm_poll_interval_secs;
+    tokio::spawn(async move {
+        alarm_scheduler::run(alarm_state, alarm_poll_interval).await;
+    });
+
     // --- lane reconciler（M8-3, §3.7）---
     // consumer の作成 / 更新 / 削除は **control-plane が唯一の書き手**である（M7 までは worker）。
     // 単一 writer は pg_try_advisory_lock で強制する（CP はステートレス × N が前提のため）。
@@ -404,6 +415,13 @@ fn build_internal_router(state: AppState) -> Router {
         .route("/internal/r2/list", get(handlers_r2::list_objects))
         // M15: producer からのメッセージを consumer invoke として enqueue する（internal のみ）。
         .route("/internal/queue/send", post(handlers_queue::queue_send))
+        // M17: DO alarm の set/get/delete（worker → CP, version_id→component 解決のため）。internal のみ。
+        .route(
+            "/internal/do/alarm",
+            put(handlers_do::set_alarm)
+                .get(handlers_do::get_alarm)
+                .delete(handlers_do::delete_alarm),
+        )
         .with_state(state)
 }
 

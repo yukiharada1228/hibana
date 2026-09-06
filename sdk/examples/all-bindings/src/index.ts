@@ -10,12 +10,27 @@ import { Hono } from "hono";
 import { DurableObject } from "cloudflare:workers";
 
 export class Counter extends DurableObject {
-  async fetch() {
+  async fetch(req: Request) {
     const ctx = (this as any).ctx;
+    const u = new URL(req.url);
+    // /arm  : 2 秒後に alarm() を予約  /fired : alarm() が動いたか(0/1)
+    if (u.pathname === "/arm") {
+      await ctx.storage.setAlarm(Date.now() + 2000);
+      return new Response("armed");
+    }
+    if (u.pathname === "/fired") {
+      return new Response(String(((await ctx.storage.get("fired")) as number) ?? 0));
+    }
+    // 既定: counter インクリメント（永続化の確認）。
     let n = ((await ctx.storage.get("n")) as number) ?? 0;
     n++;
     await ctx.storage.put("n", n);
     return new Response(String(n));
+  }
+  // DO alarm ハンドラ。fire されたら storage に印を残す（one-shot）。
+  async alarm() {
+    const ctx = (this as any).ctx;
+    await ctx.storage.put("fired", 1);
   }
 }
 
@@ -37,7 +52,11 @@ app.get("/d1", async (c) => {
   const r = await c.env.DB.prepare("SELECT v FROM t ORDER BY rowid DESC LIMIT 1").first();
   return c.text((r as any).v);
 });
-app.get("/do", (c) => c.env.COUNTER.get(c.env.COUNTER.idFromName("x")).fetch(new Request("https://do/")));
+const counter = (c: any, path: string) =>
+  c.env.COUNTER.get(c.env.COUNTER.idFromName("x")).fetch(new Request("https://do" + path));
+app.get("/do", (c) => counter(c, "/"));
+app.get("/alarm-arm", (c) => counter(c, "/arm"));
+app.get("/alarm-fired", (c) => counter(c, "/fired"));
 app.get("/q", async (c) => {
   await c.env.JOBS.send({ t: "q-ok" });
   return c.text("queued");

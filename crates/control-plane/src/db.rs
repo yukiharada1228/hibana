@@ -139,6 +139,25 @@ pub async fn find_component_by_id(
     .transpose()
 }
 
+/// M17: version_id から所属 component_id を引く（job_token の claim 由来 version を解決する）。
+///
+/// alarm の内部エンドポイントは token の version_id しか持たないため、alarm 行に載せる component_id を
+/// これで解決する。呼び出し側は `set_tenant_guc(tenant)` 済みの tx で呼ぶ（RLS で cross-tenant 不可）。
+pub async fn find_component_id_for_version(
+    executor: impl sqlx::PgExecutor<'_>,
+    tenant_id: &str,
+    version_id: &str,
+) -> Result<Option<String>, sqlx::Error> {
+    let row =
+        sqlx::query("SELECT component_id FROM component_versions WHERE tenant_id = $1 AND id = $2")
+            .bind(tenant_id)
+            .bind(version_id)
+            .fetch_optional(executor)
+            .await?;
+    row.map(|r| r.try_get::<String, _>("component_id"))
+        .transpose()
+}
+
 /// 検証通過した version を登録する (§6.2)。
 ///
 /// 同一 (component_id, version) の重複は UNIQUE 違反（呼び出し側で 409/422 へ）。
@@ -694,6 +713,123 @@ pub async fn upsert_queue_consumer(
     .execute(executor)
     .await?;
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Durable Object alarms (M17, §11)
+// ---------------------------------------------------------------------------
+
+/// M17: DO alarm 1 行（fire に必要な最小情報）。fire は invoke 対象の component だけ要る。
+pub struct DoAlarmRow {
+    pub component_id: String,
+}
+
+/// M17: DO インスタンス (tenant, class, id) の alarm を設定（上書き upsert）。
+///
+/// Workers 同様 DO ごとに 1 つの one-shot アラーム。呼び出し側は `set_tenant_guc` 済みの tx で呼ぶ。
+pub async fn upsert_do_alarm(
+    executor: impl sqlx::PgExecutor<'_>,
+    tenant_id: &str,
+    component_id: &str,
+    do_class: &str,
+    do_id: &str,
+    scheduled_at: DateTime<Utc>,
+) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        "INSERT INTO do_alarms (tenant_id, component_id, do_class, do_id, scheduled_at, updated_at) \
+         VALUES ($1,$2,$3,$4,$5, now()) \
+         ON CONFLICT (tenant_id, do_class, do_id) \
+         DO UPDATE SET component_id=EXCLUDED.component_id, scheduled_at=EXCLUDED.scheduled_at, updated_at=now()",
+    )
+    .bind(tenant_id)
+    .bind(component_id)
+    .bind(do_class)
+    .bind(do_id)
+    .bind(scheduled_at)
+    .execute(executor)
+    .await?;
+    Ok(())
+}
+
+/// M17: DO インスタンスの alarm 予定時刻を引く（未設定なら None）。
+pub async fn get_do_alarm(
+    executor: impl sqlx::PgExecutor<'_>,
+    tenant_id: &str,
+    do_class: &str,
+    do_id: &str,
+) -> Result<Option<DateTime<Utc>>, sqlx::Error> {
+    let row = sqlx::query(
+        "SELECT scheduled_at FROM do_alarms WHERE tenant_id=$1 AND do_class=$2 AND do_id=$3",
+    )
+    .bind(tenant_id)
+    .bind(do_class)
+    .bind(do_id)
+    .fetch_optional(executor)
+    .await?;
+    row.map(|r| r.try_get::<DateTime<Utc>, _>("scheduled_at"))
+        .transpose()
+}
+
+/// M17: DO インスタンスの alarm を削除（deleteAlarm / fire 後の one-shot 消去）。
+pub async fn delete_do_alarm(
+    executor: impl sqlx::PgExecutor<'_>,
+    tenant_id: &str,
+    do_class: &str,
+    do_id: &str,
+) -> Result<(), sqlx::Error> {
+    sqlx::query("DELETE FROM do_alarms WHERE tenant_id=$1 AND do_class=$2 AND do_id=$3")
+        .bind(tenant_id)
+        .bind(do_class)
+        .bind(do_id)
+        .execute(executor)
+        .await?;
+    Ok(())
+}
+
+/// M17: due な DO alarm を全テナント横断で引く（SECURITY DEFINER, GUC 無し・cron と同型）。
+pub async fn do_due_alarms(
+    executor: impl sqlx::PgExecutor<'_>,
+) -> Result<Vec<(String, String, String)>, sqlx::Error> {
+    let rows = sqlx::query("SELECT tenant_id, do_class, do_id FROM do_due_alarms()")
+        .fetch_all(executor)
+        .await?;
+    rows.into_iter()
+        .map(|r| {
+            Ok((
+                r.try_get::<String, _>("tenant_id")?,
+                r.try_get::<String, _>("do_class")?,
+                r.try_get::<String, _>("do_id")?,
+            ))
+        })
+        .collect()
+}
+
+/// M17: due な DO alarm 1 行を **`FOR UPDATE SKIP LOCKED`** で掴む（single-flight）。
+///
+/// cron の `lock_due_cron_job` と同型。ロック獲得までの間に他 CP が fire（行削除）した競合に対応する
+/// ため `scheduled_at <= now()` を再判定する。呼び出し側は同一 tx で `set_tenant_guc(tenant)` 済みのこと。
+pub async fn lock_due_do_alarm(
+    executor: impl sqlx::PgExecutor<'_>,
+    tenant_id: &str,
+    do_class: &str,
+    do_id: &str,
+) -> Result<Option<DoAlarmRow>, sqlx::Error> {
+    let row = sqlx::query(
+        "SELECT component_id FROM do_alarms \
+         WHERE tenant_id=$1 AND do_class=$2 AND do_id=$3 AND scheduled_at <= now() \
+         FOR UPDATE SKIP LOCKED",
+    )
+    .bind(tenant_id)
+    .bind(do_class)
+    .bind(do_id)
+    .fetch_optional(executor)
+    .await?;
+    row.map(|r| {
+        Ok(DoAlarmRow {
+            component_id: r.try_get::<String, _>("component_id")?,
+        })
+    })
+    .transpose()
 }
 
 /// 実行を pending で INSERT する (§ /invoke)。

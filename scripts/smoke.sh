@@ -79,6 +79,22 @@ else
   fail=$((fail + 1))
 fi
 
+echo "==> assert Durable Object alarm (setAlarm -> scheduler fires alarm())"
+assert /alarm-arm "armed"
+fired="0"
+for _ in $(seq 1 "$QUEUE_TIMEOUT"); do
+  fired="$(get /alarm-fired)"
+  [ "$fired" = "1" ] && break
+  sleep 1
+done
+if [ "$fired" = "1" ]; then
+  green "PASS  /alarm-fired -> $fired"
+  pass=$((pass + 1))
+else
+  red "FAIL  /alarm-fired -> '$fired' (want 1 within ${QUEUE_TIMEOUT}s)"
+  fail=$((fail + 1))
+fi
+
 echo
 echo "==> $pass passed, $fail failed"
 [ "$fail" -eq 0 ] || exit 1
