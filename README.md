@@ -1,6 +1,31 @@
-# WASM FaaS Platform — M9 (サンドボックス強化・サプライチェーン)
+# Hibana — セルフホスト型 Cloudflare Workers 互換プラットフォーム
 
 [![CI](https://github.com/yukiharada1228/hibana/actions/workflows/ci.yml/badge.svg?branch=develop)](https://github.com/yukiharada1228/hibana/actions/workflows/ci.yml)
+
+**Hibana** は、TypeScript/Hono アプリを `hibana deploy` で WebAssembly Component 化し、自前インフラ上で
+動かす Cloudflare Workers 互換プラットフォームです。下段の WASM FaaS 基盤（マルチテナント実行 / RLS /
+JetStream / MinIO / 署名・検証・egress 制御）の上に、Workers 互換レイヤ（M11〜M19）を載せています。
+
+**対応している Workers 機能**（`wrangler.toml` 駆動、`hibana deploy` 一発）:
+
+| 機能 | 備考 |
+|---|---|
+| HTTP（`fetch` / Hono） | `wasi:http/incoming-handler` で native 実行、公開サブドメイン URL |
+| `[vars]` / Secrets | `c.env` / `process.env` |
+| KV | Postgres バックエンド、テナント分離 |
+| R2 | MinIO/S3 バックエンド。get/put とも worker はストリーム（大容量対応） |
+| D1 | 隔離 SQLite（per-tenant, 単一書き手） |
+| Queues | producer/consumer。JetStream の再試行/DLQ を継承 |
+| Durable Objects | storage + グローバル単一書き手 + **alarms**（WebSocket/in-memory 常駐は将来 → `docs/M20-design.md`） |
+| Cron Triggers | `[triggers].crons` → `scheduled()` |
+| egress | M9c allowlist（deny-by-default） |
+
+CLI / SDK の詳しい使い方は **[`sdk/README.md`](sdk/README.md)**。全バインディングの動作例は
+[`sdk/examples/all-bindings/`](sdk/examples/all-bindings/)、その e2e 検証は `scripts/smoke.sh`（CI ゲート）。
+
+---
+
+以下は Hibana が載る **WASM FaaS 基盤**（下回り）の設計解説である。
 
 WebAssembly Component をアップロードして invoke すると、Wasmtime Worker が実行して
 結果を返す FaaS プラットフォームです。本リポジトリの現状は **仕様書.md §15 の M9
