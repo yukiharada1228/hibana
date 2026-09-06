@@ -22,7 +22,7 @@ futures = "0.3"
 #     rustls-tls のみ（OpenSSL 非依存）。
 # M7c (§4.6): `json` feature は secret 引き換え（POST /internal/job-env）のリクエスト/レスポンスを
 # serde で扱うために必要。TLS は既存どおり rustls（OpenSSL / aws-lc-sys を回避）。
-reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "stream"] }
 # --- ダウンロード本体の sha256 検証 (§3.6)。
 sha2 = { workspace = true }
 # --- in-memory Component キャッシュ (§3.6)。

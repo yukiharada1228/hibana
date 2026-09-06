@@ -159,8 +159,12 @@ impl Storage {
         })
     }
 
-    /// R2 オブジェクトを取得する（本体 + メタデータ）。存在しなければ `None`。
-    pub async fn r2_get(&self, key: &str) -> Result<Option<R2Object>, FaasError> {
+    /// M19: R2 オブジェクトを**ストリームで**取得する（本体をメモリに載せない）。存在しなければ `None`。
+    ///
+    /// `r2_get` は S3 応答を丸ごと Vec<u8> に collect するが、大きなオブジェクトはメモリを圧迫する。
+    /// こちらは S3 の `ByteStream` をそのまま返し、呼び出し側（handler）が axum Body へ流す。size は
+    /// S3 の content-length（未知なら -1）。
+    pub async fn r2_get_stream(&self, key: &str) -> Result<Option<R2ObjectStream>, FaasError> {
         let resp = match self
             .client
             .get_object()
@@ -175,28 +179,20 @@ impl Storage {
                 if se.is_no_such_key() {
                     return Ok(None);
                 }
-                return Err(FaasError::Internal(format!("s3 r2_get failed: {se}")));
+                return Err(FaasError::Internal(format!(
+                    "s3 r2_get_stream failed: {se}"
+                )));
             }
         };
-        let content_type = resp.content_type().map(|s| s.to_string());
-        let etag = resp.e_tag().map(|s| s.to_string()).unwrap_or_default();
-        let metadata = resp.metadata().cloned().unwrap_or_default();
-        let bytes = resp
-            .body
-            .collect()
-            .await
-            .map_err(|e| FaasError::Internal(format!("s3 r2_get read body: {e}")))?
-            .into_bytes()
-            .to_vec();
-        let size = bytes.len() as i64;
-        Ok(Some(R2Object {
-            bytes,
-            meta: R2Meta {
-                size,
-                etag,
-                content_type,
-                metadata,
-            },
+        let meta = R2Meta {
+            size: resp.content_length().unwrap_or(-1),
+            etag: resp.e_tag().map(|s| s.to_string()).unwrap_or_default(),
+            content_type: resp.content_type().map(|s| s.to_string()),
+            metadata: resp.metadata().cloned().unwrap_or_default(),
+        };
+        Ok(Some(R2ObjectStream {
+            meta,
+            body: resp.body,
         }))
     }
 
@@ -279,10 +275,10 @@ pub struct R2Meta {
     pub metadata: std::collections::HashMap<String, String>,
 }
 
-/// R2 オブジェクト（本体 + メタデータ）。
-pub struct R2Object {
-    pub bytes: Vec<u8>,
+/// M19: R2 オブジェクト（**ストリーム本体** + メタデータ）。本体をメモリに載せない GET 用。
+pub struct R2ObjectStream {
     pub meta: R2Meta,
+    pub body: ByteStream,
 }
 
 /// R2 list の 1 件。

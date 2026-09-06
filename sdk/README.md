@@ -239,6 +239,11 @@ platform's **MinIO/S3** under `r2/{tenant}/{bucket}/{key}`. The worker stays
 authenticates the job token and does the S3 op for the caller's tenant, so a
 component can only reach its own tenant's objects. `hibana dev` uses in-memory R2.
 
+**`get` (download) streams** end-to-end (S3 → control-plane → worker → your
+handler) without buffering the object in memory, so large objects are cheap to
+serve. `put` (upload) is still buffered, capped at **100 MiB** — streaming uploads
+(S3 multipart) are a planned follow-up.
+
 Secrets set with `hibana secret put` persist across redeploys (each new version
 inherits the previous version's approved names).
 

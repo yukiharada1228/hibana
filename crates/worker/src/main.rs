@@ -79,7 +79,7 @@ use faas_shared::{
     ResultMessage, UsageMetrics,
 };
 use futures::StreamExt;
-use http_body_util::{BodyExt, Full};
+use http_body_util::{BodyExt, Full, StreamBody};
 use lru::LruCache;
 use sha2::{Digest, Sha256};
 use sqlx::postgres::PgPoolOptions;
@@ -237,9 +237,10 @@ const QUEUE_INTERNAL_HOST: &str = "queue.hibana.internal";
 const DO_INTERNAL_HOST: &str = "do.hibana.internal";
 /// M13: R2 バインディングの内部ホスト名（同じく send_request で横取り）。
 const R2_INTERNAL_HOST: &str = "r2.hibana.internal";
-/// M13: R2 PUT オブジェクトの上限。worker は body を一括バッファして CP へ中継するため、
-/// 過大オブジェクトはメモリ保護のためここで 413 に落とす（ストリーミングは将来対応）。
-const R2_MAX_OBJECT_BYTES: usize = 25 * 1024 * 1024;
+/// R2 PUT オブジェクトの上限。worker は body を一括バッファして CP へ中継するため、過大オブジェクトは
+/// メモリ保護のためここで 413 に落とす。M19: GET はストリーム化済み（無制限）だが、PUT のストリーム化
+/// （S3 multipart）は未対応なので上限は残す。100MiB へ引き上げ（CP internal の body limit と整合）。
+const R2_MAX_OBJECT_BYTES: usize = 100 * 1024 * 1024;
 
 // wasmtime-wasi 29: `WasiView` が `ctx()` と `table()` の両方を提供する。
 impl WasiView for HostState {
@@ -3237,15 +3238,30 @@ async fn cp_r2_to_guest(
     if let Some(v) = get("x-r2-content-type") {
         extra.push(("content-type", v));
     }
-    let body = if include_body {
-        resp.bytes()
-            .await
-            .map_err(|_| ErrorCode::InternalError(Some("r2: read cp body".into())))?
-            .to_vec()
-    } else {
-        Vec::new()
-    };
-    r2_response(status, extra, body)
+    if !include_body {
+        return r2_response(status, extra, Vec::new());
+    }
+    // M19: get 本体は CP からの応答を**そのままストリーム**して guest へ渡す（メモリに載せない）。
+    let stream = resp.bytes_stream().map(|chunk| {
+        chunk
+            .map(hyper::body::Frame::data)
+            .map_err(|_| ErrorCode::InternalError(Some("r2: stream cp body".into())))
+    });
+    let boxed = BodyExt::boxed(StreamBody::new(stream));
+    let mut b = hyper::Response::builder().status(status);
+    for (k, v) in extra {
+        if let Ok(val) = hyper::header::HeaderValue::from_str(&v) {
+            b = b.header(k, val);
+        }
+    }
+    let resp = b
+        .body(boxed)
+        .map_err(|e| ErrorCode::InternalError(Some(format!("r2 resp: {e}"))))?;
+    Ok(wasmtime_wasi_http::types::IncomingResponse {
+        resp,
+        worker: None,
+        between_bytes_timeout: Duration::from_secs(60),
+    })
 }
 
 /// guest の `env.BUCKET.*`（r2.hibana.internal への fetch）を CP 内部 R2 エンドポイントへ中継する。
