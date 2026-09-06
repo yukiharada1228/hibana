@@ -163,6 +163,10 @@ async function loadProjectConfig() {
             .filter((b) => b && b.name)
             .map((b) => ({ name: b.name, class_name: b.class_name || b.name }))
         : [],
+      // Workers: [triggers] crons = ["*/5 * * * *", ...]。scheduled(event) を定時起動する。
+      crons: Array.isArray(raw.triggers?.crons)
+        ? raw.triggers.crons.filter((s) => typeof s === "string" && s.trim()).map((s) => s.trim())
+        : [],
       // hibana 固有（wrangler には無い）。
       public: h.public ?? false,
       egress: Array.isArray(h.egress) ? h.egress : [],
@@ -419,6 +423,39 @@ async function cmdDeploy(args) {
       json: { queues: proj.queueConsumers },
     });
     stepDone();
+  }
+
+  // M18: Cron Triggers 登録（[triggers].crons → scheduled()）。redeploy で重複しないよう、この
+  // component の hibana 管理 cron（input.path === "/__hibana/scheduled"）を全削除してから貼り直す。
+  // ユーザが手動登録した cron（別 input）は温存する。
+  if (proj && Array.isArray(proj.crons)) {
+    const existing = await api(cfg, "GET", "/cron-jobs", { token }).catch(() => []);
+    const mine = (Array.isArray(existing) ? existing : []).filter(
+      (c) => c.component_id === id && c.input && c.input.path === "/__hibana/scheduled",
+    );
+    for (const c of mine) {
+      await api(cfg, "DELETE", `/cron-jobs/${c.cron_job_id}`, { token }).catch(() => {});
+    }
+    if (proj.crons.length) {
+      step(`Registering ${proj.crons.length} cron trigger(s)`);
+      for (const schedule of proj.crons) {
+        await api(cfg, "POST", "/cron-jobs", {
+          token,
+          json: {
+            component: name,
+            schedule,
+            input: {
+              method: "POST",
+              path: "/__hibana/scheduled",
+              headers: { "content-type": "application/json" },
+              body: JSON.stringify({ cron: schedule }),
+              bodyBase64: false,
+            },
+          },
+        });
+      }
+      stepDone();
+    }
   }
 
   // hibana 固有: egress allowlist を承認。
