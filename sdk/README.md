@@ -67,6 +67,8 @@ Both worker shapes work — Hono `export default app` **and** plain
 | `[[d1_databases]]` → `env.DB.prepare/bind/all/first/run/batch/exec` | ✅ | real SQLite, per-tenant, single-writer |
 | `[[queues.producers]]` / `[[queues.consumers]]` → `env.Q.send` + `queue()` | ✅ | on the JetStream pipeline (retries/DLQ) |
 | `[[durable_objects.bindings]]` → `env.DO.idFromName/get().fetch()` | ✅ | durable `ctx.storage` + global single-writer (see caveats) |
+| `ctx.storage.setAlarm/getAlarm/deleteAlarm` + `alarm()` | ✅ | one-shot DO alarms (re-`setAlarm` in `alarm()` to repeat) |
+| `[triggers] crons = [...]` → `scheduled(event, env, ctx)` | ✅ | Cron Triggers on the existing cron scheduler |
 
 ### Durable Objects
 
@@ -96,10 +98,27 @@ single-writer**: a Postgres advisory lock on `(tenant, class, id)` serializes al
 access across the fleet, and `ctx.storage` is durable (per-tenant). `hibana dev`
 runs objects in-process with in-memory storage.
 
+**Alarms** are supported via `ctx.storage.setAlarm(when)` /
+`getAlarm()` / `deleteAlarm()` and an `alarm()` method on the class:
+
+```ts
+export class Reminder extends DurableObject {
+  async fetch() { await this.ctx.storage.setAlarm(Date.now() + 60_000); return new Response("armed"); }
+  async alarm() {
+    // fired ~60s later, under the object's single-writer lock
+    await this.ctx.storage.put("ranAt", Date.now());
+    // await this.ctx.storage.setAlarm(Date.now() + 60_000); // re-arm for a periodic timer
+  }
+}
+```
+
+Alarms are **one-shot** (re-`setAlarm` inside `alarm()` to repeat) and fire on the
+same enqueue pipeline as cron/queues (provenance, metering, retries).
+
 > **Subset.** This is a per-invocation activation model: durable storage +
-> serialization (the core coordination guarantee), suitable for counters, locks,
-> and per-entity state. In-memory state does **not** persist between calls, and
-> WebSocket hibernation / alarms are not yet implemented — those need a resident
+> serialization (the core coordination guarantee) + alarms, suitable for counters,
+> locks, per-entity state, and timers. In-memory state does **not** persist between
+> calls, and WebSocket hibernation is not yet implemented — that needs a resident
 > placement runtime (a future milestone).
 
 ### Queues
@@ -128,6 +147,29 @@ JetStream pipeline** that powers HTTP/cron — so retries, backoff, and the
 dead-letter path come for free. A consumer that throws fails the execution and is
 retried (then dead-lettered after `MAX_DELIVER`). `hibana dev` loops producers
 straight into your `queue()` handler in-process.
+
+### Cron Triggers
+
+```toml
+[triggers]
+crons = ["*/5 * * * *", "0 0 * * *"]
+```
+
+```ts
+export default {
+  fetch: (req, env, ctx) => app.fetch(req, env, ctx),
+  async scheduled(event, env, ctx) {
+    // event.cron = the matched pattern, event.scheduledTime = fire time (ms)
+    console.log("tick", event.cron);
+  },
+};
+```
+
+`hibana deploy` registers each `[triggers].crons` entry with the cron scheduler
+and re-syncs on every deploy (stale hibana-managed triggers are replaced, your
+manually-created cron jobs are left alone). Fires dispatch to `scheduled()` on the
+same enqueue pipeline as everything else. Schedules use standard 5-field cron
+(minute granularity).
 
 ### D1
 

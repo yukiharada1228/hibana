@@ -161,6 +161,15 @@ export async function buildComponent({ entry, out, wit, world, kv, r2, d1, queue
         `      await inst.alarm();`,
         `      return new Response("ok");`,
         `    }`,
+        // M18: Cron Triggers 配送は POST /__hibana/scheduled {cron}。app.scheduled(event) へ dispatch。
+        // event.scheduledTime は fire 時刻（近似で Date.now()）、event.cron は登録した cron 式。
+        `    if (__url.pathname === "/__hibana/scheduled") {`,
+        `      if (typeof app.scheduled !== "function") return new Response("no scheduled() handler", { status: 500 });`,
+        `      let sp = {}; try { sp = await request.json(); } catch { sp = {}; }`,
+        `      const event = { cron: sp.cron || "", scheduledTime: Date.now(), type: "scheduled", noRetry() {} };`,
+        `      await app.scheduled(event, env, ctx);`,
+        `      return new Response("ok");`,
+        `    }`,
         `    return app.fetch(request, env, ctx);`,
         `  })());`,
         `});`,
