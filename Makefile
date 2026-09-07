@@ -1,172 +1,31 @@
-# WASM FaaS Platform — M2 (Component ライフサイクルとストレージ) 開発用 Makefile
-# 仕様書 §15 M2。すべてローカル / 隔離環境専用（露出ガード §15）。
-#
-# 代表的な一連の流れ:
-#   make setup            # ツールチェイン/target/wasm-tools 等の前提を確認・導入補助
-#   make up               # docker compose で postgres + nats(JetStream) + minio 起動
-#   make migrate          # migrations/*.sql を適用（default テナント seed 込み）
-#   make build-component  # echo を wasm32-wasip2 でビルド（アップロード対象のローカル成果物）
-#   make run-cp           # control-plane 起動（別ターミナル）
-#   make run-worker       # worker 起動（別ターミナル）
-#   make bootstrap        # スモーク用テナント + admin ユーザ作成（初回のみ）
-#   make deploy           # echo を登録しアップロード（POST /components → /components/{id}/versions）
-#   make invoke           # echo を end-to-end で呼ぶ（deploy → POST /invoke → GET /executions）
-
-# .env があれば読み込む。無ければ .env.example の既定値を使う。
+# Local platform operations. Application builds and deployment use the Hibana CLI.
 ifneq (,$(wildcard .env))
 include .env
 export
 endif
-
-# --- 既定値（.env / .env.example と一致）。.env で上書き可。 ---
-# M3b(§3.2): ランタイムは非特権 faas_app（NOBYPASSRLS）。マイグレーションだけ特権ロール faas。
-DATABASE_URL          ?= postgres://faas_app:faas_app@localhost:5432/faas
-MIGRATION_DATABASE_URL ?= postgres://faas:faas@localhost:5432/faas
-NATS_URL              ?= nats://localhost:4222
-# M3a: 固定 AUTH_TOKEN は廃止。system-admin の bootstrap トークンで POST /admin/tenants を gate。
-BOOTSTRAP_ADMIN_TOKEN ?= dev-bootstrap-admin-token
-COMPONENTS_DIR        ?= ./components-dist
-BIND_ADDR             ?= 0.0.0.0:8080
-
-# --- M3a: スモークテスト用のテナント/ユーザ資格情報（make bootstrap が作成） ---
-SMOKE_TENANT_SLUG     ?= smoke
-SMOKE_TENANT_NAME     ?= Smoke Tenant
-SMOKE_EMAIL           ?= admin@example.com
-SMOKE_PASSWORD        ?= dev-password
-
-# --- Object Storage（M2: MinIO, S3 互換, path-style。§3.4） ---
-S3_ENDPOINT           ?= http://localhost:9000
-S3_REGION             ?= us-east-1
-S3_BUCKET             ?= faas-components
-S3_ACCESS_KEY         ?= minioadmin
-S3_SECRET_KEY         ?= minioadmin
-
-# --- アップロード/検証パイプライン（M2: §6.2） ---
-MAX_WASM_UPLOAD_BYTES ?= 33554432
-PRESIGN_TTL_SECS      ?= 300
-
-# --- Worker: 取得した wasm 本体のローカルキャッシュ先（M2: §3.6） ---
-WASM_CACHE_DIR        ?= ./worker-cache
-
-# --- ジョブ署名トークン（M3c: 結果の出所認証。§3.3）。CP だけが鍵を持つ。 ---
-# 開発用の決定的ダミー seed（32 バイト base64url）。本番は高エントロピーに置換すること（露出ガード §15）。
-JOB_SIGNING_KEY       ?= AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8
-JOB_SIGNING_KID       ?= k1
-# TTL 結合: token exp = iat + ACK_WAIT_SECS*MAX_DELIVER + 壁時計上限 + TOKEN_MARGIN_SECS。
-# CP と worker で同一値にすること（worker の consumer も ACK_WAIT_SECS/MAX_DELIVER を読む）。
-ACK_WAIT_SECS         ?= 30
-MAX_DELIVER           ?= 5
-TOKEN_MARGIN_SECS     ?= 60
-
-# --- 共有 admission ストア / クォータ（M3d: §8）。全 Axum インスタンスで共有するカウンタ。 ---
-REDIS_URL                       ?= redis://localhost:6379
-QUOTA_INVOKE_RATE_PER_SEC       ?= 50
-QUOTA_INVOKE_BURST              ?= 500
-QUOTA_MAX_CONCURRENT_EXECUTIONS ?= 20
-INFLIGHT_TTL_SECS               ?= 3600
-REAPER_INTERVAL_SECS            ?= 30
-# login 失敗ロックアウト（§6.0）: (tenant,email) + IP 両キー、fail-closed。
-LOGIN_LOCKOUT_THRESHOLD         ?= 10
-LOGIN_LOCKOUT_WINDOW_SECS       ?= 900
-TRUST_PROXY_HEADERS             ?= false
-# 大 I/O アップロード（§3.4/§5.2）: presigned PUT URL の TTL（秒）。
-UPLOAD_PRESIGN_TTL_SECS         ?= 300
-
-# --- M6: 同期 Invoke / Cron スケジューラ（§15） ---
-# INSTANCE_ID は未設定なら CP 起動時に inst_{uuid} を採番する（Axum×N では一意な値を与えること）。
-INSTANCE_ID                     ?=
-SYNC_REPLY_TIMEOUT_MS           ?= 5000
-CRON_POLL_INTERVAL_SECS         ?= 10
-
-# invoke / deploy ターゲット用。BIND_ADDR の 0.0.0.0 は curl 先として localhost に読み替える。
-BASE_URL ?= http://localhost:$(lastword $(subst :, ,$(BIND_ADDR)))
-
-# deploy するバージョン（semver）。
-VERSION ?= 0.1.0
-
-# M4 chaos_d 用 slow component のリソース上限。ゲストが tight loop で回り続けるため、
-# epoch interruption（max_wall_time）と tokio timeout（max_execution_time）の両方が
-# 短時間で発火する値にする（既定の 1s / 5s だとテストの待ち窓に収まらないことがある）。
-SLOW_LIMITS ?= {"max_wall_time_ms":1000,"max_execution_time_ms":2000}
-# M8-7: burn は「N ミリ秒かかって **成功する**」ノブなので、slow と違い上限を十分広く取る。
-# 上限が burn_ms より短いと epoch interruption で timeout 終端し、ノブとして機能しない。
-BURN_LIMITS ?= {"max_wall_time_ms":15000,"max_execution_time_ms":20000}
-# M9c: netprobe は外部接続を試すので wall/exec を少し広めに取る。
-NETPROBE_LIMITS ?= {"max_wall_time_ms":10000,"max_execution_time_ms":15000}
-
-# M8: 内部専用 listener（GET /internal/scale / POST /internal/job-env）。既定 loopback。
-CONTROL_PLANE_INTERNAL_URL ?= http://127.0.0.1:8081
-# control-plane の /metrics は公開 listener 側にある。
-BASE_URL_METRICS ?= $(BASE_URL)
-
-# echo component の wasm32-wasip2 ビルド成果物パス（アップロード対象のローカル成果物）。
-ECHO_WASM := target/wasm32-wasip2/release/echo.wasm
-
+BASE_URL ?= http://127.0.0.1:8080
+SMOKE_TENANT_SLUG ?= smoke
+SMOKE_TENANT_NAME ?= Smoke Tenant
+SMOKE_EMAIL ?= admin@example.com
+SMOKE_PASSWORD ?= dev-password
 .DEFAULT_GOAL := help
-
-.PHONY: run-workers autoscale stop-workers scale-status lane-status recreate-stream deploy-chaos-components component-id traffic canary promote rollback approve-env approve-egress tenant-status tenant-quotas set-secret secrets rekey help setup up down migrate minio-bucket build-component run-cp run-worker bootstrap login deploy invoke logs psql clean rls-lint
-
-help: ## 利用可能なターゲット一覧を表示
-	@echo "WASM FaaS Platform — M2 Makefile"
-	@echo
-	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) \
-		| awk 'BEGIN {FS = ":.*?## "}; {printf "  \033[36m%-16s\033[0m %s\n", $$1, $$2}'
-
-setup: ## 前提ツール（rustup / wasm32-wasip2 target / wasm-tools）の導入を確認・補助
-	@command -v rustup >/dev/null 2>&1 || { \
-		echo "ERROR: rustup が見つかりません。https://rustup.rs から導入してください。"; exit 1; }
-	@echo "==> rust-toolchain.toml に従い toolchain / target を導入..."
-	rustup show
+.PHONY: help setup up down migrate run-cp run-worker bootstrap login test rls-lint logs psql
+help:
+	@echo "setup | up | down | migrate | run-cp | run-worker | bootstrap | login | test | rls-lint | logs | psql"
+setup:
 	rustup target add wasm32-wasip2
-	@command -v wasm-tools >/dev/null 2>&1 || { \
-		echo "==> wasm-tools をインストール..."; cargo install wasm-tools; }
-	@echo "==> COMPONENTS_DIR を作成: $(COMPONENTS_DIR)"
-	mkdir -p "$(COMPONENTS_DIR)"
-	@echo "==> WASM_CACHE_DIR を作成: $(WASM_CACHE_DIR)"
-	mkdir -p "$(WASM_CACHE_DIR)"
-	@test -f .env || { cp .env.example .env && echo "==> .env を .env.example から作成しました"; }
-	@echo "OK: setup 完了。次は 'make up' → 'make migrate' → 'make build-component'。"
-
-up: ## docker compose で postgres + nats(JetStream) + redis + minio を起動（healthy 待ち）→ bucket 作成
-	# 長寿命サービスのみ healthy 待ちする。ワンショットの minio-setup を --wait に含めると
-	# 正常終了(exit 0)でも「終了した」と見なされ docker compose --wait が失敗するため除外する。
-	# redis は M3d 共有 admission ストア（§8）。
-	docker compose up -d --wait postgres nats redis minio
-	@$(MAKE) --no-print-directory minio-bucket
-
-down: ## docker compose を停止（volume は保持）
+	npm ci --prefix sdk
+up:
+	docker compose up -d --wait postgres redis minio
+	docker compose run --rm minio-setup
+down:
 	docker compose down
-
-migrate: ## sqlx migrator で migrations を冪等適用（baseline + pending を起動時と同一ロジックで処理）
-	@echo "==> sqlx migrator (--migrate-only) を実行..."
-	@# 起動時マイグレーションと同じ run_migrations() を呼ぶため、再実行しても already exists で落ちない。
-	@# 0001/0002 が手動適用済みなら baseline 行を入れて skip し、0003 以降だけが適用される。
-	@# 0004_rls.sql はテーブル所有者 + CREATEROLE 権限を要するため、MIGRATION_DATABASE_URL は
-	@# 所有者ロール（既定: faas）にしておくこと（faas_app は NOBYPASSRLS で適用不可）。
-	@MIGRATION_DATABASE_URL="$(MIGRATION_DATABASE_URL)" \
-	 DATABASE_URL="$(DATABASE_URL)" \
-		cargo run --quiet -p faas-control-plane -- --migrate-only
-	@echo "OK: migration 適用完了（冪等。再実行しても安全）。"
-
-minio-bucket: ## MinIO に bucket $(S3_BUCKET) を冪等に作成（compose の minio-setup と等価の手動版）
-	@echo "==> bucket $(S3_BUCKET) を作成（既存なら no-op）..."
-	docker compose run --rm --entrypoint /bin/sh minio-setup -c "\
-		mc alias set local http://minio:9000 $(S3_ACCESS_KEY) $(S3_SECRET_KEY) && \
-		mc mb --ignore-existing local/$(S3_BUCKET)"
-	@echo "OK: bucket $(S3_BUCKET) を確認しました。"
-
-build-component: ## echo を wasm32-wasip2 でビルドし COMPONENTS_DIR/echo.wasm へ配置（アップロード対象）
-	cargo build -p echo --target wasm32-wasip2 --release
-	mkdir -p "$(COMPONENTS_DIR)"
-	cp "$(ECHO_WASM)" "$(COMPONENTS_DIR)/echo.wasm"
-	@echo "OK: $(COMPONENTS_DIR)/echo.wasm を配置しました（make deploy でアップロードします）。"
-
-run-cp: ## control-plane を起動（別ターミナルで）
-	RUST_LOG=$${RUST_LOG:-info} cargo run -p faas-control-plane
-
-run-worker: ## worker を起動（別ターミナルで。WASM_CACHE_DIR に cwasm をキャッシュ）
-	RUST_LOG=$${RUST_LOG:-info} cargo run -p faas-worker
-
+migrate:
+	cargo run -p faas-control-plane --bin control-plane -- --migrate-only
+run-cp:
+	cargo run --release -p faas-control-plane --bin control-plane
+run-worker:
+	cargo run --release -p faas-worker --bin faas-worker
 bootstrap: ## M3a: テナント + 最初の admin ユーザを 1 回で作成（POST /admin/tenants, §9 bootstrap）
 	@set -e; \
 	echo "==> POST /admin/tenants (slug=$(SMOKE_TENANT_SLUG), admin=$(SMOKE_EMAIL))"; \
@@ -190,22 +49,6 @@ bootstrap: ## M3a: テナント + 最初の admin ユーザを 1 回で作成（
 	test -n "$$TID" || { echo "ERROR: bootstrap 応答から tenant_id を取得できませんでした。" >&2; exit 1; }; \
 	echo "OK: tenant_id=$$TID + admin ユーザ($(SMOKE_EMAIL)) を作成しました。'make login' でトークンを取得できます。"
 
-tenant-status: ## M10: テナントを suspend/再有効化（TID=ten_... STATUS=active|suspended）。bootstrap トークン gate
-	@set -e; \
-	test -n "$(TID)" || { echo "ERROR: TID=ten_... を指定してください"; exit 1; }; \
-	test -n "$(STATUS)" || { echo "ERROR: STATUS=active|suspended を指定してください"; exit 1; }; \
-	curl -sS -w '\n%{http_code}\n' -X PUT "$(BASE_URL)/admin/tenants/$(TID)/status" \
-	  -H "Authorization: Bearer $(BOOTSTRAP_ADMIN_TOKEN)" -H "Content-Type: application/json" \
-	  -d '{"status":"$(STATUS)"}'
-
-tenant-quotas: ## M10: テナントのクォータ上書き（TID=ten_... QUOTAS='{"invoke_rate_per_sec":100}'）。bootstrap トークン gate
-	@set -e; \
-	test -n "$(TID)" || { echo "ERROR: TID=ten_... を指定してください"; exit 1; }; \
-	test -n "$(QUOTAS)" || { echo "ERROR: QUOTAS='{...}' を指定してください（空にするには QUOTAS='{}'）"; exit 1; }; \
-	curl -sS -w '\n%{http_code}\n' -X PUT "$(BASE_URL)/admin/tenants/$(TID)/quotas" \
-	  -H "Authorization: Bearer $(BOOTSTRAP_ADMIN_TOKEN)" -H "Content-Type: application/json" \
-	  -d '$(QUOTAS)'
-
 login: ## POST /auth/login でトークンを標準出力に出す（TOKEN=$$(make -s login)）
 	@set -e; \
 	BODY_FILE=$$(mktemp); \
@@ -218,227 +61,14 @@ login: ## POST /auth/login でトークンを標準出力に出す（TOKEN=$$(ma
 	test -n "$$TOKEN" || { echo "ERROR: ログインに失敗しました (HTTP $$CODE): $$BODY" >&2; exit 1; }; \
 	printf '%s\n' "$$TOKEN"
 
-deploy: ## echo を登録しアップロード（冪等。login でトークン取得 → POST /components → POST /components/{id}/versions）
-	@set -e; \
-	test -f "$(COMPONENTS_DIR)/echo.wasm" || { \
-		echo "ERROR: $(COMPONENTS_DIR)/echo.wasm がありません。先に 'make build-component' を実行してください。"; exit 1; }; \
-	if ! TOKEN=$$($(MAKE) -s login); then \
-		echo "ERROR: 先に 'make bootstrap' でスモーク用テナントとユーザを作成してください。"; exit 1; \
-	fi; \
-	echo "==> POST /components (name=echo)"; \
-	BODY=$$(curl -sS -X POST "$(BASE_URL)/components" \
-		-H "Authorization: Bearer $$TOKEN" \
-		-H "Content-Type: application/json" \
-		-d '{"name":"echo"}'); \
-	echo "    $$BODY"; \
-	CID=$$(printf '%s' "$$BODY" | sed -n 's/.*"component_id"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p'); \
-	if [ -z "$$CID" ]; then \
-		echo "    (既存の可能性 → GET /components から echo を解決)"; \
-		CID=$$(curl -sS "$(BASE_URL)/components" -H "Authorization: Bearer $$TOKEN" \
-			| grep -o '{"component_id":"[^"]*","name":"echo"' \
-			| sed -n 's/.*"component_id":"\([^"]*\)".*/\1/p' | head -n1); \
-	fi; \
-	test -n "$$CID" || { echo "ERROR: component_id を解決できませんでした。"; exit 1; }; \
-	echo "    component_id=$$CID"; \
-	echo "==> POST /components/$$CID/versions (version=$(VERSION), wasm=echo.wasm)"; \
-	CODE=$$(curl -sS -o /tmp/faas_deploy_body -w '%{http_code}' -X POST "$(BASE_URL)/components/$$CID/versions" \
-		-H "Authorization: Bearer $$TOKEN" \
-		-F "version=$(VERSION)" \
-		-F "wasm=@$(COMPONENTS_DIR)/echo.wasm;type=application/wasm"); \
-	echo "    [$$CODE] $$(cat /tmp/faas_deploy_body)"; \
-	if [ "$$CODE" = "201" ]; then \
-		echo "OK: echo $(VERSION) をアップロード・active 化しました。"; \
-	elif grep -q "already exists" /tmp/faas_deploy_body; then \
-		echo "OK: echo $(VERSION) は既にデプロイ済み（冪等スキップ）。"; \
-	else \
-		echo "ERROR: アップロード失敗 (HTTP $$CODE)"; exit 1; \
-	fi
-
-invoke: ## echo を end-to-end で実行（deploy → POST /invoke → GET /executions をポーリング）
-	@$(MAKE) --no-print-directory deploy
-	@set -e; \
-	if ! TOKEN=$$($(MAKE) -s login); then echo "ERROR: ログインに失敗しました。"; exit 1; fi; \
-	echo "==> POST /invoke"; \
-	BODY=$$(curl -sS -X POST "$(BASE_URL)/invoke" \
-		-H "Authorization: Bearer $$TOKEN" \
-		-H "Content-Type: application/json" \
-		-d '{"component":"echo","input":{"hello":"world"}}'); \
-	echo "    $$BODY"; \
-	EID=$$(printf '%s' "$$BODY" | sed -n 's/.*"execution_id"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p'); \
-	test -n "$$EID" || { echo "ERROR: execution_id を取得できませんでした。"; exit 1; }; \
-	echo "    execution_id=$$EID"; \
-	echo "==> GET /executions/$$EID をポーリング（初回は本体取得＋事前コンパイルで数秒かかる）..."; \
-	for i in $$(seq 1 15); do \
-		sleep 1; \
-		R=$$(curl -sS "$(BASE_URL)/executions/$$EID" -H "Authorization: Bearer $$TOKEN"); \
-		S=$$(printf '%s' "$$R" | sed -n 's/.*"status"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p'); \
-		echo "    [$$i] status=$$S"; \
-		case "$$S" in succeeded|failed|timeout) echo "$$R"; break;; esac; \
-	done
-
-# --- M7: デプロイ運用（canary / rollback / secret）------------------------
-# canary 運用と secret 管理には **admin スコープ**のトークンが要る（細粒度スコープは M7 非スコープ）。
-# COMPONENT_ID は `make component-id` で解決するか、明示的に渡す。
-
-component-id: ## echo の component_id を標準出力に出す（CID=$$(make -s component-id)）
-	@set -e; \
-	TOKEN=$$($(MAKE) -s login); \
-	curl -sS "$(BASE_URL)/components" -H "Authorization: Bearer $$TOKEN" \
-	  | sed -n 's/.*"component_id"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -1
-
-traffic: ## M7a: canary 配分を表示（GET /components/{id}/traffic）。CID=... で対象指定
-	@set -e; \
-	TOKEN=$$($(MAKE) -s login); \
-	CID=$${CID:-$$($(MAKE) -s component-id)}; \
-	curl -sS "$(BASE_URL)/components/$$CID/traffic" -H "Authorization: Bearer $$TOKEN"; echo
-
-canary: ## M7a: canary を設定（CANARY_VERSION=0.2.0 WEIGHT=10 [CID=...]）
-	@set -e; \
-	test -n "$(CANARY_VERSION)" || { echo "ERROR: CANARY_VERSION=... を指定してください（例: make canary CANARY_VERSION=0.2.0 WEIGHT=10）"; exit 1; }; \
-	TOKEN=$$($(MAKE) -s login); \
-	CID=$${CID:-$$($(MAKE) -s component-id)}; \
-	curl -sS -X PUT "$(BASE_URL)/components/$$CID/traffic" \
-	  -H "Authorization: Bearer $$TOKEN" -H "Content-Type: application/json" \
-	  -d "{\"canary_version\":\"$(CANARY_VERSION)\",\"weight\":$${WEIGHT:-10}}"; echo
-
-promote: ## M7a: canary を stable へ昇格（[CANARY_VERSION=0.2.0 で CAS] [CID=...]）
-	@set -e; \
-	TOKEN=$$($(MAKE) -s login); \
-	CID=$${CID:-$$($(MAKE) -s component-id)}; \
-	BODY=$${CANARY_VERSION:+{\"version\":\"$(CANARY_VERSION)\"}}; \
-	curl -sS -X POST "$(BASE_URL)/components/$$CID/promote" \
-	  -H "Authorization: Bearer $$TOKEN" -H "Content-Type: application/json" \
-	  -d "$${BODY:-{}}"; echo
-
-rollback: ## M7a: ワンクリック rollback（直前 stable へ戻し canary をクリア）[CID=...]
-	@set -e; \
-	TOKEN=$$($(MAKE) -s login); \
-	CID=$${CID:-$$($(MAKE) -s component-id)}; \
-	curl -sS -X POST "$(BASE_URL)/components/$$CID/rollback" \
-	  -H "Authorization: Bearer $$TOKEN" -H "Content-Type: application/json" -d '{}'; echo
-
-approve-env: ## M7b: 注入を許可する env 名を承認（ENV_NAMES=API_KEY,LOG_LEVEL VERSION=0.1.0 [CID=...]）
-	@set -e; \
-	test -n "$(ENV_NAMES)" || { echo "ERROR: ENV_NAMES=A,B を指定してください"; exit 1; }; \
-	TOKEN=$$($(MAKE) -s login); \
-	CID=$${CID:-$$($(MAKE) -s component-id)}; \
-	JSON=$$(printf '%s' "$(ENV_NAMES)" | awk -F, '{printf "["; for(i=1;i<=NF;i++){printf "%s\"%s\"", (i>1?",":""), $$i}; printf "]"}'); \
-	curl -sS -X PUT "$(BASE_URL)/components/$$CID/versions/$(VERSION)/capabilities" \
-	  -H "Authorization: Bearer $$TOKEN" -H "Content-Type: application/json" \
-	  -d "{\"env\":$$JSON}"; echo
-
-approve-egress: ## M9c: 許可 outbound を承認（EGRESS=api.example.com:443,1.2.3.4:8080 VERSION=1.0.0 [CID=...]）
-	@set -e; \
-	test -n "$(EGRESS)" || { echo "ERROR: EGRESS=host:port,host:port を指定してください（空にするには EGRESS=- で明示）"; exit 1; }; \
-	TOKEN=$$($(MAKE) -s login); \
-	CID=$${CID:-$$($(MAKE) -s component-id)}; \
-	RAW="$(EGRESS)"; [ "$$RAW" = "-" ] && RAW=""; \
-	JSON=$$(printf '%s' "$$RAW" | awk -F, '{printf "["; for(i=1;i<=NF;i++){ if($$i!=""){printf "%s\"%s\"", (i>1?",":""), $$i}}; printf "]"}'); \
-	curl -sS -X PUT "$(BASE_URL)/components/$$CID/versions/$(VERSION)/capabilities/egress" \
-	  -H "Authorization: Bearer $$TOKEN" -H "Content-Type: application/json" \
-	  -d "{\"allow_outbound\":$$JSON}"; echo
-
-set-secret: ## M7c: secret を設定（NAME=API_KEY VALUE=... [CID=...]）。**値はエコーしない**
-	@set -e; \
-	test -n "$(NAME)" || { echo "ERROR: NAME=API_KEY を指定してください"; exit 1; }; \
-	test -n "$(VALUE)" || { echo "ERROR: VALUE=... を指定してください"; exit 1; }; \
-	TOKEN=$$($(MAKE) -s login); \
-	CID=$${CID:-$$($(MAKE) -s component-id)}; \
-	CODE=$$(curl -sS -o /dev/null -w '%{http_code}' -X PUT "$(BASE_URL)/components/$$CID/secrets/$(NAME)" \
-	  -H "Authorization: Bearer $$TOKEN" -H "Content-Type: application/json" \
-	  -d "{\"value\":\"$(VALUE)\"}"); \
-	echo "PUT /components/$$CID/secrets/$(NAME) -> $$CODE (値は出力しません)"
-
-secrets: ## M7c: secret のメタデータ一覧（値は返らない）[CID=...]
-	@set -e; \
-	TOKEN=$$($(MAKE) -s login); \
-	CID=$${CID:-$$($(MAKE) -s component-id)}; \
-	curl -sS "$(BASE_URL)/components/$$CID/secrets" -H "Authorization: Bearer $$TOKEN"; echo
-
-rekey: ## M7c: 当該テナントの secret を現行 KEK で再ラップ（**侵害復旧ではない**。README 露出ガード 4）
-	@set -e; \
-	TOKEN=$$($(MAKE) -s login); \
-	curl -sS -X POST "$(BASE_URL)/admin/secrets/rekey" -H "Authorization: Bearer $$TOKEN"; echo
-
-deploy-chaos-components: ## M4/M8 chaos 用: always-trap / slow / burn をビルドしてアップロード（冪等）
-	@set -e; \
-	echo "==> always-trap / slow を wasm32-wasip2 でビルド..."; \
-	cargo build -p always-trap -p slow -p burn -p netprobe --target wasm32-wasip2 --release; \
-	TOKEN=$$($(MAKE) -s login); \
-	resolve_cid() { \
-		curl -sS -o /dev/null -X POST "$(BASE_URL)/components" \
-			-H "Authorization: Bearer $$TOKEN" -H "Content-Type: application/json" \
-			-d "{\"name\":\"$$1\"}"; \
-		curl -sS "$(BASE_URL)/components" -H "Authorization: Bearer $$TOKEN" \
-			| tr '}' '\n' | grep "\"name\":\"$$1\"" \
-			| sed -n 's/.*"component_id"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -1; \
-	}; \
-	echo "==> always-trap"; \
-	TRAP_CID=$$(resolve_cid always-trap); \
-	test -n "$$TRAP_CID" || { echo "ERROR: always-trap の component_id を解決できませんでした"; exit 1; }; \
-	curl -sS -X POST "$(BASE_URL)/components/$$TRAP_CID/versions" \
-		-H "Authorization: Bearer $$TOKEN" -F "version=$(VERSION)" \
-		-F "wasm=@target/wasm32-wasip2/release/always_trap.wasm"; echo; \
-	echo "==> slow (resource_limits は SLOW_LIMITS 変数を参照)"; \
-	SLOW_CID=$$(resolve_cid slow); \
-	test -n "$$SLOW_CID" || { echo "ERROR: slow の component_id を解決できませんでした"; exit 1; }; \
-	curl -sS -X POST "$(BASE_URL)/components/$$SLOW_CID/versions" \
-		-H "Authorization: Bearer $$TOKEN" -F "version=$(VERSION)" \
-		-F 'resource_limits=$(SLOW_LIMITS)' \
-		-F "wasm=@target/wasm32-wasip2/release/slow.wasm"; echo; \
-	echo "==> burn (resource_limits は BURN_LIMITS 変数を参照)"; \
-	BURN_CID=$$(resolve_cid burn); \
-	test -n "$$BURN_CID" || { echo "ERROR: burn の component_id を解決できませんでした"; exit 1; }; \
-	curl -sS -X POST "$(BASE_URL)/components/$$BURN_CID/versions" \
-		-H "Authorization: Bearer $$TOKEN" -F "version=$(VERSION)" \
-		-F 'resource_limits=$(BURN_LIMITS)' \
-		-F "wasm=@target/wasm32-wasip2/release/burn.wasm"; echo; \
-	echo "==> netprobe (M9c egress 検証用)"; \
-	NETPROBE_CID=$$(resolve_cid netprobe); \
-	test -n "$$NETPROBE_CID" || { echo "ERROR: netprobe の component_id を解決できませんでした"; exit 1; }; \
-	curl -sS -X POST "$(BASE_URL)/components/$$NETPROBE_CID/versions" \
-		-H "Authorization: Bearer $$TOKEN" -F "version=1.0.0" \
-		-F 'resource_limits=$(NETPROBE_LIMITS)' \
-		-F "wasm=@target/wasm32-wasip2/release/netprobe.wasm"; echo; \
-	echo "OK: chaos 用 component をデプロイしました（CHAOS_ALWAYS_TRAP=always-trap CHAOS_SLOW=slow CHAOS_BURN=burn CHAOS_NETPROBE=netprobe）。"
-
-recreate-stream: ## M8-1: invoke stream を WorkQueue retention で作り直す（CP/worker を止めてから実行）
-	@echo "==> control-plane / worker が停止していることを確認してください（未消化 0 は本コマンドが検査します）"
-	@NATS_URL="$(NATS_URL)" cargo run --quiet -p faas-control-plane -- --recreate-invoke-stream $(FORCE_ARG)
-	@echo "OK: stream を再作成しました。control-plane → worker の順に起動してください。"
-
-# --- M8: 弾力スケールとアイソレーション（§8 / §10 / §15 M8） ---
-# worker は事前ビルドしたバイナリを直接 N 個起動する。`cargo run` を N 回叩くと
-# target/ のビルドロックで直列化するため、supervisor 経由では使わない。
-# メトリクスポートは 9101 起点（9090 と衝突させない。手動 worker の混入を検出可能にするため）。
-
-run-workers: ## M8: worker を固定 N 台起動（例: make run-workers N=3）
-	@cargo build -p faas-worker
-	@./scripts/run-workers.sh $(or $(N),1)
-
-autoscale: ## M8: GET /internal/scale をポーリングして worker を増減させる参照アクチュエータ
-	@cargo build -p faas-worker
-	@./scripts/worker-autoscale.sh
-
-stop-workers: ## M8: supervisor 管理下の worker を全台ドレイン停止
-	@./scripts/stop-workers.sh
-
-scale-status: ## M8: 現在の backlog / desired worker 数を表示（GET /internal/scale）
-	@curl -sS -w '\nHTTP %{http_code}\n' "$(CONTROL_PLANE_INTERNAL_URL)/internal/scale"
-
-lane-status: ## M8: lane consumer ごとの未消化件数を表示（Prometheus gauge 経由）
-	@curl -sS "$(BASE_URL_METRICS)/metrics" \
-		| grep -E '^faas_(lane_pending_messages|lane_ack_pending|scale_)' \
-		|| echo "(control-plane の /metrics が取得できません。起動と BIND_ADDR を確認してください)"
-
-rls-lint: ## M3b: テナント分離の静的ガード（SET app.tenant_id ハザード / 生 pool 渡し検出）
-	@./scripts/rls-lint.sh
-
-logs: ## docker compose のログを追従
+test:
+	python3 scripts/check-architecture.py
+	cargo test --workspace
+	npm test --prefix sdk
+	python3 scripts/check-kubernetes.py
+rls-lint:
+	bash scripts/rls-lint.sh
+logs:
 	docker compose logs -f
-
-psql: ## postgres に psql で接続
+psql:
 	docker compose exec postgres psql -U faas -d faas
-
-clean: ## docker compose を停止し volume も削除（DB/JetStream/MinIO を初期化）
-	docker compose down -v

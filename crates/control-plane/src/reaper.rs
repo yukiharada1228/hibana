@@ -1,41 +1,3 @@
-//! in-flight カウンタ reaper + stuck-execution sweeper (M3d, §8)。
-//!
-//! 同時実行 admission は「invoke で reserve（+1）→ 終端化（subscriber の verified finalize）で
-//! DECR（-1）」で回るが、共有カウンタ（Redis）は次の要因で真実からドリフトする:
-//! - 終端化での DECR 取りこぼし（subscriber がメッセージを drop、worker クラッシュ等）。
-//! - 二重 DECR（再配送 + 既終端でも誤って DECR）— floor で負には居座らないが過小になりうる。
-//! - CP/Redis の再起動、TTL 失効。
-//!
-//! **DB COUNT が唯一の真実**: `SELECT COUNT(*) FROM executions WHERE status IN
-//! ('pending','running')`（テナントごと）。reaper は定期的にこの値で共有カウンタを上書き
-//! 再同期し、ドリフトを消す。Redis カウンタはあくまで「速い近似」であり、DB COUNT に収束させる。
-//!
-//! **stuck-execution sweeper（§8 リーク回収）**: ただし DB COUNT 再同期だけでは、終端化されず
-//! 永久に pending/running に残る「孤立行」を回収できない —— COUNT がそれを「真実」として数え続け、
-//! in-flight スロットが恒久リークするからである。孤立行は次の経路で生じる:
-//! - invoke ハンドラが「pending 行 commit → JetStream publish」順で動き、commit 後の publish/ack
-//!   失敗で 500 を返すと、ジョブが enqueue されず worker も subscriber も走らない（pending 恒久残留）。
-//! - worker 側の取りこぼし（ack-after-publish + max_deliver 再配送でも結果が出ない）で running 残留。
-//!
-//! M4c (§6.6) の二段救済との関係: worker は `delivered == max_deliver` の最終試行で `.failed`
-//! (DLQ) を publish し、CP の DLQ subscriber (`subscriber::run_failed`) が即時に finalize+DECR
-//! する。それでも `.failed` の publish 自体が失敗するエッジ（NATS 障害・worker クラッシュ等）に
-//! 備えて、本 sweeper が **最終の安全網** として残る。**create_upload は execution 行を INSERT
-//! しない**（§6.0; reserved な execution_id のみを返す）ため、本 sweeper の対象には入らない
-//! （実際に INSERT されるのは /invoke 経路のみ）。これにより orphan upload は本 sweeper では
-//! 拾わず、object storage バケットライフサイクル（TODO 運用側）で物理 GC される。
-//!
-//! sweeper は各テナントで `created_at < now() - deadline` の非終端行を `failed` に CAS finalize し、
-//! 回収後に DB COUNT を再同期する（COUNT が下がりスロットが解放される）。deadline は最悪再配送窓を
-//! 十分上回る値にして、正規の遅延結果が再配送中に誤って failed 化されないようにする。
-//!
-//! テナント列挙: `tenants`（RLS 無し）から全 active テナントを引き、各テナントで GUC を
-//! 設定してから sweep / COUNT する（executions は FORCE RLS 下のため GUC 必須）。
-//!
-//! fail-mode: reaper は **best-effort**。Redis 到達不能（[`StoreError::is_unavailable`]）や
-//! 一時的 DB エラーで落とさず、次の周期で再試行する。長期に走らせる安全網であり、単発失敗で
-//! プロセスを巻き込まない。
-
 use std::time::Duration;
 
 use crate::state::AppState;
@@ -131,10 +93,6 @@ async fn reconcile_tenant(
         Vec::new()
     };
 
-    // (1b) M5 (§15「欠落しない」): sweeper で終端化した実行も usage_rollups に計上する。各 swept 行を
-    //      `failed`・リソース指標 0（計測不能なため）で増分する＝DLQ 経路と同一の「半端行」セマンティクス。
-    //      finalize と同一 tx 内・commit 前に発行する。sweep は CAS なので再走で同じ行は返らず、rollup も
-    //      二重計上にならない（invocation/各 count は sweeper 経路ぶんも漏れなく集計に乗る）。
     for row in &swept {
         crate::db::upsert_usage_rollup(
             &mut *tx,
@@ -152,10 +110,6 @@ async fn reconcile_tenant(
     tx.commit().await?;
 
     if !swept.is_empty() {
-        // M4a (§3.8): sweeper 回収件数と、終端化された executions（status=failed）を観測する。
-        // ここで inc される `executions_total{status="failed"}` は subscriber の正規 finalize と
-        // 同名カウンタに合流するため、合算で「失敗合計」が取れる（sweeper か worker 起因かは
-        // reaper_swept_total で分けられる）。
         state
             .metrics()
             .reaper_swept_total
@@ -173,8 +127,6 @@ async fn reconcile_tenant(
             deadline_secs = stuck_deadline_secs,
             "stuck-execution sweeper finalized orphaned pending/running rows to 'failed' (reclaiming in-flight slots)"
         );
-        // 回収した各行ぶん DECR する（subscriber の終端 DECR と同じ契約）。最終的には下の resync が
-        // DB COUNT（真実）で上書きするため、ここの DECR 失敗は無害（best-effort）。
         for _ in &swept {
             if let Err(e) = state.store().release_inflight(tenant).await {
                 tracing::warn!(tenant = %tenant, error = %e, "sweeper DECR failed; resync will correct");

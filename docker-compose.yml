@@ -1,13 +1,15 @@
-# M2 のローカル依存サービス。
-# 仕様書 §15 M2: PostgreSQL（メタデータ）+ NATS JetStream（invoke/result）+ MinIO（本体 Object Storage, §3.4）。
-#
-# 露出ガード(§15 MUST NOT): M1 は固定トークン・RLS 無効・単一テナント構成のため、
-# 本 compose は信頼境界外（共有ネットワーク / インターネット到達可能環境）へ展開してはならない。
-# ポートは既定で 127.0.0.1 にのみバインドする。
-#
-# 起動: `docker compose up -d`（または `make up`）
-
 services:
+  # ローカル公開 URL: http://<app>.<tenant>.hibana.local/ → ホスト上の CP(:8080)。
+  # Docker Desktop 用。起動: docker compose up -d ingress（名前解決は /etc/hosts で設定）。
+  ingress:
+    image: nginx:stable-alpine
+    profiles: [ingress]
+    ports:
+      - "127.0.0.1:80:80"
+    volumes:
+      - ./docker/local-ingress.conf:/etc/nginx/conf.d/default.conf:ro
+    restart: unless-stopped
+
   # --- PostgreSQL: components / component_versions / executions（§3.2 を M1 に縮約） ---
   postgres:
     image: postgres:16
@@ -34,31 +36,6 @@ services:
       timeout: 5s
       retries: 10
       start_period: 10s
-    restart: unless-stopped
-
-  # --- NATS JetStream: invoke ストリーム + 共有 Pull Consumer、result 購読（§3.3 / §6） ---
-  nats:
-    # alpine 版を使う。素の nats:2 は FROM scratch（nats-server バイナリのみ）で
-    # wget も shell も無く、healthcheck コマンドを実行できないため unhealthy になる。
-    # alpine 版は busybox（wget / sh）を含むので /healthz を叩ける。
-    image: nats:2-alpine
-    container_name: faas-nats
-    # JetStream を有効化（仕様書 §15 M1）。-m 8222 は HTTP 監視/healthcheck 用。
-    command: ["--jetstream", "--store_dir=/data", "-m", "8222"]
-    ports:
-      # .env.example の NATS_URL=nats://localhost:4222 と一致。
-      - "127.0.0.1:4222:4222"   # client
-      - "127.0.0.1:8222:8222"   # monitoring (healthz)
-    volumes:
-      - faas-nats-data:/data
-    healthcheck:
-      # NATS 監視エンドポイント /healthz で JetStream 含む健全性を確認。
-      # busybox wget 互換のため --spider ではなく -q -O /dev/null を使う。
-      test: ["CMD-SHELL", "wget -q -O /dev/null http://127.0.0.1:8222/healthz || exit 1"]
-      interval: 5s
-      timeout: 5s
-      retries: 10
-      start_period: 5s
     restart: unless-stopped
 
   # --- Redis: 共有 admission ストア（M3d, §8）。レート制限 / in-flight 同時実行 / login 失敗
@@ -128,6 +105,7 @@ services:
   # ここへ span を送る（既定 off なら未使用）。UI は http://localhost:16686。
   # all-in-one はインメモリ保存で、開発・デバッグ用途に十分（本番は永続 backend を別途）。
   jaeger:
+    profiles: [observability]
     image: jaegertracing/all-in-one:1.60
     container_name: faas-jaeger
     environment:
@@ -141,6 +119,5 @@ services:
 
 volumes:
   faas-postgres-data:
-  faas-nats-data:
   faas-redis-data:
   faas-minio-data:

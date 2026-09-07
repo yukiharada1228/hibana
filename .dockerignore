@@ -1,0 +1,17 @@
+# Only build inputs enter the context; credentials, local artifacts and .git do not.
+**
+!Dockerfile
+!Cargo.toml
+!Cargo.lock
+!crates/
+!crates/**
+!components/
+!components/**
+!migrations/
+!migrations/**
+!wit/
+!wit/**
+**/*.wasm
+**/*.cwasm
+**/target
+**/.env

@@ -406,7 +406,6 @@ pub fn validate_public_key_b64url(public_key: &str) -> Result<(), ComponentSigEr
 #[cfg(test)]
 mod tests {
     use super::*;
-    use faas_shared::{ACK_WAIT_SECS, MAX_DELIVER, TOKEN_MARGIN_SECS};
 
     fn signer() -> Signer {
         // 決定的な dev seed（テスト専用）。
@@ -663,9 +662,8 @@ mod tests {
     /// TTL 定数から計算した exp を持つ claim を sign->verify できる（結合の健全性）。
     #[test]
     fn ttl_derived_exp_roundtrips() {
-        use faas_shared::token_exp_offset_secs;
         let iat = 1_700_000_000i64;
-        let exp = iat + token_exp_offset_secs(1, ACK_WAIT_SECS, MAX_DELIVER, TOKEN_MARGIN_SECS);
+        let exp = iat + 180;
         let s = signer();
         let c = JobClaims {
             iat,

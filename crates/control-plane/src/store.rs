@@ -1,31 +1,3 @@
-//! 共有ストア (M3d, §8) — 全 Axum インスタンスで共有する低レイテンシ admission 制御。
-//!
-//! 仕様書 §8 の MUST: Axum はステートレス x N であるため、レート制限・同時実行カウント・
-//! login 失敗カウント（§6.0）をインスタンスローカルに持つと上限が実効 N 倍に緩む。これらは
-//! **全インスタンスで共有する低レイテンシストア（Redis）** で集計しなければならない。
-//!
-//! このモジュールは 3 つの admission プリミティブを 1 つの [`Store`] trait に集約する:
-//! 1. token-bucket レート制限（per-tenant `invoke_rate`, §8）。
-//! 2. in-flight 同時実行 reserve（atomic INCR-cmp-condDECR, §8）+ DECR / reaper 再同期。
-//! 3. login 失敗ロックアウト（per (tenant,email) + per IP の両キー, §6.0）。
-//!    — M3a の `LoginThrottle` 契約（M3d で本 trait に吸収・一般化し、login.rs は本 Store を使う）。
-//!
-//! TOCTOU 回避 (MUST): N インスタンスが同じ低カウントを読んで全員 admit する競合を避けるため、
-//! reserve / 消費は **単一往復の Lua スクリプト**（read-modify-write をサーバ側で原子実行）で行う。
-//!
-//! fail-mode 分類 (MUST, §8): admission の各クラスごとに [`FailPolicy`] を明示する。
-//! - login ロックアウト: **fail-closed**（Redis 到達不能 → 拒否）。ブルートフォース素通し防止。
-//! - invoke レート制限 / in-flight: **fail-open でよい**（Redis 到達不能 → 許可）が、縮退を
-//!   ログ・メトリクス・監査（§3.7）に必ず記録する。誤分類は重大インシデント。
-//!   個々の判定経路（invoke handler）は [`StoreError::is_unavailable`] を見てクラス別ポリシーを適用する。
-//!
-//! このモジュールは Redis / DB に触れない **in-proc スタブ**（[`InProcStore`]）と、常に到達不能を
-//! 返す [`FailingStore`] を提供し、admission ロジックを live Redis 無しでユニットテストする。
-//!
-//! 注: 本フェーズ（M3d 共有ストア土台）は trait + 実装 + ユニットテストまでを置く。実際の
-//! 呼び出し配線（invoke の rate/in-flight 判定、login の lockout、reaper）は後続フェーズで行う。
-//! そのため API 表面の一部はバイナリからまだ呼ばれず dead-code 警告になる。配線は次フェーズで
-//! 入るため、ここではモジュール限定で許可する（テストでは大半を実際に行使している）。
 #![allow(dead_code)]
 
 use std::collections::HashMap;
@@ -34,11 +6,6 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
 
-/// admission 制御クラスごとの障害時方針 (§8 MUST)。
-///
-/// クラスを明示的に型で表現することで、`invoke` のレート制限を誤って fail-closed にして
-/// 可用性を落とす／login ロックアウトを誤って fail-open にしてブルートフォースを素通しさせる、
-/// といった誤分類を呼び出し側コードでレビューしやすくする。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FailPolicy {
     /// セキュリティ制御。ストア到達不能 → **拒否**（login ロックアウト）。
@@ -50,17 +17,8 @@ pub enum FailPolicy {
 impl FailPolicy {
     /// login 失敗ロックアウトの方針（§8: fail-closed）。
     pub const LOGIN_LOCKOUT: FailPolicy = FailPolicy::Closed;
-    /// invoke レート制限の方針（§8: fail-open + 縮退記録）。
-    pub const INVOKE_RATE: FailPolicy = FailPolicy::Open;
-    /// in-flight 同時実行の方針（§8: fail-open + 縮退記録）。
-    pub const INFLIGHT: FailPolicy = FailPolicy::Open;
-    /// M8 (§7): テナント lane の provisioning の方針（fail-open + 縮退記録）。
-    ///
-    /// lane を作れない / 状態を読めないときに **enqueue を止めない**（可用性優先）。
-    /// 止めると「NATS の一時的な不調でテナントのジョブが一切受け付けられない」ことになり、
-    /// invoke_rate / in-flight と同じ可用性クラスの判断に従う。
-    /// 縮退したことは必ずログ・監査へ記録する（§8 の「fail-open は許可するが必ず記録する」）。
-    pub const TENANT_LANE: FailPolicy = FailPolicy::Open;
+    pub const INVOKE_RATE: FailPolicy = FailPolicy::Closed;
+    pub const INFLIGHT: FailPolicy = FailPolicy::Closed;
 }
 
 /// ストア操作のエラー。
@@ -69,7 +27,6 @@ impl FailPolicy {
 /// fail-mode 分類（§8）の分岐に使う。それ以外（Lua の戻り値が想定外等）は [`StoreError::Backend`]。
 #[derive(Debug, thiserror::Error)]
 pub enum StoreError {
-    /// バックエンドへ到達できない（接続不可・タイムアウト・IO）。fail-open/closed の分岐対象。
     #[error("store unavailable: {0}")]
     Unavailable(String),
     /// バックエンドは応答したが想定外の結果／プロトコル不整合。
@@ -78,7 +35,6 @@ pub enum StoreError {
 }
 
 impl StoreError {
-    /// バックエンド到達不能か（fail-mode 分類で fail-open/closed を選ぶための判定）。
     pub fn is_unavailable(&self) -> bool {
         matches!(self, StoreError::Unavailable(_))
     }
@@ -204,13 +160,6 @@ pub trait Store: Send + Sync {
         params: LockoutParams,
     ) -> Result<LockoutDecision, StoreError>;
 
-    /// readiness probe（M4a, §3.8）。バックエンドへの「ごく軽い」疎通確認のみを行う。
-    ///
-    /// `/readyz` が DB / NATS / Store の 3 つを並べて 503 を fail-closed で返すための呼び出し。
-    /// admission のロジックを実行しない（カウンタを動かさない）こと。`Ok(())` は到達確認のみを意味し、
-    /// 整合性の保証を含まない。Redis 到達不能は [`StoreError::Unavailable`] を返す。
-    /// `DegradedStore` は常に `Ok(())` を返す（縮退ながら in-proc で機能している = ready 扱い。
-    /// 起動時に Redis 不通だったことは main.rs が warn で記録済み）。
     async fn ping(&self) -> Result<(), StoreError>;
 }
 
@@ -405,10 +354,6 @@ impl Store for InProcStore {
 // 常に到達不能を返すスタブ（fail-mode 分類の検証用）
 // ============================================================================
 
-/// 全操作が [`StoreError::Unavailable`] を返すスタブ。
-///
-/// fail-mode 分類のテスト用: login ロックアウト経路が fail-closed（拒否）に、invoke 経路が
-/// fail-open（許可 + 縮退記録）になることを呼び出し側で検証するために使う。
 #[derive(Debug, Default, Clone, Copy)]
 pub struct FailingStore;
 
@@ -470,114 +415,6 @@ impl Store for FailingStore {
 
 // ============================================================================
 // 起動時 Redis 不通フォールバック用の縮退ストア（fail-mode を壊さない）
-// ============================================================================
-
-/// 起動時に Redis が到達不能だったときの **縮退フォールバック**ストア（§8 fail-mode 保全）。
-///
-/// 素の [`InProcStore`] にフォールバックすると致命的な誤分類が起きる: InProcStore は決して
-/// `Err` を返さないため、login ロックアウトの fail-CLOSED 判定（`check_login_lockout` の
-/// `Unavailable` 経路）が **プロセス寿命の間ずっと発火できなくなり**、ブルートフォースが
-/// 素通しする（login が事実上 fail-OPEN に反転する）。これは §8 が禁じる「セキュリティ制御の
-/// 黙示的喪失」そのものである。
-///
-/// この adapter はクラス別 fail-mode を保つ:
-/// - **login ロックアウト系**（`record_login_failure` / `clear_login_failures` /
-///   `check_login_lockout`）= [`FailPolicy::Closed`] → 常に [`StoreError::Unavailable`] を返す。
-///   呼び出し側（login.rs）は `Err` を `LockoutCheck::Unavailable` にし fail-CLOSED で拒否する。
-/// - **invoke 系**（rate / in-flight / reaper resync）= [`FailPolicy::Open`] → 内部の
-///   [`InProcStore`] に委譲して許可する（ただしインスタンスローカルで分散共有ではない;
-///   選択時に main.rs が縮退を warn で記録する。§8 の縮退記録要件）。
-///
-/// **注意**: これはあくまで「Redis がブート時に不通」のときの可用性維持用。invoke カウンタは
-/// インスタンスローカルになり上限が実効 N 倍に緩むため、本番では Redis を堅牢化すること。
-pub struct DegradedStore {
-    inner: InProcStore,
-}
-
-impl DegradedStore {
-    pub fn new() -> Self {
-        Self {
-            inner: InProcStore::new(),
-        }
-    }
-
-    fn login_unavailable<T>() -> Result<T, StoreError> {
-        Err(StoreError::Unavailable(
-            "shared store unreachable at startup; login lockout fails CLOSED (degraded store)"
-                .to_string(),
-        ))
-    }
-}
-
-impl Default for DegradedStore {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-#[async_trait]
-impl Store for DegradedStore {
-    // --- invoke 系: fail-open（in-proc に委譲して許可する） ---
-    async fn rate_limit(
-        &self,
-        tenant: &str,
-        params: RateLimitParams,
-        now_ms: u64,
-    ) -> Result<RateDecision, StoreError> {
-        self.inner.rate_limit(tenant, params, now_ms).await
-    }
-    async fn reserve_inflight(
-        &self,
-        tenant: &str,
-        params: InflightParams,
-    ) -> Result<ReserveDecision, StoreError> {
-        self.inner.reserve_inflight(tenant, params).await
-    }
-    async fn release_inflight(&self, tenant: &str) -> Result<i64, StoreError> {
-        self.inner.release_inflight(tenant).await
-    }
-    async fn resync_inflight(
-        &self,
-        tenant: &str,
-        count: i64,
-        ttl_secs: u64,
-    ) -> Result<(), StoreError> {
-        self.inner.resync_inflight(tenant, count, ttl_secs).await
-    }
-
-    // --- login ロックアウト系: fail-CLOSED（常に Unavailable → 呼び出し側で拒否） ---
-    async fn record_login_failure(
-        &self,
-        _key: &str,
-        _params: LockoutParams,
-    ) -> Result<LockoutDecision, StoreError> {
-        Self::login_unavailable()
-    }
-    async fn clear_login_failures(&self, _key: &str) -> Result<(), StoreError> {
-        Self::login_unavailable()
-    }
-    async fn check_login_lockout(
-        &self,
-        _key: &str,
-        _params: LockoutParams,
-    ) -> Result<LockoutDecision, StoreError> {
-        Self::login_unavailable()
-    }
-
-    /// readiness は **Ok** を返す（M4a, §3.8）。
-    ///
-    /// DegradedStore は「起動時に Redis に届かなかったが in-proc 縮退で稼働中」の状態であり、
-    /// プロセスとしてはリクエストを処理できる（invoke 系 fail-open / login 系 fail-closed）。
-    /// `/readyz` をここで 503 にすると、Redis 一時障害でクラスタ全体が NotReady になり、
-    /// liveness probe との分離（§3.8）が崩れる。`store.ping()` は到達確認用 hop に絞り、
-    /// 縮退状態は main.rs の起動 warn で運用が把握する責務とする。
-    async fn ping(&self) -> Result<(), StoreError> {
-        Ok(())
-    }
-}
-
-// ============================================================================
-// Redis 実装（ConnectionManager + Lua スクリプト）
 // ============================================================================
 
 pub use redis_impl::RedisStore;
@@ -1083,47 +920,7 @@ mod tests {
     #[test]
     fn fail_policy_classification_is_explicit() {
         assert_eq!(FailPolicy::LOGIN_LOCKOUT, FailPolicy::Closed);
-        assert_eq!(FailPolicy::INVOKE_RATE, FailPolicy::Open);
-        assert_eq!(FailPolicy::INFLIGHT, FailPolicy::Open);
-    }
-
-    /// DegradedStore（起動時 Redis 不通フォールバック）は fail-mode を保つ:
-    /// login ロックアウト系は **Unavailable**（→ 呼び出し側 fail-CLOSED で拒否）、
-    /// invoke 系は許可（fail-OPEN）。素の InProcStore を使うと login が fail-OPEN に
-    /// 反転してブルートフォースが素通しするため、その回帰を固定する。
-    #[tokio::test]
-    async fn degraded_store_keeps_login_fail_closed_and_invoke_open() {
-        let s = DegradedStore::new();
-        let lp = LockoutParams {
-            threshold: 3,
-            window_secs: 900,
-        };
-        // login ロックアウト系は到達不能（fail-closed）。InProcStore なら Ok を返してしまう。
-        assert!(s
-            .check_login_lockout("k", lp)
-            .await
-            .unwrap_err()
-            .is_unavailable());
-        assert!(s
-            .record_login_failure("k", lp)
-            .await
-            .unwrap_err()
-            .is_unavailable());
-        assert!(s
-            .clear_login_failures("k")
-            .await
-            .unwrap_err()
-            .is_unavailable());
-
-        // invoke 系は許可される（fail-open; インスタンスローカルだが可用性維持）。
-        let rp = rl(10.0, 5.0);
-        assert!(s.rate_limit("t", rp, 1_000_000).await.unwrap().allowed);
-        let ip = InflightParams {
-            max: 2,
-            ttl_secs: 60,
-        };
-        assert!(s.reserve_inflight("t", ip).await.unwrap().admitted);
-        assert_eq!(s.release_inflight("t").await.unwrap(), 0);
-        s.resync_inflight("t", 0, 60).await.unwrap();
+        assert_eq!(FailPolicy::INVOKE_RATE, FailPolicy::Closed);
+        assert_eq!(FailPolicy::INFLIGHT, FailPolicy::Closed);
     }
 }

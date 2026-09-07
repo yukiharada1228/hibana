@@ -14,8 +14,31 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  kubernetes:
+    name: Kubernetes manifests & images
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - uses: azure/setup-kubectl@v4
+        with:
+          version: 'v1.35.0'
+      - name: Check deployment contracts
+        run: |
+          python -m pip install PyYAML==6.0.3
+          python scripts/check-kubernetes.py
+      - uses: docker/setup-buildx-action@v3
+      - name: Build Linux runtime image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: false
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
   # ネイティブ crate（control-plane / worker / shared）のビルド・テスト。
-  # echo は wasm32-wasip2 専用のため除外し、component ジョブでビルドする。
   # sqlx は query! マクロを使わないため DB なしでビルドできる（M1）。
   native:
     name: build & test (native)
@@ -29,6 +52,9 @@ jobs:
       - name: rls-lint
         run: ./scripts/rls-lint.sh
 
+      - name: Architecture boundaries
+        run: python3 scripts/check-architecture.py
+
       # rust-toolchain.toml（stable + wasm32-wasip2）が channel を固定する。
       # clippy / rustfmt コンポーネントを固定 toolchain に追加する。
       - name: Install toolchain components
@@ -38,58 +64,29 @@ jobs:
 
       # まず「コンパイルが通るか」を確認する（最重要シグナル）。
       - name: build
-        run: cargo build --workspace --exclude echo
+        run: cargo build --workspace
 
       - name: test
-        run: cargo test --workspace --exclude echo
+        run: cargo test --workspace
+
+      - name: HTTP acceptance and provenance (isolated PostgreSQL)
+        run: bash scripts/test-http.sh
 
       # 品質ゲート（コンパイル後に評価。最初の skeleton では赤になりうる）。
       - name: clippy
-        run: cargo clippy --workspace --exclude echo --all-targets -- -D warnings
+        run: cargo clippy --workspace --all-targets -- -D warnings
 
       - name: rustfmt
         run: cargo fmt --all -- --check
 
-  # echo Component を WebAssembly Component（wasm32-wasip2）としてビルドし、
-  # wasm-tools で「妥当な Component か」を検査する（M2 検証パイプラインの先取り）。
-  component:
-    name: build & validate (wasm component)
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Add wasm target
-        run: rustup target add wasm32-wasip2
-
-      - uses: Swatinem/rust-cache@v2
-
-      - uses: taiki-e/install-action@v2
-        with:
-          tool: wasm-tools
-
-      - name: build echo component
-        run: cargo build -p echo --target wasm32-wasip2 --release
-
-      - name: validate component
-        run: |
-          WASM=target/wasm32-wasip2/release/echo.wasm
-          test -f "$WASM" || { echo "echo.wasm が見つかりません"; exit 1; }
-          wasm-tools validate "$WASM"
-          # WASI Component Model のコンポーネントであること（WIT world を持つ）を確認。
-          wasm-tools component wit "$WASM"
-
-  # 全 Workers 互換バインディング（env/KV/R2/D1/DO/Queues/alarm）を実スタックで end-to-end 検証する
-  # 回帰ゲート。docker compose で PG/NATS/Redis/MinIO を起動し、control-plane + worker を立て、SDK CLI で
-  # all-bindings サンプルを deploy して scripts/smoke.sh のアサートを回す（M17/M18/M19 の回帰検出）。
   smoke:
-    name: e2e smoke (all bindings)
+    name: e2e smoke (Wasm core)
     runs-on: ubuntu-latest
     timeout-minutes: 30
     env:
       # control-plane / worker（.env.example と一致。SECRETS_MASTER_KEY だけ placeholder を実鍵に差替）
       DATABASE_URL: postgres://faas_app:faas_app@localhost:5432/faas
       MIGRATION_DATABASE_URL: postgres://faas:faas@localhost:5432/faas
-      NATS_URL: nats://localhost:4222
       REDIS_URL: redis://localhost:6379
       S3_ENDPOINT: http://localhost:9000
       S3_REGION: us-east-1
@@ -102,12 +99,16 @@ jobs:
       SECRETS_MASTER_KID: k1
       BOOTSTRAP_ADMIN_TOKEN: dev-bootstrap-admin-token
       CONTROL_PLANE_INTERNAL_URL: http://localhost:8081
+      APP_BIND_ADDR: "0.0.0.0:8083"
+      WORKER_HTTP_URL: http://localhost:8084
+      WORKER_HTTP_BIND_ADDR: "0.0.0.0:8084"
       INGRESS_BASE_DOMAIN: hibana.local
       COMPONENTS_DIR: ./components
       WASM_CACHE_DIR: ./worker-cache
       RUST_LOG: info
-      # SDK CLI 認証（bootstrap で作る smoke テナントと一致）
+      # CLI テスト認証（bootstrapで作るsmokeテナントと一致）
       HIBANA_URL: http://localhost:8080
+      GATEWAY: http://localhost:8083
       HIBANA_TENANT: smoke
       HIBANA_EMAIL: admin@example.com
       HIBANA_PASSWORD: dev-password
@@ -125,13 +126,18 @@ jobs:
 
       - uses: actions/setup-node@v4
         with:
-          node-version: 20
+          node-version: 24
           cache: npm
           cache-dependency-path: sdk/package-lock.json
 
-      - name: Start services (postgres / nats / redis / minio)
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.26.4'
+          cache-dependency-path: sdk/templates/go/go.sum
+
+      - name: Start services (postgres / redis / minio)
         run: |
-          docker compose up -d --wait postgres nats redis minio
+          docker compose up -d --wait postgres redis minio
           docker compose run --rm minio-setup
 
       # release ビルド: debug の wasmtime は 12MiB JS コンポーネントの precompile が CI(2core) で
@@ -146,10 +152,7 @@ jobs:
         run: |
           mkdir -p "$COMPONENTS_DIR" "$WASM_CACHE_DIR"
           nohup ./target/release/control-plane > cp.log 2>&1 &
-          # gateway(:8080) が応答する＝CP 起動完了（この時点で JetStream stream 作成済み）。
-          # curl は接続不可時に自身で "000" を出すので、`|| echo` は付けない（付けると "000" が
           # 2 個連結され != "000" になり、CP 未起動でもループが即 break してしまう＝worker が
-          # stream 作成前に起動して get_stream 404 でクラッシュする）。
           up=""
           for i in $(seq 1 90); do
             code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 3 http://localhost:8080/ || true)
@@ -158,17 +161,15 @@ jobs:
           done
           [ -n "$up" ] || { echo "control-plane failed to become ready"; tail -n 100 cp.log; exit 1; }
           echo "control-plane up (HTTP $up)"
-          # worker は CP がストリームを作った後に起動する（起動順レース回避）。
           nohup ./target/release/faas-worker > worker.log 2>&1 &
-          # worker がレーン購読まで到達したことを確認（クラッシュを早期検出）。
           ok=""
           for i in $(seq 1 30); do
-            if grep -q "subscribing to lane" worker.log; then ok=1; break; fi
+            if grep -q "HTTP worker started" worker.log; then ok=1; break; fi
             if grep -qiE "^Error|panic" worker.log; then break; fi
             sleep 1
           done
-          [ -n "$ok" ] || { echo "worker failed to subscribe"; tail -n 100 worker.log; exit 1; }
-          echo "worker subscribed"
+          [ -n "$ok" ] || { echo "worker failed to start HTTP listener"; tail -n 100 worker.log; exit 1; }
+          echo "HTTP worker ready"
 
       - name: Bootstrap smoke tenant
         run: |
@@ -183,7 +184,24 @@ jobs:
         working-directory: sdk
         run: npm ci
 
-      - name: Run smoke (all bindings)
+      - name: Test language-neutral CLI
+        working-directory: sdk
+        run: npm test
+
+      - name: Test standalone Wasmtime development and reload
+        run: node scripts/test-dev.mjs
+
+      - name: Test JavaScript, Rust and Go templates on Wasmtime and deployed fleet
+        env:
+          HIBANA_TEST_DEPLOY: "1"
+        run: node scripts/test-components.mjs
+
+      - name: Check native template formatting
+        run: |
+          rustfmt --check --edition 2021 sdk/templates/rust/src/lib.rs
+          test -z "$(gofmt -l sdk/templates/go)"
+
+      - name: Run HTTP MVP smoke including rollback
         run: ./scripts/smoke.sh
 
       - name: Dump control-plane + worker logs

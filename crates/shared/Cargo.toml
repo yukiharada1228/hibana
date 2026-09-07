@@ -5,19 +5,16 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+http = "1"
+anyhow = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 uuid = { workspace = true }
 thiserror = { workspace = true }
 # M7-0 (§5.1): Redacted<T> の Drop 時ゼロ化。
 zeroize = { workspace = true }
-# M8 (§3.4): invoke stream の config を共有契約として 1 箇所に持つため。
-# stream 名 / retention / discard が worker と control-plane で食い違うと
-# 「先に起動した側が黙って勝つ」事故になるので、型ごと共有する。
-# 既に両 bin が同一版を依存しているのでビルドコストの増加は実質ゼロ。
-async-nats = { workspace = true }
 
-# M10 (§3.8): 分散トレーシングの初期化と NATS ヘッダ伝搬を CP / worker で共有する
+# M10 (§3.8): トレーシングの初期化を CP / worker で共有する
 # （両 bin で init_tracing がほぼ同一だったのを 1 箇所へ集約）。OTel は opt-in で、
 # OTEL_EXPORTER_OTLP_ENDPOINT 未設定なら exporter を張らず既存の fmt/json ログのみになる。
 tracing = { workspace = true }

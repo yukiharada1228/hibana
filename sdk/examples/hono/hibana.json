@@ -1,0 +1,1 @@
+{"name":"hello-hono","main":"src/index.ts","vars":{"GREETING":"Hello Hibana"},"limits":{"memory_mb":256,"timeout_ms":15000}}

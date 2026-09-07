@@ -1,0 +1,34 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+namespace: hibana
+resources:
+  - ../local/dependencies
+  - volumes.yaml
+patches:
+  - target:
+      kind: Deployment
+      name: hibana-postgres
+    patch: |-
+      - op: replace
+        path: /spec/template/spec/volumes/0
+        value:
+          name: data
+          persistentVolumeClaim:
+            claimName: hibana-postgres-data
+  - target:
+      kind: Deployment
+      name: hibana-minio
+    patch: |-
+      - op: replace
+        path: /spec/template/spec/volumes/0
+        value:
+          name: data
+          persistentVolumeClaim:
+            claimName: hibana-minio-data
+  - target:
+      kind: Deployment
+      name: hibana-postgres
+    patch: |-
+      - op: add
+        path: /spec/template/spec/containers/0/env/-
+        value: {name: PGDATA, value: /var/lib/postgresql/data/pgdata}

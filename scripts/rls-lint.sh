@@ -47,25 +47,18 @@ if [ -n "$set1" ]; then
 fi
 
 # --- (2) tenant-scoped db:: call passed the raw pool -----------------------
-fns="create_component|insert_version|set_active_version|insert_pending_execution|get_execution"
-fns="$fns|find_component_by_id|find_component_by_name|list_components|list_versions"
+fns="create_component|insert_version|set_active_version|get_execution"
+fns="$fns|find_component_by_id|list_components|list_versions"
 fns="$fns|soft_delete_component|soft_delete_version|find_version_id"
 fns="$fns|has_active_executions_for_component|has_active_executions_for_version|finalize_execution"
 fns="$fns|create_user|find_user_role|create_token|revoke_token|token_exists|bootstrap_tenant"
-# M6b Cron CRUD + due-scan（cron_due_tenant_jobs は SECURITY DEFINER で GUC 不要のため除外）。
-fns="$fns|insert_cron_job|list_cron_jobs|delete_cron_job|lock_due_cron_job|advance_cron_next_fire"
-# M6c トリガー CRUD + 配送台帳 + chain/event 解決（すべて set_tenant_guc 済み tx で呼ぶ）。
-fns="$fns|insert_trigger|list_triggers|delete_trigger|list_enabled_triggers_by_type|record_trigger_delivery"
-# M7a canary ルーティング / 段階移行（すべて set_tenant_guc 済み tx で呼ぶ）。
-fns="$fns|resolve_component_routing|switch_active_version|promote_active_version"
-fns="$fns|rollback_active_version|set_traffic_split|clear_traffic_split"
-fns="$fns|traffic_split_for_component|version_stats_for_component"
+fns="$fns|switch_active_version|rollback_active_version"
 # M7b per-function config + capability env 承認（すべて set_tenant_guc 済み tx で呼ぶ）。
 fns="$fns|version_capabilities|set_version_capabilities"
 fns="$fns|upsert_function_config|list_function_configs|delete_function_config"
 # M7c Secrets Manager（すべて set_tenant_guc 済み tx で呼ぶ）。
 # secrets_stale_kek / _all / secrets_kek_kid_counts_all は SECURITY DEFINER で GUC 不要のため
-# 意図的に除外する（M6 の cron_due_tenant_jobs と同じ扱い）。
+# SECURITY DEFINER の全テナント照会はこのtenant-scoped検査から除外する。
 fns="$fns|insert_secret_meta|find_live_secret_by_name|list_secrets_meta|insert_secret_version"
 fns="$fns|bump_secret_current_version|soft_delete_secret|find_secret_version|resolve_for_injection"
 fns="$fns|find_secret_meta_by_id"

@@ -14,8 +14,6 @@ faas-shared = { workspace = true }
 # Web / 非同期（multipart: POST /components/{id}/versions のアップロード受信）
 axum = { workspace = true, features = ["multipart"] }
 tokio = { workspace = true }
-# M19: R2 GET を S3 ByteStream から axum Body へストリーム変換する（ReaderStream）。
-tokio-util = { version = "0.7", features = ["io"] }
 tower = { workspace = true }
 tower-http = { workspace = true }
 
@@ -49,12 +47,10 @@ chacha20poly1305 = { workspace = true }
 sqlx = { workspace = true }
 
 # メッセージング
-async-nats = { workspace = true }
-# Stream トレイト (Subscriber は futures::Stream を実装)。async-nats と整合。
+# Async utilities.
 futures = "0.3"
 
 # 同期 invoke の per-instance waiter registry（M6a, §15）: correlation_id -> oneshot::Sender。
-dashmap = { workspace = true }
 
 # 共有ストア（M3d, §8）。レート制限 / in-flight / login ロックアウトを全 Axum
 # インスタンスで共有するカウンタ。Lua アトミック操作で TOCTOU を避ける。pure-Rust 構成。
@@ -82,17 +78,12 @@ tracing-opentelemetry = { workspace = true }
 # 観測（M4a, §3.8）。Prometheus /metrics で使う TextEncoder + Registry。
 prometheus = { workspace = true }
 
+# Direct HTTP dispatch and native integration tests.
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "stream"] }
+
 # --- 統合テスト専用 dev-dependencies ---
 [dev-dependencies]
-# M4 chaos tests（tests/chaos_m4.rs）の HTTP クライアント。プロダクションコードでは使わない。
-# worker と同じ rustls-tls バックエンドで OpenSSL/aws-lc-sys を回避。`json` feature は
-# テスト中のリクエスト/レスポンスの serde 統合のため必要。`multipart` は M7 chaos が
-# canary 用 version を activate=false でアップロードするため（POST /components/{id}/versions）。
-reqwest = { version = "0.12", default-features = false, features = [
-    "rustls-tls",
-    "json",
-    "multipart",
-] }
+reqwest = { version = "0.12", default-features = false, features = ["multipart"] }
 # chaos_b の Idempotency-Key 生成にユニーク nanos を埋める用途。
 chrono = { workspace = true }
 # chaos テストの async ランタイム（既存の workspace tokio を re-import するだけ）。

@@ -1,0 +1,179 @@
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: default-deny
+spec:
+  podSelector: {}
+  policyTypes: [Ingress, Egress]
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: hibana-dns
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/part-of: hibana
+  policyTypes: [Egress]
+  egress:
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+          podSelector:
+            matchLabels:
+              k8s-app: kube-dns
+      ports:
+        - {protocol: UDP, port: 53}
+        - {protocol: TCP, port: 53}
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: hibana-internal
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: hibana-control-plane
+  policyTypes: [Ingress]
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: hibana-worker
+      ports:
+        - {protocol: TCP, port: 8081}
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              hibana.io/ingress: "true"
+        - podSelector:
+            matchLabels:
+              hibana.io/api-client: "true"
+      ports:
+        - {protocol: TCP, port: 8080}
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              hibana.io/app-ingress: "true"
+      ports:
+        - {protocol: TCP, port: 8083}
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: hibana-worker-internal
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: hibana-worker
+  policyTypes: [Egress]
+  egress:
+    - to:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: hibana-control-plane
+      ports:
+        - {protocol: TCP, port: 8081}
+---
+# Same-namespace dependencies are used by the local overlay. For managed services
+# add narrowly scoped egress rules in the site's overlay (addresses and ports).
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: hibana-dependencies
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/part-of: hibana
+  policyTypes: [Egress]
+  egress:
+    - to:
+        - podSelector:
+            matchLabels:
+              hibana.io/dependency: "true"
+      ports:
+        - {protocol: TCP, port: 5432}
+        - {protocol: TCP, port: 6379}
+        - {protocol: TCP, port: 9000}
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: hibana-metrics
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/part-of: hibana
+  policyTypes: [Ingress]
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              hibana.io/monitoring: "true"
+      ports:
+        - {protocol: TCP, port: 8080}
+        - {protocol: TCP, port: 9090}
+---
+# Guest fetch is still subject to the per-version hostname allowlist and SSRF gate.
+# This network rule only permits public HTTPS; other approved ports need an overlay.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: hibana-worker-public-https
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: hibana-worker
+  policyTypes: [Egress]
+  egress:
+    - to:
+        - ipBlock:
+            cidr: 0.0.0.0/0
+            except:
+              - 0.0.0.0/8
+              - 10.0.0.0/8
+              - 100.64.0.0/10
+              - 127.0.0.0/8
+              - 169.254.0.0/16
+              - 172.16.0.0/12
+              - 192.168.0.0/16
+              - 224.0.0.0/4
+              - 240.0.0.0/4
+      ports:
+        - {protocol: TCP, port: 443}
+
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: hibana-http-dispatch
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: hibana-control-plane
+  policyTypes: [Egress]
+  egress:
+    - to:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: hibana-worker
+      ports:
+        - {protocol: TCP, port: 8084}
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: hibana-worker-http
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: hibana-worker
+  policyTypes: [Ingress]
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: hibana-control-plane
+      ports:
+        - {protocol: TCP, port: 8084}

@@ -1,0 +1,33 @@
+name: Security dependencies
+
+on:
+  push:
+    branches: [develop, main]
+  pull_request:
+    branches: [develop, main]
+  schedule:
+    - cron: "17 3 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  dependencies:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: sdk/package-lock.json
+      - name: Install RustSec auditor
+        run: cargo install cargo-audit --version 0.22.2 --locked
+      - name: Audit Rust dependencies and validate scoped exception
+        run: bash scripts/check-security.sh
+      - name: Audit CLI and JavaScript compiler dependencies
+        working-directory: sdk
+        run: npm audit --package-lock-only --audit-level=low

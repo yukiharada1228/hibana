@@ -1,0 +1,49 @@
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: hibana-migrate
+automountServiceAccountToken: false
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: hibana-migrate
+spec:
+  backoffLimit: 1
+  activeDeadlineSeconds: 600
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: hibana-migrate
+        app.kubernetes.io/part-of: hibana
+    spec:
+      serviceAccountName: hibana-migrate
+      automountServiceAccountToken: false
+      restartPolicy: Never
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: migrate
+          image: hibana-platform
+          imagePullPolicy: IfNotPresent
+          command: ["/usr/local/bin/control-plane", "--migrate-only"]
+          env:
+            - name: MIGRATION_DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: hibana-migration
+                  key: MIGRATION_DATABASE_URL
+            - name: LOG_FORMAT
+              value: json
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: [ALL]
+          resources:
+            requests: {cpu: "100m", memory: "128Mi"}
+            limits: {cpu: "1", memory: "512Mi"}

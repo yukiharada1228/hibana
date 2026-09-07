@@ -4,15 +4,7 @@ members = [
     "crates/control-plane",
     "crates/worker",
     "crates/shared",
-    "components/echo",
-    "components/always-trap",
-    "components/slow",
-    "components/burn",
-    "components/netprobe",
 ]
-
-# control-plane / worker / components/echo は後続エージェントが各ディレクトリを作成する。
-# このルート Cargo.toml は members に先に列挙しておくのみ（M1 足場）。
 
 [workspace.package]
 version = "0.1.0"
@@ -30,7 +22,8 @@ tower = "0.5"
 tower-http = { version = "0.6", features = ["trace", "cors"] }
 
 # --- DB（query! マクロは使わずランタイム API のみ） ---
-sqlx = { version = "0.8", features = [
+sqlx = { version = "0.8", default-features = false, features = [
+    "macros",
     "runtime-tokio",
     "tls-rustls",
     "postgres",
@@ -57,7 +50,6 @@ chacha20poly1305 = { version = "0.10", features = ["alloc"], default-features = 
 async-trait = "0.1"
 
 # --- メッセージング ---
-async-nats = "0.38"
 
 # --- 分散トレーシング (M10, §3.8 / §10): opt-in（OTEL_EXPORTER_OTLP_ENDPOINT 設定時のみ有効）。
 # exporter は HTTP/protobuf（reqwest + rustls）を使い、gRPC(tonic/prost) と C 依存を持ち込まない
@@ -120,11 +112,12 @@ sha2 = "0.10"
 ed25519-dalek = "2"
 
 # --- Wasm ランタイム ---
-wasmtime = { version = "29", features = ["component-model", "async", "cranelift"] }
-wasmtime-wasi = "29"
-# M11 (§4.2): JS/Hono Component が Request/Response を扱うために wasi:http/types を提供する。
-# **types のみ**を linker へ足し、outgoing-handler（egress）は足さない（egress は M9c のまま）。
-wasmtime-wasi-http = "29"
+# Supported LTS; keep the minimum at the reviewed security patch level.
+wasmtime = { version = "36.0.14", default-features = false, features = ["component-model", "async", "cranelift", "runtime", "std", "parallel-compilation", "wat"] }
+wasmtime-wasi = { version = "36.0.14", default-features = false }
+# All outgoing requests use Hibana's capability gate and maintained reqwest TLS.
+# Do not compile the built-in client (and its separate legacy TLS dependency).
+wasmtime-wasi-http = { version = "36.0.14", default-features = false }
 
 # --- シリアライズ / ID / 時刻 ---
 serde = { version = "1", features = ["derive"] }

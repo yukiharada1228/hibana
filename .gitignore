@@ -6,6 +6,7 @@
 
 # build artifacts / caches
 **/*.rs.bk
+__pycache__/
 *.wasm
 *.cwasm
 
@@ -18,3 +19,10 @@
 
 # M8: 参照アクチュエータの PID / ログ置き場（ローカル運用の作業ディレクトリ）
 .workers/
+
+# Isolated Kubernetes development cluster credentials and rendered local secrets.
+/.local/
+
+# Hibana CLI build output and local credentials
+.hibana/
+.dev.vars

@@ -15,7 +15,6 @@ tokio = { workspace = true }
 
 sqlx = { workspace = true }
 
-async-nats = { workspace = true }
 futures = "0.3"
 
 # --- Object Storage 本体取得 (§3.4): presigned GET URL の HTTP GET 用。
@@ -26,13 +25,9 @@ reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"
 # --- ダウンロード本体の sha256 検証 (§3.6)。
 sha2 = { workspace = true }
 # --- in-memory Component キャッシュ (§3.6)。
-lru = "0.12"
+lru = "0.18.4"
 # M11-6 (§6.6): sha ごとの precompile single-flight ロック用（stampede 防止）。
 dashmap = { workspace = true }
-# M14 (D1): 隔離 SQLite（bundled = システム依存なし）。guest の任意 SQL は authorizer で
-# ATTACH/load_extension を拒否して sandbox 化する。
-rusqlite = { version = "0.32", features = ["bundled", "hooks"] }
-
 wasmtime = { workspace = true }
 wasmtime-wasi = { workspace = true }
 wasmtime-wasi-http = { workspace = true }
@@ -63,3 +58,6 @@ tracing-opentelemetry = { workspace = true }
 axum = { workspace = true }
 prometheus = { workspace = true }
 
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["test-util"] }

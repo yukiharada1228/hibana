@@ -1,0 +1,16 @@
+{
+  "name": "hibana-hono-example",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "hibana dev",
+    "build": "hibana build",
+    "deploy": "hibana deploy"
+  },
+  "dependencies": {
+    "hono": "^4.6.0"
+  },
+  "devDependencies": {
+    "@hibana/cli": "file:../.."
+  }
+}

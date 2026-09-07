@@ -66,7 +66,6 @@ const BASELINE_APPROVED_PREFIXES: &[&str] = &[
     "wasi:cli/",
     "wasi:clocks/",
     "wasi:random/",
-    "faas:component/",
     // M9c: `wasi:sockets/*` は **import を許可する**が、実際の egress は別途 admin 承認した
     // allowlist（`capabilities.net_allow_outbound`）が非空のときだけ worker の `socket_addr_check`
     // が通す。これは `wasi:cli/environment` を許可しつつ値の注入を admin 承認で縛る env モデルと
@@ -225,7 +224,7 @@ async fn spawn_validation_child(bytes: Vec<u8>) -> Result<Validated, FaasError> 
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::null())
-        // 子は DB も NATS も要らない。余計な env / fd を渡さないため kill_on_drop で確実に始末する。
+        // 子は DB接続は不要。余計な env / fd を渡さないため kill_on_drop で確実に始末する。
         .kill_on_drop(true)
         .spawn()
         // spawn 失敗は「基盤が詰まっている」= 一時障害。wasm が悪いのではないので 503 相当。
@@ -377,6 +376,7 @@ fn validate_blocking(
 
     // (2) §4.4 strict matching: capability を伴う import を **承認集合** と厳密照合する。
     //     型のみの import は capability を伴わないため照合対象外。未承認は 422（deny-all 既定）。
+    require_http_export(bytes)?;
     let imports = collect_component_imports(bytes)?;
     let approved_imports = match_capabilities(&imports, approved)?;
 
@@ -418,8 +418,7 @@ fn match_capabilities(
         if !approved.approves(&import.name) {
             return Err(FaasError::InvalidRequest(format!(
                 "unapproved host import '{}': capabilities default to deny-all (§4.4); only the \
-                 admin-approved set (standard handler world faas:component/* and WASI Preview2 \
-                 wasi:* in this slice) is permitted",
+                 admin-approved WASI imports is permitted",
                 import.name
             )));
         }
@@ -608,19 +607,54 @@ pub fn validate_env_allowlist(names: &[String]) -> Result<BTreeSet<String>, Faas
     Ok(out)
 }
 
+fn require_http_export(bytes: &[u8]) -> Result<(), FaasError> {
+    let mut depth = 0i32;
+    for payload in Parser::new(0).parse_all(bytes) {
+        match payload.map_err(|e| FaasError::InvalidRequest(format!("parse error: {e}")))? {
+            Payload::ModuleSection { .. } | Payload::ComponentSection { .. } => depth += 1,
+            Payload::End(_) => depth -= 1,
+            Payload::ComponentExportSection(section) if depth == 0 => {
+                for export in section {
+                    let export = export
+                        .map_err(|e| FaasError::InvalidRequest(format!("parse error: {e}")))?;
+                    if export.name.0 == "wasi:http/incoming-handler@0.2.3"
+                        && export.kind == wasmparser::ComponentExternalKind::Instance
+                    {
+                        return Ok(());
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    Err(FaasError::InvalidRequest("Hibana requires a WASI HTTP Component exporting wasi:http/incoming-handler@0.2.3; bytes handlers and CLI modules are not supported".into()))
+}
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn deployment_rejects_components_without_http_export_and_core_modules() {
+        for bytes in [
+            b"\0asm\x0d\0\x01\0".as_slice(),
+            b"\0asm\x01\0\0\0".as_slice(),
+        ] {
+            let err = super::validate_blocking(bytes, &super::ApprovedCapabilities::baseline())
+                .unwrap_err();
+            assert!(err.to_string().contains("WASI HTTP Component"));
+        }
+    }
+
     use super::*;
 
     /// §4.4: baseline 承認集合は標準 WASI と標準 handler world 契約を承認する。
     #[test]
-    fn baseline_approves_wasi_and_standard_world() {
+    fn baseline_approves_wasi_http_contract() {
         let approved = ApprovedCapabilities::baseline();
         // 標準 WASI Preview2。
         assert!(approved.approves("wasi:io/streams@0.2.6"));
         assert!(approved.approves("wasi:cli/environment@0.2.0"));
         // §4.2 標準 handler world の自パッケージ型 interface（echo が import する）。
-        assert!(approved.approves("faas:component/types@1.0.0"));
+        assert!(approved.approves("wasi:http/types@0.2.3"));
     }
 
     /// §4.4: deny-all 既定。baseline を超える ambient capability は未承認 → 422 対象。
@@ -732,7 +766,7 @@ mod tests {
         let imports = vec![
             cap("wasi:io/streams@0.2.6"),
             cap("wasi:cli/environment@0.2.0"),
-            cap("faas:component/types@1.0.0"),
+            cap("wasi:http/types@0.2.3"),
         ];
         let resolved = match_capabilities(&imports, &approved).expect("approved subset accepts");
         // 承認集合に含まれる capability import がそのまま解決される。
@@ -741,7 +775,7 @@ mod tests {
             vec![
                 "wasi:io/streams@0.2.6".to_string(),
                 "wasi:cli/environment@0.2.0".to_string(),
-                "faas:component/types@1.0.0".to_string(),
+                "wasi:http/types@0.2.3".to_string(),
             ]
         );
     }
@@ -792,12 +826,12 @@ mod tests {
             // 型のみ: baseline 外の名前空間でも capability ではないので通過する。
             type_only("some:pkg/iface@1.0.0"),
             // capability を伴う baseline import は通常どおり解決される。
-            cap("faas:component/types@1.0.0"),
+            cap("wasi:http/types@0.2.3"),
         ];
         let resolved =
             match_capabilities(&imports, &approved).expect("type-only must not be rejected");
         // 型のみは承認結果に含めない。capability import のみが解決される。
-        assert_eq!(resolved, vec!["faas:component/types@1.0.0".to_string()]);
+        assert_eq!(resolved, vec!["wasi:http/types@0.2.3".to_string()]);
     }
 
     // ---- M7b: capabilities の 2 キー構造（§4.4 / §15） ----------------------

@@ -1,0 +1,19 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+namespace: hibana
+resources:
+  - ../base
+patches:
+  # An administrator must install this RuntimeClass with a VM-backed sandbox
+  # handler and verify it. A missing handler fails closed (Pods stay Pending).
+  - target:
+      kind: Deployment
+      name: hibana-worker
+    patch: |-
+      - op: add
+        path: /spec/template/spec/runtimeClassName
+        value: hibana-sandbox
+      - op: add
+        path: /spec/template/spec/nodeSelector
+        value:
+          hibana.io/untrusted-code: "true"

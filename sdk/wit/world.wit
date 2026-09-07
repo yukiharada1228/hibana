@@ -1,9 +1,6 @@
 package hibana:app;
 
-// Hono/JS アプリを wasi:http/incoming-handler として動かす world。
-// **incoming-handler だけ export**。outgoing-handler(=egress) は含めない
-// （ビルド時 --disable http でも落ちるが、world 側でも持たせない）。
-// host（worker / wasmtime-wasi-http 29）は wasi:http@0.2.3 を実装しているため 0.2.3 に合わせる。
+// The runtime provides WASI HTTP 0.2.3, with outgoing requests subject to host grants.
 world http {
   export wasi:http/incoming-handler@0.2.3;
 }
