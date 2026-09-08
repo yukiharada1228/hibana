@@ -11,7 +11,7 @@ use argon2::Argon2;
 use rand::rngs::OsRng;
 use rand::RngCore;
 
-use faas_shared::FaasError;
+use hibana_shared::FaasError;
 
 /// 不透明トークン secret のバイト長（256bit）。
 const SECRET_BYTES: usize = 32;

@@ -2,8 +2,8 @@
 use crate::auth::Principal;
 use chrono::DateTime;
 use chrono::Utc;
-use faas_shared::Role;
-use faas_shared::Scope;
+use hibana_shared::Role;
+use hibana_shared::Scope;
 use sqlx::Row;
 
 // ---------------------------------------------------------------------------

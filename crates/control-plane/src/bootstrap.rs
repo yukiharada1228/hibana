@@ -6,9 +6,17 @@ use crate::{
     config::Config, crypto, deployment, ingress, migrations, reaper, signing, state::AppState,
     storage, store, validation,
 };
-use axum::Router;
+use axum::{serve::ListenerExt as _, Router};
 use sqlx::postgres::PgPoolOptions;
 use std::time::Duration;
+
+fn configure_http_socket(stream: &mut tokio::net::TcpStream) {
+    // Headers, body chunks and the final EOF can be separate small writes.
+    // Do not hold them behind Nagle's algorithm while waiting for an ACK.
+    if let Err(error) = stream.set_nodelay(true) {
+        tracing::warn!(%error, "cannot enable TCP_NODELAY for HTTP connection");
+    }
+}
 pub(crate) async fn run() -> anyhow::Result<()> {
     // M4a (§3.8): 起動最初に LOG_FORMAT を読んで tracing を初期化する。Config::from_env() より
     // 先に env から読むのは、Config が必須 env 欠損でエラーを返すケースでも JSON ログを吐ける
@@ -19,10 +27,10 @@ pub(crate) async fn run() -> anyhow::Result<()> {
         .unwrap_or_else(|_| "text".to_string());
     // M10 (§3.8): OTel は opt-in（OTEL_EXPORTER_OTLP_ENDPOINT 設定時のみ）。未設定なら M4a の
     // fmt/json ログのみで挙動不変。guard は main の最後まで保持して終了時に span を flush する。
-    let _otel_guard = faas_shared::otel::init_tracing(
+    let _otel_guard = hibana_shared::otel::init_tracing(
         &log_format,
         "info,faas_control_plane=debug",
-        "faas-control-plane",
+        "hibana-control-plane",
     );
 
     // `--migrate-only`: 起動時マイグレーションと同じ冪等ロジック（baseline + pending）を流して exit。
@@ -62,7 +70,20 @@ pub(crate) async fn run() -> anyhow::Result<()> {
     let pool = PgPoolOptions::new()
         .max_connections(10)
         .acquire_timeout(Duration::from_secs(10))
-        .connect(&config.database_url)
+        .connect_with(
+            config
+                .database_url
+                .parse::<sqlx::postgres::PgConnectOptions>()?
+                .options([
+                    ("statement_timeout", "10000"),
+                    ("lock_timeout", "3000"),
+                    ("idle_in_transaction_session_timeout", "15000"),
+                    ("tcp_keepalives_idle", "10"),
+                    ("tcp_keepalives_interval", "3"),
+                    ("tcp_keepalives_count", "3"),
+                    ("tcp_user_timeout", "10000"),
+                ]),
+        )
         .await?;
     migrations::assert_non_privileged_runtime_role(&pool).await?;
     tracing::info!("connected to postgres");
@@ -158,7 +179,7 @@ pub(crate) async fn run() -> anyhow::Result<()> {
         tokio::spawn(async move {
             let internal_app = build_internal_router(internal_state);
             if let Err(e) = axum::serve(
-                internal_listener,
+                internal_listener.tap_io(configure_http_socket),
                 internal_app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
             )
             .with_graceful_shutdown(deployment::shutdown_signal())
@@ -169,14 +190,20 @@ pub(crate) async fn run() -> anyhow::Result<()> {
         })
     };
 
+    crate::preparation::spawn(state.clone());
+
     // --- ルータ ---
     let app_server = if let Ok(addr) = std::env::var("APP_BIND_ADDR") {
         let listener = tokio::net::TcpListener::bind(&addr).await?;
         let apps = Router::new()
             .fallback(ingress::ingress_fallback)
+            .layer(axum::middleware::from_fn_with_state(
+                state.clone(),
+                crate::maintenance::public_gate,
+            ))
             .with_state(state.clone());
         Some(tokio::spawn(async move {
-            axum::serve(listener, apps)
+            axum::serve(listener.tap_io(configure_http_socket), apps)
                 .with_graceful_shutdown(deployment::shutdown_signal())
                 .await
         }))
@@ -191,7 +218,7 @@ pub(crate) async fn run() -> anyhow::Result<()> {
     // SocketAddr をハンドラへ届ける必要がある。`into_make_service_with_connect_info`
     // で ConnectInfo<SocketAddr> を有効化する（これが無いと login の IP 抽出が機能しない）。
     axum::serve(
-        listener,
+        listener.tap_io(configure_http_socket),
         app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
     )
     .with_graceful_shutdown(deployment::shutdown_signal())

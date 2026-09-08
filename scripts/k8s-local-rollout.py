@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Verify HTTP requests during a Worker rolling restart in the owned kind cluster.
 
-Run k8s-local-smoke.sh and keep k8s-local.sh forward running first.
+Run hibana platform install and hibana platform test first. Local NodePorts stay available during rollout.
 This checks Worker Pod replacement, not physical HA or Control Plane replacement.
 """
 import json
@@ -12,8 +12,12 @@ import urllib.request
 from pathlib import Path
 
 root = Path(__file__).resolve().parents[1]
-kube = ["kubectl", "--kubeconfig", str(root / ".local/kubernetes/kubeconfig"),
-        "--context", "kind-hibana-dev", "-n", "hibana"]
+import sys
+sys.path.insert(0, str(root / "sdk/platform"))
+from kubernetes import LocalCluster
+cluster = LocalCluster(os.environ.get("HIBANA_CLUSTER", "hibana"))
+cluster.require_owned()
+kube = [*cluster.kubectl, "-n", "hibana"]
 
 
 def workers():
@@ -30,7 +34,7 @@ def get(path):
 
 
 before = workers()
-assert json.loads(get("/")) == {"message": "Hello Hibana"}
+assert json.loads(get("/")) == {"message": "Hello from Hono on Hibana 🔥"}
 subprocess.run(kube + ["rollout", "restart", "deployment/hibana-worker"], check=True)
 rollout = subprocess.Popen(kube + ["rollout", "status", "deployment/hibana-worker", "--timeout=180s"])
 count = 0
@@ -39,7 +43,7 @@ try:
     # Deployment availability can precede completion of old Pods' graceful shutdown.
     while count < 30 or rollout.poll() is None or not before.isdisjoint(workers()):
         assert time.monotonic() < deadline, "Worker rollout exceeded test deadline"
-        assert json.loads(get("/")) == {"message": "Hello Hibana"}
+        assert json.loads(get("/")) == {"message": "Hello from Hono on Hibana 🔥"}
         count += 1
         time.sleep(1)
     assert rollout.wait() == 0, "Worker rollout failed"

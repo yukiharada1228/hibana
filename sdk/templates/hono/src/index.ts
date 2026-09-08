@@ -1,7 +1,7 @@
-import { Hono } from "hono";
+import { Hono } from 'hono'
 
-const app = new Hono<{ Bindings: { GREETING: string } }>();
-app.get("/", c => c.json({ message: c.env.GREETING }));
-app.post("/echo", async c => c.body(await c.req.arrayBuffer()));
+const app = new Hono()
 
-export default app;
+app.get('/', (c) => c.text('Hello from Hono on Hibana 🔥'))
+
+export default app

@@ -141,7 +141,7 @@ impl SecretKeyring {
 
 /// AEAD の AAD を正準化して組み立てる。
 ///
-/// `faas_shared::job_claims_signing_bytes` と**同じ作法**（ドメインタグ + 4 バイト BE 長さ前置 +
+/// `hibana_shared::job_claims_signing_bytes` と**同じ作法**（ドメインタグ + 4 バイト BE 長さ前置 +
 /// UTF-8）。serde_json を使わないのは同じ理由 —— map/key 順序や空白が非正準で、書き手と読み手の
 /// 間でドリフトすると復号が黙って壊れる（あるいは貼り替えを見逃す）。
 fn aad_bytes(domain: &[u8], fields: &[&[u8]], trailing_be: &[u8]) -> Vec<u8> {
@@ -387,7 +387,7 @@ pub struct ResolvedSecret {
     /// 実際に注入した世代（execution 基準で固定された値）。監査・デバッグ用。
     #[allow(dead_code)]
     pub version: i32,
-    pub value: faas_shared::Redacted<String>,
+    pub value: hibana_shared::Redacted<String>,
 }
 
 /// job-env 引き換え専用の復号 API (§5.2)。**secrets.rs が公開する復号系はこれ 1 本だけ**。
@@ -401,17 +401,18 @@ pub struct ResolvedSecret {
 /// 保持しているのだから、注入側もその利点を使う。
 ///
 /// → `executions.created_at` 以前に作られた**最大 version** を `JOIN LATERAL` で取る。
-/// `ON TRUE` は INNER 相当なので、**世代を 1 つも解決できない secret は行が返らない**。
-/// 生存 secret があるのに世代が解決できないケースは呼び出し側が検出して fail-closed に倒す。
+/// LEFT JOINで生存Secretを残し、世代がなければ同一SQLスナップショット内で
+/// fail-closedにする。別のcountクエリとの間の削除・作成競合も避ける。
 /// `reason='rekey'` 行は同一平文なので選ばれても等価。
 ///
-/// `allowed` は `capabilities.env`（admin 承認）の許可リスト。**許可リストが権威**であり、
-/// 値が DB に存在しても載っていない名前は返さない（worker 側にも同じフィルタがある二重防御）。
+/// 版のversion_secret_bindingsが参照するSecret IDだけを解決する。`allowed`は
+/// capabilities.envによる追加のフィルタで、varsと同名のSecretを誤って取得しない。
 pub async fn resolve_for_injection(
     tx: &mut sqlx::PgConnection,
     keyring: &SecretKeyring,
     tenant_id: &str,
     component_id: &str,
+    version_id: &str,
     execution_created_at: chrono::DateTime<chrono::Utc>,
     allowed: &std::collections::BTreeSet<String>,
 ) -> Result<Vec<ResolvedSecret>, SecretError> {
@@ -427,35 +428,21 @@ pub async fn resolve_for_injection(
         .bind(component_id)
         .bind(execution_created_at)
         .bind(&names)
+        .bind(version_id)
         .fetch_all(&mut *tx)
         .await
         .map_err(|_| SecretError::VersionUnresolved)?;
 
-    // 生存 secret の件数と解決できた世代の件数が食い違ったら fail-closed（§4.7.1）。
-    let live: i64 = sqlx::query(
-        "SELECT count(*) AS n FROM function_secrets \
-          WHERE tenant_id = $1 AND component_id = $2 AND deleted_at IS NULL AND name = ANY($3)",
-    )
-    .bind(tenant_id)
-    .bind(component_id)
-    .bind(&names)
-    .fetch_one(&mut *tx)
-    .await
-    .map_err(|_| SecretError::VersionUnresolved)?
-    .try_get("n")
-    .map_err(|_| SecretError::VersionUnresolved)?;
-
-    if live != rows.len() as i64 {
-        return Err(SecretError::VersionUnresolved);
-    }
-
     let mut out = Vec::with_capacity(rows.len());
     for r in rows {
+        let version = r
+            .try_get::<Option<i32>, _>("version")
+            .map_err(|_| SecretError::BadEnvelope)?
+            .ok_or(SecretError::VersionUnresolved)?;
         let secret_id: String = r
             .try_get("secret_id")
             .map_err(|_| SecretError::BadEnvelope)?;
         let name: String = r.try_get("name").map_err(|_| SecretError::BadEnvelope)?;
-        let version: i32 = r.try_get("version").map_err(|_| SecretError::BadEnvelope)?;
         let envelope = Envelope {
             kek_kid: r.try_get("kek_kid").map_err(|_| SecretError::BadEnvelope)?,
             wrapped_dek: r
@@ -487,7 +474,7 @@ pub async fn resolve_for_injection(
         out.push(ResolvedSecret {
             name,
             version,
-            value: faas_shared::Redacted::new(value),
+            value: hibana_shared::Redacted::new(value),
         });
     }
     Ok(out)
@@ -497,7 +484,9 @@ pub async fn resolve_for_injection(
 const SECRET_INJECTION_SQL: &str = "SELECT s.id AS secret_id, s.name, \
         v.version, v.kek_kid, v.wrapped_dek, v.dek_nonce, v.nonce, v.ciphertext, v.value_len \
    FROM function_secrets s \
-   JOIN LATERAL ( \
+   JOIN version_secret_bindings b ON b.tenant_id=s.tenant_id AND b.component_id=s.component_id \
+     AND b.secret_id=s.id AND b.name=s.name AND b.version_id=$5 \
+   LEFT JOIN LATERAL ( \
         SELECT * FROM function_secret_versions v2 \
          WHERE v2.tenant_id = s.tenant_id AND v2.secret_id = s.id \
            AND v2.created_at <= $3 \

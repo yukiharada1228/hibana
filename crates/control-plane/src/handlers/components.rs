@@ -9,9 +9,7 @@ use axum::extract::{Multipart, Path, State};
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
 use axum::Json;
-use faas_shared::{
-    component_object_key, new_component_id, new_version_id, FaasError, ResourceLimits,
-};
+use hibana_shared::{new_component_id, new_version_id, FaasError, ResourceLimits};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
@@ -81,7 +79,11 @@ pub struct UploadVersionResponse {
 /// - `version` (必須): semver
 /// - `wasm` (必須): wasm component バイナリ
 /// - `capabilities` (任意): JSON。M2 は受理して検証結果と整合確認するのみ（列保存は §4.4）
-/// - `resource_limits` (任意): JSON (faas_shared::ResourceLimits)
+/// - `resource_limits` (任意): JSON (hibana_shared::ResourceLimits)
+/// - `vars` (任意): 平文環境変数のJSONマップ。既定は空。
+/// - `secrets` (任意): 管理者が配備利用を許可したSecret名のJSON配列。既定は空。
+/// - `activate` (任意): JSON boolean。既定はtrue。
+/// - `ingress` (任意): JSON boolean。activate=true時だけ指定可。省略時は現状維持。
 ///
 /// §6.2 の順序:
 /// 1. 受信ストリーミング中に MAX_WASM_UPLOAD_BYTES を強制（超過は打ち切り→413）
@@ -105,6 +107,8 @@ pub async fn upload_version(
         .await?
         .ok_or_else(|| FaasError::NotFound(format!("component '{component_id}'")))?;
 
+    tx.commit().await?; // No DB transaction while receiving or validating the upload.
+
     // --- multipart フィールドを収集 ---
     let mut version: Option<String> = None;
     let mut wasm_bytes: Option<Vec<u8>> = None;
@@ -113,6 +117,9 @@ pub async fn upload_version(
     let mut signature: Option<String> = None;
     let mut resource_limits: ResourceLimits = ResourceLimits::default();
     let mut activate = true;
+    let mut ingress: Option<bool> = None;
+    let mut environment = super::deployment::VersionEnvironment::default();
+    let mut fields = std::collections::BTreeSet::new();
 
     let max_bytes = state.max_wasm_upload_bytes();
 
@@ -121,6 +128,11 @@ pub async fn upload_version(
         .await
         .map_err(|e| FaasError::InvalidRequest(format!("malformed multipart: {e}")))?
     {
+        if let Some(name) = field.name() {
+            if !fields.insert(name.to_owned()) {
+                return Err(FaasError::InvalidRequest("duplicate multipart field".into()).into());
+            }
+        }
         match field.name() {
             Some("version") => {
                 let v = field.text().await.map_err(|e| {
@@ -135,8 +147,7 @@ pub async fn upload_version(
                 let parsed: Value = serde_json::from_str(&text).map_err(|e| {
                     FaasError::InvalidRequest(format!("capabilities is not valid JSON: {e}"))
                 })?;
-                // M7b (§4.4): env 許可リストは admin 承認の対象。deploy スコープのこの経路で
-                // 宣言されたら 400 で拒否する（黙って無視すると「設定したのに効かない」になる）。
+                // envはvarsと承認済みSecret参照から構築する。生のcapabilities.envは拒否。
                 validation::reject_env_in_declared_capabilities(&parsed)?;
                 capabilities = Some(parsed);
             }
@@ -169,12 +180,27 @@ pub async fn upload_version(
                 }
                 wasm_bytes = Some(buf);
             }
-            Some("activate") => {
-                let text = field.text().await.map_err(|e| {
-                    FaasError::InvalidRequest(format!("invalid activate field: {e}"))
-                })?;
-                // `"false"` だけを false と解釈する（未知値は既定 true ＝ 従来挙動へ倒す）。
-                activate = !text.trim().eq_ignore_ascii_case("false");
+            Some("activate" | "ingress" | "vars" | "secrets") => {
+                let name = field.name().unwrap().to_owned();
+                let text = field
+                    .text()
+                    .await
+                    .map_err(|_| FaasError::InvalidRequest("invalid deployment field".into()))?;
+                // Do not include JSON parser errors: they can quote user-supplied values.
+                let invalid = || FaasError::InvalidRequest(format!("invalid {name} field"));
+                match name.as_str() {
+                    "activate" => activate = serde_json::from_str(&text).map_err(|_| invalid())?,
+                    "ingress" => {
+                        ingress = Some(serde_json::from_str(&text).map_err(|_| invalid())?)
+                    }
+                    "vars" => {
+                        environment.vars = serde_json::from_str(&text).map_err(|_| invalid())?
+                    }
+                    "secrets" => {
+                        environment.secrets = serde_json::from_str(&text).map_err(|_| invalid())?
+                    }
+                    _ => unreachable!(),
+                }
             }
             Some("signature") => {
                 // M9a: 本体 sha256 に対する detached Ed25519 署名（base64url）。
@@ -200,6 +226,11 @@ pub async fn upload_version(
         .filter(|b| !b.is_empty())
         .ok_or_else(|| FaasError::InvalidRequest("missing required field 'wasm'".into()))?;
 
+    let allowed_env = environment.validate()?;
+    if ingress.is_some() && !activate {
+        return Err(FaasError::InvalidRequest("ingress requires activate=true".into()).into());
+    }
+
     // (2)(3)(4) 隔離検証 + §4.4 capability strict matching + sha256/サイズ確定。
     //
     // §4.4 (M3d): capability は既定 **deny-all**。クライアント宣言値（multipart `capabilities`）は
@@ -209,6 +240,52 @@ pub async fn upload_version(
     // **承認済みとして解決した import 集合**（validated.approved_imports）を使う。
     let approved = validation::ApprovedCapabilities::baseline();
     let validated = validation::validate_wasm(wasm_bytes.clone(), approved).await?;
+
+    if let Some(caps) = &capabilities {
+        // 宣言値は監査・観測用にログするのみ（保存・付与には使わない, §4.4）。
+        tracing::debug!(declared = ?caps, imports = ?validated.imports, "client-declared capabilities (not trusted; persisting resolved approved set)");
+    }
+    // §4.4 MUST: クライアント宣言値ではなく、承認集合と照合して解決した import を保存する。
+    //
+    // Plain vars and selected, separately authorized Secrets form the environment.
+    // Egress stays deny-all until an administrator approves it.
+    let capabilities_json = validation::CapabilitySet {
+        imports: validated.approved_imports.clone(),
+        env: allowed_env,
+        net_allow_outbound: std::collections::BTreeSet::new(),
+    }
+    .to_json();
+
+    // (5) 検証通過 → MinIO 保存 → INSERT(active) → active 化。
+    let version_id = new_version_id();
+    // Immutable identity: retries and recreated names must never overwrite an accepted artifact.
+    let object_key = format!("{tenant}/versions/{version_id}.wasm");
+    state
+        .storage()
+        .put_object(&object_key, wasm_bytes, "application/wasm")
+        .await?;
+
+    // Prepare before acquiring publication locks: the old version keeps serving.
+    // This only compiles verified Wasm; the handler is never called and no Secrets are supplied.
+    crate::preparation::prepare(&state, tenant, &object_key, &validated.sha256).await?;
+
+    // Recheck the component and signing policy after external I/O. These locks
+    // serialize publication with deletion and policy changes, in a short transaction.
+    let mut tx = state.pool().begin().await?;
+    db::set_tenant_guc(&mut tx, tenant).await?;
+    sqlx::query("SELECT id FROM tenants WHERE id=$1 AND status='active' FOR SHARE")
+        .bind(tenant)
+        .fetch_optional(&mut *tx)
+        .await?
+        .ok_or_else(|| FaasError::NotFound("active tenant".into()))?;
+    sqlx::query(
+        "SELECT id FROM components WHERE tenant_id=$1 AND id=$2 AND deleted_at IS NULL FOR UPDATE",
+    )
+    .bind(tenant)
+    .bind(&component_id)
+    .fetch_optional(&mut *tx)
+    .await?
+    .ok_or_else(|| FaasError::NotFound(format!("component '{component_id}'")))?;
 
     // M9a (§6.2): 供給網検証 —— テナントが登録した公開鍵での署名検証。
     //
@@ -271,34 +348,6 @@ pub async fn upload_version(
         }
     }
 
-    if let Some(caps) = &capabilities {
-        // 宣言値は監査・観測用にログするのみ（保存・付与には使わない, §4.4）。
-        tracing::debug!(declared = ?caps, imports = ?validated.imports, "client-declared capabilities (not trusted; persisting resolved approved set)");
-    }
-    // §4.4 MUST: クライアント宣言値ではなく、承認集合と照合して解決した import を保存する。
-    //
-    // M7b: `capabilities.env`（注入を許可する env 名の許可リスト）は **admin 承認**の対象であり、
-    // Deploy スコープのこの経路では**常に空**（deny-all）で保存する。deploy トークンが
-    // `env: ["PROD_API_KEY"]` を宣言できると、その wasm が `wasi:cli/environment`（baseline 承認済み）
-    // で読んだ値を invoke 出力へ返すだけで admin 専用の secret を平文で取得できる（権限昇格）。
-    // M9c: egress allowlist も upload（deploy スコープ）では**常に空**（deny-all）で保存する。
-    // `wasi:sockets/*` の import は baseline 承認だが、実際の外部到達は admin が
-    // `PUT .../capabilities/egress` で承認するまで worker の socket_addr_check が全拒否する。
-    let capabilities_json = validation::CapabilitySet {
-        imports: validated.approved_imports.clone(),
-        env: std::collections::BTreeSet::new(),
-        net_allow_outbound: std::collections::BTreeSet::new(),
-    }
-    .to_json();
-
-    // (5) 検証通過 → MinIO 保存 → INSERT(active) → active 化。
-    let object_key = component_object_key(tenant, &component.name, &version);
-    state
-        .storage()
-        .put_object(&object_key, wasm_bytes, "application/wasm")
-        .await?;
-
-    let version_id = new_version_id();
     let limits_json = serde_json::to_value(resource_limits)?;
 
     db::insert_version(
@@ -318,6 +367,14 @@ pub async fn upload_version(
     // 同一 (component_id, version) 上書きは禁止 (§6.7 MUST NOT) → 409/422。
     .map_err(|e| map_unique_violation(e, "version already exists for this component"))?;
 
+    environment
+        .save(&mut tx, tenant, &component.id, &version_id)
+        .await?;
+    if let Some(enabled) = ingress {
+        db::set_component_ingress(&mut *tx, tenant, &component.id, enabled).await?;
+    }
+    db::insert_audit_log(&mut *tx, tenant, principal.user_id.as_deref(), "version_environment_published", Some(&component.id),
+        Some(&json!({"version_id": version_id, "vars": environment.vars.keys().collect::<Vec<_>>(), "secrets": environment.secrets}))).await?;
     if activate {
         db::switch_active_version(&mut *tx, tenant, &component.id, &version_id).await?;
     }
@@ -439,29 +496,72 @@ pub async fn delete_component(
     principal: Principal,
     Path(component_id): Path<String>,
 ) -> Result<impl IntoResponse, AppError> {
-    let tenant = &principal.tenant_id;
+    delete_for_tenant(&state, &principal.tenant_id, &component_id).await?;
+    Ok(StatusCode::NO_CONTENT)
+}
 
+async fn delete_for_tenant(
+    state: &AppState,
+    tenant: &str,
+    component_id: &str,
+) -> Result<(), AppError> {
     let mut tx = state.pool().begin().await?;
     db::set_tenant_guc(&mut tx, tenant).await?;
 
-    // 存在確認（不在は 404）。
-    db::find_component_by_id(&mut *tx, tenant, &component_id)
-        .await?
-        .ok_or_else(|| FaasError::NotFound(format!("component '{component_id}'")))?;
+    // Serialize deletion with HTTP admission so a new execution cannot slip
+    // between the active-execution check and the tombstone update.
+    sqlx::query(
+        "SELECT id FROM components WHERE tenant_id=$1 AND id=$2 AND deleted_at IS NULL FOR UPDATE",
+    )
+    .bind(tenant)
+    .bind(component_id)
+    .fetch_optional(&mut *tx)
+    .await?
+    .ok_or_else(|| FaasError::NotFound(format!("component '{component_id}'")))?;
 
     // 参照中の実行があれば保護（§6.7）。
-    if db::has_active_executions_for_component(&mut *tx, tenant, &component_id).await? {
+    if db::has_active_executions_for_component(&mut *tx, tenant, component_id).await? {
         return Err(FaasError::Conflict(format!(
             "component '{component_id}' has pending/running executions"
         ))
         .into());
     }
 
-    db::soft_delete_component(&mut *tx, tenant, &component_id).await?;
+    db::soft_delete_component(&mut *tx, tenant, component_id).await?;
 
     tx.commit().await?;
 
     tracing::info!(component_id = %component_id, "component soft-deleted");
+    Ok(())
+}
+
+/// Platform-wide inventory includes suspended test tenants, without bypassing RLS.
+pub async fn admin_list_components(
+    State(state): State<AppState>,
+    headers: axum::http::HeaderMap,
+) -> Result<Json<Vec<Value>>, AppError> {
+    super::tenants::require_bootstrap_admin(&headers, &state)?;
+    let mut result = Vec::new();
+    for (tenant_id, tenant_slug) in db::list_tenants_for_admin(state.pool()).await? {
+        let mut tx = state.pool().begin().await?;
+        db::set_tenant_guc(&mut tx, &tenant_id).await?;
+        for item in db::list_components(&mut *tx, &tenant_id).await? {
+            result.push(json!({"tenant_id": tenant_id, "tenant_slug": tenant_slug,
+                "component_id": item.component_id, "name": item.name,
+                "active_version_id": item.active_version_id}));
+        }
+        tx.commit().await?;
+    }
+    Ok(Json(result))
+}
+
+pub async fn admin_delete_component(
+    State(state): State<AppState>,
+    headers: axum::http::HeaderMap,
+    Path((tenant_id, component_id)): Path<(String, String)>,
+) -> Result<StatusCode, AppError> {
+    super::tenants::require_bootstrap_admin(&headers, &state)?;
+    delete_for_tenant(&state, &tenant_id, &component_id).await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -579,6 +679,11 @@ pub async fn set_active_version(
             ))
         })?;
 
+    tx.commit().await?;
+    crate::preparation::prepare_version(&state, tenant, &target_version_id).await?;
+    let mut tx = state.pool().begin().await?;
+    db::set_tenant_guc(&mut tx, tenant).await?;
+
     if !db::switch_active_version(&mut *tx, tenant, &component_id, &target_version_id).await? {
         return Err(FaasError::NotFound(format!("component '{component_id}'")).into());
     }
@@ -687,13 +792,36 @@ pub async fn rollback_version(
         _ => None,
     };
 
-    let rolled = db::rollback_active_version(
-        &mut *tx,
-        tenant,
-        &component_id,
-        target_version_id.as_deref(),
-    )
-    .await?;
+    let prepared_target = match target_version_id.as_ref() {
+        Some(id) => id.clone(),
+        None => db::find_component_by_id(&mut *tx, tenant, &component_id)
+            .await?
+            .ok_or_else(|| FaasError::NotFound("component".into()))?
+            .previous_active_version_id
+            .ok_or_else(|| {
+                FaasError::Conflict("no previous version to roll back to; specify a version".into())
+            })?,
+    };
+    tx.commit().await?;
+    crate::preparation::prepare_version(&state, tenant, &prepared_target).await?;
+    let mut tx = state.pool().begin().await?;
+    db::set_tenant_guc(&mut tx, tenant).await?;
+    // An implicit rollback must not silently choose a different, unprepared target
+    // if another publication completed while preparation was in flight.
+    let current_previous: Option<Option<String>> = sqlx::query_scalar(
+        "SELECT previous_active_version_id FROM components WHERE tenant_id=$1 AND id=$2 AND deleted_at IS NULL FOR UPDATE")
+        .bind(tenant).bind(&component_id).fetch_optional(&mut *tx).await?;
+    if target_version_id.is_none()
+        && current_previous.flatten().as_deref() != Some(prepared_target.as_str())
+    {
+        return Err(FaasError::Conflict(
+            "rollback target changed during preparation; retry".into(),
+        )
+        .into());
+    }
+    let rolled =
+        db::rollback_active_version(&mut *tx, tenant, &component_id, Some(&prepared_target))
+            .await?;
 
     // 0 行のときだけ理由を確定する。
     let Some((active_version_id, rolled_back_from)) = rolled else {

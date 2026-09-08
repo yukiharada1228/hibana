@@ -176,19 +176,22 @@ pub async fn soft_delete_secret(
     Ok(r.rows_affected() > 0)
 }
 
-pub async fn component_has_live_secrets(
+pub async fn version_has_live_secrets(
     executor: impl sqlx::PgExecutor<'_>,
     tenant_id: &str,
     component_id: &str,
+    version_id: &str,
 ) -> Result<bool, sqlx::Error> {
     let row = sqlx::query(
         "SELECT EXISTS ( \
-             SELECT 1 FROM function_secrets \
-              WHERE tenant_id = $1 AND component_id = $2 AND deleted_at IS NULL \
+             SELECT 1 FROM function_secrets s \
+             JOIN version_secret_bindings b ON b.tenant_id=s.tenant_id AND b.component_id=s.component_id AND b.secret_id=s.id AND b.name=s.name \
+             WHERE s.tenant_id=$1 AND s.component_id=$2 AND b.version_id=$3 AND s.deleted_at IS NULL \
          ) AS present",
     )
     .bind(tenant_id)
     .bind(component_id)
+    .bind(version_id)
     .fetch_one(executor)
     .await?;
     row.try_get("present")

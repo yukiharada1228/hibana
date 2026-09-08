@@ -1,5 +1,5 @@
 use anyhow::Context;
-use faas_shared::Redacted;
+use hibana_shared::Redacted;
 
 const DEFAULT_MAX_WASM_UPLOAD_BYTES: u64 = 32 * 1024 * 1024;
 const DEFAULT_PRESIGN_TTL_SECS: u64 = 300;
@@ -15,7 +15,12 @@ const DEFAULT_REAPER_INTERVAL_SECS: u64 = 30;
 const DEFAULT_STUCK_EXECUTION_DEADLINE_SECS: u64 = 900;
 
 const DEFAULT_INTERNAL_BIND_ADDR: &str = "127.0.0.1:8081";
-const DEFAULT_JOB_ENV_EXCHANGE_RATE_PER_MIN: u64 = 600;
+// An admitted request may redeem Secrets once before executing. The default
+// internal budget must cover the public default rate plus its initial burst.
+// Operators raising tenant quotas or sharing many tenants across Worker IPs must
+// also size this per-tenant/per-peer protection explicitly.
+const DEFAULT_JOB_ENV_EXCHANGE_RATE_PER_MIN: u64 =
+    DEFAULT_INVOKE_RATE_PER_SEC * 60 + DEFAULT_INVOKE_BURST;
 
 const DEFAULT_METRICS_INCLUDE_TENANT_LABEL: bool = true;
 
@@ -108,33 +113,11 @@ impl Config {
     }
 
     pub fn secret_keyring(&self) -> anyhow::Result<crate::secrets::SecretKeyring> {
-        let active =
-            crate::signing::decode_key32(self.secrets_master_key.expose(), "SECRETS_MASTER_KEY")?;
-
-        let mut retired = Vec::new();
-        for entry in self.secrets_retired_keys.expose().split(',') {
-            let entry = entry.trim();
-            if entry.is_empty() {
-                continue;
-            }
-            let (kid, raw) = entry.split_once(':').ok_or_else(|| {
-                anyhow::anyhow!("SECRETS_RETIRED_KEYS entries must be 'kid:key' (comma separated)")
-            })?;
-            let kid = kid.trim();
-            if kid.is_empty() {
-                anyhow::bail!("SECRETS_RETIRED_KEYS: empty kid");
-            }
-            retired.push((
-                kid.to_string(),
-                crate::signing::decode_key32(raw.trim(), "SECRETS_RETIRED_KEYS")?,
-            ));
-        }
-
-        Ok(crate::secrets::SecretKeyring::new(
-            self.secrets_master_kid.clone(),
-            active,
-            retired,
-        ))
+        parse_secret_keyring(
+            &self.secrets_master_kid,
+            self.secrets_master_key.expose(),
+            self.secrets_retired_keys.expose(),
+        )
     }
 
     pub fn from_env() -> anyhow::Result<Self> {
@@ -163,7 +146,7 @@ impl Config {
 
             s3_endpoint: env_or("S3_ENDPOINT", "http://127.0.0.1:9000"),
             s3_region: env_or("S3_REGION", "us-east-1"),
-            s3_bucket: env_or("S3_BUCKET", "faas-components"),
+            s3_bucket: env_or("S3_BUCKET", "hibana-components"),
             s3_access_key: env_or("S3_ACCESS_KEY", "minioadmin"),
             s3_secret_key: Redacted::new(env_or("S3_SECRET_KEY", "minioadmin")),
 
@@ -288,9 +271,73 @@ fn env_u64(key: &str, default: u64) -> anyhow::Result<u64> {
     }
 }
 
+pub(crate) fn parse_secret_keyring(
+    active_kid: &str,
+    active_raw: &str,
+    retired_raw: &str,
+) -> anyhow::Result<crate::secrets::SecretKeyring> {
+    let active = crate::signing::decode_key32(active_raw, "SECRETS_MASTER_KEY")?;
+
+    let mut retired = Vec::new();
+    for entry in retired_raw.split(',') {
+        let entry = entry.trim();
+        if entry.is_empty() {
+            continue;
+        }
+        let (kid, raw) = entry.split_once(':').ok_or_else(|| {
+            anyhow::anyhow!("SECRETS_RETIRED_KEYS entries must be 'kid:key' (comma separated)")
+        })?;
+        let kid = kid.trim();
+        if kid.is_empty() {
+            anyhow::bail!("SECRETS_RETIRED_KEYS: empty kid");
+        }
+        retired.push((
+            kid.to_string(),
+            crate::signing::decode_key32(raw.trim(), "SECRETS_RETIRED_KEYS")?,
+        ));
+    }
+
+    Ok(crate::secrets::SecretKeyring::new(
+        active_kid.to_owned(),
+        active,
+        retired,
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn admitted_default_traffic_can_redeem_secrets() {
+        use crate::store::{InProcStore, RateLimitParams, Store};
+        let store = InProcStore::new();
+        let public = RateLimitParams {
+            refill_per_sec: DEFAULT_INVOKE_RATE_PER_SEC as f64,
+            capacity: DEFAULT_INVOKE_BURST as f64,
+        };
+        let internal = RateLimitParams {
+            refill_per_sec: DEFAULT_JOB_ENV_EXCHANGE_RATE_PER_MIN as f64 / 60.0,
+            capacity: DEFAULT_JOB_ENV_EXCHANGE_RATE_PER_MIN as f64,
+        };
+        // Initial public burst, then two minutes at the admitted steady rate.
+        // The previous 600/min internal default exhausted while public admission
+        // still succeeded, turning otherwise valid Secret-backed HTTP into 502s.
+        for now in
+            std::iter::repeat_n(0, DEFAULT_INVOKE_BURST as usize).chain((20..=120_000).step_by(20))
+        {
+            assert!(
+                store
+                    .rate_limit("public", public, now)
+                    .await
+                    .unwrap()
+                    .allowed
+            );
+            for key in ["env-peer", "env-tenant"] {
+                assert!(store.rate_limit(key, internal, now).await.unwrap().allowed);
+            }
+        }
+    }
 
     #[test]
     fn debug_never_reveals_secrets() {

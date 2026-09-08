@@ -1,20 +1,18 @@
 import { readFile, writeFile, mkdir, chmod } from "node:fs/promises";
 import { join } from "node:path";
 
-export async function apiClient(root) {
-  let saved = {};
-  try { saved = JSON.parse(await readFile(join(root, ".hibana/auth.json"), "utf8")); }
-  catch (error) { if (error.code !== "ENOENT") throw error; }
-  const url = (process.env.HIBANA_URL || saved.url || "http://127.0.0.1:8080").replace(/\/$/, "");
-  const parsed = new URL(url);
-  if (parsed.protocol !== "https:" && !(parsed.protocol === "http:" && ["localhost", "127.0.0.1", "[::1]"].includes(parsed.hostname))) throw new Error("HIBANA_URL must use HTTPS (HTTP is allowed on loopback)");
-  // Never reuse a saved token for a different server.
-  let token = process.env.HIBANA_TOKEN || (saved.url === url ? saved.token : undefined);
-  async function request(path, { method = "GET", body, auth = true } = {}) {
+import { connection, saveProfile } from "./profiles.mjs";
+
+export async function apiClient(root, options = {}) {
+  const { token: savedToken, ...selected } = await connection(root, options);
+  const { url } = selected;
+  let token = savedToken;
+  async function request(path, { method = "GET", body, auth = true, signal } = {}) {
     if (auth && !token) throw new Error("Run hibana login, or set HIBANA_TOKEN");
     const headers = auth ? { Authorization: `Bearer ${token}` } : {};
     if (body !== undefined && !(body instanceof FormData)) { headers["Content-Type"] = "application/json"; body = JSON.stringify(body); }
-    const response = await fetch(url + path, { method, headers, body, redirect: "error", signal: AbortSignal.timeout(120000) });
+    const deadline = AbortSignal.timeout(120000);
+    const response = await fetch(url + path, { method, headers, body, redirect: "error", signal: signal ? AbortSignal.any([signal, deadline]) : deadline });
     const text = await response.text();
     let result;
     try { result = text ? JSON.parse(text) : {}; } catch { result = {}; }
@@ -22,12 +20,17 @@ export async function apiClient(root) {
     if (!response.ok) throw new Error(`${method} ${path}: HTTP ${response.status}`);
     return result;
   }
-  return { request, async login() {
-    const { HIBANA_TENANT: tenant, HIBANA_EMAIL: email, HIBANA_PASSWORD: password } = process.env;
-    if (!tenant || !email || !password) throw new Error("Set HIBANA_TENANT, HIBANA_EMAIL and HIBANA_PASSWORD to log in");
+  return { ...selected, request, async login({ password = process.env.HIBANA_PASSWORD, persist = "project" } = {}) {
+    const { tenant, email } = selected;
+    if (!tenant || !email || !password) throw new Error("Specify --tenant, --email and --password-stdin (or HIBANA_TENANT, HIBANA_EMAIL and HIBANA_PASSWORD) to log in");
     const result = await request("/auth/login", { method: "POST", auth: false, body: { tenant_slug: tenant, email, password } });
     token = result.token;
     if (typeof token !== "string" || !token) throw new Error("Login returned no access token");
+    if (persist === "profile") {
+      const { profile, ...value } = selected;
+      await saveProfile(profile, { ...value, token });
+      return profile;
+    }
     await mkdir(join(root, ".hibana"), { recursive: true, mode: 0o700 });
     const path = join(root, ".hibana/auth.json");
     await writeFile(path, JSON.stringify({ url, token }) + "\n", { mode: 0o600 });
@@ -47,16 +50,13 @@ export async function deploy(api, config, artifact, version) {
   const base = `/components/${encodeURIComponent(id)}`;
   const form = new FormData();
   form.set("version", version);
-  form.set("activate", "false");
+  form.set("activate", "true");
+  form.set("ingress", "true");
+  form.set("vars", JSON.stringify(config.vars));
+  form.set("secrets", JSON.stringify(config.secrets ?? []));
   form.set("resource_limits", JSON.stringify(config.resources));
   form.set("wasm", new Blob([await readFile(artifact)], { type: "application/wasm" }), "component.wasm");
   await api.request(`${base}/versions`, { method: "POST", body: form });
-  // Resolve all environment grants before making this version active.
-  const secrets = await api.request(`${base}/secrets/keys`);
-  await api.request(`${base}/config`, { method: "PUT", body: { env: config.vars } });
-  await api.request(`${base}/versions/${encodeURIComponent(version)}/capabilities`, { method: "PUT", body: { env: [...new Set([...Object.keys(config.vars), ...secrets.secrets.map(s => s.name)])] } });
-  await api.request(`${base}/active-version`, { method: "PUT", body: { version } });
-  await api.request(`${base}/ingress`, { method: "PUT", body: { enabled: true } });
   return { component_id: id, version };
 }
 

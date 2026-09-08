@@ -1,15 +1,15 @@
 [package]
-name = "faas-worker"
+name = "hibana-worker"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 
 [[bin]]
-name = "faas-worker"
+name = "hibana-worker"
 path = "src/main.rs"
 
 [dependencies]
-faas-shared = { workspace = true }
+hibana-shared = { workspace = true }
 
 tokio = { workspace = true }
 
@@ -26,8 +26,7 @@ reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"
 sha2 = { workspace = true }
 # --- in-memory Component キャッシュ (§3.6)。
 lru = "0.18.4"
-# M11-6 (§6.6): sha ごとの precompile single-flight ロック用（stampede 防止）。
-dashmap = { workspace = true }
+libc = "0.2"
 wasmtime = { workspace = true }
 wasmtime-wasi = { workspace = true }
 wasmtime-wasi-http = { workspace = true }

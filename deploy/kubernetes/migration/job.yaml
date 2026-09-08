@@ -30,7 +30,7 @@ spec:
         - name: migrate
           image: hibana-platform
           imagePullPolicy: IfNotPresent
-          command: ["/usr/local/bin/control-plane", "--migrate-only"]
+          command: ["/usr/local/bin/hibana-control-plane", "--migrate-only"]
           env:
             - name: MIGRATION_DATABASE_URL
               valueFrom:

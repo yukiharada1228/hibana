@@ -101,6 +101,8 @@ pub struct AppState {
     inner: Arc<Inner>,
 }
 struct Inner {
+    public_requests: Arc<crate::maintenance::Requests>,
+    worker_http: reqwest::Client,
     pool: PgPool,
     storage: Storage,
     max_wasm_upload_bytes: u64,
@@ -138,6 +140,14 @@ impl AppState {
     ) -> Self {
         Self {
             inner: Arc::new(Inner {
+                public_requests: Arc::default(),
+                worker_http: reqwest::Client::builder()
+                    .no_proxy()
+                    .redirect(reqwest::redirect::Policy::none())
+                    .connect_timeout(Duration::from_secs(3))
+                    .read_timeout(Duration::from_secs(60))
+                    .build()
+                    .expect("internal HTTP client"),
                 pool,
                 storage,
                 max_wasm_upload_bytes,
@@ -158,6 +168,14 @@ impl AppState {
     }
     pub fn pool(&self) -> &PgPool {
         &self.inner.pool
+    }
+
+    pub(crate) fn public_requests(&self) -> &Arc<crate::maintenance::Requests> {
+        &self.inner.public_requests
+    }
+
+    pub fn worker_http(&self) -> &reqwest::Client {
+        &self.inner.worker_http
     }
 
     /// `faas_tenant_invoke_total` に `tenant_id` ラベルを付けるか（M10 follow-up）。

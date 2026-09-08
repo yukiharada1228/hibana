@@ -1,0 +1,826 @@
+{
+  "format": 1,
+  "recordedAt": "2026-09-07T22:05:46.943696+00:00",
+  "cluster": "hibana-demo",
+  "source": "import { Hono } from 'hono'\n\nconst app = new Hono()\nlet count = 0\n\napp.get('/', (c) => c.json({\n  message: 'Hello, Wasm!',\n  count: ++count,\n}))\n\nexport default app\n",
+  "steps": [
+    {
+      "id": "install",
+      "command": "hibana platform install --cluster hibana-demo",
+      "cwd": "<checkout>",
+      "durationSeconds": 121.229,
+      "output": "Creating cluster \"hibana-demo\" ...\n • Ensuring node image (kindest/node:v1.37.0) 🖼️  ...\n ✓ Ensuring node image (kindest/node:v1.37.0) 🖼️\n • Preparing nodes 📦 📦 📦   ...\n ✓ Preparing nodes 📦 📦 📦 \n • Writing configuration 📜  ...\n ✓ Writing configuration 📜\n • Starting control-plane 🕹️  ...\n ✓ Starting control-plane 🕹️\n • Installing CNI 🔌  ...\n ✓ Installing CNI 🔌\n • Installing StorageClass 💾  ...\n ✓ Installing StorageClass 💾\n • Joining worker nodes 🚜  ...\n ✓ Joining worker nodes 🚜\n • Waiting ≤ 2m0s for control-plane = Ready ⏳  ...\n ✓ Waiting ≤ 2m0s for control-plane = Ready ⏳\n • Ready after 7s 💚\nSet kubectl context to \"kind-hibana-demo\"\nYou can now use your cluster with:\n\nkubectl cluster-info --context kind-hibana-demo --kubeconfig <checkout>/.local/kubernetes-hibana-demo/kubeconfig\n\nHave a nice day! 👋\n#0 building with \"desktop-linux\" instance using docker driver\n\n#1 [internal] load build definition from Dockerfile\n#1 transferring dockerfile: 1.09kB 0.0s done\n#1 DONE 0.0s\n\n#2 resolve image config for docker-image://docker.io/docker/dockerfile:1\n#2 DONE 4.4s\n\n#3 docker-image://docker.io/docker/dockerfile:1@sha256:ecfaec9ed6d810b56388c508f4121597bfbba70d41a6dfeee4d8cad5f295fc32\n#3 resolve docker.io/docker/dockerfile:1@sha256:ecfaec9ed6d810b56388c508f4121597bfbba70d41a6dfeee4d8cad5f295fc32 done\n#3 CACHED\n\n#4 [internal] load metadata for docker.io/library/rust:1.98.0-bookworm\n#4 ...\n\n#5 [internal] load metadata for docker.io/library/debian:bookworm-slim\n#5 DONE 1.0s\n\n#4 [internal] load metadata for docker.io/library/rust:1.98.0-bookworm\n#4 DONE 1.0s\n\n#6 [internal] load .dockerignore\n#6 transferring context: 295B done\n#6 DONE 0.0s\n\n#7 [build 1/6] FROM docker.io/library/rust:1.98.0-bookworm@sha256:82150a52ec202c1b14d7817e14516c392bb7f5cfebd88f1ed531cb37ebd39922\n#7 resolve docker.io/library/rust:1.98.0-bookworm@sha256:82150a52ec202c1b14d7817e14516c392bb7f5cfebd88f1ed531cb37ebd39922 0.0s done\n#7 DONE 0.0s\n\n#8 [runtime 1/3] FROM docker.io/library/debian:bookworm-slim@sha256:88200866dfff7ea7f5cbcb6ec7c8a701889efe6fe859fe64d6990e4b07ea4171\n#8 resolve docker.io/library/debian:bookworm-slim@sha256:88200866dfff7ea7f5cbcb6ec7c8a701889efe6fe859fe64d6990e4b07ea4171 0.0s done\n#8 DONE 0.0s\n\n#9 [internal] load build context\n#9 transferring context: 155.86kB 0.0s done\n#9 DONE 0.0s\n\n#10 [build 2/6] WORKDIR /src\n#10 CACHED\n\n#11 [build 3/6] COPY Cargo.toml Cargo.lock ./\n#11 CACHED\n\n#12 [build 4/6] COPY crates ./crates\n#12 DONE 0.1s\n\n#13 [build 5/6] COPY migrations ./migrations\n#13 DONE 0.0s\n\n#14 [build 6/6] RUN --mount=type=cache,target=/usr/local/cargo/registry     --mount=type=cache,target=/src/target     cargo build --locked --release -j 2 -p hibana-control-plane -p hibana-worker     && mkdir /out     && cp target/release/hibana-control-plane target/release/hibana-worker /out/\n#14 0.901    Compiling hibana-worker v0.1.0 (/src/crates/worker)\n#14 0.901    Compiling hibana-control-plane v0.1.0 (/src/crates/control-plane)\n#14 38.95     Finished `release` profile [optimized] target(s) in 38.69s\n#14 DONE 39.2s\n\n#15 [runtime 2/3] RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates     && rm -rf /var/lib/apt/lists/*     && mkdir -p /var/cache/hibana && chown 10001:10001 /var/cache/hibana\n#15 CACHED\n\n#16 [runtime 3/3] COPY --from=build /out/ /usr/local/bin/\n#16 DONE 0.1s\n\n#17 exporting to image\n#17 exporting layers\n#17 exporting layers 1.3s done\n#17 exporting manifest sha256:7416adc3d768c4b3b193b7964298d09d00741b0642eb6e9141bb646ea99cb9dc done\n#17 exporting config sha256:ca7b0c7dafd016ee036f380e5f3252ef54a2507d6c257671538660417ba38e03 done\n#17 naming to docker.io/library/hibana-platform:dev done\n#17 unpacking to docker.io/library/hibana-platform:dev\n#17 unpacking to docker.io/library/hibana-platform:dev 0.3s done\n#17 DONE 1.6s\nImage: \"hibana-platform:local-7416adc3d768c4b3b193b7964298d09d00741b0642eb6e9141bb646ea99cb9dc\" with ID \"sha256:7416adc3d768c4b3b193b7964298d09d00741b0642eb6e9141bb646ea99cb9dc\" not yet present on node \"hibana-demo-worker2\", loading...\nImage: \"hibana-platform:local-7416adc3d768c4b3b193b7964298d09d00741b0642eb6e9141bb646ea99cb9dc\" with ID \"sha256:7416adc3d768c4b3b193b7964298d09d00741b0642eb6e9141bb646ea99cb9dc\" not yet present on node \"hibana-demo-worker\", loading...\nImage: \"hibana-platform:local-7416adc3d768c4b3b193b7964298d09d00741b0642eb6e9141bb646ea99cb9dc\" with ID \"sha256:7416adc3d768c4b3b193b7964298d09d00741b0642eb6e9141bb646ea99cb9dc\" not yet present on node \"hibana-demo-control-plane\", loading...\nnamespace/hibana created\nsecret/hibana-runtime created\nsecret/hibana-control-plane created\nsecret/hibana-migration created\nsecret/hibana-local-dependencies created\nconfigmap/hibana-local-postgres-init created\nservice/hibana-minio created\nservice/hibana-postgres created\nservice/hibana-redis created\npersistentvolumeclaim/hibana-minio-data created\npersistentvolumeclaim/hibana-postgres-data created\ndeployment.apps/hibana-minio created\ndeployment.apps/hibana-postgres created\ndeployment.apps/hibana-redis created\njob.batch/hibana-local-bucket created\nnetworkpolicy.networking.k8s.io/hibana-local-dependencies created\nWaiting for deployment \"hibana-postgres\" rollout to finish: 0 of 1 updated replicas are available...\ndeployment \"hibana-postgres\" successfully rolled out\ndeployment \"hibana-redis\" successfully rolled out\ndeployment \"hibana-minio\" successfully rolled out\njob.batch/hibana-local-bucket condition met\nserviceaccount/hibana-migrate created\njob.batch/hibana-migrate created\njob.batch/hibana-migrate condition met\nnamespace/hibana unchanged\nserviceaccount/hibana-control-plane created\nserviceaccount/hibana-worker created\nconfigmap/hibana-config created\nservice/hibana-api created\nservice/hibana-apps created\nservice/hibana-internal created\nservice/hibana-worker-discovery created\nservice/hibana-worker-http created\nservice/hibana-worker-metrics created\ndeployment.apps/hibana-control-plane created\ndeployment.apps/hibana-worker created\npoddisruptionbudget.policy/hibana-control-plane created\npoddisruptionbudget.policy/hibana-worker created\nnetworkpolicy.networking.k8s.io/default-deny created\nnetworkpolicy.networking.k8s.io/hibana-dependencies created\nnetworkpolicy.networking.k8s.io/hibana-dns created\nnetworkpolicy.networking.k8s.io/hibana-http-dispatch created\nnetworkpolicy.networking.k8s.io/hibana-internal created\nnetworkpolicy.networking.k8s.io/hibana-local-access created\nnetworkpolicy.networking.k8s.io/hibana-metrics created\nnetworkpolicy.networking.k8s.io/hibana-worker-http created\nnetworkpolicy.networking.k8s.io/hibana-worker-internal created\nnetworkpolicy.networking.k8s.io/hibana-worker-public-https created\nWaiting for deployment \"hibana-control-plane\" rollout to finish: 0 of 2 updated replicas are available...\nWaiting for deployment \"hibana-control-plane\" rollout to finish: 0 of 2 updated replicas are available...\nWaiting for deployment \"hibana-control-plane\" rollout to finish: 0 of 2 updated replicas are available...\ndeployment \"hibana-control-plane\" successfully rolled out\ndeployment \"hibana-worker\" successfully rolled out\nReady. API: http://127.0.0.1:18080 | Apps: http://127.0.0.1:18084\nCredentials: <checkout>/.local/kubernetes-hibana-demo/sdk.env\nStop: hibana platform stop --cluster hibana-demo\n",
+      "exitCode": 0,
+      "events": [
+        {
+          "t": 0.747,
+          "text": "Creating cluster \"hibana-demo\" ...\n • Ensuring node image (kindest/node:v1.37.0) 🖼️  ...\n"
+        },
+        {
+          "t": 0.784,
+          "text": " ✓ Ensuring node image (kindest/node:v1.37.0) 🖼️\n • Preparing nodes 📦 📦 📦   ...\n"
+        },
+        {
+          "t": 4.068,
+          "text": " ✓ Preparing nodes 📦 📦 📦 \n"
+        },
+        {
+          "t": 4.146,
+          "text": " • Writing configuration 📜  ...\n"
+        },
+        {
+          "t": 4.427,
+          "text": " ✓ Writing configuration 📜\n • Starting control-plane 🕹️  ...\n"
+        },
+        {
+          "t": 10.835,
+          "text": " ✓ Starting control-plane 🕹️\n • Installing CNI 🔌  ...\n"
+        },
+        {
+          "t": 11.173,
+          "text": " ✓ Installing CNI 🔌\n • Installing StorageClass 💾  ...\n"
+        },
+        {
+          "t": 11.394,
+          "text": " ✓ Installing StorageClass 💾\n"
+        },
+        {
+          "t": 11.475,
+          "text": " • Joining worker nodes 🚜  ...\n"
+        },
+        {
+          "t": 22.3,
+          "text": " ✓ Joining worker nodes 🚜\n • Waiting ≤ 2m0s for control-plane = Ready ⏳  ...\n"
+        },
+        {
+          "t": 29.713,
+          "text": " ✓ Waiting ≤ 2m0s for control-plane = Ready ⏳\n • Ready after 7s 💚\n"
+        },
+        {
+          "t": 30.156,
+          "text": "Set kubectl context to \"kind-hibana-demo\"\nYou can now use your cluster with:\n\nkubectl cluster-info --context kind-hibana-demo --kubeconfig <checkout>/.local/kubernetes-hibana-demo/kubeconfig\n\n"
+        },
+        {
+          "t": 30.159,
+          "text": "Have a nice day! 👋\n"
+        },
+        {
+          "t": 31.381,
+          "text": "#0 building with \"desktop-linux\" instance using docker driver\n\n#1 [internal] load build definition from Dockerfile\n"
+        },
+        {
+          "t": 31.381,
+          "text": "#1 transferring dockerfile: 1.09kB 0.0s done\n"
+        },
+        {
+          "t": 31.382,
+          "text": "#1 DONE 0.0s\n"
+        },
+        {
+          "t": 31.382,
+          "text": "\n#2 resolve image config for docker-image://docker.io/docker/dockerfile:1\n"
+        },
+        {
+          "t": 35.654,
+          "text": "#2 DONE 4.4s\n"
+        },
+        {
+          "t": 35.773,
+          "text": "\n#3 docker-image://docker.io/docker/dockerfile:1@sha256:ecfaec9ed6d810b56388c508f4121597bfbba70d41a6dfeee4d8cad5f295fc32\n#3 resolve docker.io/docker/dockerfile:1@sha256:ecfaec9ed6d810b56388c508f4121597bfbba70d41a6dfeee4d8cad5f295fc32 done\n#3 CACHED\n\n#4 [internal] load metadata for docker.io/library/rust:1.98.0-bookworm\n"
+        },
+        {
+          "t": 36.742,
+          "text": "#4 ...\n\n#5 [internal] load metadata for docker.io/library/debian:bookworm-slim\n#5 DONE 1.0s\n"
+        },
+        {
+          "t": 36.928,
+          "text": "\n#4 [internal] load metadata for docker.io/library/rust:1.98.0-bookworm\n#4 DONE 1.0s\n\n#6 [internal] load .dockerignore\n#6 transferring context: 295B done\n#6 DONE 0.0s\n"
+        },
+        {
+          "t": 37.32,
+          "text": "\n#7 [build 1/6] FROM docker.io/library/rust:1.98.0-bookworm@sha256:82150a52ec202c1b14d7817e14516c392bb7f5cfebd88f1ed531cb37ebd39922\n#7 resolve docker.io/library/rust:1.98.0-bookworm@sha256:82150a52ec202c1b14d7817e14516c392bb7f5cfebd88f1ed531cb37ebd39922 0.0s done\n#7 DONE 0.0s\n\n#8 [runtime 1/3] FROM docker.io/library/debian:bookworm-slim@sha256:88200866dfff7ea7f5cbcb6ec7c8a701889efe6fe859fe64d6990e4b07ea4171\n#8 resolve docker.io/library/debian:bookworm-slim@sha256:88200866dfff7ea7f5cbcb6ec7c8a701889efe6fe859fe64d6990e4b07ea4171 0.0s done\n#8 DONE 0.0s\n\n#9 [internal] load build context\n#9 transferring context: 155.86kB 0.0s done\n"
+        },
+        {
+          "t": 37.32,
+          "text": "#9 DONE 0.0s\n\n#10 [build 2/6] WORKDIR /src\n#10 CACHED\n\n#11 [build 3/6] COPY Cargo.toml Cargo.lock ./\n#11 CACHED\n\n#12 [build 4/6] COPY crates ./crates\n#12 DONE 0.1s\n"
+        },
+        {
+          "t": 37.527,
+          "text": "\n#13 [build 5/6] COPY migrations ./migrations\n#13 DONE 0.0s\n"
+        },
+        {
+          "t": 37.527,
+          "text": "\n#14 [build 6/6] RUN --mount=type=cache,target=/usr/local/cargo/registry     --mount=type=cache,target=/src/target     cargo build --locked --release -j 2 -p hibana-control-plane -p hibana-worker     && mkdir /out     && cp target/release/hibana-control-plane target/release/hibana-worker /out/\n"
+        },
+        {
+          "t": 38.278,
+          "text": "#14 0.901    Compiling hibana-worker v0.1.0 (/src/crates/worker)\n"
+        },
+        {
+          "t": 38.428,
+          "text": "#14 0.901    Compiling hibana-control-plane v0.1.0 (/src/crates/control-plane)\n"
+        },
+        {
+          "t": 76.326,
+          "text": "#14 38.95     Finished `release` profile [optimized] target(s) in 38.69s\n"
+        },
+        {
+          "t": 76.577,
+          "text": "#14 DONE 39.2s\n"
+        },
+        {
+          "t": 77.508,
+          "text": "\n#15 [runtime 2/3] RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates     && rm -rf /var/lib/apt/lists/*     && mkdir -p /var/cache/hibana && chown 10001:10001 /var/cache/hibana\n"
+        },
+        {
+          "t": 77.632,
+          "text": "#15 CACHED\n\n#16 [runtime 3/3] COPY --from=build /out/ /usr/local/bin/\n#16 DONE 0.1s\n"
+        },
+        {
+          "t": 77.797,
+          "text": "\n#17 exporting to image\n#17 exporting layers\n"
+        },
+        {
+          "t": 78.914,
+          "text": "#17 exporting layers 1.3s done\n"
+        },
+        {
+          "t": 79.077,
+          "text": "#17 exporting manifest sha256:7416adc3d768c4b3b193b7964298d09d00741b0642eb6e9141bb646ea99cb9dc done\n#17 exporting config sha256:ca7b0c7dafd016ee036f380e5f3252ef54a2507d6c257671538660417ba38e03 done\n"
+        },
+        {
+          "t": 79.078,
+          "text": "#17 naming to docker.io/library/hibana-platform:dev done\n#17 unpacking to docker.io/library/hibana-platform:dev\n"
+        },
+        {
+          "t": 79.222,
+          "text": "#17 unpacking to docker.io/library/hibana-platform:dev 0.3s done\n"
+        },
+        {
+          "t": 79.302,
+          "text": "#17 DONE 1.6s\n"
+        },
+        {
+          "t": 79.84,
+          "text": "Image: \"hibana-platform:local-7416adc3d768c4b3b193b7964298d09d00741b0642eb6e9141bb646ea99cb9dc\" with ID \"sha256:7416adc3d768c4b3b193b7964298d09d00741b0642eb6e9141bb646ea99cb9dc\" not yet present on node \"hibana-demo-worker2\", loading...\n"
+        },
+        {
+          "t": 79.968,
+          "text": "Image: \"hibana-platform:local-7416adc3d768c4b3b193b7964298d09d00741b0642eb6e9141bb646ea99cb9dc\" with ID \"sha256:7416adc3d768c4b3b193b7964298d09d00741b0642eb6e9141bb646ea99cb9dc\" not yet present on node \"hibana-demo-worker\", loading...\n"
+        },
+        {
+          "t": 80.079,
+          "text": "Image: \"hibana-platform:local-7416adc3d768c4b3b193b7964298d09d00741b0642eb6e9141bb646ea99cb9dc\" with ID \"sha256:7416adc3d768c4b3b193b7964298d09d00741b0642eb6e9141bb646ea99cb9dc\" not yet present on node \"hibana-demo-control-plane\", loading...\n"
+        },
+        {
+          "t": 83.961,
+          "text": "namespace/hibana created\n"
+        },
+        {
+          "t": 84.03,
+          "text": "secret/hibana-runtime created\n"
+        },
+        {
+          "t": 84.035,
+          "text": "secret/hibana-control-plane created\n"
+        },
+        {
+          "t": 84.038,
+          "text": "secret/hibana-migration created\n"
+        },
+        {
+          "t": 84.04,
+          "text": "secret/hibana-local-dependencies created\n"
+        },
+        {
+          "t": 84.23,
+          "text": "configmap/hibana-local-postgres-init created\n"
+        },
+        {
+          "t": 84.239,
+          "text": "service/hibana-minio created\n"
+        },
+        {
+          "t": 84.257,
+          "text": "service/hibana-postgres created\n"
+        },
+        {
+          "t": 84.269,
+          "text": "service/hibana-redis created\n"
+        },
+        {
+          "t": 84.277,
+          "text": "persistentvolumeclaim/hibana-minio-data created\n"
+        },
+        {
+          "t": 84.284,
+          "text": "persistentvolumeclaim/hibana-postgres-data created\n"
+        },
+        {
+          "t": 84.29,
+          "text": "deployment.apps/hibana-minio created\n"
+        },
+        {
+          "t": 84.295,
+          "text": "deployment.apps/hibana-postgres created\n"
+        },
+        {
+          "t": 84.314,
+          "text": "deployment.apps/hibana-redis created\n"
+        },
+        {
+          "t": 84.327,
+          "text": "job.batch/hibana-local-bucket created\n"
+        },
+        {
+          "t": 84.359,
+          "text": "networkpolicy.networking.k8s.io/hibana-local-dependencies created\n"
+        },
+        {
+          "t": 84.438,
+          "text": "Waiting for deployment \"hibana-postgres\" rollout to finish: 0 of 1 updated replicas are available...\n"
+        },
+        {
+          "t": 98.235,
+          "text": "deployment \"hibana-postgres\" successfully rolled out\n"
+        },
+        {
+          "t": 98.302,
+          "text": "deployment \"hibana-redis\" successfully rolled out\n"
+        },
+        {
+          "t": 98.344,
+          "text": "deployment \"hibana-minio\" successfully rolled out\n"
+        },
+        {
+          "t": 102.073,
+          "text": "job.batch/hibana-local-bucket condition met\n"
+        },
+        {
+          "t": 102.225,
+          "text": "serviceaccount/hibana-migrate created\n"
+        },
+        {
+          "t": 102.229,
+          "text": "job.batch/hibana-migrate created\n"
+        },
+        {
+          "t": 105.268,
+          "text": "job.batch/hibana-migrate condition met\n"
+        },
+        {
+          "t": 105.392,
+          "text": "namespace/hibana unchanged\n"
+        },
+        {
+          "t": 105.397,
+          "text": "serviceaccount/hibana-control-plane created\n"
+        },
+        {
+          "t": 105.399,
+          "text": "serviceaccount/hibana-worker created\n"
+        },
+        {
+          "t": 105.402,
+          "text": "configmap/hibana-config created\n"
+        },
+        {
+          "t": 105.41,
+          "text": "service/hibana-api created\n"
+        },
+        {
+          "t": 105.422,
+          "text": "service/hibana-apps created\n"
+        },
+        {
+          "t": 105.428,
+          "text": "service/hibana-internal created\n"
+        },
+        {
+          "t": 105.434,
+          "text": "service/hibana-worker-discovery created\n"
+        },
+        {
+          "t": 105.439,
+          "text": "service/hibana-worker-http created\n"
+        },
+        {
+          "t": 105.442,
+          "text": "service/hibana-worker-metrics created\n"
+        },
+        {
+          "t": 105.447,
+          "text": "deployment.apps/hibana-control-plane created\n"
+        },
+        {
+          "t": 105.452,
+          "text": "deployment.apps/hibana-worker created\n"
+        },
+        {
+          "t": 105.466,
+          "text": "poddisruptionbudget.policy/hibana-control-plane created\n"
+        },
+        {
+          "t": 105.49,
+          "text": "poddisruptionbudget.policy/hibana-worker created\n"
+        },
+        {
+          "t": 105.501,
+          "text": "networkpolicy.networking.k8s.io/default-deny created\n"
+        },
+        {
+          "t": 105.507,
+          "text": "networkpolicy.networking.k8s.io/hibana-dependencies created\n"
+        },
+        {
+          "t": 105.51,
+          "text": "networkpolicy.networking.k8s.io/hibana-dns created\n"
+        },
+        {
+          "t": 105.512,
+          "text": "networkpolicy.networking.k8s.io/hibana-http-dispatch created\n"
+        },
+        {
+          "t": 105.515,
+          "text": "networkpolicy.networking.k8s.io/hibana-internal created\n"
+        },
+        {
+          "t": 105.517,
+          "text": "networkpolicy.networking.k8s.io/hibana-local-access created\n"
+        },
+        {
+          "t": 105.519,
+          "text": "networkpolicy.networking.k8s.io/hibana-metrics created\n"
+        },
+        {
+          "t": 105.521,
+          "text": "networkpolicy.networking.k8s.io/hibana-worker-http created\n"
+        },
+        {
+          "t": 105.523,
+          "text": "networkpolicy.networking.k8s.io/hibana-worker-internal created\n"
+        },
+        {
+          "t": 105.526,
+          "text": "networkpolicy.networking.k8s.io/hibana-worker-public-https created\n"
+        },
+        {
+          "t": 105.569,
+          "text": "Waiting for deployment \"hibana-control-plane\" rollout to finish: 0 of 2 updated replicas are available...\n"
+        },
+        {
+          "t": 111.239,
+          "text": "Waiting for deployment \"hibana-control-plane\" rollout to finish: 0 of 2 updated replicas are available...\n"
+        },
+        {
+          "t": 111.383,
+          "text": "Waiting for deployment \"hibana-control-plane\" rollout to finish: 0 of 2 updated replicas are available...\n"
+        },
+        {
+          "t": 121.038,
+          "text": "deployment \"hibana-control-plane\" successfully rolled out\n"
+        },
+        {
+          "t": 121.107,
+          "text": "deployment \"hibana-worker\" successfully rolled out\n"
+        },
+        {
+          "t": 121.216,
+          "text": "Ready. API: http://127.0.0.1:18080 | Apps: http://127.0.0.1:18084\nCredentials: <checkout>/.local/kubernetes-hibana-demo/sdk.env\nStop: hibana platform stop --cluster hibana-demo\n"
+        }
+      ]
+    },
+    {
+      "id": "status",
+      "command": "hibana platform status --cluster hibana-demo",
+      "cwd": "<checkout>",
+      "durationSeconds": 0.206,
+      "output": "NAME                                      READY   STATUS      RESTARTS   AGE   IP           NODE                  NOMINATED NODE   READINESS GATES\npod/hibana-control-plane-bb6d7ddf-cfpsg   1/1     Running     0          16s   10.244.1.7   hibana-demo-worker    <none>           <none>\npod/hibana-control-plane-bb6d7ddf-x8jtv   1/1     Running     0          16s   10.244.2.5   hibana-demo-worker2   <none>           <none>\npod/hibana-local-bucket-d9c5q             0/1     Completed   0          22s   10.244.1.5   hibana-demo-worker    <none>           <none>\npod/hibana-local-bucket-t8k96             0/1     Error       0          37s   10.244.1.2   hibana-demo-worker    <none>           <none>\npod/hibana-migrate-4lj4v                  0/1     Completed   0          19s   10.244.1.6   hibana-demo-worker    <none>           <none>\npod/hibana-minio-5df4f8dbfc-z4k7n         1/1     Running     0          37s   10.244.2.4   hibana-demo-worker2   <none>           <none>\npod/hibana-postgres-d55d7cd8b-mx6z7       1/1     Running     0          37s   10.244.1.4   hibana-demo-worker    <none>           <none>\npod/hibana-redis-5bc58bdbd6-mt7hs         1/1     Running     0          37s   10.244.2.2   hibana-demo-worker2   <none>           <none>\npod/hibana-worker-54598f57d7-5jwv5        1/1     Running     0          16s   10.244.1.8   hibana-demo-worker    <none>           <none>\npod/hibana-worker-54598f57d7-7q9l4        1/1     Running     0          16s   10.244.2.6   hibana-demo-worker2   <none>           <none>\n\nNAME                            STATUS     COMPLETIONS   DURATION   AGE   CONTAINERS   IMAGES                                                                                   SELECTOR\njob.batch/hibana-local-bucket   Complete   1/1           18s        37s   setup        minio/mc@sha256:a7fe349ef4bd8521fb8497f55c6042871b2ae640607cf99d9bede5e9bdf11727         batch.kubernetes.io/controller-uid=c7a3b80c-5f3f-4fc8-8f63-8c0a60f506a5\njob.batch/hibana-migrate        Complete   1/1           3s         19s   migrate      hibana-platform:local-7416adc3d768c4b3b193b7964298d09d00741b0642eb6e9141bb646ea99cb9dc   batch.kubernetes.io/controller-uid=491eb002-56ba-498d-ba63-37f5aa121c28\n\nNAME                              TYPE        CLUSTER-IP      EXTERNAL-IP   PORT(S)          AGE   SELECTOR\nservice/hibana-api                NodePort    10.96.80.39     <none>        8080:30080/TCP   16s   app.kubernetes.io/name=hibana-control-plane\nservice/hibana-apps               NodePort    10.96.154.80    <none>        8083:30083/TCP   16s   app.kubernetes.io/name=hibana-control-plane\nservice/hibana-internal           ClusterIP   10.96.62.99     <none>        8081/TCP         16s   app.kubernetes.io/name=hibana-control-plane\nservice/hibana-minio              ClusterIP   10.96.113.222   <none>        9000/TCP         37s   app.kubernetes.io/name=hibana-minio\nservice/hibana-postgres           ClusterIP   10.96.38.205    <none>        5432/TCP         37s   app.kubernetes.io/name=hibana-postgres\nservice/hibana-redis              ClusterIP   10.96.132.99    <none>        6379/TCP         37s   app.kubernetes.io/name=hibana-redis\nservice/hibana-worker-discovery   ClusterIP   None            <none>        8084/TCP         16s   app.kubernetes.io/name=hibana-worker\nservice/hibana-worker-http        ClusterIP   10.96.83.87     <none>        8084/TCP         16s   app.kubernetes.io/name=hibana-worker\nservice/hibana-worker-metrics     ClusterIP   10.96.49.194    <none>        9090/TCP         16s   app.kubernetes.io/name=hibana-worker\n\nNAME                                              MIN AVAILABLE   MAX UNAVAILABLE   ALLOWED DISRUPTIONS   AGE\npoddisruptionbudget.policy/hibana-control-plane   1               N/A               1                     16s\npoddisruptionbudget.policy/hibana-worker          1               N/A               1                     16s\nhibana-demo-worker2: running\nhibana-demo-worker: running\nhibana-demo-control-plane: running\n",
+      "exitCode": 0,
+      "events": [
+        {
+          "t": 0.196,
+          "text": "NAME                                      READY   STATUS      RESTARTS   AGE   IP           NODE                  NOMINATED NODE   READINESS GATES\npod/hibana-control-plane-bb6d7ddf-cfpsg   1/1     Running     0          16s   10.244.1.7   hibana-demo-worker    <none>           <none>\npod/hibana-control-plane-bb6d7ddf-x8jtv   1/1     Running     0          16s   10.244.2.5   hibana-demo-worker2   <none>           <none>\npod/hibana-local-bucket-d9c5q             0/1     Completed   0          22s   10.244.1.5   hibana-demo-worker    <none>           <none>\npod/hibana-local-bucket-t8k96             0/1     Error       0          37s   10.244.1.2   hibana-demo-worker    <none>           <none>\npod/hibana-migrate-4lj4v                  0/1     Completed   0          19s   10.244.1.6   hibana-demo-worker    <none>           <none>\npod/hibana-minio-5df4f8dbfc-z4k7n         1/1     Running     0          37s   10.244.2.4   hibana-demo-worker2   <none>           <none>\npod/hibana-postgres-d55d7cd8b-mx6z7       1/1     Running     0          37s   10.244.1.4   hibana-demo-worker    <none>           <none>\npod/hibana-redis-5bc58bdbd6-mt7hs         1/1     Running     0          37s   10.244.2.2   hibana-demo-worker2   <none>           <none>\npod/hibana-worker-54598f57d7-5jwv5"
+        },
+        {
+          "t": 0.196,
+          "text": "        1/1     Running     0          16s   10.244.1.8   hibana-demo-worker    <none>           <none>\npod/hibana-worker-54598f57d7-7q9l4        1/1     Running     0          16s   10.244.2.6   hibana-demo-worker2   <none>           <none>\n"
+        },
+        {
+          "t": 0.196,
+          "text": "\nNAME                            STATUS     COMPLETIONS   DURATION   AGE   CONTAINERS   IMAGES                                                                        "
+        },
+        {
+          "t": 0.196,
+          "text": "           SELECTOR\njob.batch/hibana-local-bucket   Complete   1/1           18s        37s   setup        minio/mc@sha256:a7fe349ef4bd8521fb8497f55c6042871b2ae640607cf99d9bede5e9bdf11727         batch.kubernetes.io/controller-uid=c7a3b80c-5f3f-4fc8-8f63-8c0a60f506a5\njob.batch/hibana-migrate        Complete   1/1           3s         19s   migrate      hibana-platform:local-7416adc3d768c4b3b193b7964298d09d00741b0642eb6e9141bb646ea99cb9dc   batch.kubernetes.io/controller-uid=491eb002-56ba-498d-ba63-37f5aa121c28\n"
+        },
+        {
+          "t": 0.196,
+          "text": "\nNAME                              TYPE        CLUSTER-IP      EXTERNAL-IP   PORT(S)          AGE   SELECTOR\nservice/hibana-api                NodePort"
+        },
+        {
+          "t": 0.196,
+          "text": "    10.96.80.39     <none>        8080:30080/TCP   16s   app.kubernetes.io/name=hibana-control-plane\nservice/hibana-apps               NodePort    10.96.154.80    <none>        8083:30083/TCP   16s   app.kubernetes.io/name=hibana-control-plane\nservice/hibana-internal        "
+        },
+        {
+          "t": 0.196,
+          "text": "   ClusterIP   10.96.62.99     <none>        8081/TCP         16s"
+        },
+        {
+          "t": 0.196,
+          "text": "   app.kubernetes.io/name=hibana-control-plane\nservice/hibana-minio              ClusterIP   10.96.113.222   <none>        9000/TCP         37s   app.kubernetes.io/name=hibana-minio\nservice/hibana-postgres           ClusterIP   "
+        },
+        {
+          "t": 0.196,
+          "text": "10.96.38.205    <none>        5432/TCP         37s   app.kubernetes.io/name=hibana-postgres\n"
+        },
+        {
+          "t": 0.196,
+          "text": "service/hibana-redis              ClusterIP   10.96.132.99    <none>        6379/TCP         37s   app.kubernetes.io/name=hibana-redis\nservice/hibana-worker-discovery   ClusterIP   None            <none>        8084/TCP         "
+        },
+        {
+          "t": 0.196,
+          "text": "16s   app.kubernetes.io/name=hibana-worker\nservice/hibana-worker-http        ClusterIP   10.96.83.87     "
+        },
+        {
+          "t": 0.196,
+          "text": "<none>        8084/TCP         16s"
+        },
+        {
+          "t": 0.196,
+          "text": "   app.kubernetes.io/name=hibana-worker\nservice/hibana-worker-metrics     ClusterIP   10.96.49.194    <none>        9090/TCP         16s   app.kubernetes.io/name=hibana-worker\n"
+        },
+        {
+          "t": 0.196,
+          "text": "\nNAME                                              MIN AVAILABLE   MAX UNAVAILABLE   ALLOWED DISRUPTIONS   AGE\npoddisruptionbudget.policy/hibana-control-plane   1               N/A"
+        },
+        {
+          "t": 0.196,
+          "text": "               1                     16s\npoddisruptionbudget.policy/hibana-worker          1               "
+        },
+        {
+          "t": 0.196,
+          "text": "N/A               1                     16s\n"
+        },
+        {
+          "t": 0.198,
+          "text": "hibana-demo-worker2: running\nhibana-demo-worker: running\nhibana-demo-control-plane: running\n"
+        }
+      ]
+    },
+    {
+      "id": "init",
+      "command": "hibana init hello-hono --template hono",
+      "cwd": "<checkout>/.local/demo-recording",
+      "durationSeconds": 0.586,
+      "output": "\nadded 2 packages, and audited 4 packages in 469ms\n\nfound 0 vulnerabilities\nCreated <checkout>/.local/demo-recording/hello-hono\nnpm run dev in the project directory.\n",
+      "exitCode": 0,
+      "events": [
+        {
+          "t": 0.578,
+          "text": "\nadded 2 packages, and audited 4 packages in 469ms\n"
+        },
+        {
+          "t": 0.578,
+          "text": "\nfound 0 vulnerabilities\n"
+        },
+        {
+          "t": 0.583,
+          "text": "Created <checkout>/.local/demo-recording/hello-hono\nnpm run dev in the project directory.\n"
+        }
+      ]
+    },
+    {
+      "id": "source",
+      "command": "cat src/index.ts",
+      "cwd": "<checkout>/.local/demo-recording/hello-hono",
+      "durationSeconds": 0.003,
+      "output": "import { Hono } from 'hono'\n\nconst app = new Hono()\nlet count = 0\n\napp.get('/', (c) => c.json({\n  message: 'Hello, Wasm!',\n  count: ++count,\n}))\n\nexport default app\n",
+      "exitCode": 0,
+      "events": [
+        {
+          "t": 0.003,
+          "text": "import { Hono } from 'hono'\n\nconst app = new Hono()\nlet count = 0\n\napp.get('/', (c) => c.json({\n  message: 'Hello, Wasm!',\n  count: ++count,\n}))\n\nexport default app\n"
+        }
+      ]
+    },
+    {
+      "id": "login",
+      "command": "hibana login",
+      "cwd": "<checkout>/.local/demo-recording/hello-hono",
+      "durationSeconds": 0.176,
+      "output": "Logged in. Credentials saved in .hibana/auth.json\n",
+      "exitCode": 0,
+      "events": [
+        {
+          "t": 0.174,
+          "text": "Logged in. Credentials saved in .hibana/auth.json\n"
+        }
+      ]
+    },
+    {
+      "id": "workers-before",
+      "command": "kubectl -n hibana get pods -l app.kubernetes.io/name=hibana-worker -o json",
+      "cwd": "<checkout>",
+      "durationSeconds": 0.037,
+      "output": "{\n    \"apiVersion\": \"v1\",\n    \"items\": [\n        {\n            \"apiVersion\": \"v1\",\n            \"kind\": \"Pod\",\n            \"metadata\": {\n                \"annotations\": {\n                    \"hibana.local/settings-hash\": \"2d295dd0d5258fce76124142ee09d9a763660e5117b25eb99b638c7ec7211597\"\n                },\n                \"creationTimestamp\": \"2026-09-07T22:07:32Z\",\n                \"generateName\": \"hibana-worker-54598f57d7-\",\n                \"generation\": 1,\n                \"labels\": {\n                    \"app.kubernetes.io/name\": \"hibana-worker\",\n                    \"app.kubernetes.io/part-of\": \"hibana\",\n                    \"pod-template-hash\": \"54598f57d7\"\n                },\n                \"name\": \"hibana-worker-54598f57d7-5jwv5\",\n                \"namespace\": \"hibana\",\n                \"ownerReferences\": [\n                    {\n                        \"apiVersion\": \"apps/v1\",\n                        \"blockOwnerDeletion\": true,\n                        \"controller\": true,\n                        \"kind\": \"ReplicaSet\",\n                        \"name\": \"hibana-worker-54598f57d7\",\n                        \"uid\": \"1ac86cfe-53d5-420b-af62-9d1b89490dc4\"\n                    }\n                ],\n                \"resourceVersion\": \"1069\",\n                \"uid\": \"9c895cf9-5d80-4ec4-af59-c852757158f9\"\n            },\n            \"spec\": {\n                \"automountServiceAccountToken\": false,\n                \"containers\": [\n                    {\n                        \"command\": [\n                            \"/usr/local/bin/hibana-worker\"\n                        ],\n                        \"envFrom\": [\n                            {\n                                \"configMapRef\": {\n                                    \"name\": \"hibana-config\"\n                                }\n                            },\n                            {\n                                \"secretRef\": {\n                                    \"name\": \"hibana-runtime\"\n                                }\n                            }\n                        ],\n                        \"image\": \"hibana-platform:local-7416adc3d768c4b3b193b7964298d09d00741b0642eb6e9141bb646ea99cb9dc\",\n                        \"imagePullPolicy\": \"IfNotPresent\",\n                        \"livenessProbe\": {\n                            \"failureThreshold\": 3,\n                            \"httpGet\": {\n                                \"path\": \"/healthz\",\n                                \"port\": \"metrics\",\n                                \"scheme\": \"HTTP\"\n                            },\n                            \"periodSeconds\": 10,\n                            \"successThreshold\": 1,\n                            \"timeoutSeconds\": 3\n                        },\n                        \"name\": \"worker\",\n                        \"ports\": [\n                            {\n                                \"containerPort\": 9090,\n                                \"name\": \"metrics\",\n                                \"protocol\": \"TCP\"\n                            }\n                        ],\n                        \"readinessProbe\": {\n                            \"failureThreshold\": 3,\n                            \"httpGet\": {\n                                \"path\": \"/readyz\",\n                                \"port\": \"metrics\",\n                                \"scheme\": \"HTTP\"\n                            },\n                            \"periodSeconds\": 5,\n                            \"successThreshold\": 1,\n                            \"timeoutSeconds\": 3\n                        },\n                        \"resources\": {\n                            \"limits\": {\n                                \"cpu\": \"4\",\n                                \"ephemeral-storage\": \"5Gi\",\n                                \"memory\": \"4Gi\"\n                            },\n                            \"requests\": {\n                                \"cpu\": \"500m\",\n                                \"ephemeral-storage\": \"1Gi\",\n                                \"memory\": \"1Gi\"\n                            }\n                        },\n                        \"securityContext\": {\n                            \"allowPrivilegeEscalation\": false,\n                            \"capabilities\": {\n                                \"drop\": [\n                                    \"ALL\"\n                                ]\n                            },\n                            \"readOnlyRootFilesystem\": true\n                        },\n                        \"startupProbe\": {\n                            \"failureThreshold\": 60,\n                            \"httpGet\": {\n                                \"path\": \"/healthz\",\n                                \"port\": \"metrics\",\n                                \"scheme\": \"HTTP\"\n                            },\n                            \"periodSeconds\": 5,\n                            \"successThreshold\": 1,\n                            \"timeoutSeconds\": 1\n                        },\n                        \"terminationMessagePath\": \"/dev/termination-log\",\n                        \"terminationMessagePolicy\": \"File\",\n                        \"volumeMounts\": [\n                            {\n                                \"mountPath\": \"/tmp\",\n                                \"name\": \"tmp\"\n                            },\n                            {\n                                \"mountPath\": \"/var/cache/hibana\",\n                                \"name\": \"cache\"\n                            }\n                        ]\n                    }\n                ],\n                \"dnsPolicy\": \"ClusterFirst\",\n                \"enableServiceLinks\": true,\n                \"nodeName\": \"hibana-demo-worker\",\n                \"preemptionPolicy\": \"PreemptLowerPriority\",\n                \"priority\": 0,\n                \"restartPolicy\": \"Always\",\n                \"schedulerName\": \"default-scheduler\",\n                \"securityContext\": {\n                    \"fsGroup\": 10001,\n                    \"runAsGroup\": 10001,\n                    \"runAsNonRoot\": true,\n                    \"runAsUser\": 10001,\n                    \"seccompProfile\": {\n                        \"type\": \"RuntimeDefault\"\n                    }\n                },\n                \"serviceAccount\": \"hibana-worker\",\n                \"serviceAccountName\": \"hibana-worker\",\n                \"terminationGracePeriodSeconds\": 90,\n                \"tolerations\": [\n                    {\n                        \"effect\": \"NoExecute\",\n                        \"key\": \"node.kubernetes.io/not-ready\",\n                        \"operator\": \"Exists\",\n                        \"tolerationSeconds\": 300\n                    },\n                    {\n                        \"effect\": \"NoExecute\",\n                        \"key\": \"node.kubernetes.io/unreachable\",\n                        \"operator\": \"Exists\",\n                        \"tolerationSeconds\": 300\n                    }\n                ],\n                \"topologySpreadConstraints\": [\n                    {\n                        \"labelSelector\": {\n                            \"matchExpressions\": [\n                                {\n                                    \"key\": \"pod-template-hash\",\n                                    \"operator\": \"In\",\n                                    \"values\": [\n                                        \"54598f57d7\"\n                                    ]\n                                }\n                            ],\n                            \"matchLabels\": {\n                                \"app.kubernetes.io/name\": \"hibana-worker\"\n                            }\n                        },\n                        \"matchLabelKeys\": [\n                            \"pod-template-hash\"\n                        ],\n                        \"maxSkew\": 1,\n                        \"minDomains\": 2,\n                        \"nodeTaintsPolicy\": \"Honor\",\n                        \"topologyKey\": \"kubernetes.io/hostname\",\n                        \"whenUnsatisfiable\": \"DoNotSchedule\"\n                    }\n                ],\n                \"volumes\": [\n                    {\n                        \"emptyDir\": {\n                            \"sizeLimit\": \"1Gi\"\n                        },\n                        \"name\": \"tmp\"\n                    },\n                    {\n                        \"emptyDir\": {\n                            \"sizeLimit\": \"3Gi\"\n                        },\n                        \"name\": \"cache\"\n                    }\n                ]\n            },\n            \"status\": {\n                \"allocatedResources\": {\n                    \"cpu\": \"500m\",\n                    \"ephemeral-storage\": \"1Gi\",\n                    \"memory\": \"1Gi\"\n                },\n                \"conditions\": [\n                    {\n                        \"lastProbeTime\": null,\n                        \"lastTransitionTime\": \"2026-09-07T22:07:32Z\",\n                        \"observedGeneration\": 1,\n                        \"status\": \"True\",\n                        \"type\": \"PodReadyToStartContainers\"\n                    },\n                    {\n                        \"lastProbeTime\": null,\n                        \"lastTransitionTime\": \"2026-09-07T22:07:32Z\",\n                        \"observedGeneration\": 1,\n                        \"status\": \"True\",\n                        \"type\": \"Initialized\"\n                    },\n                    {\n                        \"lastProbeTime\": null,\n                        \"lastTransitionTime\": \"2026-09-07T22:07:38Z\",\n                        \"observedGeneration\": 1,\n                        \"status\": \"True\",\n                        \"type\": \"Ready\"\n                    },\n                    {\n                        \"lastProbeTime\": null,\n                        \"lastTransitionTime\": \"2026-09-07T22:07:38Z\",\n                        \"observedGeneration\": 1,\n                        \"status\": \"True\",\n                        \"type\": \"ContainersReady\"\n                    },\n                    {\n                        \"lastProbeTime\": null,\n                        \"lastTransitionTime\": \"2026-09-07T22:07:32Z\",\n                        \"observedGeneration\": 1,\n                        \"status\": \"True\",\n                        \"type\": \"PodScheduled\"\n                    }\n                ],\n                \"containerStatuses\": [\n                    {\n                        \"allocatedResources\": {\n                            \"cpu\": \"500m\",\n                            \"ephemeral-storage\": \"1Gi\",\n                            \"memory\": \"1Gi\"\n                        },\n                        \"containerID\": \"containerd://44351ac3c1945f4c719e965fbc5a7467dc6b05c8f4d910c2d0aebed041b7c260\",\n                        \"image\": \"docker.io/library/hibana-platform:local-7416adc3d768c4b3b193b7964298d09d00741b0642eb6e9141bb646ea99cb9dc\",\n                        \"imageID\": \"docker.io/library/import-2026-09-07@sha256:7b57bac5781b2f4c8f3c23e7b1329342d566b76a65e3aa0d96591c89a9b10e83\",\n                        \"lastState\": {},\n                        \"name\": \"worker\",\n                        \"ready\": true,\n                        \"resources\": {\n                            \"limits\": {\n                                \"cpu\": \"4\",\n                                \"ephemeral-storage\": \"5Gi\",\n                                \"memory\": \"4Gi\"\n                            },\n                            \"requests\": {\n                                \"cpu\": \"500m\",\n                                \"ephemeral-storage\": \"1Gi\",\n                                \"memory\": \"1Gi\"\n                            }\n                        },\n                        \"restartCount\": 0,\n                        \"started\": true,\n                        \"state\": {\n                            \"running\": {\n                                \"startedAt\": \"2026-09-07T22:07:32Z\"\n                            }\n                        },\n                        \"user\": {\n                            \"linux\": {\n                                \"gid\": 10001,\n                                \"supplementalGroups\": [\n                                    10001\n                                ],\n                                \"uid\": 10001\n                            }\n                        },\n                        \"volumeMounts\": [\n                            {\n                                \"mountPath\": \"/tmp\",\n                                \"name\": \"tmp\"\n                            },\n                            {\n                                \"mountPath\": \"/var/cache/hibana\",\n                                \"name\": \"cache\"\n                            }\n                        ]\n                    }\n                ],\n                \"hostIP\": \"172.26.0.2\",\n                \"hostIPs\": [\n                    {\n                        \"ip\": \"172.26.0.2\"\n                    }\n                ],\n                \"observedGeneration\": 1,\n                \"phase\": \"Running\",\n                \"podIP\": \"10.244.1.8\",\n                \"podIPs\": [\n                    {\n                        \"ip\": \"10.244.1.8\"\n                    }\n                ],\n                \"qosClass\": \"Burstable\",\n                \"resources\": {\n                    \"limits\": {\n                        \"cpu\": \"4\",\n                        \"memory\": \"4Gi\"\n                    },\n                    \"requests\": {\n                        \"cpu\": \"489m\",\n                        \"memory\": \"1Gi\"\n                    }\n                },\n                \"startTime\": \"2026-09-07T22:07:32Z\"\n            }\n        },\n        {\n            \"apiVersion\": \"v1\",\n            \"kind\": \"Pod\",\n            \"metadata\": {\n                \"annotations\": {\n                    \"hibana.local/settings-hash\": \"2d295dd0d5258fce76124142ee09d9a763660e5117b25eb99b638c7ec7211597\"\n                },\n                \"creationTimestamp\": \"2026-09-07T22:07:32Z\",\n                \"generateName\": \"hibana-worker-54598f57d7-\",\n                \"generation\": 1,\n                \"labels\": {\n                    \"app.kubernetes.io/name\": \"hibana-worker\",\n                    \"app.kubernetes.io/part-of\": \"hibana\",\n                    \"pod-template-hash\": \"54598f57d7\"\n                },\n                \"name\": \"hibana-worker-54598f57d7-7q9l4\",\n                \"namespace\": \"hibana\",\n                \"ownerReferences\": [\n                    {\n                        \"apiVersion\": \"apps/v1\",\n                        \"blockOwnerDeletion\": true,\n                        \"controller\": true,\n                        \"kind\": \"ReplicaSet\",\n                        \"name\": \"hibana-worker-54598f57d7\",\n                        \"uid\": \"1ac86cfe-53d5-420b-af62-9d1b89490dc4\"\n                    }\n                ],\n                \"resourceVersion\": \"1089\",\n                \"uid\": \"eb621ca8-07bc-47b7-9fe3-8101f3e01edd\"\n            },\n            \"spec\": {\n                \"automountServiceAccountToken\": false,\n                \"containers\": [\n                    {\n                        \"command\": [\n                            \"/usr/local/bin/hibana-worker\"\n                        ],\n                        \"envFrom\": [\n                            {\n                                \"configMapRef\": {\n                                    \"name\": \"hibana-config\"\n                                }\n                            },\n                            {\n                                \"secretRef\": {\n                                    \"name\": \"hibana-runtime\"\n                                }\n                            }\n                        ],\n                        \"image\": \"hibana-platform:local-7416adc3d768c4b3b193b7964298d09d00741b0642eb6e9141bb646ea99cb9dc\",\n                        \"imagePullPolicy\": \"IfNotPresent\",\n                        \"livenessProbe\": {\n                            \"failureThreshold\": 3,\n                            \"httpGet\": {\n                                \"path\": \"/healthz\",\n                                \"port\": \"metrics\",\n                                \"scheme\": \"HTTP\"\n                            },\n                            \"periodSeconds\": 10,\n                            \"successThreshold\": 1,\n                            \"timeoutSeconds\": 3\n                        },\n                        \"name\": \"worker\",\n                        \"ports\": [\n                            {\n                                \"containerPort\": 9090,\n                                \"name\": \"metrics\",\n                                \"protocol\": \"TCP\"\n                            }\n                        ],\n                        \"readinessProbe\": {\n                            \"failureThreshold\": 3,\n                            \"httpGet\": {\n                                \"path\": \"/readyz\",\n                                \"port\": \"metrics\",\n                                \"scheme\": \"HTTP\"\n                            },\n                            \"periodSeconds\": 5,\n                            \"successThreshold\": 1,\n                            \"timeoutSeconds\": 3\n                        },\n                        \"resources\": {\n                            \"limits\": {\n                                \"cpu\": \"4\",\n                                \"ephemeral-storage\": \"5Gi\",\n                                \"memory\": \"4Gi\"\n                            },\n                            \"requests\": {\n                                \"cpu\": \"500m\",\n                                \"ephemeral-storage\": \"1Gi\",\n                                \"memory\": \"1Gi\"\n                            }\n                        },\n                        \"securityContext\": {\n                            \"allowPrivilegeEscalation\": false,\n                            \"capabilities\": {\n                                \"drop\": [\n                                    \"ALL\"\n                                ]\n                            },\n                            \"readOnlyRootFilesystem\": true\n                        },\n                        \"startupProbe\": {\n                            \"failureThreshold\": 60,\n                            \"httpGet\": {\n                                \"path\": \"/healthz\",\n                                \"port\": \"metrics\",\n                                \"scheme\": \"HTTP\"\n                            },\n                            \"periodSeconds\": 5,\n                            \"successThreshold\": 1,\n                            \"timeoutSeconds\": 1\n                        },\n                        \"terminationMessagePath\": \"/dev/termination-log\",\n                        \"terminationMessagePolicy\": \"File\",\n                        \"volumeMounts\": [\n                            {\n                                \"mountPath\": \"/tmp\",\n                                \"name\": \"tmp\"\n                            },\n                            {\n                                \"mountPath\": \"/var/cache/hibana\",\n                                \"name\": \"cache\"\n                            }\n                        ]\n                    }\n                ],\n                \"dnsPolicy\": \"ClusterFirst\",\n                \"enableServiceLinks\": true,\n                \"nodeName\": \"hibana-demo-worker2\",\n                \"preemptionPolicy\": \"PreemptLowerPriority\",\n                \"priority\": 0,\n                \"restartPolicy\": \"Always\",\n                \"schedulerName\": \"default-scheduler\",\n                \"securityContext\": {\n                    \"fsGroup\": 10001,\n                    \"runAsGroup\": 10001,\n                    \"runAsNonRoot\": true,\n                    \"runAsUser\": 10001,\n                    \"seccompProfile\": {\n                        \"type\": \"RuntimeDefault\"\n                    }\n                },\n                \"serviceAccount\": \"hibana-worker\",\n                \"serviceAccountName\": \"hibana-worker\",\n                \"terminationGracePeriodSeconds\": 90,\n                \"tolerations\": [\n                    {\n                        \"effect\": \"NoExecute\",\n                        \"key\": \"node.kubernetes.io/not-ready\",\n                        \"operator\": \"Exists\",\n                        \"tolerationSeconds\": 300\n                    },\n                    {\n                        \"effect\": \"NoExecute\",\n                        \"key\": \"node.kubernetes.io/unreachable\",\n                        \"operator\": \"Exists\",\n                        \"tolerationSeconds\": 300\n                    }\n                ],\n                \"topologySpreadConstraints\": [\n                    {\n                        \"labelSelector\": {\n                            \"matchExpressions\": [\n                                {\n                                    \"key\": \"pod-template-hash\",\n                                    \"operator\": \"In\",\n                                    \"values\": [\n                                        \"54598f57d7\"\n                                    ]\n                                }\n                            ],\n                            \"matchLabels\": {\n                                \"app.kubernetes.io/name\": \"hibana-worker\"\n                            }\n                        },\n                        \"matchLabelKeys\": [\n                            \"pod-template-hash\"\n                        ],\n                        \"maxSkew\": 1,\n                        \"minDomains\": 2,\n                        \"nodeTaintsPolicy\": \"Honor\",\n                        \"topologyKey\": \"kubernetes.io/hostname\",\n                        \"whenUnsatisfiable\": \"DoNotSchedule\"\n                    }\n                ],\n                \"volumes\": [\n                    {\n                        \"emptyDir\": {\n                            \"sizeLimit\": \"1Gi\"\n                        },\n                        \"name\": \"tmp\"\n                    },\n                    {\n                        \"emptyDir\": {\n                            \"sizeLimit\": \"3Gi\"\n                        },\n                        \"name\": \"cache\"\n                    }\n                ]\n            },\n            \"status\": {\n                \"allocatedResources\": {\n                    \"cpu\": \"500m\",\n                    \"ephemeral-storage\": \"1Gi\",\n                    \"memory\": \"1Gi\"\n                },\n                \"conditions\": [\n                    {\n                        \"lastProbeTime\": null,\n                        \"lastTransitionTime\": \"2026-09-07T22:07:32Z\",\n                        \"observedGeneration\": 1,\n                        \"status\": \"True\",\n                        \"type\": \"PodReadyToStartContainers\"\n                    },\n                    {\n                        \"lastProbeTime\": null,\n                        \"lastTransitionTime\": \"2026-09-07T22:07:32Z\",\n                        \"observedGeneration\": 1,\n                        \"status\": \"True\",\n                        \"type\": \"Initialized\"\n                    },\n                    {\n                        \"lastProbeTime\": null,\n                        \"lastTransitionTime\": \"2026-09-07T22:07:38Z\",\n                        \"observedGeneration\": 1,\n                        \"status\": \"True\",\n                        \"type\": \"Ready\"\n                    },\n                    {\n                        \"lastProbeTime\": null,\n                        \"lastTransitionTime\": \"2026-09-07T22:07:38Z\",\n                        \"observedGeneration\": 1,\n                        \"status\": \"True\",\n                        \"type\": \"ContainersReady\"\n                    },\n                    {\n                        \"lastProbeTime\": null,\n                        \"lastTransitionTime\": \"2026-09-07T22:07:32Z\",\n                        \"observedGeneration\": 1,\n                        \"status\": \"True\",\n                        \"type\": \"PodScheduled\"\n                    }\n                ],\n                \"containerStatuses\": [\n                    {\n                        \"allocatedResources\": {\n                            \"cpu\": \"500m\",\n                            \"ephemeral-storage\": \"1Gi\",\n                            \"memory\": \"1Gi\"\n                        },\n                        \"containerID\": \"containerd://c3984a7907b9b781b852e1148e0b2b3dbe465ce884137c546b68efba0287dde8\",\n                        \"image\": \"docker.io/library/hibana-platform:local-7416adc3d768c4b3b193b7964298d09d00741b0642eb6e9141bb646ea99cb9dc\",\n                        \"imageID\": \"docker.io/library/import-2026-09-07@sha256:7b57bac5781b2f4c8f3c23e7b1329342d566b76a65e3aa0d96591c89a9b10e83\",\n                        \"lastState\": {},\n                        \"name\": \"worker\",\n                        \"ready\": true,\n                        \"resources\": {\n                            \"limits\": {\n                                \"cpu\": \"4\",\n                                \"ephemeral-storage\": \"5Gi\",\n                                \"memory\": \"4Gi\"\n                            },\n                            \"requests\": {\n                                \"cpu\": \"500m\",\n                                \"ephemeral-storage\": \"1Gi\",\n                                \"memory\": \"1Gi\"\n                            }\n                        },\n                        \"restartCount\": 0,\n                        \"started\": true,\n                        \"state\": {\n                            \"running\": {\n                                \"startedAt\": \"2026-09-07T22:07:32Z\"\n                            }\n                        },\n                        \"user\": {\n                            \"linux\": {\n                                \"gid\": 10001,\n                                \"supplementalGroups\": [\n                                    10001\n                                ],\n                                \"uid\": 10001\n                            }\n                        },\n                        \"volumeMounts\": [\n                            {\n                                \"mountPath\": \"/tmp\",\n                                \"name\": \"tmp\"\n                            },\n                            {\n                                \"mountPath\": \"/var/cache/hibana\",\n                                \"name\": \"cache\"\n                            }\n                        ]\n                    }\n                ],\n                \"hostIP\": \"172.26.0.4\",\n                \"hostIPs\": [\n                    {\n                        \"ip\": \"172.26.0.4\"\n                    }\n                ],\n                \"observedGeneration\": 1,\n                \"phase\": \"Running\",\n                \"podIP\": \"10.244.2.6\",\n                \"podIPs\": [\n                    {\n                        \"ip\": \"10.244.2.6\"\n                    }\n                ],\n                \"qosClass\": \"Burstable\",\n                \"resources\": {\n                    \"limits\": {\n                        \"cpu\": \"4\",\n                        \"memory\": \"4Gi\"\n                    },\n                    \"requests\": {\n                        \"cpu\": \"489m\",\n                        \"memory\": \"1Gi\"\n                    }\n                },\n                \"startTime\": \"2026-09-07T22:07:32Z\"\n            }\n        }\n    ],\n    \"kind\": \"List\",\n    \"metadata\": {\n        \"resourceVersion\": \"\"\n    }\n}\n",
+      "exitCode": 0,
+      "events": [
+        {
+          "t": 0.036,
+          "text": "{\n    \"apiVersion\": \"v1\",\n    \"items\": [\n        {\n            \"apiVersion\": \"v1\",\n            \"kind\": \"Pod\",\n            \"metadata\": {\n                \"annotations\": {\n                    \"hibana.local/settings-hash\": \"2d295dd0d5258fce76124142ee09d9a763660e5117b25eb99b638c7ec7211597\"\n                },\n                \"creationTimestamp\": \"2026-09-07T22:07:32Z\",\n                \"generateName\": \"hibana-worker-54598f57d7-\",\n                \"generation\": 1,\n                \"labels\": {\n                    \"app.kubernetes.io/name\": \"hibana-worker\",\n                    \"app.kubernetes.io/part-of\": \"hibana\",\n                    \"pod-template-hash\": \"54598f57d7\"\n                },\n                \"name\": \"hibana-worker-54598f57d7-5jwv5\",\n                \"namespace\": \"hibana\",\n                \"ownerReferences\": [\n                    {\n                        \"apiVersion\": \"apps/v1\",\n                        \"blockOwnerDeletion\": true,\n                        \"controller\": true,\n                        \"kind\": \"ReplicaSet\",\n                        \"name\": \"hibana-worker-54598f57d7\",\n                        \"uid\": \"1ac86cfe-53d5-420b-af62-9d1b89490dc4\"\n                    }\n                ],\n                \"resourceVersion\": \"1069\",\n                \"uid\": \"9c895cf9-5d80-4ec4-af59-c852757158f9\"\n            },\n            \"spec\": {\n                \"automountServiceAccountToken\": false,\n                \"containers\": [\n                    {\n                        \"command\": [\n                            \"/usr/local/bin/hibana-worker\"\n                        ],\n                        \"envFrom\": [\n                            {\n                                \"configMapRef\": {\n                                    \"name\": \"hibana-config\"\n                                }\n                            },\n                            {\n                                \"secretRef\": {\n                                    \"name\": \"hibana-runtime\"\n                                }\n                            }\n                        ],\n                        \"image\": \"hibana-platform:local-7416adc3d768c4b3b193b7964298d09d00741b0642eb6e9141bb646ea99cb9dc\",\n                        \"imagePullPolicy\": \"IfNotPresent\",\n                        \"livenessProbe\": {\n                            \"failureThreshold\": 3,\n                            \"httpGet\": {\n                                \"path\": \"/healthz\",\n                                \"port\": \"metrics\",\n                                \"scheme\": \"HTTP\"\n                            },\n                            \"periodSeconds\": 10,\n                            \"successThreshold\": 1,\n                            \"timeoutSeconds\": 3\n                        },\n                        \"name\": \"worker\",\n                        \"ports\": [\n                            {\n                                \"containerPort\": 9090,\n                                \"name\": \"metrics\",\n                                \"protocol\": \"TCP\"\n                            }\n                        ],\n                        \"readinessProbe\": {\n                            \"failureThreshold\": 3,\n                            \"httpGet\": {\n                                \"path\": \"/readyz\",\n                                \"port\": \"metrics\",\n                                \"scheme\": \"HTTP\"\n                            },\n                            \"periodSeconds\": 5,\n                            \"successThreshold\": 1,\n                            \"timeoutSeconds\": 3\n                        },\n                        \"resources\": {\n                            \"limits\": {\n                                \"cpu\": \"4\",\n                                \"ephemeral-storage\": \"5Gi\",\n                                \"memory\": \"4Gi\"\n                            },\n                            \"requests\": {\n                                \"cpu\": \"500m\",\n                                \"ephemeral-storage\": \"1Gi\",\n                                \"memory\": \"1Gi\"\n                            }\n                        },\n                        \"securityContext\": {\n                            \"allowPrivilegeEscalation\": false,\n                            \"capabilities\": {\n                                \"drop\": [\n                                    \"ALL\"\n                                ]\n                            },\n                            \"readOnlyRootFilesystem\": true\n                        },\n                        \"startupProbe\": {\n                            \"failureThreshold\": 60,\n                            \"httpGet\": {\n                                \"path\": \"/healthz\",\n                                \"port\": \"metrics\",\n                                \"scheme\": \"HTTP\"\n                            },\n                            \"periodSeconds\": 5,\n                            \"successThreshold\": 1,\n                            \"timeoutSeconds\": 1\n                        },\n                        \"terminationMessagePath\": \"/dev/termination-log\",\n                        \"terminationMessagePolicy\": \"File\",\n                        \"volumeMounts\": [\n                            {\n                                \"mountPath\": \"/tmp\",\n                                \"name\": \"tmp\"\n                            },\n                            {\n                                \"mountPath\": \"/var/cache/hibana\",\n                                \"name\": \"cache\"\n                            }\n                        ]\n                    }\n                ],\n                \"dnsPolicy\": \"ClusterFirst\",\n                \"enableServiceLinks\": true,\n                \"nodeName\": \"hibana-demo-worker\",\n                \"preemptionPolicy\": \"PreemptLowerPriority\",\n                \"priority\": 0,\n                \"restartPolicy\": \"Always\",\n                \"schedulerName\": \"default-scheduler\",\n                \"securityContext\": {\n                    \"fsGroup\": 10001,\n                    \"runAsGroup\": 10001,\n                    \"runAsNonRoot\": true,\n                    \"runAsUser\": 10001,\n                    \"seccompProfile\": {\n                        \"type\": \"RuntimeDefault\"\n                    }\n                },\n                \"serviceAccount\": \"hibana-worker\",\n                \"serviceAccountName\": \"hibana-worker\",\n                \"terminationGracePeriodSeconds\": 90,\n                \"tolerations\": [\n                    {\n                        \"effect\": \"NoExecute\",\n                        \"key\": \"node.kubernetes.io/not-ready\",\n                        \"operator\": \"Exists\",\n                        \"tolerationSeconds\": 300\n                    },\n                    {\n                        \"effect\": \"NoExecute\",\n                        \"key\": \"node.kubernetes.io/unreachable\",\n                        \"operator\": \"Exists\",\n                        \"tolerationSeconds\": 300\n                    }\n                ],\n                \"topologySpreadConstraints\": [\n                    {\n                        \"labelSelector\": {\n                            \"matchExpressions\": [\n                                {\n                                    \"key\": \"pod-template-hash\",\n                                    \"operator\": \"In\",\n                                    \"values\": [\n                                        \"54598f57d7\"\n                                    ]\n                                }\n                            ],\n                            \"matchLabels\": {\n                                \"app.kubernetes.io/name\": \"hibana-worker\"\n                            }\n                        },\n                        \"matchLabelKeys\": [\n                            \"pod-template-hash\"\n                        ],\n                        \"maxSkew\": 1,\n                        \"minDomains\": 2,\n                        \"nodeTaintsPolicy\": \"Honor\",\n                        \"topologyKey\": \"kubernetes.io/hostname\",\n                        \"whenUnsatisfiable\": \"DoNotSchedule\"\n                    }\n                ],\n                \"volumes\": [\n                    {\n                        \"emptyDir\": {\n                            \"sizeLimit\": \"1Gi\"\n                        },\n                        \"name\": \"tmp\"\n                    },\n                    {\n                        \"emptyDir\": {\n                            \"sizeLimit\": \"3Gi\"\n                        },\n                        \"name\": \"cache\"\n                    }\n                ]\n            },\n            \"status\": {\n                \"allocatedResources\": {\n                    \"cpu\": \"500m\",\n                    \"ephemeral-storage\": \"1Gi\",\n                    \"memory\": \"1Gi\"\n                },\n                \"conditions\": [\n                    {\n                        \"lastProbeTime\": null,\n                        \"lastTransitionTime\": \"2026-09-07T22:07:32Z\",\n                        \"observedGeneration\": 1,\n                        \"status\": \"True\",\n                        \"type\": \"PodReadyToStartContainers\"\n                    },\n                    {\n                        \"lastProbeTime\": null,\n                        \"lastTransitionTime\": \"2026-09-07T22:07:32Z\",\n                        \"observedGeneration\": 1,\n                        \"status\": \"True\",\n                        \"type\": \"Initialized\"\n                    },\n                    {\n                        \"lastProbeTime\": null,\n                        \"lastTransitionTime\": \"2026-09-07T22:07:38Z\",\n                        \"observedGeneration\": 1,\n                        \"status\": \"True\",\n                        \"type\": \"Ready\"\n                    },\n                    {\n                        \"lastProbeTime\": null,\n                        \"lastTransitionTime\": \"2026-09-07T22:07:38Z\",\n                        \"observedGeneration\": 1,\n                        \"status\": \"True\",\n                        \"type\": \"ContainersReady\"\n                    },\n                    {\n                        \"lastProbeTime\": null,\n                        \"lastTransitionTime\": \"2026-09-07T22:07:32Z\",\n                        \"observedGeneration\": 1,\n                        \"status\": \"True\",\n                        \"type\": \"PodScheduled\"\n                    }\n                ],\n                \"containerStatuses\": [\n                    {\n                        \"allocatedResources\": {\n                            \"cpu\": \"500m\",\n                            \"ephemeral-storage\": \"1Gi\",\n                            \"memory\": \"1Gi\"\n                        },\n                        \"containerID\": \"containerd://44351ac3c1945f4c719e965fbc5a7467dc6b05c8f4d910c2d0aebed041b7c260\",\n                        \"image\": \"docker.io/library/hibana-platform:local-7416adc3d768c4b3b193b7964298d09d00741b0642eb6e9141bb646ea99cb9dc\",\n                        \"imageID\": \"docker.io/library/import-2026-09-07@sha256:7b57bac5781b2f4c8f3c23e7b1329342d566b76a65e3aa0d96591c89a9b10e83\",\n                        \"lastState\": {},\n                        \"name\": \"worker\",\n                        \"ready\": true,\n                        \"resources\": {\n                            \"limits\": {\n                                \"cpu\": \"4\",\n                                \"ephemeral-storage\": \"5Gi\",\n                                \"memory\": \"4Gi\"\n                            },\n                            \"requests\": {\n                                \"cpu\": \"500m\",\n                                \"ephemeral-storage\": \"1Gi\",\n                                \"memory\": \"1Gi\"\n                            }\n                        },\n                        \"restartCount\": 0,\n                        \"started\": true,\n                        \"state\": {\n                            \"running\": {\n                                \"startedAt\": \"2026-09-07T22:07:32Z\"\n                            }\n                        },\n                        \"user\": {\n                            \"linux\": {\n                                \"gid\": 10001,\n                                \"supplementalGroups\": [\n                                    10001\n                                ],\n                                \"uid\": 10001\n                            }\n                        },\n                        \"volumeMounts\": [\n                            {\n                                \"mountPath\": \"/tmp\",\n                                \"name\": \"tmp\"\n                            },\n                            {\n                                \"mountPath\": \"/var/cache/hibana\",\n                                \"name\": \"cache\"\n                            }\n                        ]\n                    }\n                ],\n                \"hostIP\": \"172.26.0.2\",\n                \"hostIPs\": [\n                    {\n                        \"ip\": \"172.26.0.2\"\n                    }\n                ],\n                \"observedGeneration\": 1,\n                \"phase\": \"Running\",\n                \"podIP\": \"10.244.1.8\",\n                \"podIPs\": [\n                    {\n                        \"ip\": \"10.244.1.8\"\n                    }\n                ],\n                \"qosClass\": \"Burstable\",\n                \"resources\": {\n                    \"limits\": {\n                        \"cpu\": \"4\",\n                        \"memory\": \"4Gi\"\n                    },\n                    \"requests\": {\n                        \"cpu\": \"489m\",\n                        \"memory\": \"1Gi\"\n                    }\n                },\n                \"startTime\": \"2026-09-07T22:07:32Z\"\n            }\n        },\n        {\n            \"apiVersion\": \"v1\",\n            \"kind\": \"Pod\",\n            \"metadata\": {\n                \"annotations\": {\n                    \"hibana.local/settings-hash\": \"2d295dd0d5258fce76124142ee09d9a763660e5117b25eb99b638c7ec7211597\"\n                },\n                \"creationTimestamp\": \"2026-09-07T22:07:32Z\",\n                \"generateName\": \"hibana-worker-54598f57d7-\",\n                \"generation\": 1,\n                \"labels\": {\n                    \"app.kubernetes.io/name\": \"hibana-worker\",\n                    \"app.kubernetes.io/part-of\": \"hibana\",\n                    \"pod-template-hash\": \"54598f57d7\"\n                },\n                \"name\": \"hibana-worker-54598f57d7-7q9l4\",\n                \"namespace\": \"hibana\",\n                \"ownerReferences\": [\n                    {\n                        \"apiVersion\": \"apps/v1\",\n                        \"blockOwnerDeletion\": true,\n                        \"controller\": true,\n                        \"kind\": \"ReplicaSet\",\n                        \"name\": \"hibana-worker-54598f57d7\",\n                        \"uid\": \"1ac86cfe-53d5-420b-af62-9d1b89490dc4\"\n                    }\n                ],\n                \"resourceVersion\": \"1089\",\n                \"uid\": \"eb621ca8-07bc-47b7-9fe3-8101f3e01edd\"\n            },\n            \"spec\": {\n                \"automountServiceAccountToken\": false,\n                \"containers\": [\n                    {\n                        \"command\": [\n                            \"/usr/local/bin/hibana-worker\"\n                        ],\n                        \"envFrom\": [\n                            {\n                                \"configMapRef\": {\n                                    \"name\": \"hibana-config\"\n                                }\n                            },\n                            {\n                                \"secretRef\": {\n                                    \"name\": \"hibana-runtime\"\n                                }\n                            }\n                        ],\n                        \"image\": \"hibana-platform:local-7416adc3d768c4b3b193b7964298d09d00741b0642eb6e9141bb646ea99cb9dc\",\n                        \"imagePullPolicy\": \"IfNotPresent\",\n                        \"livenessProbe\": {\n                            \"failureThreshold\": 3,\n                            \"httpGet\": {\n                                \"path\": \"/healthz\",\n                                \"port\": \"metrics\",\n                                \"scheme\": \"HTTP\"\n                            },\n                            \"periodSeconds\": 10,\n                            \"successThreshold\": 1,\n                            \"timeoutSeconds\": 3\n                        },\n                        \"name\": \"worker\",\n                        \"ports\": [\n                            {\n                                \"containerPort\": 9090,\n                                \"name\": \"metrics\",\n                                \"protocol\": \"TCP\"\n                            }\n                        ],\n                        \"readinessProbe\": {\n                            \"failureThreshold\": 3,\n                            \"httpGet\": {\n                                \"path\": \"/readyz\",\n                                \"port\": \"metrics\",\n                                \"scheme\": \"HTTP\"\n                            },\n                            \"periodSeconds\": 5,\n                            \"successThreshold\": 1,\n                            \"timeoutSeconds\": 3\n                        },\n                        \"resources\": {\n                            \"limits\": {\n                                \"cpu\": \"4\",\n                                \"ephemeral-storage\": \"5Gi\",\n                                \"memory\": \"4Gi\"\n                            },\n                            \"requests\": {\n                                \"cpu\": \"500m\",\n                                \"ephemeral-storage\": \"1Gi\",\n                                \"memory\": \"1Gi\"\n                            }\n                        },\n                        \"securityContext\": {\n                            \"allowPrivilegeEscalation\": false,\n                            \"capabilities\": {\n                                \"drop\": [\n                                    \"ALL\"\n                                ]\n                            },\n                            \"readOnlyRootFilesystem\": true\n                        },\n                        \"startupProbe\": {\n                            \"failureThreshold\": 60,\n                            \"httpGet\": {\n                                \"path\": \"/healthz\",\n                                \"port\": \"metrics\",\n                                \"scheme\": \"HTTP\"\n                            },\n                            \"periodSeconds\": 5,\n                            \"successThreshold\": 1,\n                            \"timeoutSeconds\": 1\n                        },\n                        \"terminationMessagePath\": \"/dev/termination-log\",\n                        \"terminationMessagePolicy\": \"File\",\n                        \"volumeMounts\": [\n                            {\n                                \"mountPath\": \"/tmp\",\n                                \"name\": \"tmp\"\n                            },\n                            {\n                                \"mountPath\": \"/var/cache/hibana\",\n                                \"name\": \"cache\"\n                            }\n                        ]\n                    }\n                ],\n                \"dnsPolicy\": \"ClusterFirst\",\n                \"enableServiceLinks\": true,\n                \"nodeName\": \"hibana-demo-worker2\",\n                \"preemptionPolicy\": \"PreemptLowerPriority\",\n                \"priority\": 0,\n                \"restartPolicy\": \"Always\",\n                \"schedulerName\": \"default-scheduler\",\n                \"securityContext\": {\n                    \"fsGroup\": 10001,\n                    \"runAsGroup\": 10001,\n                    \"runAsNonRoot\": true,\n                    \"runAsUser\": 10001,\n                    \"seccompProfile\": {\n                        \"type\": \"RuntimeDefault\"\n                    }\n                },\n                \"serviceAccount\": \"hibana-worker\",\n                \"serviceAccountName\": \"hibana-worker\",\n                \"terminationGracePeriodSeconds\": 90,\n                \"tolerations\": [\n                    {\n                        \"effect\": \"NoExecute\",\n                        \"key\": \"node.kubernetes.io/not-ready\",\n                        \"operator\": \"Exists\",\n                        \"tolerationSeconds\": 300\n                    },\n                    {\n                        \"effect\": \"NoExecute\",\n                        \"key\": \"node.kubernetes.io/unreachable\",\n                        \"operator\": \"Exists\",\n                        \"tolerationSeconds\": 300\n                    }\n                ],\n                \"topologySpreadConstraints\": [\n                    {\n                        \"labelSelector\": {\n                            \"matchExpressions\": [\n                                {\n                                    \"key\": \"pod-template-hash\",\n                                    \"operator\": \"In\",\n                                    \"values\": [\n                                        \"54598f57d7\"\n                                    ]\n                                }\n                            ],\n                            \"matchLabels\": {\n                                \"app.kubernetes.io/name\": \"hibana-worker\"\n                            }\n                        },\n                        \"matchLabelKeys\": [\n                            \"pod-template-hash\"\n                        ],\n                        \"maxSkew\": 1,\n                        \"minDomains\": 2,\n                        \"nodeTaintsPolicy\": \"Honor\",\n                        \"topologyKey\": \"kubernetes.io/hostname\",\n                        \"whenUnsatisfiable\": \"DoNotSchedule\"\n                    }\n                ],\n                \"volumes\": [\n                    {\n                        \"emptyDir\": {\n                            \"sizeLimit\": \"1Gi\"\n                        },\n                        \"name\": \"tmp\"\n                    },\n                    {\n                        \"emptyDir\": {\n                            \"sizeLimit\": \"3Gi\"\n                        },\n                        \"name\": \"cache\"\n                    }\n                ]\n            },\n            \"status\": {\n                \"allocatedResources\": {\n                    \"cpu\": \"500m\",\n                    \"ephemeral-storage\": \"1Gi\",\n                    \"memory\": \"1Gi\"\n                },\n                \"conditions\": [\n                    {\n                        \"lastProbeTime\": null,\n                        \"lastTransitionTime\": \"2026-09-07T22:07:32Z\",\n                        \"observedGeneration\": 1,\n                        \"status\": \"True\",\n                        \"type\": \"PodReadyToStartContainers\"\n                    },\n                    {\n                        \"lastProbeTime\": null,\n                        \"lastTransitionTime\": \"2026-09-07T22:07:32Z\",\n                        \"observedGeneration\": 1,\n                        \"status\": \"True\",\n                        \"type\": \"Initialized\"\n                    },\n                    {\n                        \"lastProbeTime\": null,\n                        \"lastTransitionTime\": \"2026-09-07T22:07:38Z\",\n                        \"observedGeneration\": 1,\n                        \"status\": \"True\",\n                        \"type\": \"Ready\"\n                    },\n                    {\n                        \"lastProbeTime\": null,\n                        \"lastTransitionTime\": \"2026-09-07T22:07:38Z\",\n                        \"observedGeneration\": 1,\n                        \"status\": \"True\",\n                        \"type\": \"ContainersReady\"\n                    },\n                    {\n                        \"lastProbeTime\": null,\n                        \"lastTransitionTime\": \"2026-09-07T22:07:32Z\",\n                        \"observedGeneration\": 1,\n                        \"status\": \"True\",\n                        \"type\": \"PodScheduled\"\n                    }\n                ],\n                \"containerStatuses\": [\n                    {\n                        \"allocatedResources\": {\n                            \"cpu\": \"500m\",\n                            \"ephemeral-storage\": \"1Gi\",\n                            \"memory\": \"1Gi\"\n                        },\n                        \"containerID\": \"containerd://c3984a7907b9b781b852e1148e0b2b3dbe465ce884137c546b68efba0287dde8\",\n                        \"image\": \"docker.io/library/hibana-platform:local-7416adc3d768c4b3b193b7964298d09d00741b0642eb6e9141bb646ea99cb9dc\",\n                        \"imageID\": \"docker.io/library/import-2026-09-07@sha256:7b57bac5781b2f4c8f3c23e7b1329342d566b76a65e3aa0d96591c89a9b10e83\",\n                        \"lastState\": {},\n                        \"name\": \"worker\",\n                        \"ready\": true,\n                        \"resources\": {\n                            \"limits\": {\n                                \"cpu\": \"4\",\n                                \"ephemeral-storage\": \"5Gi\",\n                                \"memory\": \"4Gi\"\n                            },\n                            \"requests\": {\n                                \"cpu\": \"500m\",\n                                \"ephemeral-storage\": \"1Gi\",\n                                \"memory\": \"1Gi\"\n                            }\n                        },\n                        \"restartCount\": 0,\n                        \"started\": true,\n                        \"state\": {\n                            \"running\": {\n                                \"startedAt\": \"2026-09-07T22:07:32Z\"\n                            }\n                        },\n                        \"user\": {\n                            \"linux\": {\n                                \"gid\": 10001,\n                                \"supplementalGroups\": [\n                                    10001\n                                ],\n                                \"uid\": 10001\n                            }\n                        },\n                        \"volumeMounts\": [\n                            {\n                                \"mountPath\": \"/tmp\",\n                                \"name\": \"tmp\"\n                            },\n                            {\n                                \"mountPath\": \"/var/cache/hibana\",\n                                \"name\": \"cache\"\n                            }\n                        ]\n                    }\n                ],\n                \"hostIP\": \"172.26.0.4\",\n                \"hostIPs\": [\n                    {\n                        \"ip\": \"172.26.0.4\"\n                    }\n                ],\n                \"observedGeneration\": 1,\n                \"phase\": \"Running\",\n                \"podIP\": \"10.244.2.6\",\n                \"podIPs\": [\n                    {\n                        \"ip\": \"10.244.2.6\"\n                    }\n                ],\n                \"qosClass\": \"Burstable\",\n                \"resources\": {\n                    \"limits\": {\n                        \"cpu\": \"4\",\n                        \"memory\": \"4Gi\"\n                    },\n                    \"requests\": {\n                        \"cpu\": \"489m\",\n                        \"memory\": \"1Gi\"\n                    }\n                },\n                \"startTime\": \"2026-09-07T22:07:32Z\"\n            }\n        }\n    ],\n    \"kind\": \"List\",\n    \"metadata\": {\n        \"resourceVersion\": \"\"\n    }\n}\n"
+        }
+      ]
+    },
+    {
+      "id": "deploy",
+      "command": "hibana deploy --version 1.0.0",
+      "cwd": "<checkout>/.local/demo-recording/hello-hono",
+      "durationSeconds": 1.759,
+      "output": "OK Successfully written <checkout>/.local/demo-recording/hello-hono/.hibana/build/staging-tIWZsL/app.wasm.building.\nDeployed hello-hono (cmp_1013788a9e094a82a67168e60e0313c8) version 1.0.0\nHTTP host: hello-hono.smoke.hibana.local\n",
+      "exitCode": 0,
+      "events": [
+        {
+          "t": 1.51,
+          "text": "OK Successfully written <checkout>/.local/demo-recording/hello-hono/.hibana/build/staging-tIWZsL/app.wasm.building.\n"
+        },
+        {
+          "t": 1.755,
+          "text": "Deployed hello-hono (cmp_1013788a9e094a82a67168e60e0313c8) version 1.0.0\n"
+        },
+        {
+          "t": 1.755,
+          "text": "HTTP host: hello-hono.smoke.hibana.local\n"
+        }
+      ]
+    },
+    {
+      "id": "wasm-header",
+      "command": "xxd -l 8 .hibana/build/app.wasm",
+      "cwd": "<checkout>/.local/demo-recording/hello-hono",
+      "durationSeconds": 0.004,
+      "output": "00000000: 0061 736d 0d00 0100                      .asm....\n",
+      "exitCode": 0,
+      "events": [
+        {
+          "t": 0.004,
+          "text": "00000000: 0061 736d 0d00 0100                      .asm....\n"
+        }
+      ]
+    },
+    {
+      "id": "wit",
+      "command": "<checkout>/sdk/node_modules/.bin/jco wit .hibana/build/app.wasm",
+      "cwd": "<checkout>/.local/demo-recording/hello-hono",
+      "durationSeconds": 0.474,
+      "output": "package root:component;\n\nworld root {\n  import wasi:io/poll@0.2.3;\n  import wasi:clocks/monotonic-clock@0.2.3;\n  import wasi:io/error@0.2.3;\n  import wasi:io/streams@0.2.3;\n  import wasi:http/types@0.2.3;\n  import wasi:cli/stdin@0.2.3;\n  import wasi:cli/stdout@0.2.3;\n  import wasi:cli/stderr@0.2.3;\n  import wasi:cli/terminal-input@0.2.3;\n  import wasi:cli/terminal-output@0.2.3;\n  import wasi:cli/terminal-stdin@0.2.3;\n  import wasi:cli/terminal-stdout@0.2.3;\n  import wasi:cli/terminal-stderr@0.2.3;\n  import wasi:clocks/wall-clock@0.2.3;\n  import wasi:filesystem/types@0.2.3;\n  import wasi:filesystem/preopens@0.2.3;\n  import wasi:random/random@0.2.3;\n  import wasi:http/outgoing-handler@0.2.3;\n\n  export wasi:http/incoming-handler@0.2.3;\n}\n\n",
+      "exitCode": 0,
+      "events": [
+        {
+          "t": 0.467,
+          "text": "package root:component;\n\nworld root {\n  import wasi:io/poll@0.2.3;\n  import wasi:clocks/monotonic-clock@0.2.3;\n  import wasi:io/error@0.2.3;\n  import wasi:io/streams@0.2.3;\n  import wasi:http/types@0.2.3;\n  import wasi:cli/stdin@0.2.3;\n  import wasi:cli/stdout@0.2.3;\n  import wasi:cli/stderr@0.2.3;\n  import wasi:cli/terminal-input@0.2.3;\n  import wasi:cli/terminal-output@0.2.3;\n  import wasi:cli/terminal-stdin@0.2.3;\n  import wasi:cli/terminal-stdout@0.2.3;\n  import wasi:cli/terminal-stderr@0.2.3;\n  import wasi:clocks/wall-clock@0.2.3;\n  import wasi:filesystem/types@0.2.3;\n  import wasi:filesystem/preopens@0.2.3;\n  import wasi:random/random@0.2.3;\n  import wasi:http/outgoing-handler@0.2.3;\n\n  export wasi:http/incoming-handler@0.2.3;\n}\n\n"
+        }
+      ]
+    },
+    {
+      "id": "request-1",
+      "command": "curl --silent --show-error --max-time 60 -i -H 'Host: hello-hono.smoke.hibana.local' http://127.0.0.1:18084/",
+      "cwd": "<checkout>/.local/demo-recording/hello-hono",
+      "durationSeconds": 7.64,
+      "output": "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ndate: Mon, 07 Sep 2026 22:07:59 GMT\r\ntransfer-encoding: chunked\r\n\r\n{\"message\":\"Hello, Wasm!\",\"count\":1}",
+      "exitCode": 0,
+      "events": [
+        {
+          "t": 7.639,
+          "text": "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ndate: Mon, 07 Sep 2026 22:07:59 GMT\r\ntransfer-encoding: chunked\r\n\r\n{\"message\":\"Hello, Wasm!\",\"count\":1}"
+        }
+      ]
+    },
+    {
+      "id": "request-2",
+      "command": "curl --silent --show-error --max-time 60 -i -H 'Host: hello-hono.smoke.hibana.local' http://127.0.0.1:18084/",
+      "cwd": "<checkout>/.local/demo-recording/hello-hono",
+      "durationSeconds": 7.591,
+      "output": "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ndate: Mon, 07 Sep 2026 22:08:06 GMT\r\ntransfer-encoding: chunked\r\n\r\n{\"message\":\"Hello, Wasm!\",\"count\":1}",
+      "exitCode": 0,
+      "events": [
+        {
+          "t": 7.59,
+          "text": "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ndate: Mon, 07 Sep 2026 22:08:06 GMT\r\ntransfer-encoding: chunked\r\n\r\n{\"message\":\"Hello, Wasm!\",\"count\":1}"
+        }
+      ]
+    },
+    {
+      "id": "request-3",
+      "command": "curl --silent --show-error --max-time 60 -i -H 'Host: hello-hono.smoke.hibana.local' http://127.0.0.1:18084/",
+      "cwd": "<checkout>/.local/demo-recording/hello-hono",
+      "durationSeconds": 0.047,
+      "output": "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ndate: Mon, 07 Sep 2026 22:08:06 GMT\r\ntransfer-encoding: chunked\r\n\r\n{\"message\":\"Hello, Wasm!\",\"count\":1}",
+      "exitCode": 0,
+      "events": [
+        {
+          "t": 0.046,
+          "text": "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ndate: Mon, 07 Sep 2026 22:08:06 GMT\r\ntransfer-encoding: chunked\r\n\r\n{\"message\":\"Hello, Wasm!\",\"count\":1}"
+        }
+      ]
+    },
+    {
+      "id": "workers-after",
+      "command": "kubectl -n hibana get pods -l app.kubernetes.io/name=hibana-worker -o json",
+      "cwd": "<checkout>",
+      "durationSeconds": 0.172,
+      "output": "{\n    \"apiVersion\": \"v1\",\n    \"items\": [\n        {\n            \"apiVersion\": \"v1\",\n            \"kind\": \"Pod\",\n            \"metadata\": {\n                \"annotations\": {\n                    \"hibana.local/settings-hash\": \"2d295dd0d5258fce76124142ee09d9a763660e5117b25eb99b638c7ec7211597\"\n                },\n                \"creationTimestamp\": \"2026-09-07T22:07:32Z\",\n                \"generateName\": \"hibana-worker-54598f57d7-\",\n                \"generation\": 1,\n                \"labels\": {\n                    \"app.kubernetes.io/name\": \"hibana-worker\",\n                    \"app.kubernetes.io/part-of\": \"hibana\",\n                    \"pod-template-hash\": \"54598f57d7\"\n                },\n                \"name\": \"hibana-worker-54598f57d7-5jwv5\",\n                \"namespace\": \"hibana\",\n                \"ownerReferences\": [\n                    {\n                        \"apiVersion\": \"apps/v1\",\n                        \"blockOwnerDeletion\": true,\n                        \"controller\": true,\n                        \"kind\": \"ReplicaSet\",\n                        \"name\": \"hibana-worker-54598f57d7\",\n                        \"uid\": \"1ac86cfe-53d5-420b-af62-9d1b89490dc4\"\n                    }\n                ],\n                \"resourceVersion\": \"1069\",\n                \"uid\": \"9c895cf9-5d80-4ec4-af59-c852757158f9\"\n            },\n            \"spec\": {\n                \"automountServiceAccountToken\": false,\n                \"containers\": [\n                    {\n                        \"command\": [\n                            \"/usr/local/bin/hibana-worker\"\n                        ],\n                        \"envFrom\": [\n                            {\n                                \"configMapRef\": {\n                                    \"name\": \"hibana-config\"\n                                }\n                            },\n                            {\n                                \"secretRef\": {\n                                    \"name\": \"hibana-runtime\"\n                                }\n                            }\n                        ],\n                        \"image\": \"hibana-platform:local-7416adc3d768c4b3b193b7964298d09d00741b0642eb6e9141bb646ea99cb9dc\",\n                        \"imagePullPolicy\": \"IfNotPresent\",\n                        \"livenessProbe\": {\n                            \"failureThreshold\": 3,\n                            \"httpGet\": {\n                                \"path\": \"/healthz\",\n                                \"port\": \"metrics\",\n                                \"scheme\": \"HTTP\"\n                            },\n                            \"periodSeconds\": 10,\n                            \"successThreshold\": 1,\n                            \"timeoutSeconds\": 3\n                        },\n                        \"name\": \"worker\",\n                        \"ports\": [\n                            {\n                                \"containerPort\": 9090,\n                                \"name\": \"metrics\",\n                                \"protocol\": \"TCP\"\n                            }\n                        ],\n                        \"readinessProbe\": {\n                            \"failureThreshold\": 3,\n                            \"httpGet\": {\n                                \"path\": \"/readyz\",\n                                \"port\": \"metrics\",\n                                \"scheme\": \"HTTP\"\n                            },\n                            \"periodSeconds\": 5,\n                            \"successThreshold\": 1,\n                            \"timeoutSeconds\": 3\n                        },\n                        \"resources\": {\n                            \"limits\": {\n                                \"cpu\": \"4\",\n                                \"ephemeral-storage\": \"5Gi\",\n                                \"memory\": \"4Gi\"\n                            },\n                            \"requests\": {\n                                \"cpu\": \"500m\",\n                                \"ephemeral-storage\": \"1Gi\",\n                                \"memory\": \"1Gi\"\n                            }\n                        },\n                        \"securityContext\": {\n                            \"allowPrivilegeEscalation\": false,\n                            \"capabilities\": {\n                                \"drop\": [\n                                    \"ALL\"\n                                ]\n                            },\n                            \"readOnlyRootFilesystem\": true\n                        },\n                        \"startupProbe\": {\n                            \"failureThreshold\": 60,\n                            \"httpGet\": {\n                                \"path\": \"/healthz\",\n                                \"port\": \"metrics\",\n                                \"scheme\": \"HTTP\"\n                            },\n                            \"periodSeconds\": 5,\n                            \"successThreshold\": 1,\n                            \"timeoutSeconds\": 1\n                        },\n                        \"terminationMessagePath\": \"/dev/termination-log\",\n                        \"terminationMessagePolicy\": \"File\",\n                        \"volumeMounts\": [\n                            {\n                                \"mountPath\": \"/tmp\",\n                                \"name\": \"tmp\"\n                            },\n                            {\n                                \"mountPath\": \"/var/cache/hibana\",\n                                \"name\": \"cache\"\n                            }\n                        ]\n                    }\n                ],\n                \"dnsPolicy\": \"ClusterFirst\",\n                \"enableServiceLinks\": true,\n                \"nodeName\": \"hibana-demo-worker\",\n                \"preemptionPolicy\": \"PreemptLowerPriority\",\n                \"priority\": 0,\n                \"restartPolicy\": \"Always\",\n                \"schedulerName\": \"default-scheduler\",\n                \"securityContext\": {\n                    \"fsGroup\": 10001,\n                    \"runAsGroup\": 10001,\n                    \"runAsNonRoot\": true,\n                    \"runAsUser\": 10001,\n                    \"seccompProfile\": {\n                        \"type\": \"RuntimeDefault\"\n                    }\n                },\n                \"serviceAccount\": \"hibana-worker\",\n                \"serviceAccountName\": \"hibana-worker\",\n                \"terminationGracePeriodSeconds\": 90,\n                \"tolerations\": [\n                    {\n                        \"effect\": \"NoExecute\",\n                        \"key\": \"node.kubernetes.io/not-ready\",\n                        \"operator\": \"Exists\",\n                        \"tolerationSeconds\": 300\n                    },\n                    {\n                        \"effect\": \"NoExecute\",\n                        \"key\": \"node.kubernetes.io/unreachable\",\n                        \"operator\": \"Exists\",\n                        \"tolerationSeconds\": 300\n                    }\n                ],\n                \"topologySpreadConstraints\": [\n                    {\n                        \"labelSelector\": {\n                            \"matchExpressions\": [\n                                {\n                                    \"key\": \"pod-template-hash\",\n                                    \"operator\": \"In\",\n                                    \"values\": [\n                                        \"54598f57d7\"\n                                    ]\n                                }\n                            ],\n                            \"matchLabels\": {\n                                \"app.kubernetes.io/name\": \"hibana-worker\"\n                            }\n                        },\n                        \"matchLabelKeys\": [\n                            \"pod-template-hash\"\n                        ],\n                        \"maxSkew\": 1,\n                        \"minDomains\": 2,\n                        \"nodeTaintsPolicy\": \"Honor\",\n                        \"topologyKey\": \"kubernetes.io/hostname\",\n                        \"whenUnsatisfiable\": \"DoNotSchedule\"\n                    }\n                ],\n                \"volumes\": [\n                    {\n                        \"emptyDir\": {\n                            \"sizeLimit\": \"1Gi\"\n                        },\n                        \"name\": \"tmp\"\n                    },\n                    {\n                        \"emptyDir\": {\n                            \"sizeLimit\": \"3Gi\"\n                        },\n                        \"name\": \"cache\"\n                    }\n                ]\n            },\n            \"status\": {\n                \"allocatedResources\": {\n                    \"cpu\": \"500m\",\n                    \"ephemeral-storage\": \"1Gi\",\n                    \"memory\": \"1Gi\"\n                },\n                \"conditions\": [\n                    {\n                        \"lastProbeTime\": null,\n                        \"lastTransitionTime\": \"2026-09-07T22:07:32Z\",\n                        \"observedGeneration\": 1,\n                        \"status\": \"True\",\n                        \"type\": \"PodReadyToStartContainers\"\n                    },\n                    {\n                        \"lastProbeTime\": null,\n                        \"lastTransitionTime\": \"2026-09-07T22:07:32Z\",\n                        \"observedGeneration\": 1,\n                        \"status\": \"True\",\n                        \"type\": \"Initialized\"\n                    },\n                    {\n                        \"lastProbeTime\": null,\n                        \"lastTransitionTime\": \"2026-09-07T22:07:38Z\",\n                        \"observedGeneration\": 1,\n                        \"status\": \"True\",\n                        \"type\": \"Ready\"\n                    },\n                    {\n                        \"lastProbeTime\": null,\n                        \"lastTransitionTime\": \"2026-09-07T22:07:38Z\",\n                        \"observedGeneration\": 1,\n                        \"status\": \"True\",\n                        \"type\": \"ContainersReady\"\n                    },\n                    {\n                        \"lastProbeTime\": null,\n                        \"lastTransitionTime\": \"2026-09-07T22:07:32Z\",\n                        \"observedGeneration\": 1,\n                        \"status\": \"True\",\n                        \"type\": \"PodScheduled\"\n                    }\n                ],\n                \"containerStatuses\": [\n                    {\n                        \"allocatedResources\": {\n                            \"cpu\": \"500m\",\n                            \"ephemeral-storage\": \"1Gi\",\n                            \"memory\": \"1Gi\"\n                        },\n                        \"containerID\": \"containerd://44351ac3c1945f4c719e965fbc5a7467dc6b05c8f4d910c2d0aebed041b7c260\",\n                        \"image\": \"docker.io/library/hibana-platform:local-7416adc3d768c4b3b193b7964298d09d00741b0642eb6e9141bb646ea99cb9dc\",\n                        \"imageID\": \"docker.io/library/import-2026-09-07@sha256:7b57bac5781b2f4c8f3c23e7b1329342d566b76a65e3aa0d96591c89a9b10e83\",\n                        \"lastState\": {},\n                        \"name\": \"worker\",\n                        \"ready\": true,\n                        \"resources\": {\n                            \"limits\": {\n                                \"cpu\": \"4\",\n                                \"ephemeral-storage\": \"5Gi\",\n                                \"memory\": \"4Gi\"\n                            },\n                            \"requests\": {\n                                \"cpu\": \"500m\",\n                                \"ephemeral-storage\": \"1Gi\",\n                                \"memory\": \"1Gi\"\n                            }\n                        },\n                        \"restartCount\": 0,\n                        \"started\": true,\n                        \"state\": {\n                            \"running\": {\n                                \"startedAt\": \"2026-09-07T22:07:32Z\"\n                            }\n                        },\n                        \"user\": {\n                            \"linux\": {\n                                \"gid\": 10001,\n                                \"supplementalGroups\": [\n                                    10001\n                                ],\n                                \"uid\": 10001\n                            }\n                        },\n                        \"volumeMounts\": [\n                            {\n                                \"mountPath\": \"/tmp\",\n                                \"name\": \"tmp\"\n                            },\n                            {\n                                \"mountPath\": \"/var/cache/hibana\",\n                                \"name\": \"cache\"\n                            }\n                        ]\n                    }\n                ],\n                \"hostIP\": \"172.26.0.2\",\n                \"hostIPs\": [\n                    {\n                        \"ip\": \"172.26.0.2\"\n                    }\n                ],\n                \"observedGeneration\": 1,\n                \"phase\": \"Running\",\n                \"podIP\": \"10.244.1.8\",\n                \"podIPs\": [\n                    {\n                        \"ip\": \"10.244.1.8\"\n                    }\n                ],\n                \"qosClass\": \"Burstable\",\n                \"resources\": {\n                    \"limits\": {\n                        \"cpu\": \"4\",\n                        \"memory\": \"4Gi\"\n                    },\n                    \"requests\": {\n                        \"cpu\": \"489m\",\n                        \"memory\": \"1Gi\"\n                    }\n                },\n                \"startTime\": \"2026-09-07T22:07:32Z\"\n            }\n        },\n        {\n            \"apiVersion\": \"v1\",\n            \"kind\": \"Pod\",\n            \"metadata\": {\n                \"annotations\": {\n                    \"hibana.local/settings-hash\": \"2d295dd0d5258fce76124142ee09d9a763660e5117b25eb99b638c7ec7211597\"\n                },\n                \"creationTimestamp\": \"2026-09-07T22:07:32Z\",\n                \"generateName\": \"hibana-worker-54598f57d7-\",\n                \"generation\": 1,\n                \"labels\": {\n                    \"app.kubernetes.io/name\": \"hibana-worker\",\n                    \"app.kubernetes.io/part-of\": \"hibana\",\n                    \"pod-template-hash\": \"54598f57d7\"\n                },\n                \"name\": \"hibana-worker-54598f57d7-7q9l4\",\n                \"namespace\": \"hibana\",\n                \"ownerReferences\": [\n                    {\n                        \"apiVersion\": \"apps/v1\",\n                        \"blockOwnerDeletion\": true,\n                        \"controller\": true,\n                        \"kind\": \"ReplicaSet\",\n                        \"name\": \"hibana-worker-54598f57d7\",\n                        \"uid\": \"1ac86cfe-53d5-420b-af62-9d1b89490dc4\"\n                    }\n                ],\n                \"resourceVersion\": \"1089\",\n                \"uid\": \"eb621ca8-07bc-47b7-9fe3-8101f3e01edd\"\n            },\n            \"spec\": {\n                \"automountServiceAccountToken\": false,\n                \"containers\": [\n                    {\n                        \"command\": [\n                            \"/usr/local/bin/hibana-worker\"\n                        ],\n                        \"envFrom\": [\n                            {\n                                \"configMapRef\": {\n                                    \"name\": \"hibana-config\"\n                                }\n                            },\n                            {\n                                \"secretRef\": {\n                                    \"name\": \"hibana-runtime\"\n                                }\n                            }\n                        ],\n                        \"image\": \"hibana-platform:local-7416adc3d768c4b3b193b7964298d09d00741b0642eb6e9141bb646ea99cb9dc\",\n                        \"imagePullPolicy\": \"IfNotPresent\",\n                        \"livenessProbe\": {\n                            \"failureThreshold\": 3,\n                            \"httpGet\": {\n                                \"path\": \"/healthz\",\n                                \"port\": \"metrics\",\n                                \"scheme\": \"HTTP\"\n                            },\n                            \"periodSeconds\": 10,\n                            \"successThreshold\": 1,\n                            \"timeoutSeconds\": 3\n                        },\n                        \"name\": \"worker\",\n                        \"ports\": [\n                            {\n                                \"containerPort\": 9090,\n                                \"name\": \"metrics\",\n                                \"protocol\": \"TCP\"\n                            }\n                        ],\n                        \"readinessProbe\": {\n                            \"failureThreshold\": 3,\n                            \"httpGet\": {\n                                \"path\": \"/readyz\",\n                                \"port\": \"metrics\",\n                                \"scheme\": \"HTTP\"\n                            },\n                            \"periodSeconds\": 5,\n                            \"successThreshold\": 1,\n                            \"timeoutSeconds\": 3\n                        },\n                        \"resources\": {\n                            \"limits\": {\n                                \"cpu\": \"4\",\n                                \"ephemeral-storage\": \"5Gi\",\n                                \"memory\": \"4Gi\"\n                            },\n                            \"requests\": {\n                                \"cpu\": \"500m\",\n                                \"ephemeral-storage\": \"1Gi\",\n                                \"memory\": \"1Gi\"\n                            }\n                        },\n                        \"securityContext\": {\n                            \"allowPrivilegeEscalation\": false,\n                            \"capabilities\": {\n                                \"drop\": [\n                                    \"ALL\"\n                                ]\n                            },\n                            \"readOnlyRootFilesystem\": true\n                        },\n                        \"startupProbe\": {\n                            \"failureThreshold\": 60,\n                            \"httpGet\": {\n                                \"path\": \"/healthz\",\n                                \"port\": \"metrics\",\n                                \"scheme\": \"HTTP\"\n                            },\n                            \"periodSeconds\": 5,\n                            \"successThreshold\": 1,\n                            \"timeoutSeconds\": 1\n                        },\n                        \"terminationMessagePath\": \"/dev/termination-log\",\n                        \"terminationMessagePolicy\": \"File\",\n                        \"volumeMounts\": [\n                            {\n                                \"mountPath\": \"/tmp\",\n                                \"name\": \"tmp\"\n                            },\n                            {\n                                \"mountPath\": \"/var/cache/hibana\",\n                                \"name\": \"cache\"\n                            }\n                        ]\n                    }\n                ],\n                \"dnsPolicy\": \"ClusterFirst\",\n                \"enableServiceLinks\": true,\n                \"nodeName\": \"hibana-demo-worker2\",\n                \"preemptionPolicy\": \"PreemptLowerPriority\",\n                \"priority\": 0,\n                \"restartPolicy\": \"Always\",\n                \"schedulerName\": \"default-scheduler\",\n                \"securityContext\": {\n                    \"fsGroup\": 10001,\n                    \"runAsGroup\": 10001,\n                    \"runAsNonRoot\": true,\n                    \"runAsUser\": 10001,\n                    \"seccompProfile\": {\n                        \"type\": \"RuntimeDefault\"\n                    }\n                },\n                \"serviceAccount\": \"hibana-worker\",\n                \"serviceAccountName\": \"hibana-worker\",\n                \"terminationGracePeriodSeconds\": 90,\n                \"tolerations\": [\n                    {\n                        \"effect\": \"NoExecute\",\n                        \"key\": \"node.kubernetes.io/not-ready\",\n                        \"operator\": \"Exists\",\n                        \"tolerationSeconds\": 300\n                    },\n                    {\n                        \"effect\": \"NoExecute\",\n                        \"key\": \"node.kubernetes.io/unreachable\",\n                        \"operator\": \"Exists\",\n                        \"tolerationSeconds\": 300\n                    }\n                ],\n                \"topologySpreadConstraints\": [\n                    {\n                        \"labelSelector\": {\n                            \"matchExpressions\": [\n                                {\n                                    \"key\": \"pod-template-hash\",\n                                    \"operator\": \"In\",\n                                    \"values\": [\n                                        \"54598f57d7\"\n                                    ]\n                                }\n                            ],\n                            \"matchLabels\": {\n                                \"app.kubernetes.io/name\": \"hibana-worker\"\n                            }\n                        },\n                        \"matchLabelKeys\": [\n                            \"pod-template-hash\"\n                        ],\n                        \"maxSkew\": 1,\n                        \"minDomains\": 2,\n                        \"nodeTaintsPolicy\": \"Honor\",\n                        \"topologyKey\": \"kubernetes.io/hostname\",\n                        \"whenUnsatisfiable\": \"DoNotSchedule\"\n                    }\n                ],\n                \"volumes\": [\n                    {\n                        \"emptyDir\": {\n                            \"sizeLimit\": \"1Gi\"\n                        },\n                        \"name\": \"tmp\"\n                    },\n                    {\n                        \"emptyDir\": {\n                            \"sizeLimit\": \"3Gi\"\n                        },\n                        \"name\": \"cache\"\n                    }\n                ]\n            },\n            \"status\": {\n                \"allocatedResources\": {\n                    \"cpu\": \"500m\",\n                    \"ephemeral-storage\": \"1Gi\",\n                    \"memory\": \"1Gi\"\n                },\n                \"conditions\": [\n                    {\n                        \"lastProbeTime\": null,\n                        \"lastTransitionTime\": \"2026-09-07T22:07:32Z\",\n                        \"observedGeneration\": 1,\n                        \"status\": \"True\",\n                        \"type\": \"PodReadyToStartContainers\"\n                    },\n                    {\n                        \"lastProbeTime\": null,\n                        \"lastTransitionTime\": \"2026-09-07T22:07:32Z\",\n                        \"observedGeneration\": 1,\n                        \"status\": \"True\",\n                        \"type\": \"Initialized\"\n                    },\n                    {\n                        \"lastProbeTime\": null,\n                        \"lastTransitionTime\": \"2026-09-07T22:07:38Z\",\n                        \"observedGeneration\": 1,\n                        \"status\": \"True\",\n                        \"type\": \"Ready\"\n                    },\n                    {\n                        \"lastProbeTime\": null,\n                        \"lastTransitionTime\": \"2026-09-07T22:07:38Z\",\n                        \"observedGeneration\": 1,\n                        \"status\": \"True\",\n                        \"type\": \"ContainersReady\"\n                    },\n                    {\n                        \"lastProbeTime\": null,\n                        \"lastTransitionTime\": \"2026-09-07T22:07:32Z\",\n                        \"observedGeneration\": 1,\n                        \"status\": \"True\",\n                        \"type\": \"PodScheduled\"\n                    }\n                ],\n                \"containerStatuses\": [\n                    {\n                        \"allocatedResources\": {\n                            \"cpu\": \"500m\",\n                            \"ephemeral-storage\": \"1Gi\",\n                            \"memory\": \"1Gi\"\n                        },\n                        \"containerID\": \"containerd://c3984a7907b9b781b852e1148e0b2b3dbe465ce884137c546b68efba0287dde8\",\n                        \"image\": \"docker.io/library/hibana-platform:local-7416adc3d768c4b3b193b7964298d09d00741b0642eb6e9141bb646ea99cb9dc\",\n                        \"imageID\": \"docker.io/library/import-2026-09-07@sha256:7b57bac5781b2f4c8f3c23e7b1329342d566b76a65e3aa0d96591c89a9b10e83\",\n                        \"lastState\": {},\n                        \"name\": \"worker\",\n                        \"ready\": true,\n                        \"resources\": {\n                            \"limits\": {\n                                \"cpu\": \"4\",\n                                \"ephemeral-storage\": \"5Gi\",\n                                \"memory\": \"4Gi\"\n                            },\n                            \"requests\": {\n                                \"cpu\": \"500m\",\n                                \"ephemeral-storage\": \"1Gi\",\n                                \"memory\": \"1Gi\"\n                            }\n                        },\n                        \"restartCount\": 0,\n                        \"started\": true,\n                        \"state\": {\n                            \"running\": {\n                                \"startedAt\": \"2026-09-07T22:07:32Z\"\n                            }\n                        },\n                        \"user\": {\n                            \"linux\": {\n                                \"gid\": 10001,\n                                \"supplementalGroups\": [\n                                    10001\n                                ],\n                                \"uid\": 10001\n                            }\n                        },\n                        \"volumeMounts\": [\n                            {\n                                \"mountPath\": \"/tmp\",\n                                \"name\": \"tmp\"\n                            },\n                            {\n                                \"mountPath\": \"/var/cache/hibana\",\n                                \"name\": \"cache\"\n                            }\n                        ]\n                    }\n                ],\n                \"hostIP\": \"172.26.0.4\",\n                \"hostIPs\": [\n                    {\n                        \"ip\": \"172.26.0.4\"\n                    }\n                ],\n                \"observedGeneration\": 1,\n                \"phase\": \"Running\",\n                \"podIP\": \"10.244.2.6\",\n                \"podIPs\": [\n                    {\n                        \"ip\": \"10.244.2.6\"\n                    }\n                ],\n                \"qosClass\": \"Burstable\",\n                \"resources\": {\n                    \"limits\": {\n                        \"cpu\": \"4\",\n                        \"memory\": \"4Gi\"\n                    },\n                    \"requests\": {\n                        \"cpu\": \"489m\",\n                        \"memory\": \"1Gi\"\n                    }\n                },\n                \"startTime\": \"2026-09-07T22:07:32Z\"\n            }\n        }\n    ],\n    \"kind\": \"List\",\n    \"metadata\": {\n        \"resourceVersion\": \"\"\n    }\n}\n",
+      "exitCode": 0,
+      "events": [
+        {
+          "t": 0.171,
+          "text": "{\n    \"apiVersion\": \"v1\",\n    \"items\": [\n        {\n            \"apiVersion\": \"v1\",\n            \"kind\": \"Pod\",\n            \"metadata\": {\n                \"annotations\": {\n                    \"hibana.local/settings-hash\": \"2d295dd0d5258fce76124142ee09d9a763660e5117b25eb99b638c7ec7211597\"\n                },\n                \"creationTimestamp\": \"2026-09-07T22:07:32Z\",\n                \"generateName\": \"hibana-worker-54598f57d7-\",\n                \"generation\": 1,\n                \"labels\": {\n                    \"app.kubernetes.io/name\": \"hibana-worker\",\n                    \"app.kubernetes.io/part-of\": \"hibana\",\n                    \"pod-template-hash\": \"54598f57d7\"\n                },\n                \"name\": \"hibana-worker-54598f57d7-5jwv5\",\n                \"namespace\": \"hibana\",\n                \"ownerReferences\": [\n                    {\n                        \"apiVersion\": \"apps/v1\",\n                        \"blockOwnerDeletion\": true,\n                        \"controller\": true,\n                        \"kind\": \"ReplicaSet\",\n                        \"name\": \"hibana-worker-54598f57d7\",\n                        \"uid\": \"1ac86cfe-53d5-420b-af62-9d1b89490dc4\"\n                    }\n                ],\n                \"resourceVersion\": \"1069\",\n                \"uid\": \"9c895cf9-5d80-4ec4-af59-c852757158f9\"\n            },\n            \"spec\": {\n                \"automountServiceAccountToken\": false,\n                \"containers\": [\n                    {\n                        \"command\": [\n                            \"/usr/local/bin/hibana-worker\"\n                        ],\n                        \"envFrom\": [\n                            {\n                                \"configMapRef\": {\n                                    \"name\": \"hibana-config\"\n                                }\n                            },\n                            {\n                                \"secretRef\": {\n                                    \"name\": \"hibana-runtime\"\n                                }\n                            }\n                        ],\n                        \"image\": \"hibana-platform:local-7416adc3d768c4b3b193b7964298d09d00741b0642eb6e9141bb646ea99cb9dc\",\n                        \"imagePullPolicy\": \"IfNotPresent\",\n                        \"livenessProbe\": {\n                            \"failureThreshold\": 3,\n                            \"httpGet\": {\n                                \"path\": \"/healthz\",\n                                \"port\": \"metrics\",\n                                \"scheme\": \"HTTP\"\n                            },\n                            \"periodSeconds\": 10,\n                            \"successThreshold\": 1,\n                            \"timeoutSeconds\": 3\n                        },\n                        \"name\": \"worker\",\n                        \"ports\": [\n                            {\n                                \"containerPort\": 9090,\n                                \"name\": \"metrics\",\n                                \"protocol\": \"TCP\"\n                            }\n                        ],\n                        \"readinessProbe\": {\n                            \"failureThreshold\": 3,\n                            \"httpGet\": {\n                                \"path\": \"/readyz\",\n                                \"port\": \"metrics\",\n                                \"scheme\": \"HTTP\"\n                            },\n                            \"periodSeconds\": 5,\n                            \"successThreshold\": 1,\n                            \"timeoutSeconds\": 3\n                        },\n                        \"resources\": {\n                            \"limits\": {\n                                \"cpu\": \"4\",\n                                \"ephemeral-storage\": \"5Gi\",\n                                \"memory\": \"4Gi\"\n                            },\n                            \"requests\": {\n                                \"cpu\": \"500m\",\n                                \"ephemeral-storage\": \"1Gi\",\n                                \"memory\": \"1Gi\"\n                            }\n                        },\n                        \"securityContext\": {\n                            \"allowPrivilegeEscalation\": false,\n                            \"capabilities\": {\n                                \"drop\": [\n                                    \"ALL\"\n                                ]\n                            },\n                            \"readOnlyRootFilesystem\": true\n                        },\n                        \"startupProbe\": {\n                            \"failureThreshold\": 60,\n                            \"httpGet\": {\n                                \"path\": \"/healthz\",\n                                \"port\": \"metrics\",\n                                \"scheme\": \"HTTP\"\n                            },\n                            \"periodSeconds\": 5,\n                            \"successThreshold\": 1,\n                            \"timeoutSeconds\": 1\n                        },\n                        \"terminationMessagePath\": \"/dev/termination-log\",\n                        \"terminationMessagePolicy\": \"File\",\n                        \"volumeMounts\": [\n                            {\n                                \"mountPath\": \"/tmp\",\n                                \"name\": \"tmp\"\n                            },\n                            {\n                                \"mountPath\": \"/var/cache/hibana\",\n                                \"name\": \"cache\"\n                            }\n                        ]\n                    }\n                ],\n                \"dnsPolicy\": \"ClusterFirst\",\n                \"enableServiceLinks\": true,\n                \"nodeName\": \"hibana-demo-worker\",\n                \"preemptionPolicy\": \"PreemptLowerPriority\",\n                \"priority\": 0,\n                \"restartPolicy\": \"Always\",\n                \"schedulerName\": \"default-scheduler\",\n                \"securityContext\": {\n                    \"fsGroup\": 10001,\n                    \"runAsGroup\": 10001,\n                    \"runAsNonRoot\": true,\n                    \"runAsUser\": 10001,\n                    \"seccompProfile\": {\n                        \"type\": \"RuntimeDefault\"\n                    }\n                },\n                \"serviceAccount\": \"hibana-worker\",\n                \"serviceAccountName\": \"hibana-worker\",\n                \"terminationGracePeriodSeconds\": 90,\n                \"tolerations\": [\n                    {\n                        \"effect\": \"NoExecute\",\n                        \"key\": \"node.kubernetes.io/not-ready\",\n                        \"operator\": \"Exists\",\n                        \"tolerationSeconds\": 300\n                    },\n                    {\n                        \"effect\": \"NoExecute\",\n                        \"key\": \"node.kubernetes.io/unreachable\",\n                        \"operator\": \"Exists\",\n                        \"tolerationSeconds\": 300\n                    }\n                ],\n                \"topologySpreadConstraints\": [\n                    {\n                        \"labelSelector\": {\n                            \"matchExpressions\": [\n                                {\n                                    \"key\": \"pod-template-hash\",\n                                    \"operator\": \"In\",\n                                    \"values\": [\n                                        \"54598f57d7\"\n                                    ]\n                                }\n                            ],\n                            \"matchLabels\": {\n                                \"app.kubernetes.io/name\": \"hibana-worker\"\n                            }\n                        },\n                        \"matchLabelKeys\": [\n                            \"pod-template-hash\"\n                        ],\n                        \"maxSkew\": 1,\n                        \"minDomains\": 2,\n                        \"nodeTaintsPolicy\": \"Honor\",\n                        \"topologyKey\": \"kubernetes.io/hostname\",\n                        \"whenUnsatisfiable\": \"DoNotSchedule\"\n                    }\n                ],\n                \"volumes\": [\n                    {\n                        \"emptyDir\": {\n                            \"sizeLimit\": \"1Gi\"\n                        },\n                        \"name\": \"tmp\"\n                    },\n                    {\n                        \"emptyDir\": {\n                            \"sizeLimit\": \"3Gi\"\n                        },\n                        \"name\": \"cache\"\n                    }\n                ]\n            },\n            \"status\": {\n                \"allocatedResources\": {\n                    \"cpu\": \"500m\",\n                    \"ephemeral-storage\": \"1Gi\",\n                    \"memory\": \"1Gi\"\n                },\n                \"conditions\": [\n                    {\n                        \"lastProbeTime\": null,\n                        \"lastTransitionTime\": \"2026-09-07T22:07:32Z\",\n                        \"observedGeneration\": 1,\n                        \"status\": \"True\",\n                        \"type\": \"PodReadyToStartContainers\"\n                    },\n                    {\n                        \"lastProbeTime\": null,\n                        \"lastTransitionTime\": \"2026-09-07T22:07:32Z\",\n                        \"observedGeneration\": 1,\n                        \"status\": \"True\",\n                        \"type\": \"Initialized\"\n                    },\n                    {\n                        \"lastProbeTime\": null,\n                        \"lastTransitionTime\": \"2026-09-07T22:07:38Z\",\n                        \"observedGeneration\": 1,\n                        \"status\": \"True\",\n                        \"type\": \"Ready\"\n                    },\n                    {\n                        \"lastProbeTime\": null,\n                        \"lastTransitionTime\": \"2026-09-07T22:07:38Z\",\n                        \"observedGeneration\": 1,\n                        \"status\": \"True\",\n                        \"type\": \"ContainersReady\"\n                    },\n                    {\n                        \"lastProbeTime\": null,\n                        \"lastTransitionTime\": \"2026-09-07T22:07:32Z\",\n                        \"observedGeneration\": 1,\n                        \"status\": \"True\",\n                        \"type\": \"PodScheduled\"\n                    }\n                ],\n                \"containerStatuses\": [\n                    {\n                        \"allocatedResources\": {\n                            \"cpu\": \"500m\",\n                            \"ephemeral-storage\": \"1Gi\",\n                            \"memory\": \"1Gi\"\n                        },\n                        \"containerID\": \"containerd://44351ac3c1945f4c719e965fbc5a7467dc6b05c8f4d910c2d0aebed041b7c260\",\n                        \"image\": \"docker.io/library/hibana-platform:local-7416adc3d768c4b3b193b7964298d09d00741b0642eb6e9141bb646ea99cb9dc\",\n                        \"imageID\": \"docker.io/library/import-2026-09-07@sha256:7b57bac5781b2f4c8f3c23e7b1329342d566b76a65e3aa0d96591c89a9b10e83\",\n                        \"lastState\": {},\n                        \"name\": \"worker\",\n                        \"ready\": true,\n                        \"resources\": {\n                            \"limits\": {\n                                \"cpu\": \"4\",\n                                \"ephemeral-storage\": \"5Gi\",\n                                \"memory\": \"4Gi\"\n                            },\n                            \"requests\": {\n                                \"cpu\": \"500m\",\n                                \"ephemeral-storage\": \"1Gi\",\n                                \"memory\": \"1Gi\"\n                            }\n                        },\n                        \"restartCount\": 0,\n                        \"started\": true,\n                        \"state\": {\n                            \"running\": {\n                                \"startedAt\": \"2026-09-07T22:07:32Z\"\n                            }\n                        },\n                        \"user\": {\n                            \"linux\": {\n                                \"gid\": 10001,\n                                \"supplementalGroups\": [\n                                    10001\n                                ],\n                                \"uid\": 10001\n                            }\n                        },\n                        \"volumeMounts\": [\n                            {\n                                \"mountPath\": \"/tmp\",\n                                \"name\": \"tmp\"\n                            },\n                            {\n                                \"mountPath\": \"/var/cache/hibana\",\n                                \"name\": \"cache\"\n                            }\n                        ]\n                    }\n                ],\n                \"hostIP\": \"172.26.0.2\",\n                \"hostIPs\": [\n                    {\n                        \"ip\": \"172.26.0.2\"\n                    }\n                ],\n                \"observedGeneration\": 1,\n                \"phase\": \"Running\",\n                \"podIP\": \"10.244.1.8\",\n                \"podIPs\": [\n                    {\n                        \"ip\": \"10.244.1.8\"\n                    }\n                ],\n                \"qosClass\": \"Burstable\",\n                \"resources\": {\n                    \"limits\": {\n                        \"cpu\": \"4\",\n                        \"memory\": \"4Gi\"\n                    },\n                    \"requests\": {\n                        \"cpu\": \"489m\",\n                        \"memory\": \"1Gi\"\n                    }\n                },\n                \"startTime\": \"2026-09-07T22:07:32Z\"\n            }\n        },\n        {\n            \"apiVersion\": \"v1\",\n            \"kind\": \"Pod\",\n            \"metadata\": {\n                \"annotations\": {\n                    \"hibana.local/settings-hash\": \"2d295dd0d5258fce76124142ee09d9a763660e5117b25eb99b638c7ec7211597\"\n                },\n                \"creationTimestamp\": \"2026-09-07T22:07:32Z\",\n                \"generateName\": \"hibana-worker-54598f57d7-\",\n                \"generation\": 1,\n                \"labels\": {\n                    \"app.kubernetes.io/name\": \"hibana-worker\",\n                    \"app.kubernetes.io/part-of\": \"hibana\",\n                    \"pod-template-hash\": \"54598f57d7\"\n                },\n                \"name\": \"hibana-worker-54598f57d7-7q9l4\",\n                \"namespace\": \"hibana\",\n                \"ownerReferences\": [\n                    {\n                        \"apiVersion\": \"apps/v1\",\n                        \"blockOwnerDeletion\": true,\n                        \"controller\": true,\n                        \"kind\": \"ReplicaSet\",\n                        \"name\": \"hibana-worker-54598f57d7\",\n                        \"uid\": \"1ac86cfe-53d5-420b-af62-9d1b89490dc4\"\n                    }\n                ],\n                \"resourceVersion\": \"1089\",\n                \"uid\": \"eb621ca8-07bc-47b7-9fe3-8101f3e01edd\"\n            },\n            \"spec\": {\n                \"automountServiceAccountToken\": false,\n                \"containers\": [\n                    {\n                        \"command\": [\n                            \"/usr/local/bin/hibana-worker\"\n                        ],\n                        \"envFrom\": [\n                            {\n                                \"configMapRef\": {\n                                    \"name\": \"hibana-config\"\n                                }\n                            },\n                            {\n                                \"secretRef\": {\n                                    \"name\": \"hibana-runtime\"\n                                }\n                            }\n                        ],\n                        \"image\": \"hibana-platform:local-7416adc3d768c4b3b193b7964298d09d00741b0642eb6e9141bb646ea99cb9dc\",\n                        \"imagePullPolicy\": \"IfNotPresent\",\n                        \"livenessProbe\": {\n                            \"failureThreshold\": 3,\n                            \"httpGet\": {\n                                \"path\": \"/healthz\",\n                                \"port\": \"metrics\",\n                                \"scheme\": \"HTTP\"\n                            },\n                            \"periodSeconds\": 10,\n                            \"successThreshold\": 1,\n                            \"timeoutSeconds\": 3\n                        },\n                        \"name\": \"worker\",\n                        \"ports\": [\n                            {\n                                \"containerPort\": 9090,\n                                \"name\": \"metrics\",\n                                \"protocol\": \"TCP\"\n                            }\n                        ],\n                        \"readinessProbe\": {\n                            \"failureThreshold\": 3,\n                            \"httpGet\": {\n                                \"path\": \"/readyz\",\n                                \"port\": \"metrics\",\n                                \"scheme\": \"HTTP\"\n                            },\n                            \"periodSeconds\": 5,\n                            \"successThreshold\": 1,\n                            \"timeoutSeconds\": 3\n                        },\n                        \"resources\": {\n                            \"limits\": {\n                                \"cpu\": \"4\",\n                                \"ephemeral-storage\": \"5Gi\",\n                                \"memory\": \"4Gi\"\n                            },\n                            \"requests\": {\n                                \"cpu\": \"500m\",\n                                \"ephemeral-storage\": \"1Gi\",\n                                \"memory\": \"1Gi\"\n                            }\n                        },\n                        \"securityContext\": {\n                            \"allowPrivilegeEscalation\": false,\n                            \"capabilities\": {\n                                \"drop\": [\n                                    \"ALL\"\n                                ]\n                            },\n                            \"readOnlyRootFilesystem\": true\n                        },\n                        \"startupProbe\": {\n                            \"failureThreshold\": 60,\n                            \"httpGet\": {\n                                \"path\": \"/healthz\",\n                                \"port\": \"metrics\",\n                                \"scheme\": \"HTTP\"\n                            },\n                            \"periodSeconds\": 5,\n                            \"successThreshold\": 1,\n                            \"timeoutSeconds\": 1\n                        },\n                        \"terminationMessagePath\": \"/dev/termination-log\",\n                        \"terminationMessagePolicy\": \"File\",\n                        \"volumeMounts\": [\n                            {\n                                \"mountPath\": \"/tmp\",\n                                \"name\": \"tmp\"\n                            },\n                            {\n                                \"mountPath\": \"/var/cache/hibana\",\n                                \"name\": \"cache\"\n                            }\n                        ]\n                    }\n                ],\n                \"dnsPolicy\": \"ClusterFirst\",\n                \"enableServiceLinks\": true,\n                \"nodeName\": \"hibana-demo-worker2\",\n                \"preemptionPolicy\": \"PreemptLowerPriority\",\n                \"priority\": 0,\n                \"restartPolicy\": \"Always\",\n                \"schedulerName\": \"default-scheduler\",\n                \"securityContext\": {\n                    \"fsGroup\": 10001,\n                    \"runAsGroup\": 10001,\n                    \"runAsNonRoot\": true,\n                    \"runAsUser\": 10001,\n                    \"seccompProfile\": {\n                        \"type\": \"RuntimeDefault\"\n                    }\n                },\n                \"serviceAccount\": \"hibana-worker\",\n                \"serviceAccountName\": \"hibana-worker\",\n                \"terminationGracePeriodSeconds\": 90,\n                \"tolerations\": [\n                    {\n                        \"effect\": \"NoExecute\",\n                        \"key\": \"node.kubernetes.io/not-ready\",\n                        \"operator\": \"Exists\",\n                        \"tolerationSeconds\": 300\n                    },\n                    {\n                        \"effect\": \"NoExecute\",\n                        \"key\": \"node.kubernetes.io/unreachable\",\n                        \"operator\": \"Exists\",\n                        \"tolerationSeconds\": 300\n                    }\n                ],\n                \"topologySpreadConstraints\": [\n                    {\n                        \"labelSelector\": {\n                            \"matchExpressions\": [\n                                {\n                                    \"key\": \"pod-template-hash\",\n                                    \"operator\": \"In\",\n                                    \"values\": [\n                                        \"54598f57d7\"\n                                    ]\n                                }\n                            ],\n                            \"matchLabels\": {\n                                \"app.kubernetes.io/name\": \"hibana-worker\"\n                            }\n                        },\n                        \"matchLabelKeys\": [\n                            \"pod-template-hash\"\n                        ],\n                        \"maxSkew\": 1,\n                        \"minDomains\": 2,\n                        \"nodeTaintsPolicy\": \"Honor\",\n                        \"topologyKey\": \"kubernetes.io/hostname\",\n                        \"whenUnsatisfiable\": \"DoNotSchedule\"\n                    }\n                ],\n                \"volumes\": [\n                    {\n                        \"emptyDir\": {\n                            \"sizeLimit\": \"1Gi\"\n                        },\n                        \"name\": \"tmp\"\n                    },\n                    {\n                        \"emptyDir\": {\n                            \"sizeLimit\": \"3Gi\"\n                        },\n                        \"name\": \"cache\"\n                    }\n                ]\n            },\n            \"status\": {\n                \"allocatedResources\": {\n                    \"cpu\": \"500m\",\n                    \"ephemeral-storage\": \"1Gi\",\n                    \"memory\": \"1Gi\"\n                },\n                \"conditions\": [\n                    {\n                        \"lastProbeTime\": null,\n                        \"lastTransitionTime\": \"2026-09-07T22:07:32Z\",\n                        \"observedGeneration\": 1,\n                        \"status\": \"True\",\n                        \"type\": \"PodReadyToStartContainers\"\n                    },\n                    {\n                        \"lastProbeTime\": null,\n                        \"lastTransitionTime\": \"2026-09-07T22:07:32Z\",\n                        \"observedGeneration\": 1,\n                        \"status\": \"True\",\n                        \"type\": \"Initialized\"\n                    },\n                    {\n                        \"lastProbeTime\": null,\n                        \"lastTransitionTime\": \"2026-09-07T22:07:38Z\",\n                        \"observedGeneration\": 1,\n                        \"status\": \"True\",\n                        \"type\": \"Ready\"\n                    },\n                    {\n                        \"lastProbeTime\": null,\n                        \"lastTransitionTime\": \"2026-09-07T22:07:38Z\",\n                        \"observedGeneration\": 1,\n                        \"status\": \"True\",\n                        \"type\": \"ContainersReady\"\n                    },\n                    {\n                        \"lastProbeTime\": null,\n                        \"lastTransitionTime\": \"2026-09-07T22:07:32Z\",\n                        \"observedGeneration\": 1,\n                        \"status\": \"True\",\n                        \"type\": \"PodScheduled\"\n                    }\n                ],\n                \"containerStatuses\": [\n                    {\n                        \"allocatedResources\": {\n                            \"cpu\": \"500m\",\n                            \"ephemeral-storage\": \"1Gi\",\n                            \"memory\": \"1Gi\"\n                        },\n                        \"containerID\": \"containerd://c3984a7907b9b781b852e1148e0b2b3dbe465ce884137c546b68efba0287dde8\",\n                        \"image\": \"docker.io/library/hibana-platform:local-7416adc3d768c4b3b193b7964298d09d00741b0642eb6e9141bb646ea99cb9dc\",\n                        \"imageID\": \"docker.io/library/import-2026-09-07@sha256:7b57bac5781b2f4c8f3c23e7b1329342d566b76a65e3aa0d96591c89a9b10e83\",\n                        \"lastState\": {},\n                        \"name\": \"worker\",\n                        \"ready\": true,\n                        \"resources\": {\n                            \"limits\": {\n                                \"cpu\": \"4\",\n                                \"ephemeral-storage\": \"5Gi\",\n                                \"memory\": \"4Gi\"\n                            },\n                            \"requests\": {\n                                \"cpu\": \"500m\",\n                                \"ephemeral-storage\": \"1Gi\",\n                                \"memory\": \"1Gi\"\n                            }\n                        },\n                        \"restartCount\": 0,\n                        \"started\": true,\n                        \"state\": {\n                            \"running\": {\n                                \"startedAt\": \"2026-09-07T22:07:32Z\"\n                            }\n                        },\n                        \"user\": {\n                            \"linux\": {\n                                \"gid\": 10001,\n                                \"supplementalGroups\": [\n                                    10001\n                                ],\n                                \"uid\": 10001\n                            }\n                        },\n                        \"volumeMounts\": [\n                            {\n                                \"mountPath\": \"/tmp\",\n                                \"name\": \"tmp\"\n                            },\n                            {\n                                \"mountPath\": \"/var/cache/hibana\",\n                                \"name\": \"cache\"\n                            }\n                        ]\n                    }\n                ],\n                \"hostIP\": \"172.26.0.4\",\n                \"hostIPs\": [\n                    {\n                        \"ip\": \"172.26.0.4\"\n                    }\n                ],\n                \"observedGeneration\": 1,\n                \"phase\": \"Running\",\n                \"podIP\": \"10.244.2.6\",\n                \"podIPs\": [\n                    {\n                        \"ip\": \"10.244.2.6\"\n                    }\n                ],\n                \"qosClass\": \"Burstable\",\n                \"resources\": {\n                    \"limits\": {\n                        \"cpu\": \"4\",\n                        \"memory\": \"4Gi\"\n                    },\n                    \"requests\": {\n                        \"cpu\": \"489m\",\n                        \"memory\": \"1Gi\"\n                    }\n                },\n                \"startTime\": \"2026-09-07T22:07:32Z\"\n            }\n        }\n    ],\n    \"kind\": \"List\",\n    \"metadata\": {\n        \"resourceVersion\": \"\"\n    }\n}\n"
+        }
+      ]
+    },
+    {
+      "id": "executions",
+      "command": "kubectl -n hibana exec deployment/hibana-postgres -- psql -U hibana_admin -d hibana -Atc 'SELECT COALESCE(json_agg(row_to_json(r)),'\"'\"'[]'\"'\"'::json) FROM (SELECT e.id,e.status,e.http_request,e.wall_time_ms,e.peak_memory_bytes,v.wasm_sha256 FROM executions e JOIN components c ON c.id=e.component_id JOIN component_versions v ON v.id=e.version_id WHERE c.name='\"'\"'hello-hono'\"'\"' ORDER BY e.created_at) r'",
+      "cwd": "<checkout>",
+      "durationSeconds": 0.127,
+      "output": "[{\"id\":\"exec_8496fe2a83a945b78dfc13543c7a1f8f\",\"status\":\"succeeded\",\"http_request\":true,\"wall_time_ms\":7589,\"peak_memory_bytes\":9502720,\"wasm_sha256\":\"7b0f88cf64ef53e8c58e52ee3a9325929162a5f338ff1244f5073f50e9dd7ddd\"}, {\"id\":\"exec_71a2c040e68d4945b2fcad36aa81c322\",\"status\":\"succeeded\",\"http_request\":true,\"wall_time_ms\":7554,\"peak_memory_bytes\":9502720,\"wasm_sha256\":\"7b0f88cf64ef53e8c58e52ee3a9325929162a5f338ff1244f5073f50e9dd7ddd\"}, {\"id\":\"exec_5fad4a36fd2b4b8a9df6a853cc510bc6\",\"status\":\"succeeded\",\"http_request\":true,\"wall_time_ms\":4,\"peak_memory_bytes\":9502720,\"wasm_sha256\":\"7b0f88cf64ef53e8c58e52ee3a9325929162a5f338ff1244f5073f50e9dd7ddd\"}]\n",
+      "exitCode": 0,
+      "events": [
+        {
+          "t": 0.124,
+          "text": "[{\"id\":\"exec_8496fe2a83a945b78dfc13543c7a1f8f\",\"status\":\"succeeded\",\"http_request\":true,\"wall_time_ms\":7589,\"peak_memory_bytes\":9502720,\"wasm_sha256\":\"7b0f88cf64ef53e8c58e52ee3a9325929162a5f338ff1244f5073f50e9dd7ddd\"}, {\"id\":\"exec_71a2c040e68d4945b2fcad36aa81c322\",\"status\":\"succeeded\",\"http_request\":true,\"wall_time_ms\":7554,\"peak_memory_bytes\":9502720,\"wasm_sha256\":\"7b0f88cf64ef53e8c58e52ee3a9325929162a5f338ff1244f5073f50e9dd7ddd\"}, {\"id\":\"exec_5fad4a36fd2b4b8a9df6a853cc510bc6\",\"status\":\"succeeded\",\"http_request\":true,\"wall_time_ms\":4,\"peak_memory_bytes\":9502720,\"wasm_sha256\":\"7b0f88cf64ef53e8c58e52ee3a9325929162a5f338ff1244f5073f50e9dd7ddd\"}]\n"
+        }
+      ]
+    },
+    {
+      "id": "delete",
+      "command": "hibana delete hello-hono --yes",
+      "cwd": "<checkout>/.local/demo-recording/hello-hono",
+      "durationSeconds": 0.054,
+      "output": "hello-hono\nDeleted application hello-hono.\n",
+      "exitCode": 0,
+      "events": [
+        {
+          "t": 0.049,
+          "text": "hello-hono\n"
+        },
+        {
+          "t": 0.053,
+          "text": "Deleted application hello-hono.\n"
+        }
+      ]
+    },
+    {
+      "id": "list-empty",
+      "command": "hibana list",
+      "cwd": "<checkout>/.local/demo-recording/hello-hono",
+      "durationSeconds": 0.046,
+      "output": "[]\n",
+      "exitCode": 0,
+      "events": [
+        {
+          "t": 0.044,
+          "text": "[]\n"
+        }
+      ]
+    },
+    {
+      "id": "http-deleted",
+      "command": "curl --silent --show-error --max-time 15 -o /dev/null -w '%{http_code}\n' -H 'Host: hello-hono.smoke.hibana.local' http://127.0.0.1:18084/",
+      "cwd": "<checkout>/.local/demo-recording/hello-hono",
+      "durationSeconds": 0.009,
+      "output": "404\n",
+      "exitCode": 0,
+      "events": [
+        {
+          "t": 0.008,
+          "text": "404\n"
+        }
+      ]
+    },
+    {
+      "id": "uninstall",
+      "command": "hibana platform uninstall --cluster hibana-demo --yes",
+      "cwd": "<checkout>",
+      "durationSeconds": 1.616,
+      "output": "Deleting cluster \"hibana-demo\" ...\nDeleted nodes: [\"hibana-demo-worker2\" \"hibana-demo-worker\" \"hibana-demo-control-plane\"]\nUninstalled local cluster hibana-demo.\n",
+      "exitCode": 0,
+      "events": [
+        {
+          "t": 0.216,
+          "text": "Deleting cluster \"hibana-demo\" ...\n"
+        },
+        {
+          "t": 1.572,
+          "text": "Deleted nodes: [\"hibana-demo-worker2\" \"hibana-demo-worker\" \"hibana-demo-control-plane\"]\n"
+        },
+        {
+          "t": 1.602,
+          "text": "Uninstalled local cluster hibana-demo.\n"
+        }
+      ]
+    },
+    {
+      "id": "cluster-empty",
+      "command": "docker ps -a --filter label=io.x-k8s.kind.cluster=hibana-demo --format '{{.Names}}'",
+      "cwd": "<checkout>",
+      "durationSeconds": 0.016,
+      "output": "",
+      "exitCode": 0,
+      "events": []
+    }
+  ],
+  "proof": {
+    "artifact": {
+      "bytes": 12393854,
+      "sha256": "7b0f88cf64ef53e8c58e52ee3a9325929162a5f338ff1244f5073f50e9dd7ddd",
+      "header": "00 61 73 6d 0d 00 01 00",
+      "export": "export wasi:http/incoming-handler@0.2.3;"
+    },
+    "workersBefore": [
+      {
+        "name": "hibana-worker-54598f57d7-5jwv5",
+        "uid": "9c895cf9-5d80-4ec4-af59-c852757158f9",
+        "node": "hibana-demo-worker",
+        "command": [
+          "/usr/local/bin/hibana-worker"
+        ],
+        "ready": true
+      },
+      {
+        "name": "hibana-worker-54598f57d7-7q9l4",
+        "uid": "eb621ca8-07bc-47b7-9fe3-8101f3e01edd",
+        "node": "hibana-demo-worker2",
+        "command": [
+          "/usr/local/bin/hibana-worker"
+        ],
+        "ready": true
+      }
+    ],
+    "workersAfter": [
+      {
+        "name": "hibana-worker-54598f57d7-5jwv5",
+        "uid": "9c895cf9-5d80-4ec4-af59-c852757158f9",
+        "node": "hibana-demo-worker",
+        "command": [
+          "/usr/local/bin/hibana-worker"
+        ],
+        "ready": true
+      },
+      {
+        "name": "hibana-worker-54598f57d7-7q9l4",
+        "uid": "eb621ca8-07bc-47b7-9fe3-8101f3e01edd",
+        "node": "hibana-demo-worker2",
+        "command": [
+          "/usr/local/bin/hibana-worker"
+        ],
+        "ready": true
+      }
+    ],
+    "responses": [
+      {
+        "message": "Hello, Wasm!",
+        "count": 1
+      },
+      {
+        "message": "Hello, Wasm!",
+        "count": 1
+      },
+      {
+        "message": "Hello, Wasm!",
+        "count": 1
+      }
+    ],
+    "executions": [
+      {
+        "id": "exec_8496fe2a83a945b78dfc13543c7a1f8f",
+        "status": "succeeded",
+        "http_request": true,
+        "wall_time_ms": 7589,
+        "peak_memory_bytes": 9502720,
+        "wasm_sha256": "7b0f88cf64ef53e8c58e52ee3a9325929162a5f338ff1244f5073f50e9dd7ddd"
+      },
+      {
+        "id": "exec_71a2c040e68d4945b2fcad36aa81c322",
+        "status": "succeeded",
+        "http_request": true,
+        "wall_time_ms": 7554,
+        "peak_memory_bytes": 9502720,
+        "wasm_sha256": "7b0f88cf64ef53e8c58e52ee3a9325929162a5f338ff1244f5073f50e9dd7ddd"
+      },
+      {
+        "id": "exec_5fad4a36fd2b4b8a9df6a853cc510bc6",
+        "status": "succeeded",
+        "http_request": true,
+        "wall_time_ms": 4,
+        "peak_memory_bytes": 9502720,
+        "wasm_sha256": "7b0f88cf64ef53e8c58e52ee3a9325929162a5f338ff1244f5073f50e9dd7ddd"
+      }
+    ],
+    "sameWorkerPods": true,
+    "remainingApplications": [],
+    "deletedHttpStatus": 404,
+    "remainingDemoNodes": []
+  },
+  "complete": true
+}

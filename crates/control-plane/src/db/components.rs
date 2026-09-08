@@ -230,7 +230,7 @@ pub async fn find_version_resource_limits(
     executor: impl sqlx::PgExecutor<'_>,
     tenant_id: &str,
     version_id: &str,
-) -> Result<Option<faas_shared::ResourceLimits>, sqlx::Error> {
+) -> Result<Option<hibana_shared::ResourceLimits>, sqlx::Error> {
     let row = sqlx::query(
         "SELECT resource_limits FROM component_versions \
          WHERE tenant_id = $1 AND id = $2",
@@ -242,7 +242,10 @@ pub async fn find_version_resource_limits(
 
     row.map(|r| {
         let limits_json: Value = r.try_get("resource_limits")?;
-        Ok(serde_json::from_value::<faas_shared::ResourceLimits>(limits_json).unwrap_or_default())
+        Ok(
+            serde_json::from_value::<hibana_shared::ResourceLimits>(limits_json)
+                .unwrap_or_default(),
+        )
     })
     .transpose()
 }

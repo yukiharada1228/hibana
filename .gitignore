@@ -26,3 +26,12 @@ __pycache__/
 # Hibana CLI build output and local credentials
 .hibana/
 .dev.vars
+
+# Generated public manifests for npm pack
+/sdk/platform/manifests/
+
+# CLI license copied from the repository license when packing
+/sdk/LICENSE
+
+# Finder metadata
+.DS_Store

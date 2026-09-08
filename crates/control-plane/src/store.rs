@@ -421,7 +421,7 @@ pub use redis_impl::RedisStore;
 
 mod redis_impl {
     use super::*;
-    use redis::aio::ConnectionManager;
+    use redis::aio::{ConnectionManager, ConnectionManagerConfig};
     use redis::{RedisError, Script};
 
     /// Redis バックエンドの [`Store`] 実装（§8）。
@@ -462,7 +462,16 @@ mod redis_impl {
         pub async fn connect(url: &str) -> Result<Self, StoreError> {
             let client = redis::Client::open(url)
                 .map_err(|e| StoreError::Unavailable(format!("invalid REDIS_URL: {e}")))?;
-            let conn = ConnectionManager::new(client).await.map_err(map_err)?;
+            // Bounded fail-closed admission during an unreachable primary. The
+            // connection manager reconnects; application writes are never replayed.
+            let config = ConnectionManagerConfig::new()
+                .set_connection_timeout(std::time::Duration::from_secs(2))
+                .set_response_timeout(std::time::Duration::from_secs(2))
+                .set_number_of_retries(2)
+                .set_max_delay(500);
+            let conn = ConnectionManager::new_with_config(client, config)
+                .await
+                .map_err(map_err)?;
             Ok(Self {
                 conn,
                 rate_script: Script::new(RATE_LUA),

@@ -167,6 +167,61 @@ pub(crate) async fn assert_non_privileged_runtime_role(pool: &sqlx::PgPool) -> a
     Ok(())
 }
 
+/// Exercise the actual upgrade with a populated legacy schema in the disposable DB.
+#[cfg(test)]
+pub(crate) async fn test_environment_upgrade(pool: &sqlx::PgPool) {
+    let prior = sqlx::migrate::Migrator {
+        migrations: std::borrow::Cow::Owned(
+            MIGRATOR
+                .iter()
+                .filter(|m| m.version < 28)
+                .cloned()
+                .collect(),
+        ),
+        ..sqlx::migrate::Migrator::DEFAULT
+    };
+    prior.run(pool).await.unwrap();
+    sqlx::raw_sql(r#"
+      INSERT INTO tenants(id,slug,name) VALUES ('legacy','legacy','Legacy');
+      INSERT INTO components(id,tenant_id,name) VALUES ('legacy','legacy','legacy');
+      INSERT INTO component_versions(id,tenant_id,component_id,version,storage_uri,wasm_sha256,capabilities)
+        VALUES ('legacy1','legacy','legacy','1','legacy/1','aa','{"env":["TOKEN","MESSAGE"]}'),
+               ('legacy2','legacy','legacy','2','legacy/2','bb','[]'),
+               ('legacy3','legacy','legacy','3','legacy/3','cc','{"env":null}');
+      INSERT INTO function_configs(tenant_id,component_id,key,value) VALUES ('legacy','legacy','MESSAGE','baseline');
+      INSERT INTO function_secrets(id,tenant_id,component_id,name,current_version) VALUES ('legacy-secret','legacy','legacy','TOKEN',1);
+    "#).execute(pool).await.unwrap();
+    run_migrations(pool).await.unwrap();
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>(
+            "SELECT count(*) FROM version_configs WHERE tenant_id='legacy' AND value='baseline'"
+        )
+        .fetch_one(pool)
+        .await
+        .unwrap(),
+        3
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, String>(
+            "SELECT version_id FROM version_secret_bindings WHERE tenant_id='legacy'"
+        )
+        .fetch_one(pool)
+        .await
+        .unwrap(),
+        "legacy1"
+    );
+    assert!(!sqlx::query_scalar::<_, bool>(
+        "SELECT deploy_allowed FROM function_secrets WHERE id='legacy-secret'"
+    )
+    .fetch_one(pool)
+    .await
+    .unwrap());
+    // Remove only this fixture so later backup verification does not see a deliberately
+    // incomplete envelope. The test owner can delete; the runtime role cannot.
+    sqlx::raw_sql("DELETE FROM version_secret_bindings WHERE tenant_id='legacy'; DELETE FROM version_configs WHERE tenant_id='legacy'; DELETE FROM function_secrets WHERE tenant_id='legacy'; DELETE FROM function_configs WHERE tenant_id='legacy'; DELETE FROM component_versions WHERE tenant_id='legacy'; DELETE FROM components WHERE tenant_id='legacy'; DELETE FROM tenants WHERE id='legacy';").execute(pool).await.unwrap();
+    println!("PASS populated schema upgrade snapshots legacy vars/approvals without granting future Secret access");
+}
+
 #[cfg(test)]
 mod migration_tests {
     use super::MIGRATOR;

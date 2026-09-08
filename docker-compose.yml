@@ -1,3 +1,4 @@
+name: hibana
 services:
   # ローカル公開 URL: http://<app>.<tenant>.hibana.local/ → ホスト上の CP(:8080)。
   # Docker Desktop 用。起動: docker compose up -d ingress（名前解決は /etc/hosts で設定）。
@@ -13,7 +14,7 @@ services:
   # --- PostgreSQL: components / component_versions / executions（§3.2 を M1 に縮約） ---
   postgres:
     image: postgres:16
-    container_name: faas-postgres
+    container_name: hibana-postgres
     environment:
       # POSTGRES_USER=faas は SUPERUSER かつテーブル所有者。**マイグレーション専用**
       # （MIGRATION_DATABASE_URL）。0004_rls.sql がこの所有者で CREATE ROLE faas_app /
@@ -28,7 +29,7 @@ services:
       # .env.example の DATABASE_URL=postgres://faas:faas@localhost:5432/faas と一致。
       - "127.0.0.1:5432:5432"
     volumes:
-      - faas-postgres-data:/var/lib/postgresql/data
+      - hibana-postgres-data:/var/lib/postgresql/data
     healthcheck:
       # pg_isready で接続受付可能になるまで待つ。make migrate はこれを前提にする。
       test: ["CMD-SHELL", "pg_isready -U faas -d faas"]
@@ -44,7 +45,7 @@ services:
   #     TOCTOU を避ける。本番は HA（Sentinel/Cluster）構成にすること（§9。単一障害点にしない）。 ---
   redis:
     image: redis:7-alpine
-    container_name: faas-redis
+    container_name: hibana-redis
     # appendonly でカウンタの耐久性を上げる（再起動時は reaper が DB COUNT へ再同期するため
     # 厳密永続は必須でないが、短時間の再起動でカウンタを保つ）。
     command: ["redis-server", "--appendonly", "yes"]
@@ -52,7 +53,7 @@ services:
       # .env.example の REDIS_URL=redis://localhost:6379 と一致。
       - "127.0.0.1:6379:6379"
     volumes:
-      - faas-redis-data:/data
+      - hibana-redis-data:/data
     healthcheck:
       # PING に PONG が返れば healthy。
       test: ["CMD", "redis-cli", "ping"]
@@ -65,7 +66,7 @@ services:
   # --- MinIO: Component 本体の Object Storage（S3 互換, §3.4）。presigned GET URL を発行する ---
   minio:
     image: minio/minio
-    container_name: faas-minio
+    container_name: hibana-minio
     command: ["server", "/data", "--console-address", ":9001"]
     environment:
       MINIO_ROOT_USER: minioadmin
@@ -75,7 +76,7 @@ services:
       - "127.0.0.1:9000:9000"   # S3 API
       - "127.0.0.1:9001:9001"   # console
     volumes:
-      - faas-minio-data:/data
+      - hibana-minio-data:/data
     healthcheck:
       # MinIO 健全性エンドポイント。バケット作成 (minio-setup) はこれを前提にする。
       test: ["CMD", "mc", "ready", "local"]
@@ -85,10 +86,10 @@ services:
       start_period: 10s
     restart: unless-stopped
 
-  # --- ワンショット: バケット faas-components を冪等に作成する（§6.2 アップロード先） ---
+  # --- ワンショット: バケット hibana-components を冪等に作成する（§6.2 アップロード先） ---
   minio-setup:
     image: minio/mc
-    container_name: faas-minio-setup
+    container_name: hibana-minio-setup
     depends_on:
       minio:
         condition: service_healthy
@@ -96,7 +97,7 @@ services:
     entrypoint: >
       /bin/sh -c "
       mc alias set local http://minio:9000 minioadmin minioadmin &&
-      mc mb --ignore-existing local/faas-components
+      mc mb --ignore-existing local/${S3_BUCKET:-hibana-components}
       "
     restart: "no"
 
@@ -107,7 +108,7 @@ services:
   jaeger:
     profiles: [observability]
     image: jaegertracing/all-in-one:1.60
-    container_name: faas-jaeger
+    container_name: hibana-jaeger
     environment:
       # OTLP 受信を有効化する（4317=gRPC / 4318=HTTP）。本 repo は HTTP/protobuf exporter を使う。
       COLLECTOR_OTLP_ENABLED: "true"
@@ -118,6 +119,9 @@ services:
     restart: unless-stopped
 
 volumes:
-  faas-postgres-data:
-  faas-redis-data:
-  faas-minio-data:
+  hibana-postgres-data:
+    name: ${HIBANA_POSTGRES_VOLUME:-hibana-postgres-data}
+  hibana-redis-data:
+    name: ${HIBANA_REDIS_VOLUME:-hibana-redis-data}
+  hibana-minio-data:
+    name: ${HIBANA_MINIO_VOLUME:-hibana-minio-data}

@@ -1,7 +1,7 @@
 //! Bounded response channel and request conversion. No fleet services, DB or Axum dependency.
 use anyhow::anyhow;
 use bytes::Bytes;
-use faas_shared::http::HttpRequest;
+use hibana_shared::http::HttpRequest;
 use http_body_util::{BodyExt, Full};
 use std::sync::{
     atomic::{AtomicU64, Ordering},
@@ -34,7 +34,7 @@ impl ResponseSender {
                 let size =
                     self.bytes.fetch_add(data.len() as u64, Ordering::Relaxed) + data.len() as u64;
                 anyhow::ensure!(
-                    size <= faas_shared::http::MAX_RESPONSE_BYTES as u64,
+                    size <= hibana_shared::http::MAX_RESPONSE_BYTES as u64,
                     "HTTP response exceeds 64 MiB"
                 );
                 // Split frames as well as bounding their count: no giant frame queues.

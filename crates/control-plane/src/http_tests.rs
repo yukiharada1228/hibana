@@ -6,7 +6,7 @@ use axum::{
     response::IntoResponse,
     Json,
 };
-use faas_shared::{ExecutionStatus, JobClaims, ResultMessage, UsageMetrics};
+use hibana_shared::{ExecutionStatus, JobClaims, ResultMessage, UsageMetrics};
 use serde_json::json;
 use sqlx::PgPool;
 use std::sync::Arc;
@@ -78,7 +78,7 @@ async fn http_mvp_regression() {
             .unwrap(),
         "refusing a nonempty database"
     );
-    crate::migrations::run_migrations(&owner).await.unwrap();
+    crate::migrations::test_environment_upgrade(&owner).await;
     sqlx::raw_sql(r#"
         INSERT INTO tenants (id,slug,name,status,quotas) VALUES ('http','http','HTTP','active','{"max_concurrent_executions":1}'),('other','other','Other','active','{}');
         INSERT INTO components (id,tenant_id,name,ingress_enabled) VALUES ('source','http','source',true),('target','http','target',true);
@@ -154,7 +154,39 @@ async fn http_mvp_regression() {
         scalar(&owner, "SELECT count(*) FROM execution_outbox").await,
         0
     );
-    assert_eq!(store.peek_inflight("http"), 1);
+    assert_eq!(store.peek_inflight("http"), 0);
+    assert_eq!(scalar(&owner, "SELECT count(*) FROM executions WHERE status='failed' AND error->>'code'='dispatch_not_started'").await, 1);
+    let rejected: String = sqlx::query_scalar("SELECT id FROM executions")
+        .fetch_one(&owner)
+        .await
+        .unwrap();
+    assert!(!direct_http::cancel_pending(&state, "http", &rejected)
+        .await
+        .unwrap());
+    assert_eq!(store.peek_inflight("http"), 0);
+    assert_eq!(
+        scalar(&owner, "SELECT count(*) FROM usage_rollups").await,
+        0
+    );
+    // Reuse the pinned fixture to exercise pending admission/provenance below.
+    // A late Worker cannot claim a cancelled record in normal operation.
+    assert_eq!(
+        sqlx::query("UPDATE executions SET status='running' WHERE id=$1 AND status='pending'")
+            .bind(&rejected)
+            .execute(&owner)
+            .await
+            .unwrap()
+            .rows_affected(),
+        0
+    );
+    sqlx::query("UPDATE executions SET status='pending',finished_at=NULL,error=NULL WHERE id=$1")
+        .bind(&rejected)
+        .execute(&owner)
+        .await
+        .unwrap();
+    use crate::store::Store as _;
+    store.resync_inflight("http", 1, 3600).await.unwrap();
+    println!("PASS unavailable Worker releases reservation once without invocation usage; late claim fails");
     assert_eq!(
         direct_http::accept(&state, "http", "source", json!({}))
             .await
@@ -163,7 +195,6 @@ async fn http_mvp_regression() {
         StatusCode::TOO_MANY_REQUESTS
     );
     // A stale Redis reconciliation must never admit more than the DB limit.
-    use crate::store::Store as _;
     store.resync_inflight("http", 0, 3600).await.unwrap();
     let (a, b) = tokio::join!(
         direct_http::accept(&state, "http", "source", json!({})),
@@ -233,6 +264,18 @@ async fn http_mvp_regression() {
     tx.commit().await.unwrap();
     println!("PASS signed redemption / version pin / historical job rejection / FORCE RLS");
 
+    // Once claimed, a transport failure must not release or rewrite the execution.
+    sqlx::query(
+        "UPDATE executions SET status='running',started_at=now() WHERE id=$1 AND status='pending'",
+    )
+    .bind(&id)
+    .execute(&owner)
+    .await
+    .unwrap();
+    assert!(!direct_http::cancel_pending(&state, "http", &id)
+        .await
+        .unwrap());
+    assert_eq!(store.peek_inflight("http"), 1);
     let result = ResultMessage {
         execution_id: id.clone(),
         tenant_id: "http".into(),
@@ -246,6 +289,18 @@ async fn http_mvp_regression() {
             ..Default::default()
         }),
     };
+    sqlx::query("UPDATE platform_maintenance SET owner='regression' WHERE singleton")
+        .execute(&owner)
+        .await
+        .unwrap();
+    assert!(crate::maintenance::enabled(&pool).await.unwrap());
+    assert!(
+        sqlx::query("UPDATE platform_maintenance SET owner=NULL WHERE singleton")
+            .execute(&pool)
+            .await
+            .is_err(),
+        "runtime role cannot reopen admission"
+    );
     let mut forged = result.clone();
     forged.tenant_id = "other".into();
     assert!(
@@ -295,6 +350,41 @@ async fn http_mvp_regression() {
         .await
         .is_err());
     println!("PASS completion provenance / terminal CAS / bounded usage / one reservation release");
+    sqlx::query("UPDATE platform_maintenance SET owner=NULL WHERE singleton")
+        .execute(&owner)
+        .await
+        .unwrap();
+    println!("PASS durable completion remains available with admission closed; runtime role cannot change the gate");
+
+    for attempt in 0..16 {
+        let raced = format!("dispatch-race-{attempt}");
+        sqlx::query("INSERT INTO executions (id,tenant_id,component_id,version_id,status,input,http_request) VALUES ($1,'http','source','source-v1','pending','{}',true)")
+            .bind(&raced).execute(&owner).await.unwrap();
+        store.resync_inflight("http", 1, 3600).await.unwrap();
+        let claim = async {
+            let mut tx = pool.begin().await.unwrap();
+            db::set_tenant_guc(&mut tx, "http").await.unwrap();
+            let changed = sqlx::query("UPDATE executions SET status='running',started_at=now() WHERE tenant_id='http' AND id=$1 AND status='pending' AND http_request")
+                .bind(&raced).execute(&mut *tx).await.unwrap().rows_affected() == 1;
+            tx.commit().await.unwrap();
+            changed
+        };
+        let (claimed, cancelled) =
+            tokio::join!(claim, direct_http::cancel_pending(&state, "http", &raced));
+        let cancelled = cancelled.unwrap();
+        assert_ne!(claimed, cancelled, "exactly one transition must win");
+        assert_eq!(store.peek_inflight("http"), i64::from(claimed));
+        assert!(!direct_http::cancel_pending(&state, "http", &raced)
+            .await
+            .unwrap());
+        // Finish the synthetic claim without executing a guest; preserve no test reservations.
+        sqlx::query("UPDATE executions SET status='failed',finished_at=now() WHERE id=$1 AND status='running'")
+            .bind(&raced).execute(&owner).await.unwrap();
+        store.resync_inflight("http", 0, 3600).await.unwrap();
+    }
+    println!(
+        "PASS concurrent Worker claim / dispatch cancellation: one winner, one reservation release"
+    );
 
     let mut tx = pool.begin().await.unwrap();
     db::set_tenant_guc(&mut tx, "http").await.unwrap();
@@ -324,6 +414,7 @@ async fn http_mvp_regression() {
     );
     tx.commit().await.unwrap();
     println!("PASS version switch / no-op preserves previous / rollback rejects another component");
+    secret_resolution_regression(&state).await;
 
     sqlx::query("UPDATE tenants SET status='suspended' WHERE id='http'")
         .execute(&owner)
@@ -341,4 +432,226 @@ async fn http_mvp_regression() {
         .await
         .is_err());
     println!("PASS suspended tenant cannot accept or redeem HTTP requests");
+
+    use crate::handlers::components::{admin_delete_component, admin_list_components};
+    use axum::extract::Path;
+    let mut admin = HeaderMap::new();
+    admin.insert("authorization", "Bearer test-only".parse().unwrap());
+    assert_eq!(
+        admin_list_components(State(state.clone()), HeaderMap::new())
+            .await
+            .unwrap_err()
+            .into_response()
+            .status(),
+        StatusCode::UNAUTHORIZED
+    );
+    sqlx::raw_sql("INSERT INTO components (id,tenant_id,name) VALUES ('delete-test','other','reusable'); INSERT INTO component_versions (id,tenant_id,component_id,version,storage_uri,wasm_sha256,status) VALUES ('delete-v1','other','delete-test','1','delete.wasm','abcd','active'); INSERT INTO executions (id,tenant_id,component_id,version_id,status,http_request) VALUES ('delete-pending','other','delete-test','delete-v1','pending',true);")
+        .execute(&owner).await.unwrap();
+    let Json(inventory) = admin_list_components(State(state.clone()), admin.clone())
+        .await
+        .unwrap();
+    assert!(
+        inventory.iter().any(|c| c["tenant_id"] == "http"),
+        "suspended tenants remain visible to the platform administrator"
+    );
+    assert!(inventory.iter().any(|c| c["component_id"] == "delete-test"));
+    let delete_path = || Path(("other".to_string(), "delete-test".to_string()));
+    assert_eq!(
+        admin_delete_component(State(state.clone()), HeaderMap::new(), delete_path())
+            .await
+            .unwrap_err()
+            .into_response()
+            .status(),
+        StatusCode::UNAUTHORIZED
+    );
+    assert_eq!(
+        admin_delete_component(
+            State(state.clone()),
+            admin.clone(),
+            Path(("http".into(), "delete-test".into()))
+        )
+        .await
+        .unwrap_err()
+        .into_response()
+        .status(),
+        StatusCode::NOT_FOUND
+    );
+    assert_eq!(
+        admin_delete_component(State(state.clone()), admin.clone(), delete_path())
+            .await
+            .unwrap_err()
+            .into_response()
+            .status(),
+        StatusCode::CONFLICT
+    );
+    sqlx::query(
+        "UPDATE executions SET status='failed',finished_at=now() WHERE id='delete-pending'",
+    )
+    .execute(&owner)
+    .await
+    .unwrap();
+    assert_eq!(
+        admin_delete_component(State(state.clone()), admin.clone(), delete_path())
+            .await
+            .unwrap(),
+        StatusCode::NO_CONTENT
+    );
+    let Json(inventory) = admin_list_components(State(state.clone()), admin)
+        .await
+        .unwrap();
+    assert!(!inventory.iter().any(|c| c["component_id"] == "delete-test"));
+    assert_eq!(
+        scalar(
+            &owner,
+            "SELECT count(*) FROM components WHERE id='delete-test' AND deleted_at IS NOT NULL"
+        )
+        .await,
+        1
+    );
+    assert_eq!(
+        scalar(
+            &owner,
+            "SELECT count(*) FROM executions WHERE component_id='delete-test'"
+        )
+        .await,
+        1
+    );
+    let mut tx = pool.begin().await.unwrap();
+    db::set_tenant_guc(&mut tx, "other").await.unwrap();
+    db::create_component(&mut *tx, "other", "delete-recreated", "reusable")
+        .await
+        .unwrap();
+    tx.commit().await.unwrap();
+    println!("PASS admin deletion: authentication / RLS / active execution guard / suspended tenant inventory / name reuse / retained history");
+}
+
+async fn secret_resolution_regression(state: &AppState) {
+    use crate::secrets::{encrypt, resolve_for_injection, SecretError};
+    let mut tx = state.pool().begin().await.unwrap();
+    db::set_tenant_guc(&mut tx, "http").await.unwrap();
+    db::insert_secret_meta(&mut *tx, "http", "sec-projection", "source", "TOKEN", 2)
+        .await
+        .unwrap();
+    sqlx::query("INSERT INTO version_secret_bindings (tenant_id,component_id,version_id,secret_id,name) VALUES ('http','source','source-v1','sec-projection','TOKEN')")
+        .execute(&mut *tx).await.unwrap();
+    let time = |day: &str| {
+        chrono::DateTime::parse_from_rfc3339(day)
+            .unwrap()
+            .with_timezone(&chrono::Utc)
+    };
+    for (version, value, created) in [
+        (1, b"old".as_slice(), "2000-01-01T00:00:00Z"),
+        (2, b"new".as_slice(), "2000-01-03T00:00:00Z"),
+    ] {
+        let e = encrypt(
+            state.secret_keyring(),
+            "http",
+            "source",
+            "sec-projection",
+            "TOKEN",
+            version,
+            value,
+        )
+        .unwrap();
+        sqlx::query("INSERT INTO function_secret_versions (tenant_id,secret_id,version,kek_kid,wrapped_dek,dek_nonce,nonce,ciphertext,value_len,reason,created_at) VALUES ('http','sec-projection',$1,$2,$3,$4,$5,$6,$7,'rotate',$8)")
+            .bind(version).bind(e.kek_kid).bind(e.wrapped_dek).bind(e.dek_nonce)
+            .bind(e.nonce).bind(e.ciphertext).bind(e.value_len).bind(time(created))
+            .execute(&mut *tx).await.unwrap();
+    }
+    let allowed = ["TOKEN".into()].into_iter().collect();
+    for (at, version, value) in [
+        ("2000-01-02T00:00:00Z", 1, "old"),
+        ("2000-01-04T00:00:00Z", 2, "new"),
+    ] {
+        let resolved = resolve_for_injection(
+            &mut tx,
+            state.secret_keyring(),
+            "http",
+            "source",
+            "source-v1",
+            time(at),
+            &allowed,
+        )
+        .await
+        .unwrap();
+        assert_eq!(resolved.len(), 1);
+        assert_eq!(resolved[0].version, version);
+        assert_eq!(resolved[0].value.expose(), value);
+    }
+    assert!(
+        matches!(
+            resolve_for_injection(
+                &mut tx,
+                state.secret_keyring(),
+                "http",
+                "source",
+                "source-v1",
+                time("1999-01-01T00:00:00Z"),
+                &allowed
+            )
+            .await,
+            Err(SecretError::VersionUnresolved)
+        ),
+        "a live Secret without a generation must fail closed"
+    );
+    assert!(resolve_for_injection(
+        &mut tx,
+        state.secret_keyring(),
+        "http",
+        "source",
+        "source-v2",
+        time("2000-01-04T00:00:00Z"),
+        &allowed
+    )
+    .await
+    .unwrap()
+    .is_empty());
+    db::soft_delete_secret(&mut *tx, "http", "sec-projection")
+        .await
+        .unwrap();
+    db::insert_secret_meta(&mut *tx, "http", "sec-reused", "source", "TOKEN", 1)
+        .await
+        .unwrap();
+    assert!(
+        resolve_for_injection(
+            &mut tx,
+            state.secret_keyring(),
+            "http",
+            "source",
+            "source-v1",
+            time("2000-01-04T00:00:00Z"),
+            &allowed
+        )
+        .await
+        .unwrap()
+        .is_empty(),
+        "a reused name is not the pinned Secret identity"
+    );
+    sqlx::query("INSERT INTO executions (id,tenant_id,component_id,version_id,status,http_request) VALUES ('secret-projection','http','source','source-v1','pending',true)").execute(&mut *tx).await.unwrap();
+    let execution = db::secret_execution(&mut *tx, "http", "secret-projection")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(execution.component_id, "source");
+    assert_eq!(execution.version_id, "source-v1");
+    assert_eq!(execution.status, "pending");
+    db::set_tenant_guc(&mut tx, "other").await.unwrap();
+    assert!(db::secret_execution(&mut *tx, "http", "secret-projection")
+        .await
+        .unwrap()
+        .is_none());
+    assert!(resolve_for_injection(
+        &mut tx,
+        state.secret_keyring(),
+        "http",
+        "source",
+        "source-v1",
+        time("2000-01-04T00:00:00Z"),
+        &allowed
+    )
+    .await
+    .unwrap()
+    .is_empty());
+    tx.rollback().await.unwrap();
+    println!("PASS Secret generation / unresolved generation denied / version binding / name reuse / narrow execution projection / FORCE RLS");
 }

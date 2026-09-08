@@ -8,16 +8,18 @@ use crate::{
     runtime::{build_engine, duration_to_millis, ExecError, Runtime},
 };
 use anyhow::Context as _;
-use faas_shared::{ExecutionStatus, JobMessage, ResultMessage, UsageMetrics};
+use hibana_shared::{ExecutionStatus, JobMessage, ResultMessage, UsageMetrics};
 use std::{sync::Arc, time::Duration};
-use tracing::{info, warn};
+use tracing::{info, warn, Instrument};
 pub(crate) struct Worker {
     runtime: Runtime,
     repository: ExecutionRepository,
-    artifacts: ArtifactCache,
+    pub(crate) artifacts: ArtifactCache,
     pub(crate) control_plane: ControlPlaneClient,
     pub(crate) metrics: Arc<metrics::Metrics>,
+    pub(crate) memory_budget: crate::capacity::MemoryBudget,
     pub(crate) execution_slots: Arc<tokio::sync::Semaphore>,
+    pub(crate) preparation_slots: Arc<tokio::sync::Semaphore>,
 }
 impl Worker {
     pub(crate) async fn connect(
@@ -25,41 +27,79 @@ impl Worker {
         metrics: Arc<metrics::Metrics>,
     ) -> anyhow::Result<Self> {
         let pool = sqlx::postgres::PgPoolOptions::new()
-            .max_connections(32)
-            .connect(&settings.database_url)
+            .max_connections(settings.db_max_connections)
+            // Admission returns its connection asynchronously, while the spawned
+            // invocation can already be acquiring one to claim the execution.
+            // Keep both ready instead of opening a new connection on that path.
+            .min_connections(settings.db_max_connections.min(2))
+            .acquire_timeout(Duration::from_secs(3))
+            .after_connect(|connection, _| Box::pin(repository::prepare_connection(connection)))
+            .connect_with(
+                settings
+                    .database_url
+                    .parse::<sqlx::postgres::PgConnectOptions>()?
+                    .options([
+                        ("statement_timeout", "10000"),
+                        ("lock_timeout", "3000"),
+                        ("idle_in_transaction_session_timeout", "15000"),
+                        ("tcp_keepalives_idle", "10"),
+                        ("tcp_keepalives_interval", "3"),
+                        ("tcp_keepalives_count", "3"),
+                        ("tcp_user_timeout", "10000"),
+                    ]),
+            )
             .await
             .context("failed to connect to Postgres")?;
         repository::assert_non_privileged_runtime_role(&pool).await?;
         let engine = build_engine()?;
-        let http = reqwest::Client::builder().build()?;
+        let http = reqwest::Client::builder()
+            .no_proxy()
+            .redirect(reqwest::redirect::Policy::none())
+            .connect_timeout(Duration::from_secs(3))
+            .build()?;
         let artifacts = ArtifactCache::new(
             engine.clone(),
             http.clone(),
             settings.wasm_cache_dir.clone(),
+            settings.max_compilations,
+            settings.compiler_limits,
             metrics.clone(),
         )?;
         let control_plane = ControlPlaneClient::new(
             http,
             settings.control_plane_internal_url.clone(),
             Duration::from_millis(settings.job_env_fetch_timeout_ms),
+            metrics.clone(),
         );
         Ok(Self {
-            runtime: Runtime {
-                engine,
-                metrics: metrics.clone(),
-            },
+            runtime: Runtime::new(engine, metrics.clone())?,
             repository: ExecutionRepository::new(pool),
             artifacts,
             control_plane,
+            memory_budget: crate::capacity::MemoryBudget::new(
+                settings.guest_memory_budget_mib,
+                metrics.clone(),
+            ),
             metrics,
             execution_slots: Arc::new(tokio::sync::Semaphore::new(
                 settings.max_concurrency as usize,
             )),
+            preparation_slots: Arc::new(tokio::sync::Semaphore::new(settings.max_compilations + 1)),
         })
+    }
+    pub(crate) async fn resolve_job(
+        &self,
+        job: &JobMessage,
+    ) -> anyhow::Result<repository::ResolvedVersion> {
+        self.repository
+            .resolve_execution(&job.tenant_id, &job.execution_id, &job.wasm_sha256)
+            .await
     }
     pub(crate) async fn handle_http(
         &self,
         job: JobMessage,
+        resolved: repository::ResolvedVersion,
+        component: Arc<crate::runtime::PreparedComponent>,
         stream: crate::runtime::ResponseSender,
     ) -> bool {
         let execution_id = job.execution_id.clone();
@@ -90,15 +130,18 @@ impl Worker {
             }
         }
 
+        let claimed = std::time::Instant::now();
         let finish = stream.body.clone();
-        let outcome = self.execute(&job, stream).await;
+        let outcome = self.execute(&job, resolved, component, stream)
+            .instrument(tracing::debug_span!(target: "hibana_latency", "invocation", execution_id = %execution_id)).await;
         if outcome.is_err() {
             let _ = finish
                 .send(Err(std::io::Error::other("Worker execution failed")))
                 .await;
         }
         let exec_elapsed = exec_started.elapsed();
-        // wall_time_ms は設定解決・ダウンロードを含む handle_http 全体を計測する。
+        // wall_time_ms covers the DB claim, environment and runtime; it excludes
+        // admission/configuration lookup, artifact preparation and result persistence.
         // 成功経路は run_http が組んだ usage の
         // wall_time_ms をこの値で上書きし、失敗/timeout 経路は wall のみ判る部分計量を組む。
         let wall_time_ms = duration_to_millis(exec_elapsed);
@@ -174,10 +217,15 @@ impl Worker {
             .with_label_values(&[status_label])
             .inc();
 
+        let persistence_started = std::time::Instant::now();
         if let Err(e) = self.control_plane.complete(&result).await {
             warn!(%execution_id, error = %e, "HTTP result persistence failed; request will not be replayed");
             return false;
         }
+        tracing::debug!(target: "hibana_latency", %execution_id, stage = "worker_execution",
+            claim_us = claimed.duration_since(exec_started).as_micros() as u64,
+            execute_us = exec_elapsed.saturating_sub(claimed.duration_since(exec_started)).as_micros() as u64,
+            persist_us = persistence_started.elapsed().as_micros() as u64, "HTTP phase timing");
         true
     }
 
@@ -185,15 +233,10 @@ impl Worker {
     async fn execute(
         &self,
         job: &JobMessage,
+        resolved: repository::ResolvedVersion,
+        component: Arc<crate::runtime::PreparedComponent>,
         stream: crate::runtime::ResponseSender,
     ) -> std::result::Result<(crate::runtime::HttpResponseReceipt, UsageMetrics), ExecError> {
-        // resource_limits / env 許可リスト / 平文 config を DB から解決する。
-        // 取得失敗・未設定時は実行を拒否する。
-        let resolved = self
-            .repository
-            .resolve_version(&job.tenant_id, &job.component, &job.version)
-            .await
-            .map_err(|_| ExecError::Failed("Version configuration unavailable".into()))?;
         let limits = resolved.limits;
 
         let secrets = match job.env_token.as_deref() {
@@ -212,9 +255,6 @@ impl Worker {
                 "dropped env entries not present in the approved allowlist"
             );
         }
-
-        // §3.6 のキャッシュ階層で Component を解決する。
-        let component = self.artifacts.resolve_component(job).await?;
 
         let request = serde_json::from_value(job.input.clone())
             .map_err(|_| ExecError::Failed("Invalid HTTP request envelope".into()))?;
@@ -239,7 +279,7 @@ impl Worker {
 
     async fn resolve_egress_allowlist(
         &self,
-        endpoints: &[faas_shared::egress::EgressEndpoint],
+        endpoints: &[hibana_shared::egress::EgressEndpoint],
     ) -> std::collections::HashSet<std::net::SocketAddr> {
         use std::collections::HashSet;
         let mut out: HashSet<std::net::SocketAddr> = HashSet::new();
@@ -247,7 +287,7 @@ impl Worker {
             match tokio::net::lookup_host((ep.host.as_str(), ep.port)).await {
                 Ok(addrs) => {
                     for addr in addrs {
-                        if faas_shared::egress::is_hard_denied(addr.ip()) {
+                        if hibana_shared::egress::is_hard_denied(addr.ip()) {
                             tracing::warn!(
                                 host = %ep.host, port = ep.port, ip = %addr.ip(),
                                 "approved egress host resolved to a hard-denied IP; dropping (possible rebinding)"

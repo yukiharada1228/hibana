@@ -15,7 +15,7 @@ use axum::extract::rejection::JsonRejection;
 use axum::extract::FromRequest;
 use axum::http::Request;
 use axum::Json;
-use faas_shared::FaasError;
+use hibana_shared::FaasError;
 
 use crate::error::AppError;
 

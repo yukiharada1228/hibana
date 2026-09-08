@@ -1,0 +1,10 @@
+{
+  "name": "inventory-api",
+  "main": "src/index.ts",
+  "vars": {
+    "UPSTREAM_URL": "https://inventory.example.com",
+    "RELEASE": "v1"
+  },
+  "secrets": ["API_TOKEN", "UPSTREAM_TOKEN"],
+  "limits": { "memory_mb": 256, "timeout_ms": 10000 }
+}

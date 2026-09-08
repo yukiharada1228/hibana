@@ -68,6 +68,58 @@ fn shared_memories_cannot_bypass_the_store_limiter() {
     assert!(Module::new(&engine, "(module (memory 1 1 shared))").is_err());
 }
 
+#[test]
+fn preparing_memory_images_does_not_execute_guest_start() {
+    let engine = build_engine().unwrap();
+    let component = Component::new(
+        &engine,
+        r#"(component
+            (core module $m
+                (memory 1)
+                (data (i32.const 0) "initial memory")
+                (func $start unreachable)
+                (start $start))
+            (core instance (instantiate $m)))"#,
+    )
+    .unwrap();
+    // Instantiating this component would trap. Host-only preparation must not.
+    PreparedComponent::new(component).unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn shared_runtime_ticker_interrupts_a_cpu_bound_guest() {
+    let engine = build_engine().unwrap();
+    let runtime = Runtime::new(engine.clone(), crate::metrics::Metrics::init()).unwrap();
+    let module = Module::new(&engine, "(module (func (export \"run\") (loop br 0)))").unwrap();
+    let mut store = Store::new(&engine, ());
+    store.set_fuel(u64::MAX).unwrap();
+    install_epoch_deadline(&mut store, Instant::now() + Duration::from_millis(20));
+    let instance = wasmtime::Instance::new_async(&mut store, &module, &[])
+        .await
+        .unwrap();
+    let run = instance
+        .get_typed_func::<(), ()>(&mut store, "run")
+        .unwrap();
+    // A separate fail-safe prevents a broken ticker from hanging the test suite.
+    let (finished, cancelled) = std::sync::mpsc::channel();
+    let fallback = std::thread::spawn(move || {
+        if cancelled.recv_timeout(Duration::from_secs(2)).is_err() {
+            engine.increment_epoch();
+        }
+    });
+    let started = Instant::now();
+    let error = run.call_async(&mut store, ()).await.unwrap_err();
+    let elapsed = started.elapsed();
+    let _ = finished.send(());
+    fallback.join().unwrap();
+    drop(runtime);
+    assert!(is_interrupt_trap(&error));
+    assert!(
+        elapsed < Duration::from_secs(1),
+        "shared ticker failed: {elapsed:?}"
+    );
+}
+
 use wasmtime::{ResourceLimiter, Store};
 
 #[tokio::test]

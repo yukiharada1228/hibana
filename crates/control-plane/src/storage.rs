@@ -5,7 +5,8 @@
 //! `force_path_style(true)` 相当を有効にし、static credentials で接続する。
 //!
 //! 設計判断(承認済み): クライアントは `aws-sdk-s3`。Worker へは presigned GET URL
-//! を JobMessage に同梱（短命・read-only, 既定 TTL 300秒, §3.4）。
+//! を準備用の内部APIで渡す（短命・read-only, 既定 TTL 300秒, §3.4）。
+//! 通常のHTTP実行ではURLを発行せず、準備済みの成果物を使用する。
 
 use std::time::Duration;
 
@@ -16,7 +17,7 @@ use aws_sdk_s3::primitives::ByteStream;
 use aws_sdk_s3::Client;
 use aws_smithy_http_client::tls::{self, rustls_provider::CryptoMode};
 
-use faas_shared::FaasError;
+use hibana_shared::FaasError;
 
 /// MinIO/S3 への薄いラッパ。バケットを内包し、本体保存と presign を提供する。
 #[derive(Clone)]
@@ -55,6 +56,14 @@ impl Storage {
             .endpoint_url(endpoint)
             .credentials_provider(creds)
             .http_client(http_client)
+            .timeout_config(
+                aws_sdk_s3::config::timeout::TimeoutConfig::builder()
+                    .connect_timeout(std::time::Duration::from_secs(3))
+                    .operation_attempt_timeout(std::time::Duration::from_secs(10))
+                    .operation_timeout(std::time::Duration::from_secs(30))
+                    .build(),
+            )
+            .retry_config(aws_sdk_s3::config::retry::RetryConfig::standard().with_max_attempts(2))
             .force_path_style(true)
             .build();
 

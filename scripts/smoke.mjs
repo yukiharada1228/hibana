@@ -1,11 +1,18 @@
 // Run against a disposable tenant. Exercises the actual CLI and deployed Wasmtime runtime.
 import assert from "node:assert/strict";
+import { readFile, writeFile, rm, mkdtemp } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { rmSync } from "node:fs";
 import { execFileSync } from "node:child_process";
 import http from "node:http";
 import https from "node:https";
 import { Readable } from "node:stream";
 import { resolve } from "node:path";
 import { apiClient } from "../sdk/src/api.mjs";
+const cliHome = await mkdtemp(resolve(tmpdir(), "hibana-smoke-cli-"));
+process.env.HIBANA_CONFIG_HOME = cliHome;
+process.env.HIBANA_PROFILE = "";
+process.once("exit", () => rmSync(cliHome, { recursive: true, force: true }));
 const root = resolve(import.meta.dirname, "..");
 const project = resolve(root, "sdk/examples/hono");
 const cli = resolve(root, "sdk/src/cli.mjs");
@@ -13,9 +20,18 @@ function hibana(args, input) {
   execFileSync(process.execPath, [cli, ...args], { cwd: project, env: process.env, input, stdio: [input === undefined ? "ignore" : "pipe", "inherit", "inherit"], timeout: 180000 });
 }
 hibana(["login"]);
-hibana(["deploy"]);
-hibana(["secret", "put", "TEST_SECRET"], "hibana-test-secret");
-hibana(["deploy"]);
+// Use temporary config files: first publish has no bindings, the next explicitly selects TEST_SECRET.
+const configFile = resolve(project, `.smoke-${process.pid}.json`);
+const config = JSON.parse(await readFile(resolve(project, "hibana.json"), "utf8"));
+config.main = resolve(project, config.main);
+try {
+  await writeFile(configFile, JSON.stringify({ ...config, secrets: [] }));
+  hibana(["deploy", "-c", configFile]);
+  hibana(["secret", "put", "TEST_SECRET"], "hibana-test-secret");
+  hibana(["secret", "allow-deploy", "TEST_SECRET"]);
+  await writeFile(configFile, JSON.stringify({ ...config, secrets: ["TEST_SECRET"] }));
+  hibana(["deploy", "-c", configFile]);
+} finally { await rm(configFile, { force: true }); }
 const gateway = process.env.GATEWAY || "http://127.0.0.1:8083";
 const host = `hello-hono.${process.env.HIBANA_TENANT}.${process.env.HIBANA_INGRESS_DOMAIN || "hibana.local"}`;
 async function app(path, options = {}) {
@@ -31,10 +47,10 @@ async function app(path, options = {}) {
   assert.equal(response.status, 200, `${path}: HTTP ${response.status}`);
   return response;
 }
-assert.deepEqual(await (await app("/")).json(), { message: "Hello Hibana" });
+assert.deepEqual(await (await app("/")).json(), { message: "Hello from Hono on Hibana 🔥" });
 const binary = Uint8Array.of(0, 255, 128, 10, 13, 1);
 assert.deepEqual(new Uint8Array(await (await app("/echo", { method: "POST", body: binary })).arrayBuffer()), binary);
-assert.deepEqual(await (await app("/headers", { headers: { "x-hibana-env": "eyJHUkVFVElORyI6ImV2aWwifQ", "x-hibana-event": "queue" } })).json(), { envHeader: null, eventHeader: null, greeting: "Hello Hibana" });
+assert.deepEqual(await (await app("/headers", { headers: { "x-hibana-env": "eyJHUkVFVElORyI6ImV2aWwifQ", "x-hibana-event": "queue" } })).json(), { envHeader: null, eventHeader: null, greeting: "Hello from Hono on Hibana 🔥" });
 assert.deepEqual(await (await app("/secret")).json(), { configured: true });
 const stream = await app("/stream");
 assert.match(stream.headers.get("content-type"), /text\/event-stream/);
@@ -60,7 +76,7 @@ hibana(["rollback"]);
 const rolled = await api.request("/components");
 const rolledComponent = (Array.isArray(rolled) ? rolled : rolled.components).find(c => c.name === "hello-hono");
 assert.notEqual(rolledComponent.active_version_id, before, "rollback must change the active version");
-assert.deepEqual(await (await app("/")).json(), { message: "Hello Hibana" });
+assert.deepEqual(await (await app("/")).json(), { message: "Hello from Hono on Hibana 🔥" });
 // Switch back to the previously active version using the API's version name.
 const versions = await api.request(`/components/${id}/versions`);
 const version = (Array.isArray(versions) ? versions : versions.versions).find(v => (v.version_id || v.id) === before).version;

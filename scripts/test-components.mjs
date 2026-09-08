@@ -77,7 +77,7 @@ try {
     const manifest = manifestPath ? await readFile(manifestPath, "utf8") : undefined;
     const port = await availablePort();
     // Go also exercises source watching: generated bindings must not trigger a build loop.
-    const child = spawn(process.execPath, [cli, "dev", "--port", String(port), "--runtime", process.env.HIBANA_RUNTIME_BIN || resolve(root, "target/release/faas-worker"), ...(template === "go" ? [] : ["--no-watch"])], { cwd: project, stdio: ["ignore", "pipe", "pipe"] });
+    const child = spawn(process.execPath, [cli, "dev", "--port", String(port), "--runtime", process.env.HIBANA_RUNTIME_BIN || resolve(root, "target/release/hibana-worker"), ...(template === "go" ? [] : ["--no-watch"])], { cwd: project, stdio: ["ignore", "pipe", "pipe"] });
     let output = "";
     child.stdout.on("data", data => { output = (output + data).slice(-12000); });
     child.stderr.on("data", data => { output = (output + data).slice(-12000); });

@@ -1,5 +1,7 @@
 # HTTP MVP 検証記録
 
+最新のWorker資源予算・2/4/8 Pod負荷試験・HPA自動増設は[スケール改善の検証記録](scaling-validation.md)を参照してください。以下は各段階の機能検証の記録です。
+
 2026-09-07、専用 `kind-hibana-dev` クラスタとローカルで検証しました。
 Docker Desktop 一台の上に Kubernetes control-plane node 一台・worker node 二台を配置しています。
 物理サーバーのHA試験ではありません。機能の判断基準は [MVPの範囲](mvp.md) に記載しています。
@@ -73,10 +75,11 @@ bash scripts/rls-lint.sh
 bash scripts/test-http.sh
 node scripts/test-dev.mjs
 python3 scripts/check-kubernetes.py
+python3 sdk/platform/test_kubernetes.py
 python3 scripts/check-architecture.py
 ```
 
-[専用kindの手順](../deploy/kubernetes/README.md)で配備先とテスト用テナントを用意し、API・アプリのポート転送を起動した後に実行します。
+[専用kindの手順](../deploy/kubernetes/README.md)の`hibana platform install`で配備先とテスト用テナントを用意してから実行します。API・アプリはローカルのNodePort経由で接続します。
 
 ```bash
 # HIBANA_URL / HIBANA_TENANT / HIBANA_EMAIL / HIBANA_PASSWORDを設定
@@ -91,10 +94,9 @@ python3 scripts/k8s-local-rollout.py
 
 ## 残る課題
 
-- deployは複数のAPI操作で、共有varsを含む原子的な切替は未実装。承認失敗時は新コードを有効化しませんが、varsは更新される場合があります。
-- rollbackはコードの参照先だけを戻します。共有vars、Secrets、外部DBは戻しません。
+- このKubernetes検証時点ではdeployは共有varsと別々の操作でした。後続の[デプロイ改善](deployment.md)では原子的な公開とvarsを含むrollbackを実装していますが、このクラスタでの検証結果とは区別してください。Secretsの値・外部DBは巻き戻しません。
 - 物理ノード喪失、PostgreSQL/Redis/S3のHA・復元、本番CNIによる隔離、VMベースRuntimeClass、長時間負荷は未検証です。
 - 旧版からの今回の更新では受付を停止し、実行中のHTTP・非同期処理を完了させてください。新旧の内部契約を混在させた無停止更新は保証しません。
 
-通常のWeb APIに必要な機能へ整理できました。追加機能より、デプロイの原子性と運用検証を優先します。
+通常のWeb APIに必要な機能へ整理できました。追加機能より、新しいデプロイ実装での実環境の受入と運用検証を優先します。
 過去のbytes handler・非同期配送の検証は [整理前の履歴](history/kubernetes-before-http-mvp.md) です。

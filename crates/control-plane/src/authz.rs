@@ -4,7 +4,7 @@
 //!   要求スコープ ∩ 呼び出し主体のスコープ ∩ 対象ユーザのロール上限
 //! でなければならない（default-open は禁止＝要求を無検証で通さない）。
 
-use faas_shared::{FaasError, Role, Scope};
+use hibana_shared::{FaasError, Role, Scope};
 
 /// 管理操作（ユーザ/トークン作成・失効）に admin **ロール**を要求する。
 ///

@@ -7,11 +7,17 @@ use axum::{
     routing::{delete, get, post, put},
     Router,
 };
-use faas_shared::Scope;
+use hibana_shared::Scope;
 use tower_http::{cors::CorsLayer, trace::TraceLayer};
 pub(crate) fn build_internal_router(state: AppState) -> Router {
     Router::new()
+        .route("/internal/maintenance", get(crate::maintenance::status))
+        .route(
+            "/internal/maintenance/prepare",
+            post(crate::maintenance::prepare),
+        )
         .route("/internal/direct-job", post(direct_http::redeem))
+        .route("/internal/artifact", post(crate::preparation::redeem))
         .route("/internal/direct-result", post(direct_http::complete))
         .route("/internal/job-env", post(handlers_secrets::job_env))
         .with_state(state)
@@ -88,10 +94,18 @@ pub(crate) fn build_router(state: AppState) -> Router {
             "/components/{component_id}/config/{key}",
             delete(handlers::configuration::delete_function_config),
         )
+        .route(
+            "/components/{component_id}/rollback",
+            post(handlers::components::rollback_version),
+        )
         .route_layer(axum::middleware::from_fn(require_scope(Scope::Deploy)));
 
     // --- Admin スコープ（全 DELETE・active-version 切替・user/token 管理） ---
     let admin_routes = Router::new()
+        .route(
+            "/components/{component_id}/secrets/{name}/deploy-access",
+            put(handlers_secrets::set_secret_deploy_access),
+        )
         .route(
             "/components/{component_id}",
             delete(handlers::components::delete_component),
@@ -113,21 +127,14 @@ pub(crate) fn build_router(state: AppState) -> Router {
             "/tokens/{token_id}",
             delete(handlers::identity::revoke_token),
         )
-        .route(
-            "/components/{component_id}/rollback",
-            post(handlers::components::rollback_version),
-        )
-        // --- M7b: capability の env 許可リスト承認 (§4.4 / §15) ---
-        // PUT /components/{id}/versions/{version}/capabilities:
-        // 注入を許可する env 名を承認する。§4.4 MUST「付与は admin スコープを要する」に従い
-        // アップロード（Deploy）から分離した専用経路にする（deploy トークンによる権限昇格の遮断）。
+        // Legacy env mutation returns 409: bindings belong to immutable versions.
         .route(
             "/components/{component_id}/versions/{version}/capabilities",
             put(handlers::capabilities::approve_capability_env),
         )
         // --- M9c: capability の egress allowlist 承認 (§4.4 / §15 M9) ---
         // PUT /components/{id}/versions/{version}/capabilities/egress:
-        // 許可する outbound 先（host:port）を承認する。env と同じく admin 専用経路
+        // 許可する outbound 先（host:port）を承認する。Secret利用許可と同じく admin 専用経路
         // （deploy トークンが自分で外部到達を承認できてはならない）。
         .route(
             "/components/{component_id}/versions/{version}/capabilities/egress",
@@ -192,6 +199,14 @@ pub(crate) fn build_router(state: AppState) -> Router {
         .route("/metrics", get(handlers::health::metrics))
         .route("/auth/login", post(login::login))
         .route("/admin/tenants", post(handlers::tenants::create_tenant))
+        .route(
+            "/admin/components",
+            get(handlers::components::admin_list_components),
+        )
+        .route(
+            "/admin/tenants/{tenant_id}/components/{component_id}",
+            delete(handlers::components::admin_delete_component),
+        )
         // M10 follow-up: テナント status / quotas の platform 管理（bootstrap トークン gate。
         // create_tenant と同じ**非認証グループ**に置き、ハンドラ内で bootstrap トークンを照合する。
         // テナント admin スコープではない —— テナント自身が自分を再有効化 / 増枠できてはならない）。
@@ -225,6 +240,10 @@ pub(crate) fn build_router(state: AppState) -> Router {
             http_metrics_middleware,
         ))
         .layer(TraceLayer::new_for_http())
+        .layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            crate::maintenance::public_gate,
+        ))
         .layer(CorsLayer::permissive())
         .with_state(state)
 }

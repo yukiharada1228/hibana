@@ -3,9 +3,8 @@ import { access, readFile, writeFile, chmod, mkdir } from "node:fs/promises";
 import { constants, watch } from "node:fs";
 import { parseEnv } from "node:util";
 import { dirname, resolve, relative, join, delimiter } from "node:path";
-import { fileURLToPath } from "node:url";
 import { loadConfig } from "./config.mjs";
-import { run } from "./process.mjs";
+import { installedRuntime } from "./runtime.mjs";
 
 export function shouldRebuild(config, file) {
   const path = resolve(config.root, file);
@@ -22,19 +21,15 @@ export function shouldRebuild(config, file) {
 export async function dev(config, options, build) {
   const port = Number(options.port || 8787);
   if (!Number.isInteger(port) || port < 1 || port > 65535) throw new Error("port must be 1..65535");
-  const repo = resolve(dirname(fileURLToPath(import.meta.url)), "../..");
   let runtime = options.runtime || process.env.HIBANA_RUNTIME_BIN;
+  if (!runtime) runtime = await installedRuntime();
   if (!runtime) {
-    const candidates = [join(repo, "target/release/faas-worker"), ...(process.env.PATH || "").split(delimiter).map(dir => join(dir, "faas-worker"))];
-    for (const candidate of candidates) { try { await access(candidate, constants.X_OK); runtime = candidate; break; } catch {} }
-    if (!runtime) {
-      try { await access(join(repo, "crates/worker/Cargo.toml")); }
-      catch { throw new Error("Install faas-worker or set HIBANA_RUNTIME_BIN to its path"); }
-      console.log("Building the Wasmtime development runtime…");
-      await run("cargo", ["build", "--release", "-p", "faas-worker"], { cwd: repo });
-      runtime = join(repo, "target/release/faas-worker");
+    for (const directory of (process.env.PATH || "").split(delimiter).filter(Boolean)) {
+      const candidate = join(directory, "hibana-worker");
+      try { await access(candidate, constants.X_OK); runtime = candidate; break; } catch {}
     }
   }
+  if (!runtime) throw new Error("Run hibana runtime install, or supply --runtime PATH / HIBANA_RUNTIME_BIN. Remote deployment does not require a local runtime.");
   const settings = join(config.root, ".hibana/dev-settings.json");
   let child, watcher, timer, stopping = false, rebuilding = false, dirty = false;
   async function stopChild() {
@@ -81,7 +76,7 @@ export async function dev(config, options, build) {
   process.once("SIGINT", stop); process.once("SIGTERM", stop);
   try {
     await start();
-    if (!options["no-watch"]) {
+    if (!stopping && !options["no-watch"]) {
       watcher = watch(config.root, { recursive: true }, (_, file) => {
         if (!file || !shouldRebuild(config, file)) return;
         clearTimeout(timer); timer = setTimeout(rebuild, 200);

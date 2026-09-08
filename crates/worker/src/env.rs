@@ -9,7 +9,7 @@
 //! 1. **許可リストが権威**。`component_versions.capabilities.env`（admin 承認）に載っていないキーは、
 //!    値が DB に存在しても注入しない。CP 側（job-env 引き換え）でも同じフィルタを掛ける二重防御で、
 //!    片側の実装ミスが即漏洩にならないようにする。
-//! 2. **上限は `faas_shared` の定数を共有する**。CP の受付バリデーションと同じ値でここでも clamp する
+//! 2. **上限は `hibana_shared` の定数を共有する**。CP の受付バリデーションと同じ値でここでも clamp する
 //!    （DB を直接書き換えられた場合や将来の別経路に対する防御）。
 //! 3. **出力順は決定的**（キー名昇順）。同じ入力からは常に同じ `WasiCtx` が組み上がる。
 //! 4. `WasiCtx` は実行ごとに構築される（`Component` は sha256 キャッシュで共有されるが `WasiCtx` は
@@ -17,7 +17,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use faas_shared::{
+use hibana_shared::{
     Redacted, MAX_ENV_VALUE_BYTES, MAX_FUNCTION_ENV_KEYS, MAX_FUNCTION_ENV_TOTAL_BYTES,
 };
 

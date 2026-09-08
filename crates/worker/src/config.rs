@@ -9,6 +9,10 @@ pub(crate) struct Settings {
     pub(crate) control_plane_internal_url: String,
     pub(crate) job_env_fetch_timeout_ms: u64,
     pub(crate) max_concurrency: u64,
+    pub(crate) guest_memory_budget_mib: u32,
+    pub(crate) max_compilations: usize,
+    pub(crate) compiler_limits: crate::compiler::Limits,
+    pub(crate) db_max_connections: u32,
     pub(crate) drain_timeout_secs: u64,
 }
 
@@ -16,7 +20,7 @@ const DEFAULT_WASM_CACHE_DIR: &str = "./worker-cache";
 const DEFAULT_METRICS_BIND_ADDR: &str = "0.0.0.0:9090";
 const DEFAULT_CONTROL_PLANE_INTERNAL_URL: &str = "http://127.0.0.1:8081";
 const DEFAULT_JOB_ENV_FETCH_TIMEOUT_MS: u64 = 2000;
-const DEFAULT_WORKER_MAX_CONCURRENCY: u64 = 32;
+const DEFAULT_WORKER_MAX_CONCURRENCY: u64 = 8;
 const DEFAULT_WORKER_DRAIN_TIMEOUT_SECS: u64 = 30;
 impl Settings {
     pub(crate) fn from_env() -> anyhow::Result<Self> {
@@ -40,14 +44,35 @@ impl Settings {
                 "JOB_ENV_FETCH_TIMEOUT_MS",
                 DEFAULT_JOB_ENV_FETCH_TIMEOUT_MS,
             )?,
-            max_concurrency: env_u64("WORKER_MAX_CONCURRENCY", DEFAULT_WORKER_MAX_CONCURRENCY)?
-                .max(1),
+            max_concurrency: bounded(
+                "WORKER_MAX_CONCURRENCY",
+                DEFAULT_WORKER_MAX_CONCURRENCY,
+                1,
+                1024,
+            )?,
+            guest_memory_budget_mib: bounded("WORKER_GUEST_MEMORY_BUDGET_MIB", 2048, 1, 1_048_576)?
+                as u32,
+            max_compilations: bounded("WORKER_MAX_COMPILATIONS", 1, 1, 8)? as usize,
+            compiler_limits: crate::compiler::Limits {
+                memory_mib: bounded("WORKER_COMPILER_MEMORY_MIB", 1024, 256, 4096)?,
+                timeout_secs: bounded("WORKER_COMPILER_TIMEOUT_SECS", 60, 1, 300)?,
+            },
+            db_max_connections: bounded("WORKER_DB_MAX_CONNECTIONS", 8, 1, 128)? as u32,
             drain_timeout_secs: env_u64(
                 "WORKER_DRAIN_TIMEOUT_SECS",
                 DEFAULT_WORKER_DRAIN_TIMEOUT_SECS,
             )?,
         })
     }
+}
+
+fn bounded(key: &str, default: u64, min: u64, max: u64) -> anyhow::Result<u64> {
+    let value = env_u64(key, default)?;
+    anyhow::ensure!(
+        (min..=max).contains(&value),
+        "{key} must be between {min} and {max}"
+    );
+    Ok(value)
 }
 
 fn env_u64(key: &str, default: u64) -> anyhow::Result<u64> {

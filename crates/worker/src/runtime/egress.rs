@@ -32,7 +32,7 @@ pub(super) async fn gated_send_request(
     match tokio::net::lookup_host((host.as_str(), port)).await {
         Ok(addrs) => {
             for addr in addrs {
-                if faas_shared::egress::is_hard_denied(addr.ip()) {
+                if hibana_shared::egress::is_hard_denied(addr.ip()) {
                     continue;
                 }
                 if allowed.contains(&addr) {

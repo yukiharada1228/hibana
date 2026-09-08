@@ -6,7 +6,7 @@ use crate::state::AppState;
 use axum::extract::{Path, State};
 use axum::response::IntoResponse;
 use axum::Json;
-use faas_shared::FaasError;
+use hibana_shared::FaasError;
 use serde::Serialize;
 use serde_json::Value;
 

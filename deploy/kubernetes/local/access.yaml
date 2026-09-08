@@ -1,0 +1,15 @@
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: hibana-local-access
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: hibana-control-plane
+  policyTypes: [Ingress]
+  # The local NodePorts enter through a kind node, not a production Ingress namespace.
+  # Host publication is restricted to loopback in kind.yaml. Internal ports stay private.
+  ingress:
+    - ports:
+        - {protocol: TCP, port: 8080}
+        - {protocol: TCP, port: 8083}

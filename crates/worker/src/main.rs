@@ -1,5 +1,8 @@
 //! Worker binary composition. Both dev and fleet execution use the same runtime.
 mod artifacts;
+mod cache_storage;
+mod capacity;
+mod compiler;
 mod config;
 mod control_plane;
 mod dev;
@@ -15,13 +18,26 @@ use lifecycle::{spawn_metrics_server, spawn_shutdown_listener, Shutdown};
 use service::Worker;
 use std::{sync::Arc, time::Duration};
 use tracing::{info, warn};
-#[tokio::main]
-async fn main() -> anyhow::Result<()> {
+fn main() -> anyhow::Result<()> {
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    if args.len() == 1 && matches!(args[0].as_str(), "--version" | "-V") {
+        println!("hibana-worker {}", env!("CARGO_PKG_VERSION"));
+        return Ok(());
+    }
+    if args.first().is_some_and(|arg| arg == compiler::FLAG) {
+        return compiler::run(&args);
+    }
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()?
+        .block_on(run(args))
+}
+
+async fn run(args: Vec<String>) -> anyhow::Result<()> {
     let log_format = std::env::var("LOG_FORMAT")
         .map(|v| v.trim().to_string())
         .unwrap_or_else(|_| "text".into());
-    let _otel_guard = faas_shared::otel::init_tracing(&log_format, "info", "faas-worker");
-    let args: Vec<String> = std::env::args().skip(1).collect();
+    let _otel_guard = hibana_shared::otel::init_tracing(&log_format, "info", "hibana-worker");
     if !args.is_empty() {
         return dev::run(&args).await;
     }

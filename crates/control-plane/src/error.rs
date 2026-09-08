@@ -1,6 +1,6 @@
 //! HTTP エラー応答へのマッピング。
 //!
-//! `faas_shared::FaasError` を axum の `IntoResponse` に変換し、
+//! `hibana_shared::FaasError` を axum の `IntoResponse` に変換し、
 //! 一貫した JSON エラーエンベロープ
 //! `{ "error": { "code", "message", "retryable" } }` を返す (§6.5)。
 //!
@@ -12,7 +12,7 @@
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::Json;
-use faas_shared::FaasError;
+use hibana_shared::FaasError;
 use serde_json::json;
 
 /// control-plane の HTTP ハンドラ用エラー。
@@ -52,6 +52,7 @@ impl AppError {
     /// 安定した機械可読エラーコード。
     fn code(&self) -> &'static str {
         match &self.0 {
+            FaasError::Unavailable => "unavailable",
             FaasError::Unauthorized => "unauthorized",
             FaasError::Forbidden => "forbidden",
             FaasError::NotFound(_) => "not_found",
@@ -67,6 +68,7 @@ impl AppError {
     /// HTTP ステータスコード。
     fn status(&self) -> StatusCode {
         match &self.0 {
+            FaasError::Unavailable => StatusCode::SERVICE_UNAVAILABLE,
             FaasError::Unauthorized => StatusCode::UNAUTHORIZED,
             FaasError::Forbidden => StatusCode::FORBIDDEN,
             FaasError::NotFound(_) => StatusCode::NOT_FOUND,
@@ -81,7 +83,10 @@ impl AppError {
 
     /// クライアントがリトライしてよいか（ヒント）。
     fn retryable(&self) -> bool {
-        matches!(self.0, FaasError::Timeout | FaasError::Internal(_))
+        matches!(
+            self.0,
+            FaasError::Timeout | FaasError::Internal(_) | FaasError::Unavailable
+        )
     }
 }
 

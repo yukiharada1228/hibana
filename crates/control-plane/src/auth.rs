@@ -16,7 +16,7 @@ use axum::http::header::AUTHORIZATION;
 use axum::http::request::Parts;
 use axum::middleware::Next;
 use axum::response::Response;
-use faas_shared::{FaasError, Role, Scope};
+use hibana_shared::{FaasError, Role, Scope};
 
 use crate::db;
 use crate::error::AppError;

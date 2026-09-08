@@ -1,4 +1,4 @@
-# Local platform operations. Application builds and deployment use the Hibana CLI.
+# Native runtime development and checks. Foundation lifecycle: hibana platform.
 ifneq (,$(wildcard .env))
 include .env
 export
@@ -21,11 +21,11 @@ up:
 down:
 	docker compose down
 migrate:
-	cargo run -p faas-control-plane --bin control-plane -- --migrate-only
+	cargo run -p hibana-control-plane --bin hibana-control-plane -- --migrate-only
 run-cp:
-	cargo run --release -p faas-control-plane --bin control-plane
+	cargo run --release -p hibana-control-plane --bin hibana-control-plane
 run-worker:
-	cargo run --release -p faas-worker --bin faas-worker
+	cargo run --release -p hibana-worker --bin hibana-worker
 bootstrap: ## M3a: テナント + 最初の admin ユーザを 1 回で作成（POST /admin/tenants, §9 bootstrap）
 	@set -e; \
 	echo "==> POST /admin/tenants (slug=$(SMOKE_TENANT_SLUG), admin=$(SMOKE_EMAIL))"; \
@@ -66,6 +66,8 @@ test:
 	cargo test --workspace
 	npm test --prefix sdk
 	python3 scripts/check-kubernetes.py
+	python3 sdk/platform/test_kubernetes.py
+	python3 scripts/test_resilience.py
 rls-lint:
 	bash scripts/rls-lint.sh
 logs:

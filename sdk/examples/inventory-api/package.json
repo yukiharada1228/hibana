@@ -1,0 +1,12 @@
+{
+  "name": "hibana-inventory-example",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "hibana dev",
+    "build": "hibana build",
+    "deploy": "hibana deploy"
+  },
+  "dependencies": { "hono": "4.13.5" },
+  "devDependencies": { "@hibana/cli": "file:../.." }
+}
