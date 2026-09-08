@@ -4,7 +4,7 @@ use crate::migrations::{run_migrate_only, run_migrations};
 use crate::routes::{build_internal_router, build_router};
 use crate::{
     config::Config, crypto, deployment, ingress, migrations, reaper, signing, state::AppState,
-    storage, store, validation,
+    storage, store,
 };
 use axum::{serve::ListenerExt as _, Router};
 use sqlx::postgres::PgPoolOptions;
@@ -38,10 +38,6 @@ pub(crate) async fn run() -> anyhow::Result<()> {
     // JOB_SIGNING_KEY などのランタイム用必須 env が無くても通る（migrate に必要なのは DB URL だけ）。
     if std::env::args().any(|a| a == "--migrate-only") {
         return run_migrate_only().await;
-    }
-
-    if std::env::args().any(|a| a == validation::VALIDATE_STDIN_FLAG) {
-        return validation::run_validate_stdin();
     }
 
     let config = Config::from_env()?;

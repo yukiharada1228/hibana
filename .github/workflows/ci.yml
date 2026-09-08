@@ -151,6 +151,9 @@ jobs:
       - name: Build control-plane + worker (release)
         run: cargo build --release -p hibana-control-plane -p hibana-worker
 
+      - name: Validate without server runtime initialization
+        run: node scripts/test-validation-child.mjs
+
       - name: Run migrations
         run: ./target/release/hibana-control-plane --migrate-only
 

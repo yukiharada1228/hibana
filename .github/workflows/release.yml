@@ -52,6 +52,7 @@ jobs:
           name: release-${{ matrix.target }}
           path: dist/*
           if-no-files-found: error
+          retention-days: 1
 
   package:
     name: CLI and Kubernetes manifests
@@ -74,6 +75,7 @@ jobs:
           name: release-packages
           path: dist/*
           if-no-files-found: error
+          retention-days: 1
 
   image:
     name: Platform image / linux-${{ matrix.arch }}
@@ -119,6 +121,7 @@ jobs:
           path: dist/*
           compression-level: 0
           if-no-files-found: error
+          retention-days: 1
 
   assemble:
     name: Complete release checksums
@@ -142,6 +145,7 @@ jobs:
           path: dist/*
           compression-level: 0
           if-no-files-found: error
+          retention-days: 1
 
   publish:
     name: Publish and install from GitHub
@@ -165,7 +169,9 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           TAG: ${{ github.ref_name }}
-        run: gh release create "$TAG" --verify-tag --title "Hibana $TAG" --generate-notes dist/*
+        run: |
+          gh release create "$TAG" --draft --verify-tag --title "Hibana $TAG" --generate-notes dist/*
+          gh release edit "$TAG" --draft=false
       - name: Install CLI and runtime from the published Release and run Hono
         env:
           HIBANA_GITHUB_RELEASE: '1'

@@ -242,7 +242,7 @@ mod tests {
                 let Ok(env) = result else {
                     panic!("Secret request failed")
                 };
-                assert_eq!(env["TOKEN"].expose(), "secret-response-body");
+                crate::env::assert_secret_eq(&env["TOKEN"], "secret-response-body");
             } else {
                 let Err(ExecError::Failed(error)) = result else {
                     panic!("Expected Secret request failure")

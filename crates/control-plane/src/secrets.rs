@@ -44,6 +44,12 @@ use rand::rngs::OsRng;
 use rand::RngCore;
 use zeroize::Zeroizing;
 
+/// Compare test fixtures at the existing plaintext boundary without logging them.
+#[cfg(test)]
+pub(crate) fn assert_secret_eq(actual: &hibana_shared::Redacted<String>, expected: &str) {
+    assert!(actual.expose() == expected, "secret does not match fixture");
+}
+
 /// 値本体の AAD ドメインタグ。
 const VALUE_AAD_DOMAIN: &[u8] = b"faas-secret-value-v1";
 /// DEK ラップの AAD ドメインタグ。

@@ -576,7 +576,7 @@ async fn secret_resolution_regression(state: &AppState) {
         .unwrap();
         assert_eq!(resolved.len(), 1);
         assert_eq!(resolved[0].version, version);
-        assert_eq!(resolved[0].value.expose(), value);
+        crate::secrets::assert_secret_eq(&resolved[0].value, value);
     }
     assert!(
         matches!(

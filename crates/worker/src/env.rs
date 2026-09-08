@@ -81,6 +81,12 @@ pub fn build_env(
     out
 }
 
+/// Compare test fixtures at the existing plaintext boundary without logging them.
+#[cfg(test)]
+pub(crate) fn assert_secret_eq(actual: &Redacted<String>, expected: &str) {
+    assert!(actual.expose() == expected, "secret does not match fixture");
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

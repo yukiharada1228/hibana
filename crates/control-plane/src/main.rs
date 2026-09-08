@@ -34,6 +34,11 @@ mod migrations;
 mod routes;
 
 fn main() -> anyhow::Result<()> {
+    // Validation is synchronous and memory bounded. Do not allocate Tokio worker
+    // threads or initialize telemetry before applying the child's address-space limit.
+    if std::env::args().any(|a| a == validation::VALIDATE_STDIN_FLAG) {
+        return validation::run_validate_stdin();
+    }
     if std::env::args().any(|a| a == "--verify-backup-secrets") {
         return backup::run();
     }
