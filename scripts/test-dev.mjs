@@ -15,7 +15,7 @@ const config = { name: "dev-test", main: resolve(root, "sdk/examples/hono/src/in
 const path = join(directory, "hibana.json");
 await writeFile(path, JSON.stringify(config));
 await writeFile(join(directory, ".dev.vars"), 'TEST_SECRET="hibana-test-secret"\n', { mode: 0o600 });
-const child = spawn(process.execPath, [resolve(root, "sdk/src/cli.mjs"), "dev", "-c", path, "--port", String(port), "--runtime", process.env.HIBANA_RUNTIME_BIN || resolve(root, "target/release/faas-worker")], { stdio: ["ignore", "pipe", "pipe"] });
+const child = spawn(process.execPath, [resolve(root, "sdk/src/cli.mjs"), "dev", "-c", path, "--port", String(port), "--runtime", process.env.HIBANA_RUNTIME_BIN || resolve(root, "target/release/hibana-worker")], { stdio: ["ignore", "pipe", "pipe"] });
 let output = "";
 child.stdout.on("data", data => { output = (output + data).slice(-8000); });
 child.stderr.on("data", data => { output = (output + data).slice(-8000); });
@@ -49,8 +49,13 @@ try {
     await new Promise(done => {
       const timer = setTimeout(() => child.kill("SIGKILL"), 60000);
       child.once("exit", () => { clearTimeout(timer); done(); });
-      child.kill("SIGTERM");
+      child.kill("SIGINT");
     });
   }
   await rm(directory, { recursive: true, force: true });
 }
+assert.equal(child.exitCode, 0, `dev did not stop cleanly: ${output}`);
+const stopped = net.createServer();
+await new Promise((done, fail) => { stopped.once("error", fail); stopped.listen(port, "127.0.0.1", done); });
+await new Promise(done => stopped.close(done));
+console.log("PASS Ctrl+C stops the CLI and releases the Wasmtime listening port");

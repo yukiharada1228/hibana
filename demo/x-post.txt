@@ -1,0 +1,9 @@
+HonoをWasm Componentにして、自分のKubernetesで動かすWasm FaaS「hibana」。
+
+基盤構築 → デプロイ → HTTP実行 → アプリ削除 → 基盤撤去まで、CLIで。
+
+Wasmの成果物と実行履歴を照合し、リクエストごとに状態が初期化される様子も確認しました。
+
+実際の実行ログを90秒に編集したデモです。
+
+#WebAssembly #Hono #Kubernetes

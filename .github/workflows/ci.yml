@@ -30,6 +30,9 @@ jobs:
         run: |
           python -m pip install PyYAML==6.0.3
           python scripts/check-kubernetes.py
+          python sdk/platform/test_kubernetes.py
+          python scripts/test_resilience.py
+          python scripts/acceptance/test_results.py
       - uses: docker/setup-buildx-action@v3
       - name: Build Linux runtime image
         uses: docker/build-push-action@v6
@@ -45,6 +48,9 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
 
       # M3b (§3.2): テナント分離の静的ガード。toolchain 不要で安価なため最初に走らせる。
       # SET app.tenant_id ハザード（LOCAL 欠落・文字列結合）と、tenant-scoped db:: 呼び出しを
@@ -90,7 +96,7 @@ jobs:
       REDIS_URL: redis://localhost:6379
       S3_ENDPOINT: http://localhost:9000
       S3_REGION: us-east-1
-      S3_BUCKET: faas-components
+      S3_BUCKET: hibana-components
       S3_ACCESS_KEY: minioadmin
       S3_SECRET_KEY: minioadmin
       JOB_SIGNING_KEY: AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8
@@ -100,7 +106,9 @@ jobs:
       BOOTSTRAP_ADMIN_TOKEN: dev-bootstrap-admin-token
       CONTROL_PLANE_INTERNAL_URL: http://localhost:8081
       APP_BIND_ADDR: "0.0.0.0:8083"
-      WORKER_HTTP_URL: http://localhost:8084
+      # Discovery prepares every resolved Worker address. This listener is IPv4;
+      # localhost also resolves to ::1 on Linux runners, where nothing listens.
+      WORKER_HTTP_URL: http://127.0.0.1:8084
       WORKER_HTTP_BIND_ADDR: "0.0.0.0:8084"
       INGRESS_BASE_DOMAIN: hibana.local
       COMPONENTS_DIR: ./components
@@ -143,15 +151,18 @@ jobs:
       # release ビルド: debug の wasmtime は 12MiB JS コンポーネントの precompile が CI(2core) で
       # 極端に遅く gate が実用にならないため、CP/worker は --release で立てる（precompile が高速化）。
       - name: Build control-plane + worker (release)
-        run: cargo build --release -p faas-control-plane -p faas-worker
+        run: cargo build --release -p hibana-control-plane -p hibana-worker
+
+      - name: Validate without server runtime initialization
+        run: node scripts/test-validation-child.mjs
 
       - name: Run migrations
-        run: ./target/release/control-plane --migrate-only
+        run: ./target/release/hibana-control-plane --migrate-only
 
       - name: Start control-plane + worker
         run: |
           mkdir -p "$COMPONENTS_DIR" "$WASM_CACHE_DIR"
-          nohup ./target/release/control-plane > cp.log 2>&1 &
+          nohup ./target/release/hibana-control-plane > cp.log 2>&1 &
           # 2 個連結され != "000" になり、CP 未起動でもループが即 break してしまう＝worker が
           up=""
           for i in $(seq 1 90); do
@@ -161,7 +172,7 @@ jobs:
           done
           [ -n "$up" ] || { echo "control-plane failed to become ready"; tail -n 100 cp.log; exit 1; }
           echo "control-plane up (HTTP $up)"
-          nohup ./target/release/faas-worker > worker.log 2>&1 &
+          nohup ./target/release/hibana-worker > worker.log 2>&1 &
           ok=""
           for i in $(seq 1 30); do
             if grep -q "HTTP worker started" worker.log; then ok=1; break; fi
@@ -188,6 +199,12 @@ jobs:
         working-directory: sdk
         run: npm test
 
+      - name: Verify distributable CLI outside the checkout
+        run: HIBANA_RUNTIME_BIN="$GITHUB_WORKSPACE/target/release/hibana-worker" npm run test:package --prefix sdk
+
+      - name: Bounded operational commands
+        run: node --test scripts/test-bounded-process.test.mjs
+
       - name: Test standalone Wasmtime development and reload
         run: node scripts/test-dev.mjs
 
@@ -202,7 +219,7 @@ jobs:
           test -z "$(gofmt -l sdk/templates/go)"
 
       - name: Run HTTP MVP smoke including rollback
-        run: ./scripts/smoke.sh
+        run: node scripts/smoke.mjs
 
       - name: Dump control-plane + worker logs
         if: always()

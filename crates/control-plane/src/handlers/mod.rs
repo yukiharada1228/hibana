@@ -1,9 +1,10 @@
 //! Management HTTP handlers grouped by resource. Authorization is attached by routes.rs.
 use crate::error::AppError;
-use faas_shared::FaasError;
+use hibana_shared::FaasError;
 pub(crate) mod capabilities;
 pub(crate) mod components;
 pub(crate) mod configuration;
+mod deployment;
 pub(crate) mod executions;
 pub(crate) mod health;
 pub(crate) mod identity;

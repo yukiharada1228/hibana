@@ -4,6 +4,8 @@ use std::collections::BTreeMap;
 
 pub const MAX_REQUEST_BYTES: usize = 8 * 1024 * 1024;
 pub const MAX_RESPONSE_BYTES: usize = 64 * 1024 * 1024;
+/// Internal transport marker. Guest responses must never set this header.
+pub const WORKER_REJECTED_HEADER: &str = "x-hibana-worker-rejected";
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(default)]

@@ -51,7 +51,7 @@ async fn reconcile_once(
         match reconcile_tenant(state, tenant, inflight_ttl_secs, stuck_deadline_secs).await {
             Ok(()) => resynced += 1,
             Err(e) => {
-                // Redis 到達不能はこの周期では諦める（fail-open: admission は別途素通し）。
+                // Redis 到達不能はこの周期では諦める。admission は fail-closed で拒否する。
                 // DB エラーは当該テナントのみスキップ。いずれも次周期で再試行。
                 tracing::warn!(tenant = %tenant, error = %e, "reaper: failed to reconcile tenant");
             }
@@ -99,8 +99,8 @@ async fn reconcile_tenant(
             tenant,
             &row.component_id,
             row.period_start,
-            faas_shared::ExecutionStatus::Failed,
-            &faas_shared::UsageMetrics::default(),
+            hibana_shared::ExecutionStatus::Failed,
+            &hibana_shared::UsageMetrics::default(),
         )
         .await?;
     }

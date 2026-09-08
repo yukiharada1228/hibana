@@ -30,7 +30,7 @@ use axum::Json;
 use chrono::{Duration, Utc};
 use serde::{Deserialize, Serialize};
 
-use faas_shared::{new_token_id, FaasError, Scope};
+use hibana_shared::{new_token_id, FaasError, Scope};
 
 use crate::auth::hash_token;
 use crate::authz::resolve_login_scopes;
@@ -62,8 +62,8 @@ pub struct LoginResponse {
     /// M7-0 (§5.1): `Redacted` は `Serialize` を実装しないので、平文で返すには
     /// `expose_once` を**明示的に**書く必要がある。この属性の grep が「意図的に秘密を返す
     /// API」の全一覧になる。ログ・Debug 出力には `<redacted>` しか出ない。
-    #[serde(serialize_with = "faas_shared::expose_once")]
-    pub token: faas_shared::Redacted<String>,
+    #[serde(serialize_with = "hibana_shared::expose_once")]
+    pub token: hibana_shared::Redacted<String>,
     pub token_id: String,
     pub scopes: Vec<Scope>,
     /// RFC3339 失効時刻。
@@ -220,7 +220,7 @@ pub async fn login(
     Ok((
         StatusCode::CREATED,
         Json(LoginResponse {
-            token: faas_shared::Redacted::new(secret),
+            token: hibana_shared::Redacted::new(secret),
             token_id,
             scopes,
             expires_at: expires_at.to_rfc3339(),
@@ -343,7 +343,7 @@ mod tests {
     use crate::authz::resolve_login_scopes;
     use crate::crypto::{dummy_password_hash, verify_password};
     use axum::http::HeaderMap;
-    use faas_shared::{Role, Scope};
+    use hibana_shared::{Role, Scope};
     use std::net::SocketAddr;
 
     /// uniform-failure: ダミーハッシュ verify は決して成功しない（no-user パスで

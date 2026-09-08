@@ -27,7 +27,7 @@ use axum::Json;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 
-use faas_shared::FaasError;
+use hibana_shared::FaasError;
 
 use crate::auth::Principal;
 use crate::authz::require_admin_role;
@@ -37,9 +37,9 @@ use crate::extract::JsonBody;
 use crate::secrets;
 use crate::state::AppState;
 
-/// `sec_*` の採番（`faas_shared` の ID 採番作法に合わせた不透明 ID）。
+/// `sec_*` の採番（`hibana_shared` の ID 採番作法に合わせた不透明 ID）。
 fn new_secret_id() -> String {
-    faas_shared::new_secret_id()
+    hibana_shared::new_secret_id()
 }
 
 /// 値の受け取り。**`Debug` を derive しない**（`JsonBody` の rejection ログ等に載せないため）。
@@ -74,34 +74,44 @@ pub struct SecretKeyInfo {
     pub value_len: i32,
 }
 
-/// component の存在確認（不在は 404。存在秘匿の既存作法どおり 403 にしない）。
+/// componentの生存確認とロック。Secret操作を同じアプリの配備・削除と直列化する。
 async fn require_component(
     tx: &mut sqlx::PgConnection,
     tenant: &str,
     component_id: &str,
 ) -> Result<(), AppError> {
-    db::find_component_by_id(&mut *tx, tenant, component_id)
-        .await?
-        .ok_or_else(|| FaasError::NotFound(format!("component '{component_id}'")))?;
+    sqlx::query(
+        "SELECT id FROM components WHERE tenant_id=$1 AND id=$2 AND deleted_at IS NULL FOR UPDATE",
+    )
+    .bind(tenant)
+    .bind(component_id)
+    .fetch_optional(&mut *tx)
+    .await?
+    .ok_or_else(|| FaasError::NotFound(format!("component '{component_id}'")))?;
     Ok(())
 }
 
-/// secret 名と平文値の受付検証（純関数部分は `faas_shared` の定数を共有）。
-fn validate_secret_input(name: &str, value: &str) -> Result<(), FaasError> {
-    if !faas_shared::is_valid_env_key(name) {
+/// secret 名と平文値の受付検証（純関数部分は `hibana_shared` の定数を共有）。
+fn validate_secret_name(name: &str) -> Result<(), FaasError> {
+    if !hibana_shared::is_valid_env_key(name) {
         return Err(FaasError::InvalidRequest(format!(
             "invalid secret name '{name}': must match ^[A-Z_][A-Z0-9_]{{0,{}}}$",
-            faas_shared::MAX_ENV_KEY_LEN - 1
+            hibana_shared::MAX_ENV_KEY_LEN - 1
         )));
     }
+    Ok(())
+}
+
+fn validate_secret_input(name: &str, value: &str) -> Result<(), FaasError> {
+    validate_secret_name(name)?;
     if value.is_empty() {
         return Err(FaasError::InvalidRequest("value must not be empty".into()));
     }
-    if value.len() > faas_shared::MAX_ENV_VALUE_BYTES {
+    if value.len() > hibana_shared::MAX_ENV_VALUE_BYTES {
         // **値そのものは絶対にメッセージへ入れない**（長さだけ）。
         return Err(FaasError::InvalidRequest(format!(
             "secret value exceeds {} bytes",
-            faas_shared::MAX_ENV_VALUE_BYTES
+            hibana_shared::MAX_ENV_VALUE_BYTES
         )));
     }
     Ok(())
@@ -120,7 +130,7 @@ async fn reject_config_key_collision(
     if configs.iter().any(|c| c.key == name) {
         return Err(FaasError::Conflict(format!(
             "config key '{name}' already exists for this component; \
-             delete it first (a name must be either config or secret, never both)"
+             deploy without this var first (a name must be either config or secret, never both)"
         ))
         .into());
     }
@@ -188,6 +198,46 @@ async fn write_secret_version(
 fn map_secret_error(e: secrets::SecretError) -> AppError {
     tracing::error!(reason = e.reason(), "secret cryptographic operation failed");
     FaasError::Internal(String::new()).into()
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SecretDeployAccessRequest {
+    pub allowed: bool,
+}
+
+/// Admin approval for future versions of this application. Existing bindings stay
+/// approved; delete the Secret to remove its runtime availability from all versions.
+pub async fn set_secret_deploy_access(
+    State(state): State<AppState>,
+    principal: Principal,
+    Path((component_id, name)): Path<(String, String)>,
+    JsonBody(req): JsonBody<SecretDeployAccessRequest>,
+) -> Result<impl IntoResponse, AppError> {
+    require_admin_role(principal.role)?;
+    validate_secret_name(&name)?;
+    let tenant = &principal.tenant_id;
+    let mut tx = state.pool().begin().await?;
+    db::set_tenant_guc(&mut tx, tenant).await?;
+    require_component(&mut tx, tenant, &component_id).await?;
+    let changed = sqlx::query("UPDATE function_secrets SET deploy_allowed=$4, updated_at=now() WHERE tenant_id=$1 AND component_id=$2 AND name=$3 AND deleted_at IS NULL")
+        .bind(tenant).bind(&component_id).bind(&name).bind(req.allowed).execute(&mut *tx).await?;
+    if changed.rows_affected() != 1 {
+        return Err(FaasError::NotFound("Secret".into()).into());
+    }
+    db::insert_audit_log(
+        &mut *tx,
+        tenant,
+        principal.user_id.as_deref(),
+        "secret_deploy_access_changed",
+        Some(&component_id),
+        Some(&serde_json::json!({"name": name, "allowed": req.allowed})),
+    )
+    .await?;
+    tx.commit().await?;
+    Ok(Json(
+        serde_json::json!({"name": name, "allowed": req.allowed}),
+    ))
 }
 
 /// PUT /components/{id}/secrets/{name} — 値を設定する（新規 201 / 更新 200）。
@@ -481,7 +531,7 @@ pub async fn job_env(
         refill_per_sec: per_min / 60.0,
         capacity: per_min,
     };
-    // fail-open（ストア障害時は許可）は invoke と同じ方針。ここは無認証面の粗いガードであり、
+    // ここだけはストア障害時に粗いガードをスキップする。公開HTTP受付は別にfail-closed。
     // 実質的な認証は env-token の署名（手順 2）と行の突き合わせ（手順 6）が担う。
     if let Ok(d) = state
         .store()
@@ -500,7 +550,7 @@ pub async fn job_env(
         .verifier()
         .verify_env(&req.env_token)
         .map_err(|_| FaasError::Unauthorized)?;
-    if claims.aud != faas_shared::ENV_TOKEN_AUDIENCE {
+    if claims.aud != hibana_shared::ENV_TOKEN_AUDIENCE {
         return Err(FaasError::Unauthorized.into());
     }
 
@@ -522,7 +572,7 @@ pub async fn job_env(
 
     // --- 6) executions 行と claim の突き合わせ ---
     // subscriber が result 側で行っている claim ↔ 行の照合と同じ思想。
-    let Some(exec) = db::get_execution(&mut *tx, &tenant, &claims.execution_id).await? else {
+    let Some(exec) = db::secret_execution(&mut *tx, &tenant, &claims.execution_id).await? else {
         drop(tx);
         audit_denied(
             &state,
@@ -558,7 +608,7 @@ pub async fn job_env(
     }
 
     // --- 7) テナント名前空間のレート制限（invoke 予算とは独立） ---
-    // JetStream の再配送（max_deliver 既定 5）を許容するため single-use にはしない。
+    // HTTP受付とは独立した内部API保護。実行の状態・版・署名による認可は常に必須。
     if let Ok(d) = state
         .store()
         .rate_limit(&env_tenant_rate_key(&tenant), ip_params, now_ms)
@@ -581,6 +631,7 @@ pub async fn job_env(
         state.secret_keyring(),
         &tenant,
         &claims.component_id,
+        &claims.version_id,
         exec.created_at,
         &allowed,
     )

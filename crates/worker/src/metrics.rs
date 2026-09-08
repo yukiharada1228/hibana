@@ -15,6 +15,10 @@ fn default_latency_buckets() -> Vec<f64> {
 
 pub struct Metrics {
     pub registry: Registry,
+    pub guest_memory_budget_bytes: IntGauge,
+    pub guest_memory_reserved_bytes: IntGauge,
+    pub capacity_rejections_total: IntCounterVec,
+    pub active_compilations: IntGauge,
     pub wasmtime_execution_duration_seconds: HistogramVec,
     pub wasmtime_memory_pages: IntGauge,
     pub wasmtime_component_cache_hits_total: IntCounterVec,
@@ -22,11 +26,24 @@ pub struct Metrics {
     pub executions_total: IntCounterVec,
     pub guest_stderr_dropped_bytes_total: IntCounter,
     pub inflight_executions: IntGauge,
+    pub control_plane_request_duration_seconds: HistogramVec,
 }
 
 impl Metrics {
     pub fn init() -> Arc<Self> {
         let registry = Registry::new();
+        let control_plane_request_duration_seconds = HistogramVec::new(
+            HistogramOpts::new(
+                "hibana_worker_control_plane_request_duration_seconds",
+                "Internal control-plane requests including response body, by operation and outcome",
+            )
+            .buckets(default_latency_buckets()),
+            &["operation", "outcome"],
+        )
+        .expect("metric: control_plane_request_duration_seconds");
+        registry
+            .register(Box::new(control_plane_request_duration_seconds.clone()))
+            .expect("register control_plane_request_duration_seconds");
 
         let wasmtime_execution_duration_seconds = HistogramVec::new(
             HistogramOpts::new(
@@ -101,7 +118,47 @@ impl Metrics {
             .register(Box::new(inflight_executions.clone()))
             .expect("register inflight_executions");
 
+        let guest_memory_budget_bytes = IntGauge::new(
+            "hibana_worker_guest_memory_budget_bytes",
+            "Configured guest linear-memory reservation budget",
+        )
+        .unwrap();
+        let guest_memory_reserved_bytes = IntGauge::new(
+            "hibana_worker_guest_memory_reserved_bytes",
+            "Reserved guest linear memory, rounded up to MiB",
+        )
+        .unwrap();
+        let active_compilations = IntGauge::new(
+            "hibana_worker_active_compilations",
+            "Currently compiling components",
+        )
+        .unwrap();
+        let capacity_rejections_total = IntCounterVec::new(
+            Opts::new(
+                "hibana_worker_capacity_rejections_total",
+                "Pre-execution capacity refusals",
+            ),
+            &["reason"],
+        )
+        .unwrap();
+        registry
+            .register(Box::new(guest_memory_budget_bytes.clone()))
+            .unwrap();
+        registry
+            .register(Box::new(guest_memory_reserved_bytes.clone()))
+            .unwrap();
+        registry
+            .register(Box::new(active_compilations.clone()))
+            .unwrap();
+        registry
+            .register(Box::new(capacity_rejections_total.clone()))
+            .unwrap();
         Arc::new(Self {
+            control_plane_request_duration_seconds,
+            guest_memory_budget_bytes,
+            guest_memory_reserved_bytes,
+            active_compilations,
+            capacity_rejections_total,
             registry,
             wasmtime_execution_duration_seconds,
             wasmtime_memory_pages,

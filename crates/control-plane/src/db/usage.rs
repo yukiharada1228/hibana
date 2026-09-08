@@ -1,8 +1,8 @@
 //! Usage persistence.
 use super::saturating_i64;
 use chrono::NaiveDate;
-use faas_shared::ExecutionStatus;
-use faas_shared::UsageMetrics;
+use hibana_shared::ExecutionStatus;
+use hibana_shared::UsageMetrics;
 use sqlx::Row;
 
 pub async fn upsert_usage_rollup(

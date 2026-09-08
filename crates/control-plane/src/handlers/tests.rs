@@ -8,7 +8,7 @@ use super::usage::UsageTotals;
 use super::*;
 use crate::authz::resolve_token_scopes;
 use axum::http::StatusCode;
-use faas_shared::{FaasError, Role, Scope};
+use hibana_shared::{FaasError, Role, Scope};
 use serde_json::Value;
 
 // --- GET /usage 純関数 ---

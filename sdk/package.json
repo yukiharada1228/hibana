@@ -3,9 +3,11 @@
   "version": "0.1.0",
   "private": true,
   "type": "module",
-  "description": "Workers-like development tools for Wasmtime HTTP Components",
+  "description": "Independent CLI for local WebAssembly development and remote Hibana deployments",
   "scripts": {
-    "test": "node --test test/*.test.mjs"
+    "test": "node --test test/*.test.mjs",
+    "prepack": "node scripts/pack.mjs",
+    "test:package": "node scripts/verify-package.mjs"
   },
   "bin": {
     "hibana": "src/cli.mjs"
@@ -20,5 +22,26 @@
     "@bytecodealliance/componentize-js": "^0.19.3",
     "@bytecodealliance/jco": "^1.17.9",
     "esbuild": "^0.28.2"
+  },
+  "files": [
+    "src/",
+    "templates/",
+    "wit/",
+    "platform/remote.py",
+    "platform/existing.py",
+    "platform/common.py",
+    "platform/manifests/migration/",
+    "scripts/pack.mjs",
+    "LICENSE"
+  ],
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/yukiharada1228/hibana.git",
+    "directory": "sdk"
+  },
+  "homepage": "https://github.com/yukiharada1228/hibana/tree/main/sdk",
+  "bugs": {
+    "url": "https://github.com/yukiharada1228/hibana/issues"
   }
 }

@@ -10,9 +10,9 @@ COPY migrations ./migrations
 ARG CARGO_BUILD_JOBS=2
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/src/target \
-    cargo build --locked --release -j ${CARGO_BUILD_JOBS} -p faas-control-plane -p faas-worker \
+    cargo build --locked --release -j ${CARGO_BUILD_JOBS} -p hibana-control-plane -p hibana-worker \
     && mkdir /out \
-    && cp target/release/control-plane target/release/faas-worker /out/
+    && cp target/release/hibana-control-plane target/release/hibana-worker /out/
 
 FROM ${RUNTIME_IMAGE} AS runtime
 RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates \
@@ -22,4 +22,4 @@ COPY --from=build /out/ /usr/local/bin/
 ENV WASM_CACHE_DIR=/var/cache/hibana TMPDIR=/tmp LOG_FORMAT=json
 USER 10001:10001
 EXPOSE 8080 8081 9090
-ENTRYPOINT ["/usr/local/bin/control-plane"]
+ENTRYPOINT ["/usr/local/bin/hibana-control-plane"]

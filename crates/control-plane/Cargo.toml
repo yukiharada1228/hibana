@@ -1,15 +1,15 @@
 [package]
-name = "faas-control-plane"
+name = "hibana-control-plane"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 
 [[bin]]
-name = "control-plane"
+name = "hibana-control-plane"
 path = "src/main.rs"
 
 [dependencies]
-faas-shared = { workspace = true }
+hibana-shared = { workspace = true }
 
 # Web / 非同期（multipart: POST /components/{id}/versions のアップロード受信）
 axum = { workspace = true, features = ["multipart"] }

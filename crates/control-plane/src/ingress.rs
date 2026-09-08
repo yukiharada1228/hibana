@@ -16,7 +16,7 @@ use axum::{
     response::{IntoResponse, Response},
 };
 
-use faas_shared::http::{HttpRequest, MAX_REQUEST_BYTES};
+use hibana_shared::http::{HttpRequest, MAX_REQUEST_BYTES};
 
 use crate::state::AppState;
 

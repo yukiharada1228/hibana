@@ -18,6 +18,7 @@ pub use redacted::{expose_once, Redacted};
 pub mod egress;
 pub mod http;
 pub mod otel;
+pub mod preparation;
 
 // ============================================================================
 // ID 採番ヘルパ（uuid 由来の不透明文字列）
@@ -199,6 +200,9 @@ pub struct JobMessage {
     pub component: String,
     pub version: String,
     pub wasm_sha256: String,
+    /// Retained for mixed-version rollouts. HTTP jobs send an empty string;
+    /// artifact download credentials are issued only by the preparation endpoint.
+    #[serde(default)]
     pub wasm_url: String,
     pub input: Value,
     #[serde(default)]
@@ -638,6 +642,8 @@ impl ResourceLimits {
 /// TODO(§6.5): M3/M4 でエラー分類を拡張する（リトライ可否など）。
 #[derive(Debug, thiserror::Error)]
 pub enum FaasError {
+    #[error("service temporarily unavailable")]
+    Unavailable,
     /// メッセージの (de)serialize 失敗。
     #[error("serialization error: {0}")]
     Serialization(#[from] serde_json::Error),

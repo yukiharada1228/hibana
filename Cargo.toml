@@ -13,7 +13,7 @@ license = "MIT"
 
 [workspace.dependencies]
 # --- 共有 ---
-faas-shared = { path = "crates/shared" }
+hibana-shared = { path = "crates/shared" }
 
 # --- Web / 非同期 ---
 axum = "0.8"
@@ -66,7 +66,6 @@ tracing-opentelemetry = "0.33"
 
 # --- 同期 invoke の per-instance waiter registry（M6a, §15）。correlation_id -> oneshot::Sender の
 # 並行マップ。reply 購読タスク（remove）と invoke ハンドラ（insert）が共有ロックなしで触る。pure-Rust。
-dashmap = "6"
 
 # --- 共有ストア (M3d, §8): 全 Axum インスタンスで共有する低レイテンシカウンタ。
 # レート制限（token-bucket）/ 同時実行 in-flight / login 失敗ロックアウトを集計する。

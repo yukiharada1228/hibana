@@ -34,7 +34,7 @@ use sha2::{Digest, Sha256};
 use tokio::sync::Semaphore;
 use wasmparser::{ComponentTypeRef, Parser, Payload, Validator, WasmFeatures};
 
-use faas_shared::FaasError;
+use hibana_shared::FaasError;
 
 /// 同時に走る検証の上限（DoS 緩和, §6.2）。
 const MAX_CONCURRENT_VALIDATIONS: usize = 4;
@@ -550,12 +550,12 @@ pub fn parse_capabilities(value: &serde_json::Value) -> CapabilitySet {
             // 許可リストは env 名として妥当なものだけを採る（DB が壊れていても不正名は入れない）。
             env: string_list(map.get("env"))
                 .into_iter()
-                .filter(|k| faas_shared::is_valid_env_key(k))
+                .filter(|k| hibana_shared::is_valid_env_key(k))
                 .collect(),
             // egress も「パースできる host:port だけ」を採る（壊れた値は落として fail-closed）。
             net_allow_outbound: string_list(map.get("net_allow_outbound"))
                 .into_iter()
-                .filter(|e| faas_shared::egress::parse_egress_endpoint(e).is_ok())
+                .filter(|e| hibana_shared::egress::parse_egress_endpoint(e).is_ok())
                 .collect(),
         },
         // null / 数値 / 文字列 / パース不能 → deny-all（fail-closed）。
@@ -565,9 +565,8 @@ pub fn parse_capabilities(value: &serde_json::Value) -> CapabilitySet {
 
 /// `upload_version` の multipart `capabilities` に `env` キーが含まれていないことを検査する。
 ///
-/// `Err` は 400 に写像する。**この関数が「deploy スコープで env 許可リストを書けない」ことの
-/// 実装上の唯一の門番**であり、`validation.rs` のテストで「upload 経路で `env` が非空になる
-/// 入力が存在しない」ことを固定する。
+/// `Err`は400に写像する。生のcapabilities.envによる利用許可の迂回を拒否し、
+/// varsと承認済みSecretの選択からのみサーバーが環境を構成する。
 pub fn reject_env_in_declared_capabilities(declared: &serde_json::Value) -> Result<(), FaasError> {
     let has_env = match declared {
         serde_json::Value::Object(map) => map.contains_key("env"),
@@ -575,31 +574,30 @@ pub fn reject_env_in_declared_capabilities(declared: &serde_json::Value) -> Resu
     };
     if has_env {
         return Err(FaasError::InvalidRequest(
-            "capabilities.env is admin-approved; use \
-             PUT /components/{component_id}/versions/{version}/capabilities"
+            "capabilities.env is server-managed; use vars and secrets deployment fields after Secret deploy-access approval"
                 .into(),
         ));
     }
     Ok(())
 }
 
-/// admin が承認する env 名リストを検証する（`PUT .../capabilities`）。純関数。
+/// バージョンへ注入する環境変数名の形式と件数を検証する純関数。
 ///
-/// 重複は集合化で吸収する。名前の形式・件数の上限は `faas_shared` の定数を使う
+/// 重複は集合化で吸収する。名前の形式・件数の上限は `hibana_shared` の定数を使う
 /// （CP と worker で同じ定数を参照する二重防御）。
 pub fn validate_env_allowlist(names: &[String]) -> Result<BTreeSet<String>, FaasError> {
-    if names.len() > faas_shared::MAX_FUNCTION_ENV_KEYS {
+    if names.len() > hibana_shared::MAX_FUNCTION_ENV_KEYS {
         return Err(FaasError::InvalidRequest(format!(
             "at most {} env names may be approved per version",
-            faas_shared::MAX_FUNCTION_ENV_KEYS
+            hibana_shared::MAX_FUNCTION_ENV_KEYS
         )));
     }
     let mut out = BTreeSet::new();
     for name in names {
-        if !faas_shared::is_valid_env_key(name) {
+        if !hibana_shared::is_valid_env_key(name) {
             return Err(FaasError::InvalidRequest(format!(
                 "invalid env name '{name}': must match ^[A-Z_][A-Z0-9_]{{0,{}}}$",
-                faas_shared::MAX_ENV_KEY_LEN - 1
+                hibana_shared::MAX_ENV_KEY_LEN - 1
             )));
         }
         out.insert(name.clone());
@@ -939,12 +937,12 @@ mod tests {
             );
         }
         // 境界: 64 文字は可、65 文字は不可。
-        let max = "A".repeat(faas_shared::MAX_ENV_KEY_LEN);
+        let max = "A".repeat(hibana_shared::MAX_ENV_KEY_LEN);
         assert!(validate_env_allowlist(&[max]).is_ok());
-        let over = "A".repeat(faas_shared::MAX_ENV_KEY_LEN + 1);
+        let over = "A".repeat(hibana_shared::MAX_ENV_KEY_LEN + 1);
         assert!(validate_env_allowlist(&[over]).is_err());
         // 件数上限。
-        let many: Vec<String> = (0..=faas_shared::MAX_FUNCTION_ENV_KEYS)
+        let many: Vec<String> = (0..=hibana_shared::MAX_FUNCTION_ENV_KEYS)
             .map(|i| format!("K{i}"))
             .collect();
         assert!(validate_env_allowlist(&many).is_err());

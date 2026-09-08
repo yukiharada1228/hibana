@@ -1,6 +1,6 @@
 //! Signed HTTP completion with a single CAS transition and accounting transaction.
 use crate::state::AppState;
-use faas_shared::{ExecutionStatus, JobClaims, ResourceLimits, ResultMessage, UsageMetrics};
+use hibana_shared::{ExecutionStatus, JobClaims, ResourceLimits, ResultMessage, UsageMetrics};
 use serde_json::json;
 pub(crate) async fn handle_message(
     state: &AppState,

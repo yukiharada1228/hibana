@@ -8,23 +8,9 @@ use crate::{db, validation};
 use axum::extract::{Path, State};
 use axum::response::IntoResponse;
 use axum::Json;
-use faas_shared::FaasError;
+use hibana_shared::FaasError;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-
-#[derive(Debug, Deserialize)]
-pub struct ApproveCapabilityEnvRequest {
-    /// 注入を許可する env 名の**全置換**リスト（空配列 = deny-all へ戻す）。
-    pub env: Vec<String>,
-}
-
-#[derive(Debug, Serialize)]
-pub struct ApproveCapabilityEnvResponse {
-    pub component_id: String,
-    pub version: String,
-    pub version_id: String,
-    pub env: Vec<String>,
-}
 
 #[derive(Debug, Serialize)]
 pub struct GetCapabilitiesResponse {
@@ -66,79 +52,9 @@ pub async fn get_capabilities(
     }))
 }
 
-/// PUT /components/{id}/versions/{version}/capabilities — env 許可リストを承認する（admin）。
-///
-/// `imports`（strict matching の結果）は受け付けない。あれは検証パイプラインが決める値であり、
-/// API から書き換えられてはならない。
-pub async fn approve_capability_env(
-    State(state): State<AppState>,
-    principal: Principal,
-    Path((component_id, version)): Path<(String, String)>,
-    JsonBody(req): JsonBody<ApproveCapabilityEnvRequest>,
-) -> Result<impl IntoResponse, AppError> {
-    // admin スコープ（ルータ）に加えて admin **ロール**も要求する（二重ガード, §3.7）。
-    require_admin_role(principal.role)?;
-    let tenant = &principal.tenant_id;
-
-    let approved = validation::validate_env_allowlist(&req.env)?;
-
-    let mut tx = state.pool().begin().await?;
-    db::set_tenant_guc(&mut tx, tenant).await?;
-
-    db::find_component_by_id(&mut *tx, tenant, &component_id)
-        .await?
-        .ok_or_else(|| FaasError::NotFound(format!("component '{component_id}'")))?;
-
-    let version_id = db::find_version_id(&mut *tx, tenant, &component_id, &version)
-        .await?
-        .ok_or_else(|| {
-            FaasError::NotFound(format!("version '{version}' of component '{component_id}'"))
-        })?;
-
-    // 既存の imports は保持し、env だけを差し替える。
-    let current = db::version_capabilities(&mut *tx, tenant, &version_id)
-        .await?
-        .unwrap_or(Value::Null);
-    let mut caps = validation::parse_capabilities(&current);
-    caps.env = approved.clone();
-
-    if !db::set_version_capabilities(&mut *tx, tenant, &version_id, &caps.to_json()).await? {
-        return Err(FaasError::NotFound(format!(
-            "version '{version}' of component '{component_id}'"
-        ))
-        .into());
-    }
-
-    // 監査には**承認された名前**だけを残す（値はここには存在しない）。
-    db::insert_audit_log(
-        &mut *tx,
-        tenant,
-        principal.user_id.as_deref(),
-        "capability_env_approved",
-        Some(&version_id),
-        Some(&json!({
-            "component_id": component_id,
-            "version": version,
-            "env": approved.iter().collect::<Vec<_>>(),
-        })),
-    )
-    .await?;
-
-    tx.commit().await?;
-
-    tracing::info!(
-        %component_id,
-        %version,
-        approved_env_count = approved.len(),
-        "capability env allowlist approved"
-    );
-
-    Ok(Json(ApproveCapabilityEnvResponse {
-        component_id,
-        version,
-        version_id,
-        env: approved.into_iter().collect(),
-    }))
+/// Legacy env grants must not mutate the environment of an existing version.
+pub async fn approve_capability_env() -> Result<(), AppError> {
+    Err(FaasError::Conflict("environment bindings are versioned; authorize Secret deploy-access, then deploy a new version".into()).into())
 }
 
 #[derive(Debug, Deserialize)]
@@ -157,7 +73,7 @@ pub struct ApproveCapabilityEgressResponse {
 
 /// PUT /components/{id}/versions/{version}/capabilities/egress — egress allowlist を承認する（admin, M9c）。
 ///
-/// `approve_capability_env` と**同型**（admin スコープ + admin ロールの二重ガード, §3.7）。
+/// admin スコープ + admin ロールの二重ガード。envは保持し、egressだけを更新する。
 /// `wasi:sockets/*` の import は baseline で許可されるが、実際の outbound はこの allowlist が
 /// 非空のときだけ worker の `socket_addr_check` が通す。ここで承認された `host:port` を
 /// `capabilities.net_allow_outbound` へ**全置換**で書く。空配列は egress を deny-all に戻す。
@@ -177,7 +93,7 @@ pub async fn approve_capability_egress(
     // 1 つでも不正なら 400 で全体を拒否する（部分承認しない）。
     let mut approved = std::collections::BTreeSet::new();
     for raw in &req.allow_outbound {
-        let ep = faas_shared::egress::parse_egress_endpoint(raw).map_err(|e| {
+        let ep = hibana_shared::egress::parse_egress_endpoint(raw).map_err(|e| {
             FaasError::InvalidRequest(format!("invalid egress endpoint '{raw}': {e}"))
         })?;
         approved.insert(format!("{}:{}", ep.host, ep.port));

@@ -11,7 +11,7 @@ use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
 use axum::Json;
-use faas_shared::{new_token_id, new_user_id, FaasError, Role, Scope};
+use hibana_shared::{new_token_id, new_user_id, FaasError, Role, Scope};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 
@@ -121,8 +121,8 @@ pub struct CreateTokenResponse {
     ///
     /// M7-0 (§5.1): `Redacted` は `Serialize` を実装しないので、平文で返すには `expose_once` を
     /// 明示する必要がある（この属性の grep が「意図的に秘密を返す API」の全一覧になる）。
-    #[serde(serialize_with = "faas_shared::expose_once")]
-    pub token: faas_shared::Redacted<String>,
+    #[serde(serialize_with = "hibana_shared::expose_once")]
+    pub token: hibana_shared::Redacted<String>,
     pub token_id: String,
     pub scopes: Vec<Scope>,
     pub expires_at: String,
@@ -202,7 +202,7 @@ pub async fn create_token(
     Ok((
         StatusCode::CREATED,
         Json(CreateTokenResponse {
-            token: faas_shared::Redacted::new(secret),
+            token: hibana_shared::Redacted::new(secret),
             token_id,
             scopes,
             expires_at: expires_at.to_rfc3339(),

@@ -1,0 +1,46 @@
+# Site example: replace hosts, IngressClass and TLS Secret references before install.
+# The existing controller's namespace must carry hibana.io/ingress=true and
+# hibana.io/app-ingress=true to pass the base NetworkPolicy.
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: hibana-management
+spec:
+  ingressClassName: hibana
+  tls:
+    - hosts: [api.example.internal]
+      secretName: hibana-management-tls
+  rules:
+    - host: api.example.internal
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: hibana-api
+                port:
+                  number: 8080
+---
+# App URLs contain TWO labels before INGRESS_BASE_DOMAIN: <app>.<tenant>.
+# Standard Ingress/TLS wildcards cover one label, so add a rule/certificate per tenant.
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: hibana-apps-team
+spec:
+  ingressClassName: hibana
+  tls:
+    - hosts: ["*.team.apps.example.internal"]
+      secretName: hibana-apps-team-tls
+  rules:
+    - host: "*.team.apps.example.internal"
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: hibana-apps
+                port:
+                  number: 8083

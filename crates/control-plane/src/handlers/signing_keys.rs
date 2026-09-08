@@ -9,7 +9,7 @@ use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
 use axum::Json;
-use faas_shared::FaasError;
+use hibana_shared::FaasError;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 

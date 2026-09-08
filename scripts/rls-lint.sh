@@ -55,7 +55,7 @@ fns="$fns|create_user|find_user_role|create_token|revoke_token|token_exists|boot
 fns="$fns|switch_active_version|rollback_active_version"
 # M7b per-function config + capability env 承認（すべて set_tenant_guc 済み tx で呼ぶ）。
 fns="$fns|version_capabilities|set_version_capabilities"
-fns="$fns|upsert_function_config|list_function_configs|delete_function_config"
+fns="$fns|list_function_configs|version_has_live_secrets"
 # M7c Secrets Manager（すべて set_tenant_guc 済み tx で呼ぶ）。
 # secrets_stale_kek / _all / secrets_kek_kid_counts_all は SECURITY DEFINER で GUC 不要のため
 # SECURITY DEFINER の全テナント照会はこのtenant-scoped検査から除外する。
@@ -97,7 +97,7 @@ if [ -n "$dburl" ]; then
 fi
 
 # --- (4) Redacted::expose() の allowlist（M7-0, §5.1 / §5.6）-----------------
-# 秘密値は faas_shared::Redacted<T> に包み、平文の取り出しは expose() の 1 経路に閉じる。
+# 秘密値は hibana_shared::Redacted<T> に包み、平文の取り出しは expose() の 1 経路に閉じる。
 # 呼び出せるファイルを allowlist に限定することで「秘密がプロセス内のどこへ渡ったか」を
 # grep で全数把握できる状態を維持する。
 #

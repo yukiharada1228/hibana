@@ -43,7 +43,7 @@ addEventListener("fetch", event => {
 `);
     const bundle = join(work, "worker.mjs");
     await esbuild({ entryPoints: [shim], bundle: true, format: "esm", platform: "browser", target: "es2022", mainFields: ["module", "main"], conditions: ["import", "default"], outfile: bundle, logLevel: "warning" });
-    await run(process.execPath, [join(SDK_ROOT, "node_modules/.bin/jco"), "componentize", bundle, "--wit", join(SDK_ROOT, "wit"), "--world-name", "http", "--out", temporary]);
+    await run(process.execPath, [fileURLToPath(new URL("./jco.js", import.meta.resolve("@bytecodealliance/jco"))), "componentize", bundle, "--wit", join(SDK_ROOT, "wit"), "--world-name", "http", "--out", temporary]);
     await rename(temporary, outAbs);
     return outAbs;
   } finally {

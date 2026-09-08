@@ -1,0 +1,178 @@
+name: GitHub release
+
+# Branches build candidates; version tags publish the verified files to GitHub only.
+on:
+  workflow_dispatch:
+  push:
+    branches: ["release/**"]
+    tags: ["v*"]
+
+permissions:
+  contents: read
+
+env:
+  CARGO_BUILD_JOBS: 2
+
+jobs:
+  runtime:
+    name: Runtime / ${{ matrix.target }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-22.04
+            target: linux-x64
+          - runner: ubuntu-22.04-arm
+            target: linux-arm64
+          - runner: macos-15-intel
+            target: darwin-x64
+          - runner: macos-14
+            target: darwin-arm64
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+          cache: npm
+          cache-dependency-path: sdk/package-lock.json
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: release-${{ matrix.target }}
+      - run: node scripts/release.mjs version
+      - run: cargo build --locked --release -p hibana-worker
+      - run: npm ci --prefix sdk
+      - run: npm test --prefix sdk
+      - name: Install the tarball, compile Hono, install runtime and verify HTTP / shutdown
+        run: HIBANA_RUNTIME_BIN="$GITHUB_WORKSPACE/target/release/hibana-worker" npm run test:package --prefix sdk
+      - run: node scripts/release.mjs runtime target/release/hibana-worker dist
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-${{ matrix.target }}
+          path: dist/*
+          if-no-files-found: error
+          retention-days: 1
+
+  package:
+    name: CLI and Kubernetes manifests
+    runs-on: ubuntu-22.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+      - run: node scripts/release.mjs version
+      - run: npm ci --prefix sdk
+      - run: npm test --prefix sdk
+      - run: mkdir dist
+      - working-directory: sdk
+        run: npm pack --pack-destination ../dist
+      - run: node scripts/release.mjs platform dist
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-packages
+          path: dist/*
+          if-no-files-found: error
+          retention-days: 1
+
+  image:
+    name: Platform image / linux-${{ matrix.arch }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-22.04
+            arch: amd64
+          - runner: ubuntu-22.04-arm
+            arch: arm64
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+      - id: version
+        run: echo "value=$(node scripts/release.mjs version)" >> "$GITHUB_OUTPUT"
+      - uses: docker/setup-buildx-action@v3
+      - run: mkdir dist
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/${{ matrix.arch }}
+          tags: hibana-platform:${{ steps.version.outputs.value }}-linux-${{ matrix.arch }}
+          push: false
+          outputs: type=docker,dest=dist/hibana-platform-${{ steps.version.outputs.value }}-linux-${{ matrix.arch }}.tar
+          cache-from: type=gha,scope=release-${{ matrix.arch }}
+          cache-to: type=gha,mode=max,scope=release-${{ matrix.arch }}
+      - name: Verify the archived runtime starts
+        env:
+          VERSION: ${{ steps.version.outputs.value }}
+          ARCH: ${{ matrix.arch }}
+        run: |
+          docker load --input "dist/hibana-platform-$VERSION-linux-$ARCH.tar"
+          result=$(docker run --rm --entrypoint hibana-worker "hibana-platform:$VERSION-linux-$ARCH" --version)
+          test "$result" = "hibana-worker $VERSION"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-image-${{ matrix.arch }}
+          path: dist/*
+          compression-level: 0
+          if-no-files-found: error
+          retention-days: 1
+
+  assemble:
+    name: Complete release checksums
+    needs: [runtime, package, image]
+    runs-on: ubuntu-22.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: release-*
+          merge-multiple: true
+          path: dist
+      - run: node scripts/release.mjs checksums dist --complete
+      - uses: actions/upload-artifact@v4
+        with:
+          name: hibana-release-candidate
+          path: dist/*
+          compression-level: 0
+          if-no-files-found: error
+          retention-days: 1
+
+  publish:
+    name: Publish and install from GitHub
+    if: github.ref_type == 'tag'
+    needs: assemble
+    runs-on: ubuntu-22.04
+    timeout-minutes: 20
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+      - uses: actions/download-artifact@v4
+        with:
+          name: hibana-release-candidate
+          path: dist
+      - run: node scripts/release.mjs version
+      - name: Publish versioned assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          gh release create "$TAG" --draft --verify-tag --title "Hibana $TAG" --generate-notes dist/*
+          gh release edit "$TAG" --draft=false
+      - name: Install CLI and runtime from the published Release and run Hono
+        env:
+          HIBANA_GITHUB_RELEASE: '1'
+        run: npm run test:package --prefix sdk

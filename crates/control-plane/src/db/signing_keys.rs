@@ -22,7 +22,7 @@ pub async fn list_signing_keys(
 ) -> Result<Vec<SigningKey>, sqlx::Error> {
     let rows = sqlx::query(
         "SELECT key_id, public_key, status FROM component_signing_keys \
-          WHERE tenant_id = $1 ORDER BY created_at ASC, key_id ASC",
+          WHERE tenant_id = $1 ORDER BY created_at ASC, key_id ASC FOR SHARE",
     )
     .bind(tenant_id)
     .fetch_all(executor)

@@ -5,7 +5,7 @@
 //! result に verbatim に echo、subscriber がここで kid を選んで検証する。
 //!
 //! 設計上の最重要点:
-//! - 署名対象バイトは **必ず** `faas_shared::job_claims_signing_bytes` が組み立てる
+//! - 署名対象バイトは **必ず** `hibana_shared::job_claims_signing_bytes` が組み立てる
 //!   正準形（長さ前置・固定順・ドメイン分離）を使う。搬送 JSON のキー順・空白には
 //!   一切依存しない（[`Verifier::verify`] は受け取った JSON を一度 [`JobClaims`] に
 //!   パースしてから正準バイトを **再導出** する）。
@@ -18,7 +18,7 @@ use std::collections::HashMap;
 
 use ed25519_dalek::{Signature, Signer as _, SigningKey, VerifyingKey};
 
-use faas_shared::{
+use hibana_shared::{
     b64url_decode, b64url_encode, env_claims_signing_bytes, job_claims_signing_bytes, EnvClaims,
     JobClaims,
 };
@@ -125,6 +125,15 @@ impl Signer {
         )
     }
 
+    pub fn sign_preparation(&self, claims: &hibana_shared::preparation::Claims) -> String {
+        let signature: Signature = self.key.sign(&claims.signing_bytes());
+        format!(
+            "{}.{}",
+            b64url_encode(&serde_json::to_vec(claims).expect("claims serialize")),
+            b64url_encode(&signature.to_bytes())
+        )
+    }
+
     /// 検証器への参照（subscriber が `state.verifier()` 経由で使う）。
     pub fn verifier(&self) -> &Verifier {
         &self.verifier
@@ -137,6 +146,22 @@ pub struct Verifier {
 }
 
 impl Verifier {
+    pub fn verify_preparation(
+        &self,
+        token: &str,
+    ) -> Result<hibana_shared::preparation::Claims, VerifyError> {
+        let (payload, signature) = token.split_once('.').ok_or(VerifyError::MalformedToken)?;
+        let payload = b64url_decode(payload).ok_or(VerifyError::PayloadDecode)?;
+        let claims: hibana_shared::preparation::Claims =
+            serde_json::from_slice(&payload).map_err(|_| VerifyError::PayloadJson)?;
+        let signature = b64url_decode(signature).ok_or(VerifyError::SignatureDecode)?;
+        let signature =
+            Signature::from_slice(&signature).map_err(|_| VerifyError::SignatureDecode)?;
+        let key = self.keys.get(&claims.kid).ok_or(VerifyError::UnknownKid)?;
+        key.verify_strict(&claims.signing_bytes(), &signature)
+            .map_err(|_| VerifyError::BadSignature)?;
+        Ok(claims)
+    }
     /// `job_token` を検証し、成功時に正準パース済みの [`JobClaims`] を返す。
     ///
     /// 手順（§3.3）:
@@ -405,6 +430,63 @@ pub fn validate_public_key_b64url(public_key: &str) -> Result<(), ComponentSigEr
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn preparation_tokens_bind_artifact_and_cannot_authorize_execution() {
+        use hibana_shared::preparation::Claims;
+        let signer = super::Signer::from_seed([7; 32], "prepare-test".into());
+        let claims = Claims {
+            tenant_id: "tenant".into(),
+            storage_uri: "tenant/versions/ver_1.wasm".into(),
+            sha256: "a".repeat(64),
+            kid: "prepare-test".into(),
+            iat: 1000,
+            exp: 1120,
+        };
+        let token = signer.sign_preparation(&claims);
+        assert_eq!(
+            signer.verifier().verify_preparation(&token).unwrap(),
+            claims
+        );
+        assert!(claims.valid_at(1000));
+        assert!(!claims.valid_at(1120));
+        assert!(!claims.valid_at(994));
+        assert!(signer.verifier().verify(&token).is_err());
+        assert!(signer.verifier().verify_env(&token).is_err());
+        let job = hibana_shared::JobClaims {
+            execution_id: "exec".into(),
+            tenant_id: "tenant".into(),
+            version_id: "version".into(),
+            kid: "prepare-test".into(),
+            iat: 1000,
+            exp: 1120,
+        };
+        assert!(signer
+            .verifier()
+            .verify_preparation(&signer.sign(&job))
+            .is_err());
+        let (_, signature) = token.split_once('.').unwrap();
+        for changed in [
+            Claims {
+                sha256: "b".repeat(64),
+                ..claims.clone()
+            },
+            Claims {
+                storage_uri: "tenant/versions/ver_other.wasm".into(),
+                ..claims.clone()
+            },
+            Claims {
+                tenant_id: "other".into(),
+                ..claims.clone()
+            },
+        ] {
+            let forged = format!(
+                "{}.{}",
+                hibana_shared::b64url_encode(&serde_json::to_vec(&changed).unwrap()),
+                signature
+            );
+            assert!(signer.verifier().verify_preparation(&forged).is_err());
+        }
+    }
     use super::*;
 
     fn signer() -> Signer {

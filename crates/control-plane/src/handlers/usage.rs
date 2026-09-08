@@ -6,7 +6,7 @@ use crate::state::AppState;
 use axum::extract::{Query, State};
 use axum::response::IntoResponse;
 use axum::Json;
-use faas_shared::FaasError;
+use hibana_shared::FaasError;
 use serde::{Deserialize, Serialize};
 
 // ---------------------------------------------------------------------------

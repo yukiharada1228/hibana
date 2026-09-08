@@ -10,7 +10,7 @@ use serde::Serialize;
 ///
 /// **`Serialize` を実装しない**のが設計の中心である。うっかり API 応答型のフィールドに入れると
 /// **コンパイルエラーになる**（実行時に漏れてから気付くのではなく、型で塞ぐ）。一度だけ返す
-/// 正当なケース（login / token 発行）は `#[serde(serialize_with = "faas_shared::expose_once")]` を
+/// 正当なケース（login / token 発行）は `#[serde(serialize_with = "hibana_shared::expose_once")]` を
 /// フィールドに明示する —— この属性は grep 可能であり、「意図的に平文を返している箇所」の
 /// 全一覧がレビューできる。
 ///

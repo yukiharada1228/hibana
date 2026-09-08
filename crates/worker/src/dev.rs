@@ -6,9 +6,10 @@ use axum::{
     extract::State,
     http::{Request, StatusCode},
     response::{IntoResponse, Response},
+    serve::ListenerExt as _,
     Router,
 };
-use faas_shared::ResourceLimits;
+use hibana_shared::ResourceLimits;
 use serde::Deserialize;
 use std::{collections::BTreeMap, net::SocketAddr, sync::Arc};
 use tokio::sync::Semaphore;
@@ -23,7 +24,7 @@ struct Settings {
 
 struct DevState {
     runtime: Runtime,
-    component: Arc<Component>,
+    component: Arc<crate::runtime::PreparedComponent>,
     settings: Settings,
     slots: Arc<Semaphore>,
 }
@@ -54,16 +55,18 @@ pub async fn run(args: &[String]) -> Result<()> {
     let component =
         Component::from_file(&engine, component.context("--dev-component is required")?)?;
     let state = Arc::new(DevState {
-        runtime: Runtime {
-            engine,
-            metrics: metrics::Metrics::init(),
-        },
-        component: Arc::new(component),
+        runtime: Runtime::new(engine, metrics::Metrics::init())?,
+        component: Arc::new(crate::runtime::PreparedComponent::new(component)?),
         settings,
         slots: Arc::new(Semaphore::new(8)),
     });
     let listener = tokio::net::TcpListener::bind(bind).await?;
     println!("Hibana (Wasmtime): http://{}", listener.local_addr()?);
+    let listener = listener.tap_io(|stream| {
+        if let Err(error) = stream.set_nodelay(true) {
+            tracing::warn!(%error, "cannot enable TCP_NODELAY for HTTP connection");
+        }
+    });
     axum::serve(listener, Router::new().fallback(invoke).with_state(state))
         .with_graceful_shutdown(async {
             #[cfg(unix)]
@@ -87,10 +90,10 @@ async fn invoke(State(state): State<Arc<DevState>>, request: Request<Body>) -> R
         return StatusCode::SERVICE_UNAVAILABLE.into_response();
     };
     let (parts, body) = request.into_parts();
-    let Ok(body) = to_bytes(body, faas_shared::http::MAX_REQUEST_BYTES).await else {
+    let Ok(body) = to_bytes(body, hibana_shared::http::MAX_REQUEST_BYTES).await else {
         return StatusCode::PAYLOAD_TOO_LARGE.into_response();
     };
-    let request = faas_shared::http::HttpRequest::from_parts(&parts, &body);
+    let request = hibana_shared::http::HttpRequest::from_parts(&parts, &body);
     let (stream, response) = crate::runtime::response_channel();
     let body_tx = stream.body.clone();
     tokio::spawn(async move {

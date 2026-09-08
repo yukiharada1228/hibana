@@ -2,6 +2,15 @@
 use serde_json::Value;
 use sqlx::Row;
 
+/// Platform-admin inventory; tenant-scoped rows are still read under their own GUC.
+pub async fn list_tenants_for_admin(
+    pool: &sqlx::PgPool,
+) -> Result<Vec<(String, String)>, sqlx::Error> {
+    sqlx::query_as("SELECT id, slug FROM tenants ORDER BY slug")
+        .fetch_all(pool)
+        .await
+}
+
 /// テナントが `active` かどうか (M7c: `/internal/job-env` は認証 middleware 外なので個別確認する)。
 ///
 /// `auth::authenticate` が middleware で行っている停止テナント遮断と同じ判定を、middleware の

@@ -10,7 +10,7 @@ use axum::http::header::AUTHORIZATION;
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::IntoResponse;
 use axum::Json;
-use faas_shared::{new_tenant_id, new_user_id, FaasError};
+use hibana_shared::{new_tenant_id, new_user_id, FaasError};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
@@ -131,7 +131,7 @@ pub async fn create_tenant(
 // ---------------------------------------------------------------------------
 
 /// リクエストから bootstrap トークンを取り出して照合する（platform-admin gate）。不一致は Unauthorized。
-pub(super) fn require_bootstrap_admin(
+pub(crate) fn require_bootstrap_admin(
     headers: &HeaderMap,
     state: &AppState,
 ) -> Result<(), FaasError> {

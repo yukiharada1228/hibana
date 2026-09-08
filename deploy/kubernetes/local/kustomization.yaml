@@ -3,11 +3,32 @@ kind: Kustomization
 namespace: hibana
 resources:
   - ../base
+  - access.yaml
 images:
   - name: registry.example.com/hibana/platform
     newName: hibana-platform
     newTag: dev
 patches:
+  - target:
+      kind: Service
+      name: hibana-api
+    patch: |-
+      - op: add
+        path: /spec/type
+        value: NodePort
+      - op: add
+        path: /spec/ports/0/nodePort
+        value: 30080
+  - target:
+      kind: Service
+      name: hibana-apps
+    patch: |-
+      - op: add
+        path: /spec/type
+        value: NodePort
+      - op: add
+        path: /spec/ports/0/nodePort
+        value: 30083
   - target:
       kind: ConfigMap
       name: hibana-config

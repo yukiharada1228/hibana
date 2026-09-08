@@ -51,7 +51,7 @@ spec:
         - name: control-plane
           image: hibana-platform
           imagePullPolicy: IfNotPresent
-          command: ["/usr/local/bin/control-plane"]
+          command: ["/usr/local/bin/hibana-control-plane"]
           envFrom:
             - configMapRef:
                 name: hibana-config

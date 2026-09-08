@@ -3,8 +3,8 @@ use super::saturating_i64;
 use chrono::DateTime;
 use chrono::NaiveDate;
 use chrono::Utc;
-use faas_shared::ExecutionStatus;
-use faas_shared::UsageMetrics;
+use hibana_shared::ExecutionStatus;
+use hibana_shared::UsageMetrics;
 use serde_json::Value;
 use sqlx::postgres::PgRow;
 use sqlx::Row;
@@ -90,6 +90,31 @@ pub async fn get_execution(
     .await?;
 
     row.as_ref().map(ExecutionRow::from_row).transpose()
+}
+
+/// Secret authorization needs provenance and creation time, never the HTTP body.
+/// Keep this projection small even when the execution contains a large upload.
+#[derive(sqlx::FromRow)]
+pub struct SecretExecution {
+    pub component_id: String,
+    pub version_id: String,
+    pub status: String,
+    pub created_at: DateTime<Utc>,
+}
+
+pub async fn secret_execution(
+    executor: impl sqlx::PgExecutor<'_>,
+    tenant_id: &str,
+    execution_id: &str,
+) -> Result<Option<SecretExecution>, sqlx::Error> {
+    sqlx::query_as(
+        "SELECT component_id, version_id, status, created_at FROM executions \
+         WHERE tenant_id=$1 AND id=$2",
+    )
+    .bind(tenant_id)
+    .bind(execution_id)
+    .fetch_optional(executor)
+    .await
 }
 
 /// 当該 component を参照する pending/running の execution が存在するか (§6.7 削除保護)。
