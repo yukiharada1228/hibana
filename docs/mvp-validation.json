@@ -2612,5 +2612,39 @@
       "run": "https://github.com/yukiharada1228/hibana/actions/runs/34185200852",
       "source_commit": "9f74e24db5ab631641c7b9a2c551c440600e63e5"
     }
+  },
+  "published_release": {
+    "url": "https://github.com/yukiharada1228/hibana/releases/tag/v0.1.0",
+    "source_commit": "017df9fd7d5d7ba366df4e935b2a4eeebb1da569",
+    "workflow": "https://github.com/yukiharada1228/hibana/actions/runs/34187371947",
+    "verified_at": "2026-09-08T04:57:09.028495+00:00",
+    "github_url_install_hono_http_and_shutdown": [
+      "linux-x64 (GitHub Actions)",
+      "darwin-arm64 (local Mac)"
+    ],
+    "checksums": {
+      "hibana-cli-0.1.0.tgz": "7bcfcd2623064452f8c0f6992f15f4b4a0e128b6fd7833d8bc885954616f32f8",
+      "hibana-kubernetes-0.1.0.tar.gz": "a511801fed7675165bb24d934d9b2ef1149d46085960eb7f0f2989b307bdb306",
+      "hibana-platform-0.1.0-linux-amd64.tar": "eb33cb305fdaff62af74a458537e67ef281acf4a322e97cb02c92df72a202c46",
+      "hibana-platform-0.1.0-linux-arm64.tar": "79a87fac0a509a60523a03ca02e182967c6513e0551285f60e3ff225a1da0e34",
+      "hibana-worker-0.1.0-darwin-arm64": "d89cd723b1100276328a956dfdeebd1954bf0cc72b52f17d73c1939785b66e10",
+      "hibana-worker-0.1.0-darwin-x64": "5778e8af0849da9a10cdbb86ce448594f19338042cbd39c970ac5cc592c32c09",
+      "hibana-worker-0.1.0-linux-arm64": "5a25ec27fe7a4656a7e39ac4397d456903d214cc846b2f7c2e8034aeeb423309",
+      "hibana-worker-0.1.0-linux-x64": "5aeb3d10f913d1b4a3e918005c8f3273f76a8c1cc84da7398d49ea4047b7ba5e"
+    },
+    "cli_and_all_four_native_runtimes_identical_to_tested_candidate": true,
+    "kubernetes_archive_contents_identical_to_tested_candidate": true,
+    "linux_arm64_image_comparison": {
+      "image_execution_config_identical": true,
+      "filesystem_entries_compared": 4743,
+      "content_mode_owner_and_links_identical": false,
+      "differing_paths": [
+        "var/cache/ldconfig/aux-cache",
+        "var/log/apt/history.log",
+        "var/log/apt/term.log",
+        "var/log/dpkg.log"
+      ],
+      "ignored": "archive/layer timestamps and build history"
+    }
   }
 }

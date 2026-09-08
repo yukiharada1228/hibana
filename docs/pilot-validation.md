@@ -127,3 +127,9 @@ GitHubの全体CIは[34185203071](https://github.com/yukiharada1228/hibana/actio
 - Adminでのアプリ全件削除、ルート404、基盤撤去、外部依存サービスの保持、専用環境の撤去が成功。
 
 秘密値を除いた件数・資源観測・30秒窓の応答時間・イメージ情報を[mvp-validation.json](mvp-validation.json)に保存しています。CLIの配布先はGitHub Releasesで、npmレジストリへは公開しません。
+
+## 公開URLからの導入確認：成功
+
+[v0.1.0 Release](https://github.com/yukiharada1228/hibana/releases/tag/v0.1.0)を2026-09-08 04:51 UTCに公開しました。[公開ワークフロー](https://github.com/yukiharada1228/hibana/actions/runs/34187371947)は全ジョブ成功です。Linux x64（GitHub Actions）とmacOS arm64（手元）で、実際の公開URLからCLIをインストールし、既定のHonoプロジェクトを生成、公開ランタイムのハッシュ確認、Wasmtime上のHTTP応答、Ctrl+Cによるプロセス・HTTP listenerの終了まで確認しました。
+
+CLIと4種類のローカルランタイムは、実行試験に使った候補とSHA-256が一致しています。Kubernetesアーカイブはファイル内容・権限・リンクが一致しています。Linux arm64の基盤イメージは4,743エントリーと実行設定を照合し、差分はapt/dpkgのビルド時刻を含むログ3件とldconfigの補助キャッシュだけでした。Control Plane・Worker・ライブラリ・ランタイム用設定・権限・リンクは一致しています。アーカイブ自体のハッシュと、この4件の差分をJSONの`published_release`に明記しています。
