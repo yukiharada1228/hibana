@@ -106,7 +106,9 @@ jobs:
       BOOTSTRAP_ADMIN_TOKEN: dev-bootstrap-admin-token
       CONTROL_PLANE_INTERNAL_URL: http://localhost:8081
       APP_BIND_ADDR: "0.0.0.0:8083"
-      WORKER_HTTP_URL: http://localhost:8084
+      # Discovery prepares every resolved Worker address. This listener is IPv4;
+      # localhost also resolves to ::1 on Linux runners, where nothing listens.
+      WORKER_HTTP_URL: http://127.0.0.1:8084
       WORKER_HTTP_BIND_ADDR: "0.0.0.0:8084"
       INGRESS_BASE_DOMAIN: hibana.local
       COMPONENTS_DIR: ./components
