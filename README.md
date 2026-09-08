@@ -6,7 +6,7 @@ Hibanaは、Hono・TypeScript・JavaScript・Rust・Goで書いたWeb APIを、�
 
 Cloudflare Workersのような短い開発・配備の流れを参考にしています。実行にはWasmtimeを使い、各言語のアプリを共通のWASI HTTP Componentとして扱います。
 
-現在は開発中のMVPです。ローカル開発とKubernetesへの配備を提供しており、本番利用の条件は[運用ガイド](docs/on-prem-production.md)にまとめています。
+GitHubから導入できるMVP v0.1.0です。2時間のHTTP負荷と、配備・復元・停止・削除の[自動受入結果](docs/pilot-validation.md)を公開しています。実オンプレでの本番利用の条件は[運用ガイド](docs/on-prem-production.md)にまとめています。
 
 ## できること
 
@@ -65,11 +65,11 @@ export default app
 
 `--template`で選択します。`javascript`はTypeScriptの雛形を生成し、通常の`.js`ファイルもエントリーポイントに指定できます。Goのビルドツールはテンプレートでバージョンを固定しています。
 
-Hono・JavaScriptのプロジェクトでは`npm run dev`や`npx hibana deploy`を使えます。Rust・Goのプロジェクトにはnpm依存を追加せず、共通CLIから設定ファイルを指定して操作します。たとえば、リポジトリのルートから次のように始められます。
+Hono・JavaScriptのプロジェクトでは`npm run dev`や`npx hibana deploy`を使えます。Rust・Goのプロジェクトにはnpm依存を追加せず、インストールした共通CLIから設定ファイルを指定して操作します。
 
 ```bash
-node sdk/src/cli.mjs init my-rust --template rust
-node sdk/src/cli.mjs dev -c my-rust/hibana.json --runtime ./target/release/hibana-worker
+hibana init my-rust --template rust
+hibana dev -c my-rust/hibana.json
 ```
 
 ビルド済みのWASI HTTP Componentも配備できます。言語別のツール要件とビルド設定は[CLIガイド](sdk/README.md)を参照してください。
@@ -153,15 +153,19 @@ flowchart LR
 
 PostgreSQLは配備・実行記録・テナント情報、Redisは共有の受付制限、S3/MinIOはWasm成果物の保管に使います。Worker群がアプリの実行を受け持つため、アプリごとにDockerfileやKubernetesマニフェストを書く必要はありません。
 
-CLIは単体npmパッケージとしてPCへ導入でき、`hibana login --profile onprem --url https://api.example.internal`でリモート基盤を選択できます。開発者のアプリ操作にDockerやKubernetes資格情報は不要です。[CLI配布・接続プロファイル・オンプレ構成](docs/remote-cli.md)を参照してください。
+CLIはGitHubのtarballからPCへ導入でき、`hibana login --profile onprem --url https://api.example.internal`でリモート基盤を選択できます。開発者のアプリ操作にDockerやKubernetes資格情報は不要です。[CLI配布・接続プロファイル・オンプレ構成](docs/remote-cli.md)を参照してください。
 
-基盤管理者向けに、Kubernetesマニフェストと専用のkind環境を用意しています。[Kubernetes導入ガイド](deploy/kubernetes/README.md)のツールを用意し、リポジトリのルートで起動します。
+基盤管理者は[GitHubの配布ガイド](docs/releases.md)に従ってイメージを社内レジストリへ搬入し、DNS・TLS・依存サービスを設定したoverlayで既存クラスタへ導入します。基盤の操作にはkubectl・Python 3・PyYAMLと、管理者用のKubernetes資格情報が必要です。
 
 ```bash
-hibana platform install --source .
+hibana platform install --kubeconfig FILE --context onprem \
+  --overlay PATH --image registry.example.internal/hibana/platform@sha256:DIGEST
+hibana platform stop --kubeconfig FILE --context onprem
+hibana platform start --kubeconfig FILE --context onprem
+hibana platform uninstall --kubeconfig FILE --context onprem --yes
 ```
 
-起動が完了すると管理APIは`http://127.0.0.1:18080`、アプリHTTPは`http://127.0.0.1:18084`で利用できます。ポート転送用の常駐コマンドは不要です。`hibana platform test --source .`でサンプルの配備と疎通を検証できます。本番環境ではDNS・TLS、永続ストレージ、監視、バックアップなどをサイトに合わせて構成します。
+基盤そのものを手元で開発する場合は、ソースを取得して`hibana platform install --source .`で専用kind環境を作成できます。管理APIは`http://127.0.0.1:18080`、アプリHTTPは`http://127.0.0.1:18084`です。[Kubernetes導入ガイド](deploy/kubernetes/README.md)を参照してください。
 
 ## 利用できる範囲
 

@@ -8,7 +8,9 @@ Hono は JS/TS の選択肢の一つであり、サーバーは言語やフレ�
 
 ## 残す範囲
 
-- `hibana init / build / dev / deploy`、認証、環境変数、Secrets。
+- GitHubから単独で導入する`hibana` CLIと、OS別のローカルランタイム。
+- `hibana init / build / dev / deploy / delete`、リモート接続プロファイル、認証、環境変数、Secrets。
+- 管理者による既存Kubernetesへの基盤導入・停止・再開・撤去。
 - Hono、通常の JS/TS、Rust、Go のテンプレート。
 - HTTP の入出力、バイナリ、ストリーミング。
 - 実行時間・メモリ・同時実行数の制限、テナント分離、既定で拒否する外向き通信。
