@@ -1,11 +1,12 @@
 {
   "name": "@hibana/cli",
-  "version": "0.1.0",
+  "version": "0.2.0-rc.1",
   "private": true,
   "type": "module",
   "description": "Independent CLI for local WebAssembly development and remote Hibana deployments",
   "scripts": {
     "test": "node --test test/*.test.mjs",
+    "pretest": "node scripts/pack.mjs",
     "prepack": "node scripts/pack.mjs",
     "test:package": "node scripts/verify-package.mjs"
   },
@@ -29,8 +30,13 @@
     "wit/",
     "platform/remote.py",
     "platform/existing.py",
+    "platform/preflight.py",
     "platform/common.py",
-    "platform/manifests/migration/",
+    "platform/maintenance.py",
+    "platform/network.py",
+    "platform/operation.py",
+    "platform/readiness.py",
+    "platform/manifests/",
     "scripts/pack.mjs",
     "LICENSE"
   ],

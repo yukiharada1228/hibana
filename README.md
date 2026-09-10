@@ -8,6 +8,8 @@ Cloudflare Workersのような短い開発・配備の流れを参考にして�
 
 GitHubから導入できるMVP v0.1.0です。2時間のHTTP負荷と、配備・復元・停止・削除の[自動受入結果](docs/pilot-validation.md)を公開しています。実オンプレでの本番利用の条件は[運用ガイド](docs/on-prem-production.md)にまとめています。
 
+このソースは次期候補`0.2.0-rc.1`です。停止・導入・回収処理の修正を含み、以下の公開済みv0.1.0とは配布物が異なります。候補版を試す場合は[候補版の導入手順](docs/release-candidate.md)でCLIと基盤を揃えてください。
+
 ## できること
 
 - **CLIで開発から配備まで。** `init`で雛形を作成し、`dev`で変更を確認、`deploy`でビルドと配備を実行します。
@@ -25,13 +27,12 @@ Node.js 24以上とnpmが必要です。CLIとPC用ランタイムはGitHub Rele
 
 ```bash
 npm install -g https://github.com/yukiharada1228/hibana/releases/download/v0.1.0/hibana-cli-0.1.0.tgz
-hibana runtime install
-hibana init my-api --template hono
+hibana init my-api
 cd my-api
 npm run dev
 ```
 
-ソースからビルドする手順と閉域環境への搬入は[配布ガイド](docs/releases.md)を参照してください。
+初回の`dev`でPC用ランタイムを自動取得します。次回以降は保存済みのランタイムを再利用します。ソースからビルドする手順と閉域環境への搬入は[配布ガイド](docs/releases.md)を参照してください。
 
 `http://127.0.0.1:8787`でAPIが起動します。別のターミナルから呼び出せます。
 

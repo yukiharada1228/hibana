@@ -1,5 +1,7 @@
 # Hibana CLI
 
+このソースは候補版`0.2.0-rc.1`です。以下のGitHub Release URLは公開済みv0.1.0用です。今回の修正を試す場合は[候補版の導入手順](../docs/release-candidate.md)を使ってください。
+
 Hibanaの実行契約はWebAssembly Componentです。Honoは対応するJavaScriptフレームワークの一つで、専用SDKのインポートは必要ありません。
 
 ```ts
@@ -16,12 +18,11 @@ export default app
 
 ## インストールとテンプレート
 
-CLIはNode.js 24以上が必要です。CLI・ローカル実行ランタイム・Kubernetes基盤は別々に導入します。開発者のPCに基盤のソースやDocker/kubectlは不要です。[リモートCLI構成・配布・オンプレ接続](../docs/remote-cli.md)に全手順があります。配布先はGitHub Releasesです。npmレジストリへの公開は無効にしています。
+CLIはNode.js 24以上が必要です。ローカル実行ランタイムは初回の`dev`で自動取得し、Kubernetes基盤は管理者が別途導入します。開発者のPCに基盤のソースやDocker/kubectlは不要です。[リモートCLI構成・配布・オンプレ接続](../docs/remote-cli.md)に全手順があります。配布先はGitHub Releasesです。npmレジストリへの公開は無効にしています。
 
 ```bash
 npm install -g https://github.com/yukiharada1228/hibana/releases/download/v0.1.0/hibana-cli-0.1.0.tgz
-hibana runtime install
-hibana init my-app --template hono
+hibana init my-app
 cd my-app
 hibana dev
 ```
@@ -54,6 +55,10 @@ Rust・GoのプロジェクトにはWIT定義と依存ロックもコピーさ�
 
 ## アプリと基盤の操作
 
+`hibana --help`で基本の流れとコマンド一覧、`hibana dev --help`でその操作のオプションと実行例を確認できます。`hibana help deploy`の形式も使えます。`runtime`や`platform`などのサブコマンドも同じ形式でヘルプを表示します。
+
+不明なコマンド、未対応のオプション、余分な引数は実行前にエラーにします。たとえば`hibana deploy --dry-run`は未対応なので、配備せずに使い方を案内します。CLIの設計方針は[CLIの操作設計](../docs/cli-design.md)にまとめています。
+
 ```bash
 hibana dev                         # ローカル開発。Ctrl+Cで停止
 hibana deploy                      # hibana.jsonのアプリを配備
@@ -65,6 +70,7 @@ hibana delete --all --yes           # 現在のテナントの全アプリ
 hibana list --all-tenants
 hibana delete --all --all-tenants --yes
 # 基盤管理者のみ: 既存オンプレのKubernetes資格情報で操作
+hibana platform init my-site       # サイト用設定と秘密値ファイルを生成
 hibana platform status --kubeconfig /secure/config --context onprem
 hibana platform stop --kubeconfig /secure/config --context onprem
 hibana platform start --kubeconfig /secure/config --context onprem
@@ -115,7 +121,9 @@ CLIはComponentのヘッダーを確認します。WITの一致や全体の検�
 
 ## 開発・配備・Secrets
 
-`dev`は完成したComponentを`hibana-worker --dev-component`で動かします。`--runtime`、`HIBANA_RUNTIME_BIN`、CLIと同じバージョンの管理済みランタイム、PATHの順に選択します。`hibana runtime install --from FILE --sha256 HASH`でオフライン導入できます。`hibana runtime install`でGitHub Releaseの対応OS版を取得できます。基盤のソースを探す処理や暗黙のRustビルド・ダウンロードはありません。ビルド失敗時は起動済みの開発サーバーを維持します。`--no-watch`で監視を無効にできます。
+`dev`は完成したComponentを`hibana-worker --dev-component`で動かします。`--runtime`、`HIBANA_RUNTIME_BIN`、CLIと同じバージョンの管理済みランタイム、PATHの順に選択します。見つからなければ、CLIと同じバージョンの対応OS/CPU版をGitHub Releasesから自動取得し、SHA-256を検証して保存します。次回以降は保存済みのランタイムを再利用します。
+
+`dev`がランタイムの準備と起動をまとめて行います。事前準備には`hibana runtime install`、閉域環境への搬入には`hibana runtime install --from FILE --sha256 HASH`を使い、導入後は通常どおり`hibana dev`で起動します。手元の実行ファイルを使う場合は`--runtime PATH`または`HIBANA_RUNTIME_BIN`を指定できます。ビルド失敗時は起動済みの開発サーバーを維持します。`--no-watch`で監視を無効にできます。
 
 ローカル専用の秘密値は`.dev.vars`にdotenv形式で書きます。値は`vars`より優先します。`.hibana/`と`.dev.vars`をバージョン管理に含めないでください。サーバーのSecretsは管理者が`hibana secret put NAME`の標準入力から登録し、`hibana secret allow-deploy NAME`でそのアプリへの利用を許可します。`hibana.json`に`"secrets": ["NAME"]`を指定し、通常の開発者が`deploy`します。省略時は空配列で、Secretを自動列挙・注入しません。`secret deny-deploy NAME`は今後の配備だけを拒否します。既存バージョンでの利用も止める場合は`secret delete NAME`を使います。
 

@@ -1737,7 +1737,7 @@ checksum = "7f24254aa9a54b5c858eaee2f5bccdb46aaf0e486a595ed5fd8f86ba55232a70"
 
 [[package]]
 name = "hibana-control-plane"
-version = "0.1.0"
+version = "0.2.0-rc.1"
 dependencies = [
  "anyhow",
  "argon2",
@@ -1777,7 +1777,7 @@ dependencies = [
 
 [[package]]
 name = "hibana-shared"
-version = "0.1.0"
+version = "0.2.0-rc.1"
 dependencies = [
  "anyhow",
  "http 1.4.2",
@@ -1796,7 +1796,7 @@ dependencies = [
 
 [[package]]
 name = "hibana-worker"
-version = "0.1.0"
+version = "0.2.0-rc.1"
 dependencies = [
  "anyhow",
  "axum",

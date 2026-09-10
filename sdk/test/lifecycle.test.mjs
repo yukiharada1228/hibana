@@ -96,3 +96,31 @@ test("stopping dev during its first build does not leave a file watcher running"
   assert.equal(result.code, 0);
   assert.equal(result.signal, null);
 });
+
+test("stopping dev during a rebuild waits for the old runtime and never spawns another", async t => {
+  const cwd = await mkdtemp(join(tmpdir(), "hibana-stop-rebuild-"));
+  const runtime = join(cwd, "runtime.mjs");
+  await writeFile(runtime, `#!${process.execPath}\nconsole.log('RUNTIME_STARTED');setInterval(()=>{},1000);process.once('SIGTERM',()=>{console.log('RUNTIME_DRAINING');setTimeout(()=>process.exit(0),350)});`, {mode:0o700});
+  await writeFile(join(cwd, "hibana.json"), JSON.stringify({name:"review",main:"main.js"}));
+  await writeFile(join(cwd, "main.js"), "initial");
+  const module = new URL("../src/dev.mjs", import.meta.url).href;
+  const config = new URL("../src/config.mjs", import.meta.url).href;
+  const code = `import {dev} from ${JSON.stringify(module)};import {loadConfig} from ${JSON.stringify(config)};await dev(await loadConfig(),{runtime:${JSON.stringify(runtime)}},async()=> 'unused.wasm');console.log('DEV_FINISHED');`;
+  const child = spawn(process.execPath, ["--input-type=module", "-e", code], {cwd, detached: true, stdio:["ignore","pipe","pipe"]});
+  let output = "", changed = false, stopped = false;
+  const timer = setTimeout(()=>{try{process.kill(-child.pid,"SIGKILL")}catch{}},5000);
+  t.after(async()=>{clearTimeout(timer);try{process.kill(-child.pid,"SIGKILL")}catch{} await rm(cwd,{recursive:true,force:true});});
+  child.stdout.on("data", b=>{
+    output += b;
+    if(!changed && output.includes("Watching") && output.includes("RUNTIME_STARTED")) {
+      changed = true; writeFile(join(cwd,"main.js"),"updated").catch(()=>child.kill("SIGKILL"));
+    }
+    if(!stopped && output.includes("RUNTIME_DRAINING")) { stopped=true; child.kill("SIGTERM"); }
+  });
+  child.stderr.on("data",b=>output+=b);
+  const result = await new Promise(done=>child.once("exit",(code,signal)=>done({code,signal})));
+  assert.deepEqual(result,{code:0,signal:null},output);
+  assert.ok(stopped,output);
+  assert.match(output,/DEV_FINISHED/);
+  assert.equal(output.match(/RUNTIME_STARTED/g)?.length,1,output);
+});

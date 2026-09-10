@@ -1,5 +1,6 @@
 """Offline regression checks for local startup's data-preservation and ordering guarantees."""
 import json
+from contextlib import nullcontext
 from pathlib import Path
 import subprocess
 import tempfile
@@ -7,6 +8,9 @@ import unittest
 from unittest.mock import MagicMock, patch
 
 import kubernetes as k8s
+from test_preflight import PreflightTests, RemoteInstallTests
+from test_operation import OperationTests, MaintenanceDrainTests
+from test_readiness import ReadinessTests
 
 
 class StartupTests(unittest.TestCase):
@@ -75,7 +79,7 @@ class StartupTests(unittest.TestCase):
 
     def test_failed_migration_prevents_application_deployment(self):
         resources = [{"kind": "Namespace"}, {"kind": "Deployment"}]
-        with patch.object(self.cluster, "ensure_cluster"), \
+        with patch.object(self.cluster, "preflight"), patch.object(self.cluster, "ensure_cluster"), \
                 patch.object(self.cluster, "credentials", return_value={"items": []}), \
                 patch("kubernetes.run", return_value="sha256:" + "a" * 64), \
                 patch.object(self.cluster, "render", return_value=resources), \
@@ -89,6 +93,13 @@ class StartupTests(unittest.TestCase):
                 self.cluster.install()
         self.assertFalse(any(doc["kind"] == "Deployment" for call in apply.call_args_list for doc in call.args[0]))
         bootstrap.assert_not_called()
+
+    def test_local_install_preview_checks_tools_and_does_not_create_cluster_or_build(self):
+        with patch("kubernetes.shutil.which", return_value="tool"), patch.object(self.cluster, "render", return_value=[]), \
+                patch("kubernetes.run", return_value="") as run:
+            self.cluster.preview("install")
+        self.assertTrue(any(call.args[1] == "info" for call in run.call_args_list))
+        self.assertFalse(any(action in call.args for call in run.call_args_list for action in ["create", "build", "apply", "delete"]))
 
     def test_image_replacement_only_changes_platform_container(self):
         rendered = """kind: Deployment
@@ -121,12 +132,101 @@ spec:
 
 
 class LifecycleTests(unittest.TestCase):
+    def setUp(self):
+        # These tests isolate lifecycle sequencing. Real acquisition, competing
+        # operators and nested uninstall/stop are covered by OperationTests.
+        lock = patch("existing.ExistingCluster.operation", side_effect=lambda action: nullcontext())
+        lock.start()
+        self.addCleanup(lock.stop)
+
+    def test_operator_selects_ready_container_and_skips_crashloop(self):
+        from maintenance import Maintenance, NoControlPlane
+        maintenance = Maintenance(MagicMock())
+        pods = {name: {"metadata": {"name": name}, "status": {"phase": "Running", "containerStatuses": [
+            {"name": "control-plane", "ready": ready, "state": state}]}} for name, ready, state in [
+                ("a-crashloop", False, {"waiting": {"reason": "CrashLoopBackOff"}}),
+                ("b-starting", False, {"running": {}}), ("c-ready", True, {"running": {}})]}
+        with patch.object(maintenance, "pods", return_value=pods):
+            self.assertEqual(maintenance.control_plane(), "c-ready")
+            del pods["c-ready"]
+            self.assertEqual(maintenance.control_plane(), "b-starting")
+            del pods["b-starting"]
+            with self.assertRaises(NoControlPlane):
+                maintenance.control_plane()
+
+    def test_local_failed_install_can_stop_and_uninstall_without_cp(self):
+        nodes = [{"Id": "owned", "State": {"Running": True}}]
+        stopped = [{"Id": "owned", "State": {"Running": False}}]
+        with tempfile.TemporaryDirectory() as directory:
+            cluster = k8s.LocalCluster("hibana-check")
+            cluster.state = Path(directory)
+            with patch.object(cluster, "owned_nodes", side_effect=[nodes, stopped]), patch.object(cluster, "kube", return_value='{"items": []}'), patch("kubernetes.run") as command:
+                cluster.stop()
+                command.assert_called_once_with("docker", "stop", "--timeout", "60", "owned")
+            self.assertFalse((cluster.state / "maintenance.json").exists())
+            with patch.object(cluster, "owned_nodes", return_value=nodes), patch.object(cluster, "kube", return_value='{"items": []}'), patch("kubernetes.run", return_value="") as command:
+                cluster.uninstall()
+                self.assertIn("delete", command.call_args_list[0].args)
+
+    def test_install_can_resume_nodes_before_repairing_missing_workloads(self):
+        cluster = k8s.LocalCluster("hibana-check")
+        with patch.object(cluster, "owned_nodes", return_value=[{"Id": "owned", "State": {"Running": False}}]), patch("kubernetes.run"), patch.object(cluster, "kube") as kube, patch.object(cluster, "wait_workloads") as wait, patch.object(cluster, "resume_admission") as resume:
+            cluster.start(wait_runtime=False)
+            wait.assert_not_called()
+            resume.assert_not_called()
+            self.assertFalse(any("rollout" in c.args for c in kube.call_args_list))
+
+    def test_failed_drain_does_not_scale_or_open_admission(self):
+        from existing import ExistingCluster
+        with tempfile.NamedTemporaryFile() as config:
+            cluster = ExistingCluster(config.name, "explicit")
+            record = {"resources": [], "paused": {"owner": "review", "drained": False,
+                      "replicas": {"hibana-control-plane": 2, "hibana-worker": 2}, "hpas": []}}
+            with patch.object(cluster, "record", return_value=record), patch.object(cluster, "save"), patch.object(cluster, "kube") as kube, patch("existing.Maintenance") as maintenance:
+                maintenance.return_value.drain.side_effect = ValueError("busy")
+                with self.assertRaisesRegex(ValueError, "busy"):
+                    cluster.stop()
+                self.assertFalse(any("scale" in c.args for c in kube.call_args_list))
+                self.assertFalse(record["paused"]["drained"])
+                maintenance.return_value.open.assert_not_called()
+
+    def test_failed_preparation_keeps_pause_owner_and_gate_closed(self):
+        from existing import ExistingCluster
+        with tempfile.NamedTemporaryFile() as config:
+            cluster = ExistingCluster(config.name, "explicit")
+            record = {"resources": [], "paused": {"owner": "review", "drained": True,
+                      "replicas": {"hibana-control-plane": 2, "hibana-worker": 2}, "hpas": []}}
+            with patch.object(cluster, "record", return_value=record), patch.object(cluster, "save"), patch.object(cluster, "kube"), patch.object(cluster, "ready"), patch("existing.Maintenance") as maintenance:
+                maintenance.return_value.prepare.side_effect = ValueError("cache full")
+                with self.assertRaisesRegex(ValueError, "cache full"):
+                    cluster.start()
+                maintenance.return_value.open.assert_not_called()
+                self.assertEqual(record["paused"]["owner"], "review")
+                self.assertFalse(record["paused"]["drained"])
+
+    def test_drain_checks_replacement_pods_and_durable_execution_count(self):
+        from maintenance import Maintenance
+        maintenance = Maintenance(MagicMock())
+        def pod(name):
+            return {"metadata": {"name": name}, "status": {"containerStatuses": [
+                {"name": "control-plane", "state": {"running": {}}}]}}
+        first = {"a": pod("first")}
+        second = {"b": pod("second")}
+        statuses = [{"active_requests": 0, "inflight_executions": 1},
+                    {"active_requests": 0, "inflight_executions": 0},
+                    {"active_requests": 0, "inflight_executions": 0}]
+        with patch.object(maintenance, "pods", side_effect=[first, first, second, second, second]), patch.object(maintenance, "call", side_effect=[json.dumps(s) for s in statuses]) as call, patch("maintenance.time.sleep"):
+            maintenance.drain()
+        self.assertEqual(call.call_count, 3)
+        self.assertEqual(call.call_args.args[0], "second")
+
     def test_local_stop_targets_only_owned_running_nodes(self):
         cluster = k8s.LocalCluster("hibana-check")
         nodes = [{"Id": "owned-a", "State": {"Running": True}}, {"Id": "owned-b", "State": {"Running": False}}]
         stopped = [{"Id": n["Id"], "State": {"Running": False}} for n in nodes]
-        with patch.object(cluster, "owned_nodes", side_effect=[nodes, stopped]), patch("kubernetes.run") as command:
+        with patch.object(cluster, "owned_nodes", side_effect=[nodes, stopped]), patch.object(cluster, "pause_admission") as drain, patch("kubernetes.run") as command:
             cluster.stop()
+        drain.assert_called_once()
         command.assert_called_once_with("docker", "stop", "--timeout", "60", "owned-a")
 
     def test_local_start_waits_for_live_api_before_ready_checks(self):
@@ -156,7 +256,7 @@ class LifecycleTests(unittest.TestCase):
             cluster.state = Path(directory)
             secret = cluster.state / "secrets.json"
             secret.write_text("retained")
-            with patch.object(cluster, "owned_nodes"), patch("kubernetes.run", side_effect=["", "leftover"]):
+            with patch.object(cluster, "owned_nodes", return_value=[]), patch("kubernetes.run", side_effect=["", "leftover"]):
                 with self.assertRaisesRegex(ValueError, "incomplete"):
                     cluster.uninstall()
             self.assertEqual(secret.read_text(), "retained")
@@ -215,14 +315,20 @@ class LifecycleTests(unittest.TestCase):
             def kube(*args, **kwargs):
                 events.append(args)
                 return json.dumps({"items": [hpa]}) if "get" in args else ""
-            with patch.object(cluster, "record", return_value=record), patch.object(cluster, "get", side_effect=deployment), patch.object(cluster, "kube", side_effect=kube), patch.object(cluster, "save", side_effect=lambda r: events.append(("save", deepcopy(r)))) as save, patch.object(cluster, "ready"), patch.object(cluster, "apply") as apply:
+            with patch.object(cluster, "record", return_value=record), patch.object(cluster, "get", side_effect=deployment), patch.object(cluster, "kube", side_effect=kube), patch.object(cluster, "save", side_effect=lambda r: events.append(("save", deepcopy(r)))) as save, patch.object(cluster, "ready"), patch.object(cluster, "apply") as apply, patch("existing.Maintenance") as maintenance:
+                for action in ("close", "drain", "prepare", "open"):
+                    getattr(maintenance.return_value, action).side_effect = lambda *args, action=action: events.append((action,))
                 cluster.stop()
                 self.assertEqual(events[1][0], "save", "resume settings must be saved before scaling")
                 self.assertEqual(record["paused"]["replicas"], {"hibana-control-plane": 2, "hibana-worker": 4})
+                scaled = [e for e in events if "scale" in e]
+                self.assertIn("deployment/hibana-worker", scaled[0])
+                self.assertLess(events.index(("drain",)), events.index(scaled[0]))
                 cluster.start()
                 self.assertNotIn("paused", record)
                 apply.assert_called_once_with([hpa])
                 self.assertIn(("-n", "hibana", "scale", "deployment/hibana-worker", "--replicas=4"), events)
+                self.assertLess(events.index(("prepare",)), events.index(("open",)))
 
 
 if __name__ == "__main__":

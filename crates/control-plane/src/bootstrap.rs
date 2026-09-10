@@ -167,6 +167,7 @@ pub(crate) async fn run() -> anyhow::Result<()> {
     // そのものであり、テナント停止の遮断はハンドラ内で明示的に行う。
     // 既定 bind は loopback（127.0.0.1:8081）。これをインターネット / 共有ネットワークへ
     // 公開してはならない (MUST NOT)。
+    let (internal_stop, internal_stopped) = tokio::sync::oneshot::channel::<()>();
     let internal_server = {
         let internal_state = state.clone();
         let internal_addr = config.internal_bind_addr.clone();
@@ -178,7 +179,9 @@ pub(crate) async fn run() -> anyhow::Result<()> {
                 internal_listener.tap_io(configure_http_socket),
                 internal_app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
             )
-            .with_graceful_shutdown(deployment::shutdown_signal())
+            .with_graceful_shutdown(async {
+                let _ = internal_stopped.await;
+            })
             .await
             {
                 tracing::error!(error = %e, "internal listener terminated");
@@ -187,6 +190,7 @@ pub(crate) async fn run() -> anyhow::Result<()> {
     };
 
     crate::preparation::spawn(state.clone());
+    crate::artifact_reservations::spawn(state.clone());
 
     // --- ルータ ---
     let app_server = if let Ok(addr) = std::env::var("APP_BIND_ADDR") {
@@ -219,10 +223,13 @@ pub(crate) async fn run() -> anyhow::Result<()> {
     )
     .with_graceful_shutdown(deployment::shutdown_signal())
     .await?;
-    internal_server.await?;
     if let Some(server) = app_server {
         server.await??;
     }
+    // Workers still redeem jobs/Secrets and persist results while public HTTP drains.
+    // Kubernetes stop closes fleet admission before removing any Service endpoints.
+    let _ = internal_stop.send(());
+    internal_server.await?;
 
     Ok(())
 }

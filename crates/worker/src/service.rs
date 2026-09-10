@@ -64,7 +64,8 @@ impl Worker {
             settings.max_compilations,
             settings.compiler_limits,
             metrics.clone(),
-        )?;
+        )?
+        .protect_versions(pool.clone());
         let control_plane = ControlPlaneClient::new(
             http,
             settings.control_plane_internal_url.clone(),

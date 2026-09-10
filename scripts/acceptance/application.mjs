@@ -78,15 +78,12 @@ if (process.argv[2] === '--verify-restored') {
   const result={passed:false,startup_statuses:{},phase:'restart'};
   const began=performance.now();
   try {
-    // platform start waits for Kubernetes readiness. Active applications are
-    // prepared after process startup; record this separately from steady load.
-    while (true) {
+    // A successful platform start includes application preparation. Do not hide
+    // missing artifacts behind retries after it has reopened admission.
+    for (let probe=0;probe<10;probe++) {
       const response=await request('/health',null,{},AbortSignal.timeout(10000));
       result.startup_statuses[response.status]=(result.startup_statuses[response.status]||0)+1;
-      if (response.status===200) break;
-      assert.equal(response.status,503,'unexpected restart response');
-      assert.ok(performance.now()-began<120000,'active applications did not become ready');
-      await sleep(250);
+      assert.equal(response.status,200,'platform start reopened admission before preparation');
     }
     result.startup_seconds=(performance.now()-began)/1000;
     await checkHealthy('v2');

@@ -260,10 +260,20 @@ pub async fn upload_version(
     let version_id = new_version_id();
     // Immutable identity: retries and recreated names must never overwrite an accepted artifact.
     let object_key = format!("{tenant}/versions/{version_id}.wasm");
+    let mut reservation = crate::artifact_reservations::Reservation::new(
+        &state,
+        tenant,
+        &version_id,
+        &object_key,
+        &validated.sha256,
+    )
+    .await?;
+    let result = async {
     state
         .storage()
         .put_object(&object_key, wasm_bytes, "application/wasm")
         .await?;
+    reservation.confirm_object();
 
     // Prepare before acquiring publication locks: the old version keeps serving.
     // This only compiles verified Wasm; the handler is never called and no Secrets are supplied.
@@ -273,19 +283,15 @@ pub async fn upload_version(
     // serialize publication with deletion and policy changes, in a short transaction.
     let mut tx = state.pool().begin().await?;
     db::set_tenant_guc(&mut tx, tenant).await?;
+    reservation.lock(&mut tx).await?;
     sqlx::query("SELECT id FROM tenants WHERE id=$1 AND status='active' FOR SHARE")
         .bind(tenant)
         .fetch_optional(&mut *tx)
         .await?
         .ok_or_else(|| FaasError::NotFound("active tenant".into()))?;
-    sqlx::query(
-        "SELECT id FROM components WHERE tenant_id=$1 AND id=$2 AND deleted_at IS NULL FOR UPDATE",
-    )
-    .bind(tenant)
-    .bind(&component_id)
-    .fetch_optional(&mut *tx)
-    .await?
-    .ok_or_else(|| FaasError::NotFound(format!("component '{component_id}'")))?;
+    if !db::lock_component(&mut tx, tenant, &component_id).await? {
+        return Err(FaasError::NotFound(format!("component '{component_id}'")).into());
+    }
 
     // M9a (§6.2): 供給網検証 —— テナントが登録した公開鍵での署名検証。
     //
@@ -398,6 +404,9 @@ pub async fn upload_version(
             status: "active",
         }),
     ))
+    }.await;
+    reservation.finish().await;
+    result
 }
 
 // ---------------------------------------------------------------------------
@@ -510,14 +519,9 @@ async fn delete_for_tenant(
 
     // Serialize deletion with HTTP admission so a new execution cannot slip
     // between the active-execution check and the tombstone update.
-    sqlx::query(
-        "SELECT id FROM components WHERE tenant_id=$1 AND id=$2 AND deleted_at IS NULL FOR UPDATE",
-    )
-    .bind(tenant)
-    .bind(component_id)
-    .fetch_optional(&mut *tx)
-    .await?
-    .ok_or_else(|| FaasError::NotFound(format!("component '{component_id}'")))?;
+    if !db::lock_component(&mut tx, tenant, component_id).await? {
+        return Err(FaasError::NotFound(format!("component '{component_id}'")).into());
+    }
 
     // 参照中の実行があれば保護（§6.7）。
     if db::has_active_executions_for_component(&mut *tx, tenant, component_id).await? {
@@ -584,7 +588,11 @@ pub async fn delete_version(
     let mut tx = state.pool().begin().await?;
     db::set_tenant_guc(&mut tx, tenant).await?;
 
-    // component の存在確認（不在は 404）。active_version_id も引く。
+    // Hold the same parent lock as publication, rollback and HTTP admission.
+    // Read active/previous/execution state only after any earlier publisher commits.
+    if !db::lock_component(&mut tx, tenant, &component_id).await? {
+        return Err(FaasError::NotFound(format!("component '{component_id}'")).into());
+    }
     let component = db::find_component_by_id(&mut *tx, tenant, &component_id)
         .await?
         .ok_or_else(|| FaasError::NotFound(format!("component '{component_id}'")))?;
@@ -680,12 +688,22 @@ pub async fn set_active_version(
         })?;
 
     tx.commit().await?;
-    crate::preparation::prepare_version(&state, tenant, &target_version_id).await?;
+    let reservation =
+        crate::preparation::prepare_version(&state, tenant, &target_version_id).await?;
     let mut tx = state.pool().begin().await?;
     db::set_tenant_guc(&mut tx, tenant).await?;
+    reservation.lock(&mut tx).await?;
+
+    if !db::lock_component(&mut tx, tenant, &component_id).await? {
+        return Err(FaasError::NotFound(format!("component '{component_id}'")).into());
+    }
 
     if !db::switch_active_version(&mut *tx, tenant, &component_id, &target_version_id).await? {
-        return Err(FaasError::NotFound(format!("component '{component_id}'")).into());
+        return Err(FaasError::NotFound(format!(
+            "version '{}' of component '{component_id}'",
+            req.version
+        ))
+        .into());
     }
 
     // M7a: 版の切替は監査に残す（現行は tracing のみで audit_logs に痕跡が無かった）。
@@ -710,6 +728,7 @@ pub async fn set_active_version(
         active_version_id = %target_version_id,
         "active version switched"
     );
+    reservation.finish().await;
 
     Ok(Json(SetActiveVersionResponse {
         component_id,
@@ -803,9 +822,10 @@ pub async fn rollback_version(
             })?,
     };
     tx.commit().await?;
-    crate::preparation::prepare_version(&state, tenant, &prepared_target).await?;
+    let reservation = crate::preparation::prepare_version(&state, tenant, &prepared_target).await?;
     let mut tx = state.pool().begin().await?;
     db::set_tenant_guc(&mut tx, tenant).await?;
+    reservation.lock(&mut tx).await?;
     // An implicit rollback must not silently choose a different, unprepared target
     // if another publication completed while preparation was in flight.
     let current_previous: Option<Option<String>> = sqlx::query_scalar(
@@ -858,6 +878,7 @@ pub async fn rollback_version(
     tx.commit().await?;
 
     tracing::info!(%component_id, %active_version_id, "rolled back");
+    reservation.finish().await;
 
     Ok(Json(RollbackVersionResponse {
         component_id,

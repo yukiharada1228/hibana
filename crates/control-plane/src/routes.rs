@@ -11,7 +11,10 @@ use hibana_shared::Scope;
 use tower_http::{cors::CorsLayer, trace::TraceLayer};
 pub(crate) fn build_internal_router(state: AppState) -> Router {
     Router::new()
-        .route("/internal/maintenance", get(crate::maintenance::status))
+        .route(
+            "/internal/maintenance",
+            get(crate::maintenance::status).put(crate::maintenance::set),
+        )
         .route(
             "/internal/maintenance/prepare",
             post(crate::maintenance::prepare),

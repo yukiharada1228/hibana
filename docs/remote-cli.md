@@ -1,13 +1,15 @@
 # 手元のCLIからオンプレHibanaを操作する
 
-CLI、ローカル開発ランタイム、Kubernetes上の基盤は別々にインストールします。開発者のPCにはクラスタの資格情報を渡さず、Hibanaのテナント用認証でHTTPS管理APIを操作します。
+このソースの候補版は`0.2.0-rc.1`です。公開済みv0.1.0への導入例と、今回の変更を含む[候補版の導入手順](release-candidate.md)を区別してください。新しい基盤操作には同じ候補版のCLIと基盤イメージが必要です。
+
+CLIを導入すると、ローカル開発ランタイムは初回の`dev`で自動取得します。Kubernetes上の基盤は管理者が別途導入します。開発者のPCにはクラスタの資格情報を渡さず、Hibanaのテナント用認証でHTTPS管理APIを操作します。
 
 ```mermaid
 flowchart LR
   subgraph PC[開発者のPC]
     CLI[hibana CLI]
     Build[JS/TS → Wasm Component]
-    Dev[別途インストールした hibana-worker]
+    Dev[devが自動取得・再利用する hibana-worker]
     CLI --> Build
     CLI -->|dev| Dev
   end
@@ -59,7 +61,7 @@ hibana login --profile onprem \
 hibana profile list
 hibana profile use onprem
 
-hibana init hello --template hono
+hibana init hello
 cd hello
 hibana deploy --profile onprem --version 1.0.0
 curl https://hello.team.apps.example.internal/
@@ -96,22 +98,32 @@ HTTPはloopbackだけ許可し、それ以外はHTTPSが必要です。APIリダ
 `hibana dev`はPC用`hibana-worker`を起動します。Docker・DB・Kubernetes・オンプレ接続は不要です。`--runtime` → `HIBANA_RUNTIME_BIN` → CLIと同じバージョンの管理済みランタイム → `PATH`の順に探します。CLIが基盤のRustソースを探したり自動ビルドしたりすることはありません。
 
 ```bash
-hibana runtime install
-# 閉域環境: hibana runtime install --from FILE --sha256 HASH
+# ランタイムがなければ自動取得し、次回以降は再利用
 hibana dev
 # Ctrl+Cで開発サーバーとランタイムを停止
+
+# 事前準備（任意）
+hibana runtime install
+# 閉域環境
+hibana runtime install --from FILE --sha256 HASH
+hibana dev
 ```
 
-`hibana runtime install`がOS/CPUに合うバイナリをHTTPSで取得し、SHA-256を検証して保存します。破損したダウンロードでは既存のランタイムを置き換えません。保存先は`$HIBANA_RUNTIME_HOME`、未指定なら`${XDG_DATA_HOME:-~/.local/share}/hibana/runtimes/VERSION/OS-ARCH/hibana-worker`です。`dev`の起動時に暗黙のダウンロードは行いません。基盤と同じバージョンを使用してください。配布担当者向けの[候補作成・OS別ビルド手順](releases.md)を用意しています。アプリのリモート配備だけならローカルランタイムは不要です。
+`dev`はランタイムが見つからなければ、CLIと同じバージョンのOS/CPUに合うバイナリをGitHub ReleasesからHTTPSで自動取得し、SHA-256を検証して保存します。`hibana runtime install`でも同じ処理を事前に実行できます。破損したダウンロードでは既存のランタイムを置き換えません。保存先は`${HIBANA_RUNTIME_HOME}/VERSION/OS-ARCH/hibana-worker`、未指定なら`${XDG_DATA_HOME:-~/.local/share}/hibana/runtimes/VERSION/OS-ARCH/hibana-worker`です。基盤と同じバージョンを使用してください。
+
+閉域環境では事前にランタイムを搬入するか、`--runtime PATH`または`HIBANA_RUNTIME_BIN`で手元の実行ファイルを指定します。準備済みなら通常の`dev`でダウンロードは発生しません。JavaScriptコンパイラーや各言語の依存も社内ミラーやキャッシュに用意してください。配布担当者向けの[候補作成・OS別ビルド手順](releases.md)を用意しています。アプリのリモート配備だけならローカルランタイムは不要で、自動取得も行いません。
 
 ## 基盤管理者の操作
 
 既存Kubernetesの管理にだけkubectl・Python 3・PyYAML・明示的なkubeconfig/contextが必要です。既存クラスタと配布済みの基盤イメージを使い、CLIからDockerビルドやkindクラスタ作成は行いません。アプリ用の`--profile`はKubernetesの対象指定には使えません。
 
 ```bash
+hibana platform init my-site
+# my-site/README.mdに沿って接続情報・DNS/TLS等を設定
+# installに--dry-runを付けると検査と変更予定を確認できます
 hibana platform install \
   --kubeconfig /secure/operator-kubeconfig --context onprem \
-  --overlay /ops/hibana/site \
+  --overlay my-site \
   --image registry.example.internal/hibana/platform@sha256:RELEASE_DIGEST
 
 hibana platform status --kubeconfig /secure/operator-kubeconfig --context onprem
@@ -120,7 +132,17 @@ hibana platform start --kubeconfig /secure/operator-kubeconfig --context onprem
 hibana platform uninstall --kubeconfig /secure/operator-kubeconfig --context onprem --yes
 ```
 
-停止はCP/Workerのreplica数と管理対象HPAを保存して0 Podにし、再開で復元します。撤去はインストール時に記録したHibanaリソースだけを削除し、オンプレのクラスタ・namespace・PVC・外部DB/S3等を保持します。GitOpsで管理する場合はそのリポジトリを正として運用し、同じDeploymentにCLIのstart/stopを同時適用しないでください。
+停止はreplica数と管理対象HPAを保存し、全CPで新規受付を閉じます。受付済みの処理と実行結果の保存を待ち、Worker、CPの順に0 Podにします。再開はreplica数を復元し、公開中の全アプリをWorkerへ準備してからHPAと受付を復元します。待機や準備に失敗した場合は受付を閉じたまま設定を保持するため、原因を解消して`stop`または`start`を再実行できます。CLIはoperatorのkubectl権限でCP内のアダプターを呼び出し、基盤の認証情報をPCへ取り出しません。
+
+閉鎖後に503で拒否するアクセスは停止待ちに含めません。起動設定やイメージの問題で`stop`・`start`が完了しない場合は、修正したoverlayとイメージで`install`を再実行できます。未完了の受付制御ownerを保持し、修復後のアプリ準備が成功してから受付を再開します。停止が正常に完了している環境では、先に`start`を実行してください。
+
+既存Kubernetesを変更する基盤操作は、クラスタ側のConfigMapで排他制御します。複数PCのCLIが同じ停止情報を上書きすることはありません。起動失敗したCPが混在していても、稼働中のCPで処理完了を確認できれば停止・撤去できます。CLIを強制終了してロックが残った場合の確認・解除方法は[基盤管理ガイド](../deploy/kubernetes/README.md)に記載しています。
+
+撤去も処理完了を待ってからインストール時に記録したHibanaリソースを削除し、オンプレのクラスタ・namespace・PVC・外部DB/S3等を保持します。再導入に必要な受付制御のownerはnamespaceの`hibana.io/maintenance-owner`へ残し、`install`がアプリ準備後に受付を再開します。GitOpsで管理する場合はそのリポジトリを正として運用し、同じDeploymentにCLIのstart/stopを同時適用しないでください。
+
+Control Planeが起動していない導入途中の環境も`uninstall`で撤去できます。この場合はKubernetesの終了猶予を使い、CPのDeploymentとPodが消えてからWorkerを削除します。実行中のCPがある場合、処理完了待ちや通信の失敗を無視して削除することはありません。
+
+`install`は変更前に接続・権限・設定参照を検査します。`--dry-run`ではリソースの変更予定と変更フィールドを表示し、Secretの値は出力しません。新規namespace配下のサーバー側検証は、実導入でnamespaceを作成した後に行います。失敗時は進行段階と再実行方法を案内します。詳細は[基盤管理ガイド](../deploy/kubernetes/README.md)を参照してください。
 
 [remote overlay](../deploy/kubernetes/remote/kustomization.yaml)は管理APIとアプリHTTPを別々のTLS Ingressへ振り分けるサイト設定の出発点です。次を実環境に合わせて設定します。
 

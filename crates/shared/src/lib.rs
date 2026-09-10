@@ -29,6 +29,10 @@ fn new_prefixed_id(prefix: &str) -> String {
     format!("{prefix}_{}", Uuid::new_v4().simple())
 }
 
+pub fn new_artifact_reservation_id() -> String {
+    new_prefixed_id("artifact")
+}
+
 /// `cmp_*` Component ID を生成する。
 pub fn new_component_id() -> String {
     new_prefixed_id("cmp")

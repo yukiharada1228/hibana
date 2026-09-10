@@ -388,6 +388,7 @@ async fn http_mvp_regression() {
 
     let mut tx = pool.begin().await.unwrap();
     db::set_tenant_guc(&mut tx, "http").await.unwrap();
+    assert!(db::lock_component(&mut tx, "http", "source").await.unwrap());
     assert!(
         db::switch_active_version(&mut *tx, "http", "source", "source-v2")
             .await
@@ -412,8 +413,40 @@ async fn http_mvp_regression() {
             .unwrap()
             .is_none()
     );
+    assert!(
+        !db::switch_active_version(&mut *tx, "http", "source", "target-v1")
+            .await
+            .unwrap(),
+        "activation must reject another component's version"
+    );
+    sqlx::query("SAVEPOINT deleted_target")
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+    db::soft_delete_version(&mut *tx, "http", "source", "source-v2")
+        .await
+        .unwrap();
+    assert!(
+        !db::switch_active_version(&mut *tx, "http", "source", "source-v2")
+            .await
+            .unwrap(),
+        "publication must recheck the target after preparation"
+    );
+    assert_eq!(
+        db::find_component_by_id(&mut *tx, "http", "source")
+            .await
+            .unwrap()
+            .unwrap()
+            .active_version_id
+            .as_deref(),
+        Some("source-v1")
+    );
+    sqlx::query("ROLLBACK TO SAVEPOINT deleted_target")
+        .execute(&mut *tx)
+        .await
+        .unwrap();
     tx.commit().await.unwrap();
-    println!("PASS version switch / no-op preserves previous / rollback rejects another component");
+    println!("PASS version switch / no-op preserves previous / publication rejects deleted and foreign targets");
     secret_resolution_regression(&state).await;
 
     sqlx::query("UPDATE tenants SET status='suspended' WHERE id='http'")

@@ -12,7 +12,7 @@ trap cleanup EXIT
 docker run --rm -d --name "$pg" -e POSTGRES_DB=hibana_http -e POSTGRES_HOST_AUTH_METHOD=trust -p 127.0.0.1::5432 postgres:16 >/dev/null
 docker run --rm -d --name "$redis" -p 127.0.0.1::6379 redis:7-alpine >/dev/null
 for _ in $(seq 1 30); do
-  if docker exec "$pg" pg_isready -U postgres >/dev/null 2>&1; then break; fi
+  if docker exec "$pg" pg_isready -h 127.0.0.1 -U postgres >/dev/null 2>&1; then break; fi
   sleep 1
 done
 pg_port="$(docker port "$pg" 5432/tcp | sed 's/.*://')"
