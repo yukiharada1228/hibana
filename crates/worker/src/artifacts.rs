@@ -25,7 +25,8 @@ pub(crate) struct ArtifactCache {
     compilation_slots: Arc<tokio::sync::Semaphore>,
     metrics: Arc<metrics::Metrics>,
     compiler_limits: crate::compiler::Limits,
-    disk_writer: Mutex<()>,
+    disk_writer: tokio::sync::Mutex<()>,
+    retention_pool: Option<sqlx::PgPool>,
 }
 impl ArtifactCache {
     pub(crate) fn new(
@@ -39,7 +40,8 @@ impl ArtifactCache {
         std::fs::create_dir_all(&wasm_cache_dir).context("failed to create WASM_CACHE_DIR")?;
         crate::cache_storage::prune(&wasm_cache_dir, 0, crate::cache_storage::DISK_BUDGET)?;
         Ok(Self {
-            disk_writer: Mutex::new(()),
+            disk_writer: tokio::sync::Mutex::new(()),
+            retention_pool: None,
             engine,
             compiler_limits,
             http,
@@ -51,6 +53,10 @@ impl ArtifactCache {
             inflight_precompile: std::array::from_fn(|_| tokio::sync::Mutex::new(())),
             compilation_slots: Arc::new(tokio::sync::Semaphore::new(max_compilations)),
         })
+    }
+    pub(crate) fn protect_versions(mut self, pool: sqlx::PgPool) -> Self {
+        self.retention_pool = Some(pool);
+        self
     }
     /// HTTP admission can only load code already compiled by this Worker.
     /// Preparation probes do not increment HTTP cache-hit counters.
@@ -114,7 +120,11 @@ impl ArtifactCache {
         sha: &str,
         url: &str,
     ) -> std::result::Result<Arc<PreparedComponent>, ExecError> {
-        if let Some(component) = self.cached_component(sha, false)? {
+        let cached = {
+            let _writer = self.disk_writer.lock().await;
+            self.retained_component(sha)?
+        };
+        if let Some(component) = cached {
             return Ok(component);
         }
         let stripe = usize::from(u8::from_str_radix(&sha[..2], 16).unwrap())
@@ -125,7 +135,11 @@ impl ArtifactCache {
         )
         .await
         .map_err(|_| ExecError::Failed("Artifact preparation capacity timeout".into()))?;
-        if let Some(component) = self.cached_component(sha, false)? {
+        let cached = {
+            let _writer = self.disk_writer.lock().await;
+            self.retained_component(sha)?
+        };
+        if let Some(component) = cached {
             return Ok(component);
         }
         let cwasm_path = self.wasm_cache_dir.join(format!("{sha}.cwasm"));
@@ -153,13 +167,24 @@ impl ArtifactCache {
         .await
         .map_err(|e| ExecError::Failed(format!("Compilation failed: {e}")))?;
 
-        // アトミックに書き込む (tmp -> rename)。失敗しても実行自体は続行する。
-        let persisted = {
-            let _writer = self.disk_writer.lock().expect("cache disk mutex poisoned");
-            crate::cache_storage::write(&self.wasm_cache_dir, &cwasm_path, &cwasm)
-        };
-        if let Err(e) = persisted {
-            warn!(%sha, error = %e, "failed to persist cwasm cache (continuing)");
+        // Refresh protection under the writer lock: another preparation may have
+        // published since compilation began. DB failure must never trigger eviction.
+        {
+            let _writer = self.disk_writer.lock().await;
+            let pool = self
+                .retention_pool
+                .as_ref()
+                .ok_or_else(|| ExecError::Failed("Artifact retention is not configured".into()))?;
+            let protected: std::collections::HashSet<String> = sqlx::query_scalar::<_, String>(
+                "SELECT sha256 FROM hibana_protected_artifact_hashes()",
+            )
+            .fetch_all(pool)
+            .await
+            .map_err(|_| ExecError::Failed("Artifact retention unavailable".into()))?
+            .into_iter()
+            .collect();
+            crate::cache_storage::write(&self.wasm_cache_dir, &cwasm_path, &cwasm, &protected)
+                .map_err(|e| ExecError::Failed(format!("Artifact cache: {e}")))?;
         }
 
         let engine = self.engine.clone();
@@ -183,6 +208,26 @@ impl ArtifactCache {
     }
 
     /// in-memory LRU から取得する (hit で参照順を更新)。
+    // An inactive version can remain in memory after its disk entry was evicted.
+    // Republishing it must restore the disk copy before releasing its reservation;
+    // otherwise the next memory-LRU eviction would make an active app unavailable.
+    fn retained_component(
+        &self,
+        sha: &str,
+    ) -> std::result::Result<Option<Arc<PreparedComponent>>, ExecError> {
+        if !hibana_shared::preparation::valid_digest(sha) {
+            return Err(ExecError::Failed("Invalid artifact digest".into()));
+        }
+        let path = self.wasm_cache_dir.join(format!("{sha}.cwasm"));
+        match path.symlink_metadata() {
+            Ok(meta) if meta.is_file() && meta.len() <= crate::compiler::MAX_OUTPUT as u64 => {
+                self.cached_component(sha, false)
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            _ => Err(ExecError::Failed("Invalid compiled cache file".into())),
+        }
+    }
+
     fn cache_get(&self, sha: &str) -> Option<Arc<PreparedComponent>> {
         let mut cache = self.cache.lock().expect("component cache mutex poisoned");
         cache.get(sha).map(|(component, _)| Arc::clone(component))
@@ -259,8 +304,8 @@ fn hex_encode(bytes: &[u8]) -> String {
 mod tests {
     use super::*;
 
-    #[test]
-    fn admission_uses_only_prepared_code_and_keeps_it_alive_after_eviction() {
+    #[tokio::test]
+    async fn admission_uses_only_prepared_code_and_keeps_it_alive_after_eviction() {
         let dir = std::env::temp_dir().join(format!(
             "hibana-prepared-{}-{}",
             std::process::id(),
@@ -312,12 +357,20 @@ mod tests {
             .ok()
             .flatten()
             .expect("prepared code");
+        std::fs::remove_file(dir.join(format!("{sha}.cwasm"))).unwrap();
+        assert!(cache
+            .cached_component(&sha, false)
+            .is_ok_and(|v| v.is_some()));
+        assert!(
+            cache.prepare(&sha, "invalid:artifact").await.is_err(),
+            "a memory-only hit must not certify a version for publication"
+        );
         cache.cache.lock().unwrap().clear();
         std::fs::remove_dir_all(&dir).unwrap();
         assert!(cache
             .cached_component(&sha, true)
             .is_ok_and(|v| v.is_none()));
-        assert_eq!(metrics.wasmtime_component_cache_misses_total.get(), 0);
+        assert_eq!(metrics.wasmtime_component_cache_misses_total.get(), 1);
         // An invocation admitted before eviction owns its own Component reference.
         assert!(accepted.component().serialize().is_ok());
     }

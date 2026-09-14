@@ -2,8 +2,10 @@ import { fileURLToPath } from "node:url";
 import { resolve } from "node:path";
 import { run } from "./process.mjs";
 import { confirm } from "./confirm.mjs";
+import { initPlatform } from "./platform-init.mjs";
 
 export const platformHelp = `Administrator operations (separate Kubernetes credentials):
+hibana platform init [directory]
 hibana platform install --kubeconfig PATH --context NAME --overlay DIRECTORY --image IMAGE
 hibana platform start|stop|status|uninstall --kubeconfig PATH --context NAME
 
@@ -31,13 +33,15 @@ export function platformCommand(args, options) {
   else command.push("--cluster", options.cluster || "hibana");
   if (options.overlay) command.push("--overlay", resolve(options.overlay));
   if (options.image) command.push("--image", options.image);
+  if (options["dry-run"]) command.push("--dry-run");
   return { command, target, action };
 }
 
 export async function platform(args, options) {
   if (options.help || !args.length) { console.log(platformHelp); return; }
+  if (args[0] === "init") return initPlatform(args[1]);
   const { command, target, action } = platformCommand(args, options);
-  if (options["dry-run"]) { console.log(`Would ${action} Hibana: ${target}. No changes made.`); return; }
-  if (action === "uninstall" && !await confirm(`Uninstall Hibana from ${target}? ${options.context ? "External storage and the cluster are retained." : "Local cluster data will be removed."}`, options.yes)) { console.log("Cancelled."); return; }
+  console.log(`${options["dry-run"] ? "Preview" : "Target"}: ${target}`);
+  if (!options["dry-run"] && action === "uninstall" && !await confirm(`Uninstall Hibana from ${target}? ${options.context ? "External storage and the cluster are retained." : "Local cluster data will be removed."}`, options.yes)) { console.log("Cancelled."); return; }
   await run("python3", command);
 }

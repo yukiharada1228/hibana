@@ -62,9 +62,6 @@ const NONCE_LEN: usize = 24;
 ///
 /// HTTP へは一律 500（`FaasError::Internal`）に写像し、ボディには reason も値も出さない
 /// （`error.rs` の 5xx redaction と同じ思想）。`reason()` は**メトリクスラベル / 内部ログ専用**。
-// `KeyMissing` は現状のキーリング構築（active を必ず入れる）では到達しないが、
-// 将来 KEK の遅延解決を入れたときの分類として残す。
-#[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SecretError {
     /// 行が参照する kid がキーリングに無い（retired キーの早期撤去が典型）。
@@ -73,8 +70,6 @@ pub enum SecretError {
     BadEnvelope,
     /// 復号失敗（AAD 不一致 = 貼り替え / 改竄、または鍵違い）。
     DecryptFailed,
-    /// アクティブな KEK が解決できない（設定不備）。
-    KeyMissing,
     /// execution 基準で世代を解決できなかった（§4.7）。
     VersionUnresolved,
 }
@@ -86,7 +81,6 @@ impl SecretError {
             Self::UnknownKid => "unknown_kid",
             Self::BadEnvelope => "bad_envelope",
             Self::DecryptFailed => "decrypt_failed",
-            Self::KeyMissing => "key_missing",
             Self::VersionUnresolved => "version_unresolved",
         }
     }
@@ -390,8 +384,8 @@ pub fn rewrap(
 /// **execution 基準**で解決した secret 1 件（注入用）。
 pub struct ResolvedSecret {
     pub name: String,
-    /// 実際に注入した世代（execution 基準で固定された値）。監査・デバッグ用。
-    #[allow(dead_code)]
+    /// 実DBの回帰テストで、execution基準の世代解決を確認する。
+    #[cfg(test)]
     pub version: i32,
     pub value: hibana_shared::Redacted<String>,
 }
@@ -479,6 +473,7 @@ pub async fn resolve_for_injection(
 
         out.push(ResolvedSecret {
             name,
+            #[cfg(test)]
             version,
             value: hibana_shared::Redacted::new(value),
         });

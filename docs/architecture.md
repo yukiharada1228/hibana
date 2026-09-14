@@ -2,7 +2,7 @@
 
 Hibana の実行契約は `wasi:http/incoming-handler@0.2.3` です。言語別のビルドは CLI、HTTP の受付・認証・配備管理は Control Plane、Wasm の実行は Worker が担当します。
 
-CLIは独立したnpmパッケージです。HTTPS管理APIへのアプリ操作、別途導入したランタイムでの`dev`、明示的なKubernetes資格情報を使う管理者の基盤操作を分離しています。CLIから基盤ソースやローカルDockerを暗黙に参照しません。[配布とリモート接続の構成](remote-cli.md)を参照してください。
+CLIは独立したnpmパッケージです。HTTPS管理APIへのアプリ操作、PC用ランタイムでの`dev`、明示的なKubernetes資格情報を使う管理者の基盤操作を分離しています。`dev`は未導入のPC用ランタイムを自動取得します。CLIから基盤ソースやローカルDockerを暗黙に参照しません。[配布とリモート接続の構成](remote-cli.md)を参照してください。
 
 ## プロセスと実行経路
 
@@ -40,6 +40,7 @@ PostgreSQL は配備・実行記録・テナント情報の正本、Redis は共
 |---|---|
 | `sdk/src/` | 設定読み込み、言語別ビルド、ローカル起動、管理 API への配備。Hono 専用のサーバー契約を追加しない |
 | `shared/src/http.rs` | CP・dev・runtime 共通の型付き HTTP リクエスト、バイナリ符号化、本文サイズの契約 |
+| `shared/src/metrics.rs` | CP・Worker共通のPrometheus登録・テキスト出力・応答時間バケット。各プロセスのメトリクス定義はそれぞれの`metrics.rs`に置く |
 | `control-plane/src/bootstrap.rs` | 設定・接続・バックグラウンドタスク・listener の組立て |
 | `control-plane/src/routes.rs` | URL とハンドラーの対応、認証レイヤーの適用 |
 | `control-plane/src/handlers/` | 配備、実行履歴、認証、テナント、設定などの API ごとの入力検証・権限確認 |
@@ -71,6 +72,8 @@ PostgreSQL は配備・実行記録・テナント情報の正本、Redis は共
 
 `python3 scripts/check-architecture.py` は禁止した層への import / パス参照を検査する簡易ガードです。`scripts/rls-lint.sh`、Rust テスト、実 PostgreSQL の HTTP 受入試験、CLI の実 Wasmtime / 配備試験と合わせて検証します。
 
+共有ストアの`InProcStore`・`FailingStore`は`control-plane/src/store/test_support.rs`に置き、テスト時だけコンパイルします。実行時はRedis実装を使います。Workerの`wasmtime_memory_pages`は計測処理がなく常に0だったため削除しました。実際に更新するメモリ予約量・予算のメトリクスは引き続き公開します。
+
 ## デプロイ時の設定
 
 `handlers/deployment.rs`がvarsとSecret名を検証し、`version_configs`・`version_secret_bindings`へ版ごとの設定を保存します。`handlers/components.rs`が公開トランザクションを所有し、Secret利用許可の確認とactive版の切替までをまとめます。HTTP受付は版IDをexecutionへ固定し、WorkerはそのIDからvarsを取得します。Secretsの復号はCP内に閉じ、版が参照するSecretのIDとexecutionの受付時刻から値を解決します。[移行と権限の仕様](deployment.md)を参照してください。
@@ -79,9 +82,13 @@ PostgreSQL は配備・実行記録・テナント情報の正本、Redis は共
 
 実行先が設定されている場合、デプロイはWasm保存後にDNSで発見したWorkerへ`/prepare`を送り、全応答の成功後に公開トランザクションへ進みます。コンパイル中にDBの公開ロックを保持しません。準備失敗は503となり、旧版のactive設定は維持されます。rollback・active版の明示切替も対象版を準備してから行います。`WORKER_HTTP_URL`のない管理専用プロセスではWorker準備を省略します。
 
+S3へのPUT前に`artifact_reservations`へ保存先・版ID・ハッシュを記録します。PUT成功後に公開が失敗した場合は未登録オブジェクトを削除します。プロセス中断や削除失敗で残った記録は、有効期限の5分経過後に30秒周期の回収処理で再試行します。公開と回収は同じ記録の行ロックで直列化し、DBに登録済みの版が参照するオブジェクトは保持します。CPのS3資格情報には対象バケットの`DeleteObject`権限も必要です。
+
 `/prepare`は専用の署名を内部APIで検証し、SHA-256が一致するWasmだけを制限付き子プロセスでコンパイルします。ゲストのhandlerやSecrets引換えは実行しません。HTTP実行ではLRUまたはWorker自身が生成したローカルcwasmのみを読み、取得・コンパイルへ進みません。コンパイル済みComponentはWASIのimportを解決した`InstancePre`として同じLRUに保持します。ローカルcwasmからの再読込時もimportを解決します。取得した`PreparedComponent`の`Arc`を実行終了まで保持するため、その後のキャッシュ追い出しで再コンパイルされることもありません。各リクエストのStore・インスタンスは引き続き新規です。
 
-各Control Planeは有効版の再配置を一巡し、5秒待って繰り返します。追加・交換Workerもこれにより準備します。KubernetesのReadyはプロセス単位であり、全アプリの準備完了を意味しません。Workerは対象成果物が未準備なら実行を取得する前に明示的に拒否し、Control Planeは別Workerを試します。全候補が未準備の場合は準備完了まで503です。キャッシュ容量を超える有効成果物や全Worker同時交換でも無停止になる保証はありません。
+各Control Planeは有効版の再配置を一巡し、5秒待って繰り返します。追加・交換Workerもこれにより準備します。KubernetesのReadyはプロセス単位であり、全アプリの準備完了を意味しません。Workerは対象成果物が未準備なら実行を取得する前に明示的に拒否し、Control Planeは別Workerを試します。全候補が未準備の場合は準備完了まで503です。全Worker同時交換でも無停止になる保証はありません。
+
+ディスクキャッシュはWorkerごとに2 GiB・256成果物を上限とし、公開中・pending/running実行が参照中・有効な予約があるハッシュをDBから取得して削除対象から除外します。容量を確保できない場合はファイルを削除せず新しいデプロイを失敗させ、既存の公開版を保ちます。メモリのLRUから追い出されても保護したディスク成果物から読み直せます。各Workerが全公開アプリを準備するため、Workerの台数を増やしても保持できるアプリ総量は増えません。
 
 `PreparedComponent`の生成時には、Wasmtimeの`initialize_copy_on_write_image`で初期メモリの共有用イメージも準備します。特にLinuxでメモリ上のcwasmから読み込む場合、最初のインスタンス生成まで遅延されるmemfdへの書込みをここで済ませます。コンパイル後の読込み・メモリイメージ作成はblockingタスクで行い、HTTPを処理する非同期実行スレッドを占有しません。ゲストのstart関数・handlerは事前に実行しません。
 

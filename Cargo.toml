@@ -7,7 +7,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.1.0"
+version = "0.2.0-rc.1"
 edition = "2021"
 license = "MIT"
 
@@ -18,7 +18,6 @@ hibana-shared = { path = "crates/shared" }
 # --- Web / 非同期 ---
 axum = "0.8"
 tokio = { version = "1", features = ["full"] }
-tower = "0.5"
 tower-http = { version = "0.6", features = ["trace", "cors"] }
 
 # --- DB（query! マクロは使わずランタイム API のみ） ---
@@ -46,10 +45,8 @@ zeroize = "1"
 # XChaCha20-Poly1305（24 バイト nonce）を使うので、nonce を毎回 OsRng で引いても衝突確率が
 # 無視でき、カウンタ管理（＝状態）が要らない（ステートレス×N の CP と噛み合う）。
 chacha20poly1305 = { version = "0.10", features = ["alloc"], default-features = false }
-# LoginThrottle trait の async メソッド用（M3a は no-op スタブ、実装は M3d）。
+# 共有ストアとログイン制限の非同期 trait。
 async-trait = "0.1"
-
-# --- メッセージング ---
 
 # --- 分散トレーシング (M10, §3.8 / §10): opt-in（OTEL_EXPORTER_OTLP_ENDPOINT 設定時のみ有効）。
 # exporter は HTTP/protobuf（reqwest + rustls）を使い、gRPC(tonic/prost) と C 依存を持ち込まない
@@ -63,9 +60,6 @@ opentelemetry-otlp = { version = "0.32", default-features = false, features = [
     "reqwest-rustls",
 ] }
 tracing-opentelemetry = "0.33"
-
-# --- 同期 invoke の per-instance waiter registry（M6a, §15）。correlation_id -> oneshot::Sender の
-# 並行マップ。reply 購読タスク（remove）と invoke ハンドラ（insert）が共有ロックなしで触る。pure-Rust。
 
 # --- 共有ストア (M3d, §8): 全 Axum インスタンスで共有する低レイテンシカウンタ。
 # レート制限（token-bucket）/ 同時実行 in-flight / login 失敗ロックアウトを集計する。
@@ -89,7 +83,6 @@ redis = { version = "0.27", default-features = false, features = [
 # そのため AWS SDK の `default-features` を切り、`default-https-client`
 # (= rustls-aws-lc を強制) を取り込まないようにし、HTTP クライアントは
 # `aws-smithy-http-client` の rustls-ring 版をコードで明示注入する（storage.rs）。
-aws-config = { version = "1", default-features = false, features = ["behavior-version-latest"] }
 aws-sdk-s3 = { version = "1", default-features = false, features = [
     "behavior-version-latest",
     "sigv4a",
@@ -137,6 +130,3 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 # protobuf feature は使わず TextEncoder だけで /metrics を返す）。default-features = false で
 # protobuf 依存を含めない（cc 経由のビルドを回避するため明示）。
 prometheus = { version = "0.13", default-features = false }
-
-# --- Component (guest) ---
-wit-bindgen = "0.36"

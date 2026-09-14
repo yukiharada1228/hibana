@@ -183,19 +183,29 @@ pub(crate) async fn prepare_version(
     state: &AppState,
     tenant: &str,
     version: &str,
-) -> Result<(), AppError> {
+) -> Result<crate::artifact_reservations::Reservation, AppError> {
     let mut tx = state.pool().begin().await?;
     db::set_tenant_guc(&mut tx, tenant).await?;
     let row = sqlx::query("SELECT v.storage_uri,v.wasm_sha256 FROM component_versions v JOIN components c ON c.id=v.component_id AND c.tenant_id=v.tenant_id WHERE v.tenant_id=$1 AND v.id=$2 AND v.deleted_at IS NULL AND c.deleted_at IS NULL")
         .bind(tenant).bind(version).fetch_optional(&mut *tx).await?.ok_or_else(|| FaasError::NotFound("version".into()))?;
     tx.commit().await?;
+    let mut reservation = crate::artifact_reservations::Reservation::new(
+        state,
+        tenant,
+        version,
+        &row.get::<String, _>("storage_uri"),
+        &row.get::<String, _>("wasm_sha256"),
+    )
+    .await?;
+    reservation.confirm_object();
     prepare(
         state,
         tenant,
         &row.get::<String, _>("storage_uri"),
         &row.get::<String, _>("wasm_sha256"),
     )
-    .await
+    .await?;
+    Ok(reservation)
 }
 
 async fn reconcile(state: &AppState) -> Result<(), AppError> {

@@ -11,14 +11,11 @@ use sqlx::Row;
 // ---------------------------------------------------------------------------
 
 /// `function_secrets` のメタデータ 1 行（**値は含まない**）。
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, sqlx::FromRow)]
 pub struct SecretMetaRow {
     pub id: String,
     pub name: String,
     pub current_version: i32,
-    /// 作成時刻。M7c-3 の execution 基準の世代解決（§4.7）で参照する。
-    #[allow(dead_code)]
-    pub created_at: chrono::DateTime<chrono::Utc>,
     pub updated_at: chrono::DateTime<chrono::Utc>,
 }
 
@@ -56,26 +53,15 @@ pub async fn find_live_secret_by_name(
     component_id: &str,
     name: &str,
 ) -> Result<Option<SecretMetaRow>, sqlx::Error> {
-    let row = sqlx::query(
-        "SELECT id, name, current_version, created_at, updated_at FROM function_secrets \
+    sqlx::query_as(
+        "SELECT id, name, current_version, updated_at FROM function_secrets \
           WHERE tenant_id = $1 AND component_id = $2 AND name = $3 AND deleted_at IS NULL",
     )
     .bind(tenant_id)
     .bind(component_id)
     .bind(name)
     .fetch_optional(executor)
-    .await?;
-
-    row.map(|r| {
-        Ok(SecretMetaRow {
-            id: r.try_get("id")?,
-            name: r.try_get("name")?,
-            current_version: r.try_get("current_version")?,
-            created_at: r.try_get("created_at")?,
-            updated_at: r.try_get("updated_at")?,
-        })
-    })
-    .transpose()
+    .await
 }
 
 /// component の生存 secret を全件引く（**メタのみ**。値も value_len も kek_kid も返さない）。
@@ -84,26 +70,14 @@ pub async fn list_secrets_meta(
     tenant_id: &str,
     component_id: &str,
 ) -> Result<Vec<SecretMetaRow>, sqlx::Error> {
-    let rows = sqlx::query(
-        "SELECT id, name, current_version, created_at, updated_at FROM function_secrets \
+    sqlx::query_as(
+        "SELECT id, name, current_version, updated_at FROM function_secrets \
           WHERE tenant_id = $1 AND component_id = $2 AND deleted_at IS NULL ORDER BY name",
     )
     .bind(tenant_id)
     .bind(component_id)
     .fetch_all(executor)
-    .await?;
-
-    rows.into_iter()
-        .map(|r| {
-            Ok(SecretMetaRow {
-                id: r.try_get("id")?,
-                name: r.try_get("name")?,
-                current_version: r.try_get("current_version")?,
-                created_at: r.try_get("created_at")?,
-                updated_at: r.try_get("updated_at")?,
-            })
-        })
-        .collect()
+    .await
 }
 
 /// 版台帳へ 1 行 INSERT する（追記専用）。`reason` は `'create' | 'rotate' | 'rekey'`。
@@ -238,25 +212,14 @@ pub async fn find_secret_meta_by_id(
     tenant_id: &str,
     secret_id: &str,
 ) -> Result<Option<SecretMetaRow>, sqlx::Error> {
-    let row = sqlx::query(
-        "SELECT id, name, current_version, created_at, updated_at FROM function_secrets \
+    sqlx::query_as(
+        "SELECT id, name, current_version, updated_at FROM function_secrets \
           WHERE tenant_id = $1 AND id = $2 AND deleted_at IS NULL",
     )
     .bind(tenant_id)
     .bind(secret_id)
     .fetch_optional(executor)
-    .await?;
-
-    row.map(|r| {
-        Ok(SecretMetaRow {
-            id: r.try_get("id")?,
-            name: r.try_get("name")?,
-            current_version: r.try_get("current_version")?,
-            created_at: r.try_get("created_at")?,
-            updated_at: r.try_get("updated_at")?,
-        })
-    })
-    .transpose()
+    .await
 }
 
 /// 指定 secret の指定版の封筒を引く。

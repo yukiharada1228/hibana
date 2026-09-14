@@ -1,17 +1,9 @@
-#![allow(dead_code)]
-
 use std::sync::Arc;
 
+use hibana_shared::metrics::{default_latency_buckets, register, render};
 use prometheus::{
-    Encoder, HistogramOpts, HistogramVec, IntCounter, IntCounterVec, IntGauge, Opts, Registry,
-    TextEncoder,
+    HistogramOpts, HistogramVec, IntCounter, IntCounterVec, IntGauge, Opts, Registry,
 };
-
-fn default_latency_buckets() -> Vec<f64> {
-    vec![
-        0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0,
-    ]
-}
 
 pub struct Metrics {
     pub registry: Registry,
@@ -20,7 +12,6 @@ pub struct Metrics {
     pub capacity_rejections_total: IntCounterVec,
     pub active_compilations: IntGauge,
     pub wasmtime_execution_duration_seconds: HistogramVec,
-    pub wasmtime_memory_pages: IntGauge,
     pub wasmtime_component_cache_hits_total: IntCounterVec,
     pub wasmtime_component_cache_misses_total: IntCounter,
     pub executions_total: IntCounterVec,
@@ -32,127 +23,104 @@ pub struct Metrics {
 impl Metrics {
     pub fn init() -> Arc<Self> {
         let registry = Registry::new();
-        let control_plane_request_duration_seconds = HistogramVec::new(
+        let control_plane_request_duration_seconds = register(&registry, HistogramVec::new(
             HistogramOpts::new(
                 "hibana_worker_control_plane_request_duration_seconds",
                 "Internal control-plane requests including response body, by operation and outcome",
             )
             .buckets(default_latency_buckets()),
             &["operation", "outcome"],
-        )
-        .expect("metric: control_plane_request_duration_seconds");
-        registry
-            .register(Box::new(control_plane_request_duration_seconds.clone()))
-            .expect("register control_plane_request_duration_seconds");
+        ));
 
-        let wasmtime_execution_duration_seconds = HistogramVec::new(
-            HistogramOpts::new(
-                "wasmtime_execution_duration_seconds",
-                "Wasm component execution wall-clock duration in seconds",
-            )
-            .buckets(default_latency_buckets()),
-            &["outcome"],
-        )
-        .expect("metric: wasmtime_execution_duration_seconds");
-        registry
-            .register(Box::new(wasmtime_execution_duration_seconds.clone()))
-            .expect("register wasmtime_execution_duration_seconds");
-
-        let wasmtime_memory_pages = IntGauge::new(
-            "wasmtime_memory_pages",
-            "Last observed Wasm linear memory size in pages (1 page = 64KiB)",
-        )
-        .expect("metric: wasmtime_memory_pages");
-        registry
-            .register(Box::new(wasmtime_memory_pages.clone()))
-            .expect("register wasmtime_memory_pages");
-
-        let wasmtime_component_cache_hits_total = IntCounterVec::new(
-            Opts::new(
-                "wasmtime_component_cache_hits_total",
-                "Component cache hits broken down by tier (lru / cwasm)",
+        let wasmtime_execution_duration_seconds = register(
+            &registry,
+            HistogramVec::new(
+                HistogramOpts::new(
+                    "wasmtime_execution_duration_seconds",
+                    "Wasm component execution wall-clock duration in seconds",
+                )
+                .buckets(default_latency_buckets()),
+                &["outcome"],
             ),
-            &["tier"],
-        )
-        .expect("metric: wasmtime_component_cache_hits_total");
-        registry
-            .register(Box::new(wasmtime_component_cache_hits_total.clone()))
-            .expect("register wasmtime_component_cache_hits_total");
+        );
 
-        let wasmtime_component_cache_misses_total = IntCounter::new(
-            "wasmtime_component_cache_misses_total",
-            "Component cache misses (forced download + precompile)",
-        )
-        .expect("metric: wasmtime_component_cache_misses_total");
-        registry
-            .register(Box::new(wasmtime_component_cache_misses_total.clone()))
-            .expect("register wasmtime_component_cache_misses_total");
-
-        let executions_total = IntCounterVec::new(
-            Opts::new(
-                "executions_total",
-                "Total executions handled by this worker, by outcome",
+        let wasmtime_component_cache_hits_total = register(
+            &registry,
+            IntCounterVec::new(
+                Opts::new(
+                    "wasmtime_component_cache_hits_total",
+                    "Component cache hits broken down by tier (lru / cwasm)",
+                ),
+                &["tier"],
             ),
-            &["outcome"],
-        )
-        .expect("metric: executions_total");
-        registry
-            .register(Box::new(executions_total.clone()))
-            .expect("register executions_total");
+        );
 
-        let guest_stderr_dropped_bytes_total = IntCounter::new(
-            "faas_guest_stderr_dropped_bytes_total",
-            "Guest stderr bytes discarded because the execution had secrets injected",
-        )
-        .expect("metric: guest_stderr_dropped_bytes_total");
-        registry
-            .register(Box::new(guest_stderr_dropped_bytes_total.clone()))
-            .expect("register guest_stderr_dropped_bytes_total");
-
-        let inflight_executions = IntGauge::new(
-            "wasmtime_inflight_executions",
-            "Executions currently running in this worker process",
-        )
-        .expect("metric: inflight_executions");
-        registry
-            .register(Box::new(inflight_executions.clone()))
-            .expect("register inflight_executions");
-
-        let guest_memory_budget_bytes = IntGauge::new(
-            "hibana_worker_guest_memory_budget_bytes",
-            "Configured guest linear-memory reservation budget",
-        )
-        .unwrap();
-        let guest_memory_reserved_bytes = IntGauge::new(
-            "hibana_worker_guest_memory_reserved_bytes",
-            "Reserved guest linear memory, rounded up to MiB",
-        )
-        .unwrap();
-        let active_compilations = IntGauge::new(
-            "hibana_worker_active_compilations",
-            "Currently compiling components",
-        )
-        .unwrap();
-        let capacity_rejections_total = IntCounterVec::new(
-            Opts::new(
-                "hibana_worker_capacity_rejections_total",
-                "Pre-execution capacity refusals",
+        let wasmtime_component_cache_misses_total = register(
+            &registry,
+            IntCounter::new(
+                "wasmtime_component_cache_misses_total",
+                "Component cache misses (forced download + precompile)",
             ),
-            &["reason"],
-        )
-        .unwrap();
-        registry
-            .register(Box::new(guest_memory_budget_bytes.clone()))
-            .unwrap();
-        registry
-            .register(Box::new(guest_memory_reserved_bytes.clone()))
-            .unwrap();
-        registry
-            .register(Box::new(active_compilations.clone()))
-            .unwrap();
-        registry
-            .register(Box::new(capacity_rejections_total.clone()))
-            .unwrap();
+        );
+
+        let executions_total = register(
+            &registry,
+            IntCounterVec::new(
+                Opts::new(
+                    "executions_total",
+                    "Total executions handled by this worker, by outcome",
+                ),
+                &["outcome"],
+            ),
+        );
+
+        let guest_stderr_dropped_bytes_total = register(
+            &registry,
+            IntCounter::new(
+                "faas_guest_stderr_dropped_bytes_total",
+                "Guest stderr bytes discarded because the execution had secrets injected",
+            ),
+        );
+
+        let inflight_executions = register(
+            &registry,
+            IntGauge::new(
+                "wasmtime_inflight_executions",
+                "Executions currently running in this worker process",
+            ),
+        );
+
+        let guest_memory_budget_bytes = register(
+            &registry,
+            IntGauge::new(
+                "hibana_worker_guest_memory_budget_bytes",
+                "Configured guest linear-memory reservation budget",
+            ),
+        );
+        let guest_memory_reserved_bytes = register(
+            &registry,
+            IntGauge::new(
+                "hibana_worker_guest_memory_reserved_bytes",
+                "Reserved guest linear memory, rounded up to MiB",
+            ),
+        );
+        let active_compilations = register(
+            &registry,
+            IntGauge::new(
+                "hibana_worker_active_compilations",
+                "Currently compiling components",
+            ),
+        );
+        let capacity_rejections_total = register(
+            &registry,
+            IntCounterVec::new(
+                Opts::new(
+                    "hibana_worker_capacity_rejections_total",
+                    "Pre-execution capacity refusals",
+                ),
+                &["reason"],
+            ),
+        );
         Arc::new(Self {
             control_plane_request_duration_seconds,
             guest_memory_budget_bytes,
@@ -161,7 +129,6 @@ impl Metrics {
             capacity_rejections_total,
             registry,
             wasmtime_execution_duration_seconds,
-            wasmtime_memory_pages,
             wasmtime_component_cache_hits_total,
             wasmtime_component_cache_misses_total,
             executions_total,
@@ -171,18 +138,7 @@ impl Metrics {
     }
 
     pub fn render(&self) -> (axum::http::HeaderMap, String) {
-        let metric_families = self.registry.gather();
-        let mut buf = Vec::new();
-        let encoder = TextEncoder::new();
-        if let Err(e) = encoder.encode(&metric_families, &mut buf) {
-            tracing::warn!(error = %e, "failed to encode prometheus metrics");
-        }
-        let body = String::from_utf8(buf).unwrap_or_default();
-        let mut headers = axum::http::HeaderMap::new();
-        if let Ok(v) = axum::http::HeaderValue::from_str(TextEncoder::new().format_type()) {
-            headers.insert(axum::http::header::CONTENT_TYPE, v);
-        }
-        (headers, body)
+        render(&self.registry)
     }
 }
 
@@ -197,8 +153,15 @@ mod tests {
         m.wasmtime_component_cache_hits_total
             .with_label_values(&["lru"])
             .inc();
-        let (_h, body) = m.render();
-        assert!(body.contains("executions_total"));
-        assert!(body.contains("wasmtime_component_cache_hits_total"));
+        m.guest_memory_reserved_bytes.set(1_048_576);
+        let (headers, body) = m.render();
+        assert_eq!(
+            headers[axum::http::header::CONTENT_TYPE],
+            "text/plain; version=0.0.4"
+        );
+        assert!(body.contains("executions_total{outcome=\"succeeded\"} 1"));
+        assert!(body.contains("wasmtime_component_cache_hits_total{tier=\"lru\"} 1"));
+        assert!(body.contains("hibana_worker_guest_memory_reserved_bytes 1048576"));
+        assert!(!body.contains("wasmtime_memory_pages"));
     }
 }

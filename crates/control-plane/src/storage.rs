@@ -110,4 +110,21 @@ impl Storage {
 
         Ok(req.uri().to_string())
     }
+
+    pub(crate) async fn delete_object(&self, key: &str) -> Result<(), FaasError> {
+        // Cleanup holds only a journal-row lock, with a shorter I/O deadline than
+        // the DB transaction timeout. Failed deletes retain the journal for retry.
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            self.client
+                .delete_object()
+                .bucket(&self.bucket)
+                .key(key)
+                .send(),
+        )
+        .await
+        .map_err(|_| FaasError::Unavailable)?
+        .map_err(|_| FaasError::Unavailable)?;
+        Ok(())
+    }
 }

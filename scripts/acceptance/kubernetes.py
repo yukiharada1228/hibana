@@ -15,7 +15,7 @@ import secrets
 import sys
 import threading
 import time
-from urllib.request import urlopen
+from urllib.request import Request, urlopen
 
 ROOT = Path(__file__).resolve().parents[2]
 sys.path[:0] = [str(ROOT / 'scripts'), str(ROOT / 'sdk/platform')]
@@ -216,14 +216,46 @@ def main():
         print('Verifying CLI platform stop/start, application deletion and platform uninstall', flush=True)
         def platform(action):
             command('node', args.cli_entry, 'platform', action, '--kubeconfig', cluster.kubeconfig,
-                    '--context', f'kind-{CLUSTER}', '--yes', timeout=900)
+                    '--context', f'kind-{CLUSTER}', *(['--yes'] if action == 'uninstall' else []), timeout=900)
 
         def dependencies_preserved():
             for dependency in ('postgres', 'redis', 'minio'):
                 if operations.deployment(dependency).get('status', {}).get('readyReplicas', 0) < 1:
                     raise ValueError('External dependency was stopped or removed')
 
-        platform('stop')
+        drain = {}
+        with operations.forward('control-plane', 8083) as apps:
+            state = json.loads((folder / 'client.json').read_text())
+            def slow_request():
+                try:
+                    request = Request(apps + '/items/DRAIN', headers={
+                        'Host': 'inventory-api.smoke.hibana.local',
+                        'Authorization': 'Bearer ' + state['apiToken']})
+                    with urlopen(request, timeout=20) as response:
+                        drain['status'] = response.status
+                        drain['body_valid'] = json.load(response) == {'sku':'DRAIN','name':'Drain check','available':1}
+                    drain['gate_closed_at_completion'] = operations.sql('SELECT owner IS NOT NULL FROM platform_maintenance WHERE singleton') == 't'
+                except Exception as error:
+                    drain['error'] = type(error).__name__
+            request_thread = threading.Thread(target=slow_request)
+            request_thread.start()
+            try:
+                deadline = time.monotonic() + 5
+                execution = ''
+                while time.monotonic() < deadline and not execution:
+                    execution = operations.sql("SELECT id FROM executions WHERE status='running' ORDER BY created_at DESC LIMIT 1")
+                    if not execution:
+                        time.sleep(0.1)
+                if not execution:
+                    raise ValueError('Slow guest did not enter execution before the drain check')
+                platform('stop')
+            finally:
+                request_thread.join(timeout=25)
+            if request_thread.is_alive() or drain != {'status':200,'body_valid':True,'gate_closed_at_completion':True}:
+                raise ValueError('In-flight HTTP request did not complete during CLI platform stop')
+            if operations.sql("SELECT status FROM executions WHERE id='" + execution + "'") != 'succeeded':
+                raise ValueError('Worker completion was not persisted before platform stop')
+        report['stop_inflight_http'] = drain
         for name in ('control-plane', 'worker'):
             deployment = operations.deployment(name)
             if deployment['spec'].get('replicas') != 0:
@@ -234,6 +266,15 @@ def main():
         dependencies_preserved()
         report['platform_stopped'] = True
         platform('start')
+        # Keep the published applications in the external DB, then reinstall to
+        # exercise recovery of the namespace's saved maintenance owner as well.
+        platform('uninstall')
+        dependencies_preserved()
+        command('node', args.cli_entry, 'platform', 'install', '--kubeconfig', cluster.kubeconfig,
+                '--context', f'kind-{CLUSTER}', '--overlay', LOCAL, '--image', image, timeout=900)
+        if operations.sql('SELECT owner IS NULL FROM platform_maintenance WHERE singleton') != 't':
+            raise ValueError('Reinstall did not reopen admission after preparing retained applications')
+        report['reinstall_preserved_applications'] = True
         with operations.forward('control-plane', 8080) as api, operations.forward('control-plane', 8083) as apps:
             state = json.loads((folder / 'client.json').read_text())
             state.update(url=api, gateway=apps)

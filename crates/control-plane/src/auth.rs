@@ -24,11 +24,8 @@ use crate::state::AppState;
 
 /// 認証済みの呼び出し主体（principal）。request extension 経由でハンドラへ渡る。
 ///
-/// `user_id` / `token_id` / `role` は principal 契約（§6.0）の一部として確立する。
-/// M3a の現ハンドラ群は `tenant_id` と `scopes` のみ参照するが、後続スライス
-/// （監査ログ・per-user 認可・トークン所有確認）で読むため保持する。
+/// テナント境界、スコープ・ロール認可、監査ログの主体を保持する。
 #[derive(Debug, Clone)]
-#[allow(dead_code)]
 pub struct Principal {
     /// 解決済みテナント ID（全 DB アクセスのテナント境界）。
     pub tenant_id: String,

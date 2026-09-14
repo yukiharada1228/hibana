@@ -14,6 +14,11 @@ http.createServer(async (req, res) => {
   if (sku === 'LARGE') return res.end(JSON.stringify({name:'x'.repeat(20000)}));
   if (sku === 'INVALID') return res.end('{"sku":"INVALID","name":"Invalid","available":-1}');
   if (sku === 'MISSING') { res.statusCode=404; return res.end('{}'); }
+  // A real Wasm guest remains in flight while the CLI closes admission.
+  if (sku === 'DRAIN') {
+    await new Promise(done => setTimeout(done,8000));
+    return res.end(JSON.stringify({sku,name:'Drain check',available:1}));
+  }
   if (sku !== 'PEN-001') { res.statusCode=404; return res.end('{}'); }
   res.end(JSON.stringify({sku, name:'Hibana pen', available:42, internal_token:token}));
 }).listen(8080, '0.0.0.0');

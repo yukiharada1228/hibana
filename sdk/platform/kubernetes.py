@@ -18,16 +18,18 @@ from urllib.parse import urlsplit
 
 import yaml
 from common import KubernetesTarget, stamp_runtime_settings
+from maintenance import Maintenance, NoControlPlane
 
 ROOT = Path(__file__).resolve().parents[2]
 LOCAL = ROOT / "deploy/kubernetes/local"
 
 
-def run(*args, capture=False, input=None, env=None, quiet=False):
+def run(*args, capture=False, input=None, env=None, quiet=False, timeout=None):
     return subprocess.run(
         [str(arg) for arg in args], cwd=ROOT, check=True, text=True,
         input=input, stdout=subprocess.PIPE if capture else None, env=env,
         stderr=subprocess.DEVNULL if quiet else None,
+        timeout=timeout,
     ).stdout
 
 
@@ -65,7 +67,7 @@ class LocalCluster(KubernetesTarget):
                         "back up and recreate the old cluster; see deploy/kubernetes/README.md."
                     )
             if any(not node["State"]["Running"] for node in self.owned_nodes()):
-                self.start()
+                self.start(wait_runtime=False)
         else:
             self.state.mkdir(parents=True, exist_ok=True, mode=0o700)
             run(self.kind, "create", "cluster", "--name", self.name, "--config", LOCAL / "kind.yaml",
@@ -91,7 +93,7 @@ class LocalCluster(KubernetesTarget):
             raise ValueError("Unexpected kind node names; no changes made.")
         return nodes
 
-    def start(self):
+    def start(self, wait_runtime=True):
         nodes = self.owned_nodes()
         stopped = [n["Id"] for n in nodes if not n["State"]["Running"]]
         resumed_at = datetime.now(timezone.utc) if stopped else None
@@ -108,10 +110,43 @@ class LocalCluster(KubernetesTarget):
                     raise ValueError("Kubernetes did not resume within 120 seconds.") from None
                 time.sleep(2)
         self.kube("wait", "--for=condition=Ready", "node", "--all", "--timeout=120s")
+        if not wait_runtime:
+            # Installation will repair absent/broken workloads after node resume.
+            return
         self.wait_workloads(resumed_at, {n["Name"].lstrip("/") for n in nodes if not n["State"]["Running"]})
         for component in ("control-plane", "worker"):
             self.kube("-n", "hibana", "rollout", "status", f"deployment/hibana-{component}", "--timeout=180s")
+        self.resume_admission()
         print(f"Started local cluster {self.name}. Data was preserved.")
+
+    def pause_admission(self):
+        maintenance = Maintenance(self)
+        try:
+            maintenance.control_plane()
+        except NoControlPlane:
+            print("No Control Plane is running. The owned local cluster will stop using container termination grace periods.")
+            return
+        path = self.state / "maintenance.json"
+        if path.exists():
+            owner = json.loads(path.read_text())["owner"]
+        else:
+            owner = secrets.token_hex(16)
+            with path.open("x") as stream:
+                os.chmod(path, 0o600)
+                json.dump({"owner": owner}, stream)
+        maintenance.close(owner)
+        maintenance.drain()
+
+    def resume_admission(self):
+        path = self.state / "maintenance.json"
+        if not path.exists():
+            return
+        owner = json.loads(path.read_text())["owner"]
+        maintenance = Maintenance(self)
+        maintenance.close(owner)
+        maintenance.prepare(owner)
+        maintenance.open(owner)
+        path.unlink()
 
     def wait_workloads(self, resumed_at=None, restarted_nodes=None):
         """Do not trust persisted Pod/Deployment Ready conditions after a node restart."""
@@ -131,18 +166,21 @@ class LocalCluster(KubernetesTarget):
         nodes = self.owned_nodes()
         running = [n["Id"] for n in nodes if n["State"]["Running"]]
         if running:
+            self.pause_admission()
             run("docker", "stop", "--timeout", "60", *running)
         if any(n["State"]["Running"] for n in self.owned_nodes()):
             raise ValueError("Some kind nodes are still running.")
         print(f"Stopped local cluster {self.name}. Data is preserved; use hibana platform start --source {shlex.quote(str(ROOT))} --cluster {self.name} to resume.")
 
     def uninstall(self):
-        self.owned_nodes()
+        nodes = self.owned_nodes()
+        if nodes and all(n["State"]["Running"] for n in nodes):
+            self.pause_admission()
         run(self.kind, "delete", "cluster", "--name", self.name, "--kubeconfig", self.kubeconfig)
         remaining = run("docker", "ps", "-aq", "--filter", f"label=io.x-k8s.kind.cluster={self.name}", capture=True).strip()
         if remaining:
             raise ValueError("Cluster deletion is incomplete; local state was retained.")
-        for name in ("kubeconfig", "sdk.env", "secrets.json"):
+        for name in ("kubeconfig", "sdk.env", "secrets.json", "maintenance.json"):
             (self.state / name).unlink(missing_ok=True)
         print(f"Uninstalled local cluster {self.name}.")
 
@@ -245,9 +283,41 @@ class LocalCluster(KubernetesTarget):
             return LOCAL / "dependencies"
         return LOCAL.parent / "persistent-dependencies"
 
+    def preflight(self):
+        for tool in ["docker", "kubectl", self.kind]:
+            if not shutil.which(tool):
+                raise ValueError(f"Required tool not found: {tool}. Install it and ensure it is on PATH.")
+        run("docker", "info", "--format", "{{.ServerVersion}}", capture=True, timeout=20)
+        self.render(LOCAL, "hibana-platform:preflight")
+        self.render(LOCAL / "migration", "hibana-platform:preflight")
+        print("Local checks passed: Docker, kind, kubectl and Kubernetes manifests.")
+
+    def preview(self, action):
+        if action == "install":
+            self.preflight()
+            clusters = run(self.kind, "get", "clusters", capture=True).splitlines()
+            if self.name in clusters:
+                self.owned_nodes()
+            print(f"  {'reuse' if self.name in clusters else 'create'} kind cluster {self.name}")
+            print("  build and load the platform image; prepare credentials and persistent dependencies")
+            print("  run the database migration; deploy Control Plane and Worker; verify HTTP and tenant login")
+            print("Image and generated-credential diffs require the build and are not computed in this preview.")
+        else:
+            nodes = self.owned_nodes()
+            for node in nodes:
+                print(f"  {action} {node['Name']} (currently {'running' if node['State']['Running'] else 'stopped'})")
+            if action == "uninstall":
+                print("  delete the owned cluster's data and local credentials")
+        print("Dry run complete. No resources were changed.")
+
     def install(self):
+        self.install_phase = "local preflight"
+        self.preflight()
+        self.install_phase = "cluster creation"
         self.ensure_cluster()
         credentials = self.credentials()
+        self.install_phase = "image build"
+        print("Installing: image build")
         # A fresh provenance attestation would change the image index even for a cached build.
         run("docker", "build", "--provenance=false", "-t", "hibana-platform:dev", ".")
         digest = run("docker", "image", "inspect", "hibana-platform:dev", "--format", "{{.Id}}", capture=True).strip()
@@ -260,14 +330,21 @@ class LocalCluster(KubernetesTarget):
         stamp_runtime_settings(docs, credentials["items"])
         self.apply([doc for doc in docs if doc["kind"] == "Namespace"])
         self.apply(credentials["items"])
+        self.install_phase = "dependencies"
+        print("Installing: dependencies")
         self.kube("apply", "-k", self.dependency_path())
         for dependency in ["postgres", "redis", "minio"]:
             self.kube("-n", "hibana", "rollout", "status", f"deployment/hibana-{dependency}", "--timeout=180s")
         self.kube("-n", "hibana", "wait", "--for=condition=complete", "job/hibana-local-bucket", "--timeout=180s")
+        self.install_phase = "database migration"
+        print("Installing: database migration")
         self.migrate(image)
+        self.install_phase = "workload rollout"
+        print("Installing: workload rollout")
         self.apply(docs)
         for component in ["control-plane", "worker"]:
             self.kube("-n", "hibana", "rollout", "status", f"deployment/hibana-{component}", "--timeout=300s")
+        self.resume_admission()
         wait_http("http://127.0.0.1:18080/readyz", 200)
         wait_http("http://127.0.0.1:18084/", 404, {"Host": "startup-probe.smoke.hibana.local"})
         self.bootstrap()
@@ -332,6 +409,7 @@ def main():
     parser.add_argument("--context")
     parser.add_argument("--overlay", type=Path)
     parser.add_argument("--image")
+    parser.add_argument("--dry-run", action="store_true")
     args = parser.parse_args()
     os.umask(0o077)
     try:
@@ -340,9 +418,15 @@ def main():
             target = ExistingCluster(args.kubeconfig, args.context, args.overlay, args.image)
         else:
             target = LocalCluster(args.cluster)
-        getattr(target, args.action)()
-    except (ValueError, OSError, subprocess.CalledProcessError) as error:
+        if args.dry_run:
+            target.preview(args.action)
+        else:
+            getattr(target, args.action)()
+    except (ValueError, OSError, subprocess.SubprocessError) as error:
         print(f"Error: {error}", file=sys.stderr)
+        if "target" in locals():
+            print(f"Stopped during: {getattr(target, 'install_phase', args.action)}", file=sys.stderr)
+        print("Retry after fixing the issue: " + shlex.join(["hibana", "platform", args.action, "--source", str(ROOT), "--cluster", args.cluster] + (["--dry-run"] if args.dry_run else [])), file=sys.stderr)
         return 1
     except KeyboardInterrupt:
         return 130

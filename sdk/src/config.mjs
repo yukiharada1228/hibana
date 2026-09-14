@@ -1,9 +1,21 @@
 import { readFile } from "node:fs/promises";
 import { resolve, dirname, isAbsolute } from "node:path";
+export async function readConfigFile(file = "hibana.json") {
+  const path = resolve(file);
+  let contents, value;
+  try { contents = await readFile(path, "utf8"); }
+  catch (error) {
+    if (error.code === "ENOENT") throw new Error(`Project configuration not found: ${path}\nRun from your application directory, use --config FILE, or create an app with hibana init my-api.`, { cause: error });
+    throw error;
+  }
+  try { value = JSON.parse(contents); }
+  catch (error) { throw new Error(`Invalid JSON in ${path}. Check the file's JSON syntax.`, { cause: error }); }
+  if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error("hibana.json must be an object");
+  return value;
+}
 export async function loadConfig(file = "hibana.json") {
   const path = resolve(file);
-  const value = JSON.parse(await readFile(path, "utf8"));
-  if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error("hibana.json must be an object");
+  const value = await readConfigFile(path);
   const supported = new Set(["name", "main", "component", "build", "vars", "secrets", "limits"]);
   for (const key of Object.keys(value)) if (!supported.has(key)) throw new Error(`Unsupported hibana.json field: ${key}`);
   if (!/^[a-z](?:[a-z0-9-]{0,61}[a-z0-9])?$/.test(value.name || "")) throw new Error("name must be a lowercase DNS label (1..63 characters)");

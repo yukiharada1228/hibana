@@ -4,19 +4,12 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use uuid::Uuid;
 
-// ============================================================================
-// 既定テナント (M1)
-// ============================================================================
-
-/// M1 で固定使用する単一テナント ID。
-/// TODO(§3.2 / §6.0): M3 で認証コンテキストから解決する。
-pub const DEFAULT_TENANT: &str = "default";
-
 mod redacted;
 pub use redacted::{expose_once, Redacted};
 
 pub mod egress;
 pub mod http;
+pub mod metrics;
 pub mod otel;
 pub mod preparation;
 
@@ -27,6 +20,10 @@ pub mod preparation;
 /// `{prefix}_{uuid_simple}` 形式の不透明 ID を生成する。
 fn new_prefixed_id(prefix: &str) -> String {
     format!("{prefix}_{}", Uuid::new_v4().simple())
+}
+
+pub fn new_artifact_reservation_id() -> String {
+    new_prefixed_id("artifact")
 }
 
 /// `cmp_*` Component ID を生成する。

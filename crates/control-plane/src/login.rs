@@ -14,7 +14,7 @@
 //! ロックアウト (M3d, §6.0 / §8): [`crate::store::Store`] ベースの分散ロックアウト。失敗を
 //! **2 つの鍵**でカウントする —— `(tenant_slug, email)` と **クライアント IP** —— どちらかが
 //! 閾値を超えたら 401（fail-CLOSED）。fail-closed の意味は **ストア到達不能でも拒否** であり、
-//! Redis 障害時にブルートフォースを素通しさせない（[`crate::store::FailPolicy::LOGIN_LOCKOUT`]）。
+//! Redis 障害時もログインを拒否し、ブルートフォースを素通しさせない。
 //!
 //! TIMING-ORACLE 不変条件 (MUST): ロックアウト棄却の早期 return は、資格情報失敗の 401 が
 //! 経由する argon2 verify を踏まないため、そのままだとロックアウト 401 のほうが速くなる
@@ -273,7 +273,7 @@ enum LockoutCheck {
 /// 1 鍵のロックアウトをストアに問い合わせる（カウントは増やさない）。
 ///
 /// `Err`（到達不能）は [`LockoutCheck::Unavailable`] にし、呼び出し側で fail-closed（拒否）扱い
-/// にする（§8: login=FailPolicy::Closed）。
+/// にする（共有ストアの障害時も拒否する）。
 async fn check_lockout(
     state: &AppState,
     key: &str,

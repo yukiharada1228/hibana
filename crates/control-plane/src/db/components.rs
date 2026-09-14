@@ -63,6 +63,23 @@ pub async fn find_component_by_id(
     .transpose()
 }
 
+/// Serialize publication and deletion on the parent row. Read version state in
+/// a subsequent statement, after acquiring this lock, so it sees the winner's commit.
+pub async fn lock_component(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    tenant_id: &str,
+    component_id: &str,
+) -> Result<bool, sqlx::Error> {
+    Ok(sqlx::query(
+        "SELECT id FROM components WHERE tenant_id=$1 AND id=$2 AND deleted_at IS NULL FOR UPDATE",
+    )
+    .bind(tenant_id)
+    .bind(component_id)
+    .fetch_optional(&mut **tx)
+    .await?
+    .is_some())
+}
+
 /// 検証通過した version を登録する (§6.2)。
 ///
 /// 同一 (component_id, version) の重複は UNIQUE 違反（呼び出し側で 409/422 へ）。
@@ -106,6 +123,7 @@ pub async fn insert_version(
     Ok(())
 }
 
+/// Caller holds the component lock; recheck the live version after external preparation.
 pub async fn switch_active_version(
     executor: impl sqlx::PgExecutor<'_>,
     tenant_id: &str,
@@ -121,12 +139,15 @@ pub async fn switch_active_version(
     Ok(r.rows_affected() > 0)
 }
 
-pub(super) const SWITCH_ACTIVE_VERSION_SQL: &str = "UPDATE components \
+pub(super) const SWITCH_ACTIVE_VERSION_SQL: &str = "UPDATE components c \
         SET previous_active_version_id = CASE \
-                WHEN active_version_id IS DISTINCT FROM $3 THEN active_version_id \
-                ELSE previous_active_version_id END, \
-            active_version_id = $3 \
-      WHERE tenant_id = $1 AND id = $2 AND deleted_at IS NULL";
+                WHEN c.active_version_id IS DISTINCT FROM cv.id THEN c.active_version_id \
+                ELSE c.previous_active_version_id END, \
+            active_version_id = cv.id \
+       FROM component_versions cv \
+      WHERE c.tenant_id = $1 AND c.id = $2 AND c.deleted_at IS NULL \
+        AND cv.id = $3 AND cv.tenant_id = c.tenant_id AND cv.component_id = c.id \
+        AND cv.deleted_at IS NULL";
 
 pub(super) const ROLLBACK_ACTIVE_VERSION_SQL: &str = "UPDATE components c \
         SET previous_active_version_id = CASE \

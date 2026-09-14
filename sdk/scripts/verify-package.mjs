@@ -29,7 +29,10 @@ try {
   const packed = JSON.parse(await run("npm", ["pack", "--json", "--pack-destination", temporary, ...(github ? ["--ignore-scripts", release] : [])], sdk))[0];
   assert.equal(packed.version, metadata.version);
   const paths = packed.files.map(f => f.path);
-  for (const required of ["LICENSE", "src/cli.mjs", "src/runtime.mjs", "src/profiles.mjs", "platform/remote.py", "platform/common.py", "platform/existing.py", "platform/manifests/migration/job.yaml", "templates/hono/src/index.ts", "wit/world.wit"]) assert.ok(paths.includes(required), required);
+  assert.ok(paths.includes("platform/network.py"), "platform/network.py");
+  assert.ok(paths.includes("platform/operation.py"), "platform/operation.py");
+  assert.ok(paths.includes("platform/readiness.py"), "platform/readiness.py");
+  for (const required of ["LICENSE", "src/cli.mjs", "src/runtime.mjs", "src/profiles.mjs", "platform/remote.py", "platform/common.py", "platform/maintenance.py", "platform/preflight.py", "platform/existing.py", "platform/manifests/base/kustomization.yaml", "platform/manifests/remote/ingress.yaml", "platform/manifests/migration/job.yaml", "templates/hono/src/index.ts", "wit/world.wit"]) assert.ok(paths.includes(required), required);
   assert.ok(paths.every(path => !/^(examples|test|node_modules)\/|kubernetes\.py$|\.hibana|\.env$|Dockerfile|Cargo\.toml/.test(path) || path === "templates/rust/Cargo.toml"));
   const tarball = join(temporary, packed.filename);
   if (github) {
@@ -45,8 +48,8 @@ try {
   assert.equal((await run(process.execPath, [cli, "--version"])).trim(), `hibana ${packed.version}`);
   assert.match(await run(process.execPath, [cli, "--help"]), /--profile/);
   console.log("Packed CLI installed without JS compilers, Docker, platform source or a local runtime.");
-  console.log(await run(process.execPath, ["--test", join(sdk, "test/remote.test.mjs")], temporary, { HIBANA_TEST_CLI: cli }));
-  assert.match(await run(process.execPath, [cli, "platform", "status", "--kubeconfig", "operator-config", "--context", "onprem", "--dry-run"]), /context onprem/);
+  console.log(await run(process.execPath, ["--test", join(sdk, "test/remote.test.mjs"), join(sdk, "test/dev.test.mjs"), join(sdk, "test/cli.test.mjs")], temporary, { HIBANA_TEST_CLI: cli }));
+  assert.match(await run(process.execPath, [cli, "platform", "install", "--help"]), /--kubeconfig/);
 
   const project = join(temporary, "hello");
   await run(process.execPath, [cli, "init", project, "--template", "hono", ...(github ? [] : ["--cli-package", tarball]), "--no-install"]);
@@ -62,21 +65,19 @@ try {
     await new Promise(resolve => listener.listen(0, "127.0.0.1", resolve));
     const port = listener.address().port;
     await new Promise(resolve => listener.close(resolve));
-    if (github) await run(process.execPath, [projectCli, "runtime", "install"]);
-    else {
+    if (!github) {
       const runtime = resolve(process.env.HIBANA_RUNTIME_BIN);
       assert.equal((await run(runtime, ["--version"])).trim(), `hibana-worker ${packed.version}`);
       const checksum = createHash("sha256").update(await readFile(runtime)).digest("hex");
       await run(process.execPath, [projectCli, "runtime", "install", "--from", runtime, "--sha256", checksum]);
     }
     const managedRuntime = join(env.HIBANA_RUNTIME_HOME, packed.version, `${process.platform}-${process.arch}`, "hibana-worker");
-    assert.equal((await run(managedRuntime, ["--version"])).trim(), `hibana-worker ${packed.version}`);
     const child = spawn(process.execPath, [projectCli, "dev", "--no-watch", "--port", String(port)], { cwd: project, env, stdio: ["ignore", "pipe", "pipe"] });
     let output = ""; child.stdout.on("data", b => output += b); child.stderr.on("data", b => output += b);
     const exited = new Promise(resolve => child.once("exit", (code, signal) => resolve({ code, signal })));
     child.once("error", error => { output += error.message; });
     try {
-      const deadline = Date.now() + 120000;
+      const deadline = Date.now() + (github ? 300000 : 120000);
       let response;
       while (Date.now() < deadline && child.exitCode === null) {
         try { response = await fetch(`http://127.0.0.1:${port}/`, { signal: AbortSignal.timeout(2000) }); break; } catch {}
@@ -84,6 +85,8 @@ try {
       }
       assert.equal(response?.status, 200, output);
       assert.match(await response.text(), /Hello from Hono on Hibana/);
+      assert.equal((await run(managedRuntime, ["--version"])).trim(), `hibana-worker ${packed.version}`);
+      if (github) assert.match(output, /Downloading the runtime matching this CLI version/);
       console.log("Hono response verified on the checksum-installed Wasmtime runtime, discovered without --runtime or PATH changes.");
     } finally {
       child.kill("SIGINT");
