@@ -59,7 +59,7 @@ export async function soak({urls, slug, project, command, database, replicas}) {
       await writeFile(path, JSON.stringify(data, null, 2));
     }
     const config = await loadConfig(resolve(directory, 'hibana.json'));
-    const api = await apiClient(directory); await api.login();
+    const api = await apiClient(); await api.login();
     const artifact = await build(config);
     await deploy(api, config, artifact, `0.0.0-soak.${Date.now()}`);
     const fixture = {language, api, config, artifact, host: `${config.name}.${slug}.hibana.local`, original: await readFile(artifact)};

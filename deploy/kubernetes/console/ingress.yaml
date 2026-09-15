@@ -1,0 +1,22 @@
+# Use an internal DNS record, a trusted TLS certificate and your IngressClass.
+# Label the controller namespace hibana.io/ingress=true as for the management API.
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: hibana-console
+spec:
+  ingressClassName: hibana
+  tls:
+    - hosts: [hibana.example.internal]
+      secretName: hibana-console-tls
+  rules:
+    - host: hibana.example.internal
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: hibana-console
+                port:
+                  number: 8080

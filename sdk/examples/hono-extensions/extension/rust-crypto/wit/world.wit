@@ -1,0 +1,9 @@
+package example:crypto@1.0.0;
+
+interface hash {
+  sha256: func(data: list<u8>) -> string;
+}
+
+world crypto {
+  export hash;
+}

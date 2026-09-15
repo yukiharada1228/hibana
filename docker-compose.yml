@@ -19,7 +19,7 @@ services:
       # POSTGRES_USER=faas は SUPERUSER かつテーブル所有者。**マイグレーション専用**
       # （MIGRATION_DATABASE_URL）。0004_rls.sql がこの所有者で CREATE ROLE faas_app /
       # FORCE RLS / SECURITY DEFINER 関数を作る。M3b(§3.2): ランタイム（control-plane /
-      # worker の DATABASE_URL）は migration 0004 が作る非特権 faas_app で接続する。
+      # worker の DATABASE_URL）は 初期マイグレーション が作る非特権 faas_app で接続する。
       # superuser/owner で接続すると FORCE RLS が無条件にバイパスされ RLS が無効化されるため、
       # アプリは起動時に current_user の rolsuper/rolbypassrls を検証して fail-fast する。
       POSTGRES_USER: faas

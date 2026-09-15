@@ -28,7 +28,7 @@ Fleet Workerは、SHA-256を照合したWasmを別プロセスのWasmtimeでコ�
 
 既存環境の移行はメンテナンス時間に行います。HPAが存在する場合、スクリプトは何も停止する前に拒否します。先にHPAを外す等の運用調整が必要です。
 
-対応するControl Plane・Workerイメージとmigration `0027_maintenance_gate.sql`を先に適用します。停止時はDB上の共通ゲートで管理API・アプリの新規受付を503にし、各CPで受付済みリクエスト（アップロードを含む）が終了し、DBのpending/runningが0になるまで待ちます。内部のSecrets引き換え・結果保存APIは維持し、その後Worker→CPの順に停止します。再開はCP→Worker→全active版のWasm準備→受付再開です。ゲートはCPの再起動でも維持され、ランタイムDBロールには変更権限を与えません。別のメンテナンス操作との同時実行も拒否します。
+対応するControl Plane・Workerと[基盤DBの初期スキーマ](database.md)を使用します。停止時はDB上の共通ゲートで管理API・アプリの新規受付を503にし、各CPで受付済みリクエスト（アップロードを含む）が終了し、DBのpending/runningが0になるまで待ちます。内部のSecrets引き換え・結果保存APIは維持し、その後Worker→CPの順に停止します。再開はCP→Worker→全active版のWasm準備→受付再開です。ゲートはCPの再起動でも維持され、ランタイムDBロールには変更権限を与えません。別のメンテナンス操作との同時実行も拒否します。
 
 `backup`と`persist`の自動復帰では、Pod Readyだけで受付を再開しません。bootstrap管理者で認証する内部APIが、Kubernetesから取得した全Worker IPとDNSの結果を照合し、各Workerへactive版を準備します。最後にコンパイルをしないHEAD確認を行い、準備中のキャッシュ追い出しも検出します。操作側はPod UID・再起動回数・Ready状態を再確認します。準備APIは1回240秒、操作全体は300秒が上限で、不足・失敗・所有者変更時はゲートを解除しません。active版がキャッシュ容量に収まらない場合も、容量の見直しが必要です。ゲストのHTTPハンドラーはこの準備では実行しません。
 

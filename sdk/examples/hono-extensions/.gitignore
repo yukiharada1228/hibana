@@ -1,0 +1,3 @@
+node_modules/
+extension/rust-crypto/target/
+extension/wit/

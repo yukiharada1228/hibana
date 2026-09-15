@@ -15,7 +15,7 @@ Hibana の MVP は、組織が管理するオンプレ Kubernetes 上で、Hono�
 
 | 境界 | 実装・受入条件 |
 |---|---|
-| CLI → 管理 API | loopback 以外は HTTPS 必須。リダイレクトを拒否。保存したトークンは別のサーバーへ再利用しない。プロファイルはユーザー設定領域にディレクトリ0700・ファイル0600で保存。旧 `.hibana/auth.json` は互換用に読む。Secrets は標準入力で渡す |
+| CLI → 管理 API | loopback 以外は HTTPS 必須。リダイレクトを拒否。保存したトークンは別のサーバーへ再利用しない。プロファイルはユーザー設定領域にディレクトリ0700・ファイル0600で保存。プロジェクトの `.hibana/auth.json` は読み書きしない。Secrets は標準入力で渡す |
 | 管理 API | 認証・スコープ確認と tenant-scoped トランザクション / FORCE RLS。マイグレーション権限を通常プロセスに渡さない |
 | 配備成果物 | HTTP Component の形式・契約と import を検証。検証子プロセスに時間・Linux メモリ制限。Worker は Wasm の SHA-256 を照合する |
 | 内部実行 | 署名トークン、期限、テナント・実行・バージョンの照合。公開アプリ API と管理 API と内部 API を分離。HTTP を自動再実行しない |
@@ -41,9 +41,11 @@ bash scripts/check-security.sh
 npm audit --prefix sdk --package-lock-only --audit-level=low
 ```
 
-唯一の例外は `RUSTSEC-2023-0071` です。SQLx の未使用 MySQL 経由の `rsa` が lockfile に残りますが、Hibana は PostgreSQL のみ使用します。検査スクリプトは **全ターゲットの実際の依存グラフに rsa が存在しないことを確認してから** この1件だけを除外します。将来その経路が有効になれば検査は失敗します。この例外を「Cargo.lock 全体で検出ゼロ」と表現しません。
+SeaORMへの移行で旧SQLx経由の未使用RSA依存もlockfileから外れたため、`RUSTSEC-2023-0071`の除外を削除しています。検査はadvisoryの除外なしで実行します。
 
-2026-09-07の検査では、`spin` 0.9.8 / 0.10.0 に yanked 警告も残ります。multer / crc-fast の推移依存です。既知脆弱性・unsoundとは区別して表示を維持し、上流更新時に再確認します。警告を削除するための独自の依存パッチは導入していません。
+2026-09-15の検査では、`spin` 0.9.8 / 0.10.0 に yanked 警告も残ります。multer / crc-fast の推移依存です。既知脆弱性・unsoundとは区別して表示を維持し、上流更新時に再確認します。警告を削除するための独自の依存パッチは導入していません。
+
+2026-09-15の依存更新で、rustlsを0.23.45、rustls-webpkiを0.103.15へ更新しました。TLSハンドシェイクの[RUSTSEC-2026-0285](https://rustsec.org/advisories/RUSTSEC-2026-0285.html)の修正を含みます。
 
 ## 本番公開前に残る受入条件
 

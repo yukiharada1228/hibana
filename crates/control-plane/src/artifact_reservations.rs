@@ -1,7 +1,7 @@
 //! Durable upload journal and short-lived cache pins across publication and rollback.
 use crate::{db, error::AppError, state::AppState};
+use hibana_database::prelude::*;
 use hibana_shared::FaasError;
-use sqlx::Row;
 
 pub(crate) struct Reservation {
     state: AppState,
@@ -20,11 +20,18 @@ impl Reservation {
         sha256: &str,
     ) -> Result<Self, AppError> {
         let id = hibana_shared::new_artifact_reservation_id();
-        let mut tx = state.pool().begin().await?;
-        db::set_tenant_guc(&mut tx, tenant).await?;
-        sqlx::query("INSERT INTO artifact_reservations(id,tenant_id,version_id,storage_uri,wasm_sha256) VALUES($1,$2,$3,$4,$5)")
-            .bind(&id).bind(tenant).bind(version).bind(storage_uri).bind(sha256)
-            .execute(&mut *tx).await?;
+        let tx = state.pool().begin().await?;
+        db::set_tenant_guc(&tx, tenant).await?;
+        artifact_reservations::Entity::insert(artifact_reservations::ActiveModel {
+            id: Set(id.clone()),
+            tenant_id: Set(tenant.into()),
+            version_id: Set(version.into()),
+            storage_uri: Set(storage_uri.into()),
+            wasm_sha256: Set(sha256.into()),
+            ..Default::default()
+        })
+        .exec(&tx)
+        .await?;
         tx.commit().await?;
         Ok(Self {
             state: state.clone(),
@@ -41,12 +48,19 @@ impl Reservation {
         self.confirmed = true;
     }
 
-    pub(crate) async fn lock(
-        &self,
-        tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
-    ) -> Result<(), AppError> {
-        sqlx::query("SELECT id FROM artifact_reservations WHERE tenant_id=$1 AND id=$2 AND expires_at > now() FOR UPDATE")
-            .bind(&self.tenant).bind(&self.id).fetch_optional(&mut **tx).await?
+    pub(crate) async fn lock(&self, tx: &sea_orm::DatabaseTransaction) -> Result<(), AppError> {
+        artifact_reservations::Entity::find_by_id(self.id.clone())
+            .filter(artifact_reservations::Column::TenantId.eq(&self.tenant))
+            .filter(
+                Expr::col((
+                    artifact_reservations::Entity,
+                    artifact_reservations::Column::ExpiresAt,
+                ))
+                .gt(now()),
+            )
+            .lock_exclusive()
+            .one(tx)
+            .await?
             .ok_or(FaasError::Unavailable)?;
         Ok(())
     }
@@ -85,28 +99,38 @@ async fn cleanup(
     id: &str,
     expired_only: bool,
 ) -> Result<(), AppError> {
-    let mut tx = state.pool().begin().await?;
-    db::set_tenant_guc(&mut tx, tenant).await?;
-    let row = sqlx::query("SELECT version_id,storage_uri FROM artifact_reservations WHERE tenant_id=$1 AND id=$2 AND (NOT $3 OR expires_at <= now()) FOR UPDATE")
-        .bind(tenant).bind(id).bind(expired_only).fetch_optional(&mut *tx).await?;
+    let tx = state.pool().begin().await?;
+    db::set_tenant_guc(&tx, tenant).await?;
+    let mut query = artifact_reservations::Entity::find_by_id(id)
+        .filter(artifact_reservations::Column::TenantId.eq(tenant));
+    if expired_only {
+        query = query.filter(
+            Expr::col((
+                artifact_reservations::Entity,
+                artifact_reservations::Column::ExpiresAt,
+            ))
+            .lte(now()),
+        );
+    }
+    let row = query.lock_exclusive().one(&tx).await?;
     let Some(row) = row else {
         return Ok(());
     };
     // Publication locks this same journal row until COMMIT. Even if the commit's
     // acknowledgement is lost, never delete an artifact referenced by a version.
-    let registered: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM component_versions WHERE tenant_id=$1 AND id=$2 AND storage_uri=$3)")
-        .bind(tenant).bind(row.get::<String,_>("version_id")).bind(row.get::<String,_>("storage_uri"))
-        .fetch_one(&mut *tx).await?;
+    let registered = component_versions::Entity::find_by_id(row.version_id.clone())
+        .filter(component_versions::Column::TenantId.eq(tenant))
+        .filter(component_versions::Column::StorageUri.eq(&row.storage_uri))
+        .count(&tx)
+        .await?
+        > 0;
     if !registered {
-        state
-            .storage()
-            .delete_object(&row.get::<String, _>("storage_uri"))
-            .await?;
+        state.storage().delete_object(&row.storage_uri).await?;
     }
-    sqlx::query("DELETE FROM artifact_reservations WHERE tenant_id=$1 AND id=$2")
-        .bind(tenant)
-        .bind(id)
-        .execute(&mut *tx)
+    artifact_reservations::Entity::delete_many()
+        .filter(artifact_reservations::Column::TenantId.eq(tenant))
+        .filter(artifact_reservations::Column::Id.eq(id))
+        .exec(&tx)
         .await?;
     tx.commit().await?;
     Ok(())
@@ -134,20 +158,57 @@ pub(crate) async fn sweep(state: &AppState) -> Result<(), AppError> {
 }
 
 async fn expired(state: &AppState, tenant: &str) -> Result<Vec<String>, AppError> {
-    let mut tx = state.pool().begin().await?;
-    db::set_tenant_guc(&mut tx, tenant).await?;
-    let ids = sqlx::query_scalar("SELECT id FROM artifact_reservations WHERE tenant_id=$1 AND expires_at <= now() AND cleanup_retry_at <= now() ORDER BY cleanup_retry_at,expires_at,id LIMIT 20")
-        .bind(tenant).fetch_all(&mut *tx).await?;
+    let tx = state.pool().begin().await?;
+    db::set_tenant_guc(&tx, tenant).await?;
+    let ids = artifact_reservations::Entity::find()
+        .select_only()
+        .column(artifact_reservations::Column::Id)
+        .filter(artifact_reservations::Column::TenantId.eq(tenant))
+        .filter(
+            Expr::col((
+                artifact_reservations::Entity,
+                artifact_reservations::Column::ExpiresAt,
+            ))
+            .lte(now()),
+        )
+        .filter(
+            Expr::col((
+                artifact_reservations::Entity,
+                artifact_reservations::Column::CleanupRetryAt,
+            ))
+            .lte(now()),
+        )
+        .order_by_asc(artifact_reservations::Column::CleanupRetryAt)
+        .order_by_asc(artifact_reservations::Column::ExpiresAt)
+        .order_by_asc(artifact_reservations::Column::Id)
+        .limit(20)
+        .into_tuple()
+        .all(&tx)
+        .await?;
     tx.commit().await?;
     Ok(ids)
 }
 
 async fn defer_cleanup(state: &AppState, tenant: &str, id: &str) -> Result<(), AppError> {
-    let mut tx = state.pool().begin().await?;
-    db::set_tenant_guc(&mut tx, tenant).await?;
+    let tx = state.pool().begin().await?;
+    db::set_tenant_guc(&tx, tenant).await?;
     // Do not change expires_at: a failed delete must not pin an orphan in caches.
-    sqlx::query("UPDATE artifact_reservations SET cleanup_retry_at=now()+interval '30 seconds' WHERE tenant_id=$1 AND id=$2 AND expires_at <= now()")
-        .bind(tenant).bind(id).execute(&mut *tx).await?;
+    artifact_reservations::Entity::update_many()
+        .col_expr(
+            artifact_reservations::Column::CleanupRetryAt,
+            now().add(Expr::cust("interval '30 seconds'")),
+        )
+        .filter(artifact_reservations::Column::TenantId.eq(tenant))
+        .filter(artifact_reservations::Column::Id.eq(id))
+        .filter(
+            Expr::col((
+                artifact_reservations::Entity,
+                artifact_reservations::Column::ExpiresAt,
+            ))
+            .lte(now()),
+        )
+        .exec(&tx)
+        .await?;
     tx.commit().await?;
     Ok(())
 }

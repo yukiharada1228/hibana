@@ -1,6 +1,6 @@
 //! Read-only installation probes. Each invocation opens fresh connections in the
 //! target Pod's network namespace; credentials and transport errors stay there.
-use sqlx::Connection;
+
 use std::{future::Future, net::IpAddr, time::Duration};
 
 async fn checked(check: impl Future<Output = anyhow::Result<()>>) -> bool {
@@ -11,8 +11,9 @@ async fn checked(check: impl Future<Output = anyhow::Result<()>>) -> bool {
 }
 
 async fn database() -> anyhow::Result<()> {
-    let mut connection = sqlx::PgConnection::connect(&std::env::var("DATABASE_URL")?).await?;
-    sqlx::query("SELECT 1").execute(&mut connection).await?;
+    let connection =
+        hibana_database::postgres::connect(&std::env::var("DATABASE_URL")?, 1, 0).await?;
+    connection.ping().await?;
     connection.close().await?;
     Ok(())
 }

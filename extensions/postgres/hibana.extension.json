@@ -1,0 +1,9 @@
+{
+  "schemaVersion": 1,
+  "runtime": "wasi:http/incoming-handler@0.2.3",
+  "aliases": { "pg": "./dist/pg.mjs" },
+  "components": ["./dist/crypto.wasm"],
+  "imports": ["hibana:postgres/crypto@0.1.0"],
+  "wit": "./wit",
+  "permissions": ["outbound-network"]
+}

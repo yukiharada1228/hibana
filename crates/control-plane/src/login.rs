@@ -20,6 +20,7 @@
 //! 経由する argon2 verify を踏まないため、そのままだとロックアウト 401 のほうが速くなる
 //! （タイミングオラクル）。これを防ぐため、ロックアウトで return する前に必ずダミー
 //! `verify_password` を 1 回走らせ、両 401 経路の所要時間を揃える。
+use sea_orm::TransactionTrait as _;
 
 use std::net::SocketAddr;
 
@@ -186,10 +187,10 @@ pub async fn login(
     // api_tokens は FORCE RLS 下にあるため、INSERT は解決済み tenant_id を GUC に
     // セットした tx 上で行う（WITH CHECK を通す）。slug/user の解決は SECURITY DEFINER
     // 関数経由なので GUC 不要だが、トークン INSERT はテナントコンテキストを要する。
-    let mut tx = state.pool().begin().await?;
-    db::set_tenant_guc(&mut tx, &tenant_id).await?;
+    let tx = state.pool().begin().await?;
+    db::set_tenant_guc(&tx, &tenant_id).await?;
     db::create_token(
-        &mut *tx,
+        &tx,
         &token_id,
         &tenant_id,
         Some(&user.id),
@@ -202,7 +203,7 @@ pub async fn login(
     // §3.7: トークン発行を audit_logs に記録する（GUC は設定済み → WITH CHECK を通す。
     // 同一 tx で token 行とアトミックに commit する）。生 secret/hash は載せない。
     db::insert_audit_log(
-        &mut *tx,
+        &tx,
         &tenant_id,
         Some(user.id.as_str()),
         "token_issued",
@@ -243,9 +244,9 @@ async fn write_login_audit(
     detail: serde_json::Value,
 ) {
     let res: anyhow::Result<()> = async {
-        let mut tx = state.pool().begin().await?;
-        db::set_tenant_guc(&mut tx, tenant).await?;
-        db::insert_audit_log(&mut *tx, tenant, actor, action, target, Some(&detail)).await?;
+        let tx = state.pool().begin().await?;
+        db::set_tenant_guc(&tx, tenant).await?;
+        db::insert_audit_log(&tx, tenant, actor, action, target, Some(&detail)).await?;
         tx.commit().await?;
         Ok(())
     }

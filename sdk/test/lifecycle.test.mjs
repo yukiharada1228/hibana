@@ -20,16 +20,16 @@ function invoke(args, cwd, env = {}) {
   });
 }
 
-test("delete supports Wrangler name/config and offline dry-run without source files", async t => {
+test("delete supports name/config and offline dry-run without source files", async t => {
   const cwd = await mkdtemp(join(tmpdir(), "hibana-delete-"));
   t.after(() => rm(cwd, { recursive: true, force: true }));
   await writeFile(join(cwd, "hibana.json"), JSON.stringify({ name: "hello", main: "missing.ts" }));
-  for (const args of [[], ["hello"], ["--name", "hello"], ["-c", "hibana.json"]]) {
+  for (const args of [[], ["hello"], ["-c", "hibana.json"]]) {
     const r = await invoke(["delete", ...args, "--dry-run"], cwd, { HIBANA_URL: "http://127.0.0.1:1", HIBANA_TOKEN: "" });
     assert.equal(r.code, 0, r.output);
     assert.match(r.output, /Would delete application hello/);
   }
-  for (const args of [["hello", "--name", "other"], ["hello", "--all"], ["--all-tenants"], ["../invalid"]]) {
+  for (const args of [["--name", "other"], ["hello", "--all"], ["--all-tenants"], ["../invalid"]]) {
     assert.notEqual((await invoke(["delete", ...args, "--dry-run"], cwd)).code, 0);
   }
 });
@@ -62,7 +62,7 @@ test("delete confirms, scopes admin credentials, preserves conflicts and handles
   assert.equal(deleted.code, 0, deleted.output);
   assert.deepEqual(calls.at(-1), { path: "/admin/tenants/ten-1/components/cmp-1", method: "DELETE", token: "Bearer admin-only" });
   status = 409;
-  const conflict = await invoke(["delete", "hello", "--force"], cwd, adminEnv);
+  const conflict = await invoke(["delete", "hello", "--yes"], cwd, adminEnv);
   assert.notEqual(conflict.code, 0);
   assert.match(conflict.output, /409/);
   assert.equal(calls.at(-1).token, "Bearer test-token");

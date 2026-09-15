@@ -7,6 +7,7 @@ use axum::extract::{Query, State};
 use axum::response::IntoResponse;
 use axum::Json;
 use hibana_shared::FaasError;
+use sea_orm::TransactionTrait as _;
 use serde::{Deserialize, Serialize};
 
 // ---------------------------------------------------------------------------
@@ -139,9 +140,9 @@ pub async fn get_usage(
     let today = chrono::Utc::now().date_naive();
     let (from, to) = resolve_usage_range(q.from.as_deref(), q.to.as_deref(), today)?;
 
-    let mut tx = state.pool().begin().await?;
-    db::set_tenant_guc(&mut tx, tenant).await?;
-    let rows = db::get_usage_rollups(&mut *tx, tenant, from, to, q.component_id.as_deref()).await?;
+    let tx = state.pool().begin().await?;
+    db::set_tenant_guc(&tx, tenant).await?;
+    let rows = db::get_usage_rollups(&tx, tenant, from, to, q.component_id.as_deref()).await?;
     tx.commit().await?;
 
     let by_component: Vec<UsageByComponent> = rows

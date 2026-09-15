@@ -5,17 +5,28 @@ import { randomBytes } from "node:crypto";
 export async function initPlatform(directory = "hibana-platform") {
   const root = resolve(directory);
   await mkdir(root, { recursive: true, mode: 0o700 });
-  if ((await readdir(root)).length) throw new Error(`Directory is not empty: ${root}. Choose a new directory for the platform configuration.`);
-  for (const name of ["base", "migration"]) {
-    await cp(new URL(`../platform/manifests/${name}/`, import.meta.url), join(root, name), { recursive: true });
+  if ((await readdir(root)).length)
+    throw new Error(
+      `Directory is not empty: ${root}. Choose a new directory for the platform configuration.`,
+    );
+  for (const name of ["base", "migration", "console"]) {
+    await cp(
+      new URL(`../platform/manifests/${name}/`, import.meta.url),
+      join(root, name),
+      { recursive: true },
+    );
   }
-  await cp(new URL("../platform/manifests/remote/ingress.yaml", import.meta.url), join(root, "ingress.yaml"));
+  await cp(
+    new URL("../platform/manifests/remote/ingress.yaml", import.meta.url),
+    join(root, "ingress.yaml"),
+  );
   const files = {
     "kustomization.yaml": `apiVersion: kustomize.config.k8s.io/v1beta1
 kind: Kustomization
 namespace: hibana
 resources:
   - base
+  - console
   - ingress.yaml
   - egress.yaml
 patches:
@@ -49,6 +60,10 @@ spec:
   podSelector:
     matchLabels:
       app.kubernetes.io/part-of: hibana
+    matchExpressions:
+      - key: app.kubernetes.io/name
+        operator: NotIn
+        values: [hibana-console]
   policyTypes: [Egress]
   egress:
     - to: [{ipBlock: {cidr: CHANGE_ME_POSTGRES_CIDR}}]
@@ -73,6 +88,7 @@ SECRETS_MASTER_KEY=${randomBytes(32).toString("hex")}
 1. Fill in runtime.env, control-plane.env and migration.env with your PostgreSQL, Redis and S3 credentials. Keep the generated signing, master and bootstrap keys; back them up securely.
 2. Update site.yaml with your S3 endpoint, bucket and application domain.
 3. Update ingress.yaml with your management hostname, per-tenant app hostname, IngressClass and TLS Secret names. Provision the TLS Secrets in namespace hibana or include them as resources in this overlay. Label the Ingress controller namespace as described in ingress.yaml.
+   Update console/ingress.yaml with the intranet console hostname and TLS Secret. Set a released console image (prefer a digest) in console/kustomization.yaml. Browser users open https://CONSOLE_HOST/; the CLI can use https://CONSOLE_HOST/api. The platform --image option only selects the Control Plane/Worker image.
 4. Set your dependency address ranges and ports in egress.yaml. Provision the external databases and bucket before installation.
 5. Run the preview, resolve every reported issue, then install:
 
@@ -91,7 +107,12 @@ Python HTTPS checks use the system CA trust. For a private CA, configure SSL_CER
 `,
   };
   for (const [name, contents] of Object.entries(files)) {
-    await writeFile(join(root, name), contents, { flag: "wx", mode: name.endsWith(".env") ? 0o600 : 0o644 });
+    await writeFile(join(root, name), contents, {
+      flag: "wx",
+      mode: name.endsWith(".env") ? 0o600 : 0o644,
+    });
   }
-  console.log(`Created platform configuration: ${root}\nFill in the site settings listed in README.md, then run hibana platform install with --overlay pointing to this directory.\nSigning, encryption and bootstrap keys were generated in control-plane.env (excluded from Git).`);
+  console.log(
+    `Created platform configuration: ${root}\nFill in the site settings listed in README.md, then run hibana platform install with --overlay pointing to this directory.\nSigning, encryption and bootstrap keys were generated in control-plane.env (excluded from Git).`,
+  );
 }

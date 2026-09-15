@@ -13,7 +13,7 @@ export async function testVersionEnvironment(h) {
   assert.ok(limited);
   const previousUrl = process.env.HIBANA_URL;
   process.env.HIBANA_URL = url;
-  const client = await apiClient(root, {token:limited});
+  const client = await apiClient({token:limited});
   if (previousUrl === undefined) delete process.env.HIBANA_URL; else process.env.HIBANA_URL = previousUrl;
   const config = {name:'upload',vars:{GREETING:'one'},secrets:[],resources:{}};
   await deploy(client, config, artifact, 'atomic-one');

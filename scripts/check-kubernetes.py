@@ -73,6 +73,21 @@ for overlay, image in [
     assert internal["ports"] == [{"protocol": "TCP", "port": 8081}]
     assert internal["from"][0]["podSelector"]["matchLabels"]["app.kubernetes.io/name"] == "hibana-worker"
     print(f"{overlay}: deployment contracts passed ({len(docs)} resources)")
+    if overlay == "remote":
+        assert named(docs, "NetworkPolicy", "hibana-dependencies")["spec"]["podSelector"]["matchExpressions"] == [{"key": "app.kubernetes.io/name", "operator": "NotIn", "values": ["hibana-console"]}]
+        console = named(docs, "Deployment", "hibana-console")["spec"]["template"]
+        assert console["metadata"]["labels"]["hibana.io/api-client"] == "true"
+        pod = console["spec"]
+        assert pod["automountServiceAccountToken"] is False
+        assert pod["securityContext"]["runAsNonRoot"] is True
+        container = pod["containers"][0]
+        assert container["securityContext"]["readOnlyRootFilesystem"] is True
+        assert "envFrom" not in container, "console must not inherit database or platform credentials"
+        assert container["env"] == [{"name": "HIBANA_API_UPSTREAM", "value": "http://hibana-api:8080"}]
+        policy = named(docs, "NetworkPolicy", "hibana-console")["spec"]
+        assert policy["egress"] == [{"to": [{"podSelector": {"matchLabels": {"app.kubernetes.io/name": "hibana-control-plane"}}}], "ports": [{"protocol": "TCP", "port": 8080}]}]
+        ingress = named(docs, "Ingress", "hibana-console")["spec"]
+        assert ingress["tls"] and ingress["rules"][0]["http"]["paths"][0]["backend"]["service"]["name"] == "hibana-console"
 
 kind = yaml.safe_load((root / "deploy/kubernetes/local/kind.yaml").read_text())
 ports = kind["nodes"][0]["extraPortMappings"]

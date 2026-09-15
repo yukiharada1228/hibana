@@ -7,6 +7,7 @@ use uuid::Uuid;
 mod redacted;
 pub use redacted::{expose_once, Redacted};
 
+pub mod capabilities;
 pub mod egress;
 pub mod http;
 pub mod metrics;
@@ -180,16 +181,6 @@ impl std::fmt::Display for Role {
     }
 }
 
-/// Object Storage 上の Component 本体オブジェクトキー (§3.4)。
-///
-/// テナントプレフィックスレイアウト
-/// `tenants/{tenant_id}/components/{component_name}/{version}/component.wasm`
-/// を採用し、テナント境界をキー空間で明示する。
-/// M2 は単一テナント "default" 固定だが、将来の M3 分離に備えてレイアウトを固定する。
-pub fn component_object_key(tenant_id: &str, component_name: &str, version: &str) -> String {
-    format!("tenants/{tenant_id}/components/{component_name}/{version}/component.wasm")
-}
-
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct JobMessage {
     pub execution_id: String,
@@ -226,12 +217,11 @@ pub struct UsageMetrics {
     pub output_bytes: u64,
 }
 
-/// result subject に流れる実行結果 (§6.5)。
+/// Worker が Control Plane の完了 API に返す実行結果。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ResultMessage {
     /// `exec_*`。
     pub execution_id: String,
-    /// M1 は "default"。
     pub tenant_id: String,
     /// 終端状態 (succeeded | failed | timeout)。
     pub status: ExecutionStatus,
@@ -245,7 +235,6 @@ pub struct ResultMessage {
     pub usage: Option<UsageMetrics>,
 }
 
-/// トークン有効期限に足す余裕秒数（既定）。
 /// ジョブトークンに載せる claim (§3.3)。
 ///
 /// `Serialize`/`Deserialize` は wire 上の搬送（JSON セグメント）のためだけに
@@ -784,15 +773,7 @@ mod tests {
     }
 
     #[test]
-    fn object_key_layout() {
-        assert_eq!(
-            component_object_key("default", "echo", "1.0.0"),
-            "tenants/default/components/echo/1.0.0/component.wasm"
-        );
-    }
-
-    #[test]
-    fn job_message_roundtrip_includes_m2_fields() {
+    fn job_message_roundtrip_preserves_artifact_identity_and_token() {
         let job = JobMessage {
             execution_id: "exec_1".into(),
             tenant_id: "default".into(),
@@ -811,9 +792,6 @@ mod tests {
         assert_eq!(back.wasm_sha256, "abc123");
         assert_eq!(back.wasm_url, "http://localhost:9000/faas-components/x?sig");
         assert_eq!(back.job_token, "payload.sig");
-        // M6: reply_to / origin は None のとき wire に現れない（skip_serializing_if）。
-        assert!(!json.contains("reply_to"));
-        assert!(!json.contains("origin"));
         // M7c: env_token も同様（secret を持たない component では wire に一切現れない）。
         assert!(!json.contains("env_token"));
     }
@@ -872,7 +850,6 @@ mod tests {
         let job_json = r#"{"execution_id":"exec_1","tenant_id":"default","component":"echo","version":"1.0.0","wasm_sha256":"abc","wasm_url":"http://x","input":{}}"#;
         let job: JobMessage = serde_json::from_str(job_json).unwrap();
         assert_eq!(job.job_token, "");
-        // M6: reply_to / origin も serde default で None（旧メッセージ互換）。
 
         let res_json = r#"{"execution_id":"exec_1","tenant_id":"default","status":"succeeded","output":null,"error":null}"#;
         let res: ResultMessage = serde_json::from_str(res_json).unwrap();

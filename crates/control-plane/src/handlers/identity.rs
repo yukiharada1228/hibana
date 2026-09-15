@@ -12,6 +12,7 @@ use axum::http::StatusCode;
 use axum::response::IntoResponse;
 use axum::Json;
 use hibana_shared::{new_token_id, new_user_id, FaasError, Role, Scope};
+use sea_orm::TransactionTrait as _;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 
@@ -60,10 +61,10 @@ pub async fn create_user(
     let password_hash = hash_password(&req.password)?;
     let user_id = new_user_id();
 
-    let mut tx = state.pool().begin().await?;
-    db::set_tenant_guc(&mut tx, &principal.tenant_id).await?;
+    let tx = state.pool().begin().await?;
+    db::set_tenant_guc(&tx, &principal.tenant_id).await?;
     db::create_user(
-        &mut *tx,
+        &tx,
         &user_id,
         &principal.tenant_id,
         req.email.trim(),
@@ -75,7 +76,7 @@ pub async fn create_user(
     // §3.7: identity プロビジョニングを記録する（GUC 設定済み → user 行と同一 tx で commit）。
     // パスワード/ハッシュは載せない。target は新 user_id、detail に role のみ。
     db::insert_audit_log(
-        &mut *tx,
+        &tx,
         &principal.tenant_id,
         principal.actor(),
         "user_created",
@@ -147,11 +148,11 @@ pub async fn create_token(
     // admin ロール必須（scope に加えた多層防御）。
     require_admin_role(principal.role)?;
 
-    let mut tx = state.pool().begin().await?;
-    db::set_tenant_guc(&mut tx, &principal.tenant_id).await?;
+    let tx = state.pool().begin().await?;
+    db::set_tenant_guc(&tx, &principal.tenant_id).await?;
 
     // 対象ユーザは同一テナント内に存在しなければならない（不在/外部は 404）。
-    let target_role_str = db::find_user_role(&mut *tx, &principal.tenant_id, &req.user_id)
+    let target_role_str = db::find_user_role(&tx, &principal.tenant_id, &req.user_id)
         .await?
         .ok_or_else(|| FaasError::NotFound(format!("user '{}'", req.user_id)))?;
     let target_role = db::parse_role(Some(&target_role_str))
@@ -173,7 +174,7 @@ pub async fn create_token(
     let token_id = new_token_id();
 
     db::create_token(
-        &mut *tx,
+        &tx,
         &token_id,
         &principal.tenant_id,
         Some(&req.user_id),
@@ -187,7 +188,7 @@ pub async fn create_token(
     // §3.7: トークン発行を audit_logs に記録する（GUC 設定済み → token 行と同一 tx で
     // アトミックに commit）。actor は発行主体、target は新トークン id。生 secret は載せない。
     db::insert_audit_log(
-        &mut *tx,
+        &tx,
         &principal.tenant_id,
         principal.actor(),
         "token_issued",
@@ -226,13 +227,13 @@ pub async fn revoke_token(
     // admin ロール必須（scope に加えた多層防御）。
     require_admin_role(principal.role)?;
 
-    let mut tx = state.pool().begin().await?;
-    db::set_tenant_guc(&mut tx, &principal.tenant_id).await?;
+    let tx = state.pool().begin().await?;
+    db::set_tenant_guc(&tx, &principal.tenant_id).await?;
 
-    let affected = db::revoke_token(&mut *tx, &principal.tenant_id, &token_id).await?;
+    let affected = db::revoke_token(&tx, &principal.tenant_id, &token_id).await?;
     if affected == 0 {
         // 自テナントに存在するが既失効なら 204（冪等）。存在しなければ 404（秘匿）。
-        let exists = db::token_exists(&mut *tx, &principal.tenant_id, &token_id).await?;
+        let exists = db::token_exists(&tx, &principal.tenant_id, &token_id).await?;
         tx.commit().await?;
         if exists {
             return Ok(StatusCode::NO_CONTENT);
@@ -243,7 +244,7 @@ pub async fn revoke_token(
     // §3.7: 実際に失効した（affected > 0）ときだけ audit_logs に記録する（GUC 設定済み →
     // 失効と同一 tx でアトミックに commit）。冪等な再失効（affected == 0）は記録しない。
     db::insert_audit_log(
-        &mut *tx,
+        &tx,
         &principal.tenant_id,
         principal.actor(),
         "token_revoked",
@@ -255,5 +256,43 @@ pub async fn revoke_token(
     tx.commit().await?;
 
     tracing::info!(token_id = %token_id, tenant = %principal.tenant_id, "token revoked");
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// Session metadata comes from the authenticated principal, never a caller's tenant ID.
+pub async fn get_session(
+    State(state): State<AppState>,
+    principal: Principal,
+) -> Result<impl IntoResponse, AppError> {
+    let tenant = db::session_tenant(state.pool(), &principal.tenant_id)
+        .await?
+        .ok_or(FaasError::Unauthorized)?;
+    Ok(Json(json!({
+        "tenant_id": principal.tenant_id,
+        "tenant_slug": tenant.0,
+        "tenant_name": tenant.1,
+        "scopes": principal.scopes,
+        "ingress_base_domain": state.ingress_base_domain(),
+    })))
+}
+
+/// Revoke the presented token. This deliberately needs no Admin scope and accepts no target ID.
+pub async fn logout(
+    State(state): State<AppState>,
+    principal: Principal,
+) -> Result<impl IntoResponse, AppError> {
+    let tx = state.pool().begin().await?;
+    db::set_tenant_guc(&tx, &principal.tenant_id).await?;
+    db::revoke_token(&tx, &principal.tenant_id, &principal.token_id).await?;
+    db::insert_audit_log(
+        &tx,
+        &principal.tenant_id,
+        principal.actor(),
+        "token_revoked",
+        Some(&principal.token_id),
+        Some(&json!({ "via": "logout" })),
+    )
+    .await?;
+    tx.commit().await?;
     Ok(StatusCode::NO_CONTENT)
 }

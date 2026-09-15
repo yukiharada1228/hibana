@@ -191,6 +191,9 @@ pub(crate) fn build_router(state: AppState) -> Router {
     let protected = read_routes
         .merge(deploy_routes)
         .merge(admin_routes)
+        // Authenticated clients can inspect and revoke only their own session.
+        .route("/auth/session", get(handlers::identity::get_session))
+        .route("/auth/logout", post(handlers::identity::logout))
         .route_layer(axum::middleware::from_fn_with_state(
             state.clone(),
             auth::authenticate,

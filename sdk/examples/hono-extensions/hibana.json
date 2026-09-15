@@ -1,0 +1,5 @@
+{
+  "name": "hono-extensions",
+  "main": "src/index.ts",
+  "extensions": ["@hibana-example/node-compat"]
+}

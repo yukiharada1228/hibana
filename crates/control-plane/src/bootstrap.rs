@@ -7,8 +7,6 @@ use crate::{
     storage, store,
 };
 use axum::{serve::ListenerExt as _, Router};
-use sqlx::postgres::PgPoolOptions;
-use std::time::Duration;
 
 fn configure_http_socket(stream: &mut tokio::net::TcpStream) {
     // Headers, body chunks and the final EOF can be separate small writes.
@@ -33,7 +31,7 @@ pub(crate) async fn run() -> anyhow::Result<()> {
         "hibana-control-plane",
     );
 
-    // `--migrate-only`: 起動時マイグレーションと同じ冪等ロジック（baseline + pending）を流して exit。
+    // `--migrate-only`: 起動時マイグレーションと同じバージョン管理されたマイグレーションを流して exit。
     // `make migrate` から呼ばれる入口。`Config::from_env()` を経由しないため、BOOTSTRAP_ADMIN_TOKEN /
     // JOB_SIGNING_KEY などのランタイム用必須 env が無くても通る（migrate に必要なのは DB URL だけ）。
     if std::env::args().any(|a| a == "--migrate-only") {
@@ -44,44 +42,23 @@ pub(crate) async fn run() -> anyhow::Result<()> {
     tracing::info!(bind = %config.bind_addr, "starting control-plane");
 
     // --- マイグレーション（特権ロールで適用）---
-    // 0004_rls.sql は CREATE ROLE / FORCE RLS / CREATE FUNCTION SECURITY DEFINER を含み、
-    // テーブル所有者かつ CREATEROLE 権限を要する。ランタイムの faas_app（NOBYPASSRLS）では
-    // 適用できないため、専用の短命プールを所有者 URL で開いて適用し、適用後に閉じる。
-    // 0001/0002 は手動適用済みのため baseline 行で再適用をスキップし、0003 以降のみ適用する
-    // （冪等。serve 前に必ず完了させる）。
+    // RLS、ロール、SECURITY DEFINER 関数の作成には所有者権限が必要。
+    // 専用の短命プールで適用し、非特権ランタイムの接続と分離する。
+    // 初期マイグレーションは空の DB 専用。旧スキーマは別途切り替える。
     if deployment::run_migrations_on_start()? {
-        let migration_pool = PgPoolOptions::new()
-            .max_connections(2)
-            .acquire_timeout(Duration::from_secs(10))
-            .connect(&config.migration_database_url)
-            .await?;
+        let migration_pool =
+            hibana_database::postgres::connect(&config.migration_database_url, 2, 0).await?;
         run_migrations(&migration_pool).await?;
-        migration_pool.close().await;
+        migration_pool.close().await?;
     }
 
     // --- ランタイム DB（非特権 faas_app で接続）---
     // RLS が実効的であるには、ランタイムが必ず NOBYPASSRLS・非 SUPERUSER のロールで
     // 接続していなければならない。superuser/owner は FORCE RLS を無条件にバイパスし、
     // GUC 未設定時の fail-closed も働かない。起動時に self-check で検証して fail-fast する。
-    let pool = PgPoolOptions::new()
-        .max_connections(10)
-        .acquire_timeout(Duration::from_secs(10))
-        .connect_with(
-            config
-                .database_url
-                .parse::<sqlx::postgres::PgConnectOptions>()?
-                .options([
-                    ("statement_timeout", "10000"),
-                    ("lock_timeout", "3000"),
-                    ("idle_in_transaction_session_timeout", "15000"),
-                    ("tcp_keepalives_idle", "10"),
-                    ("tcp_keepalives_interval", "3"),
-                    ("tcp_keepalives_count", "3"),
-                    ("tcp_user_timeout", "10000"),
-                ]),
-        )
-        .await?;
+    let pool = hibana_database::postgres::connect(&config.database_url, 10, 0).await?;
     migrations::assert_non_privileged_runtime_role(&pool).await?;
+    hibana_database::postgres::assert_runtime_schema(&pool).await?;
     tracing::info!("connected to postgres");
 
     // --- Object Storage (MinIO/S3 互換, §3.4) ---

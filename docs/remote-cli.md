@@ -8,6 +8,7 @@ CLIを導入すると、ローカル開発ランタイムは初回の`dev`で自
 flowchart LR
   subgraph PC[開発者のPC]
     CLI[hibana CLI]
+    ConsoleBrowser[コンソールを開くブラウザ]
     Build[JS/TS → Wasm Component]
     Dev[devが自動取得・再利用する hibana-worker]
     CLI --> Build
@@ -18,14 +19,49 @@ flowchart LR
     Apps[アプリHTTP / HTTPS]
     CP[Control Plane群]
     Workers[Wasmtime Worker群]
+    Console[Nginx / コンソールの静的ファイル]
+    Console -->|/api を転送| API
     API --> CP
     Apps --> CP
     CP --> Workers
   end
   CLI -->|Componentをdeploy / list / rollback / delete| API
+  ConsoleBrowser -->|HTTPS| Console
   Browser[アプリ利用者] --> Apps
   Operator[基盤管理者 / GitOps] -->|別のKubernetes資格情報| Site
 ```
+
+## イントラネットのコンソールと端末の分担
+
+開発者のPCとKubernetesのサーバーは別端末を前提とします。CLIのリモート配備とコンソールのコード・配信マニフェストを用意しています。[コンソールの導入手順](console.md)に沿って、イントラネットのDNS・証明書・イメージを設定してください。
+
+| 場所 | 担当 |
+|---|---|
+| 開発者のPC | `hibana`でJS/TSをWasmへビルドして管理APIへアップロードする。ブラウザでコンソールを開く |
+| Kubernetes上のコンソール配信サービス | ブラウザへHTML・CSS・JavaScriptを配信し、同じURL配下の管理APIへの接続を提供する |
+| Kubernetes上のControl Plane | CLIとコンソールに共通の認証・テナント・配備管理を提供し、アプリへのHTTP要求をWorkerへ転送する |
+| Kubernetes上のWorker | 配備されたWasmを準備し、アプリへの要求をWasmtimeで実行する |
+| 基盤が管理するPostgreSQL・Redis・S3互換ストレージ | 配備状態・受付制御・成果物を保持する。接続先はクラスタ内外から選べる |
+
+デプロイ完了後、CLIの終了・ブラウザの終了・PCの電源断にかかわらず、基盤は配備済みアプリの実行と配信を続けます。CLIがPC上で起動したサーバーへの転送や、PCからの`kubectl port-forward`を必要としません。`hibana dev`だけが明示的にPC上でアプリを実行する操作です。
+
+コンソールはReactとViteの静的ファイルとして配信し、[指定のデザインリポジトリ](https://github.com/yukiharada1228/shadcn-digital-agency-jp)のコンポーネントとスタイルを利用しています。画面の描画はPCのブラウザ、配備済みHonoアプリの実行は基盤のWorkerが担当します。アプリ一覧・バージョン・設定は管理APIから取得し、CLIとコンソールで同じ状態を参照します。CLIのプロファイルとブラウザのログイン状態はそれぞれのクライアントで管理し、同じテナントの権限で操作します。
+
+接続先はイントラネットから到達できるDNS名とHTTPSを使います。remote overlayのURL例は次のとおりです。実際のDNS・証明書は管理者が用意します。
+
+| URL例 | 接続先 |
+|---|---|
+| `https://hibana.example.internal/` | コンソールの静的ファイル |
+| `https://hibana.example.internal/api/` | CLI・コンソール共通の管理API。プロキシで`/api`を取り除き、既存の管理APIへ転送する |
+| `https://hello.team.apps.example.internal/` | 配備したアプリのHTTP入口 |
+
+CLIは`--url https://hibana.example.internal/api`のようにパス付きの管理API URLも指定できます。ブラウザは同じオリジンの`/api`へ接続します。管理者はこれらのDNS・証明書・ルーティングを基盤側に用意し、社内CAの場合はCLIのNode.jsとブラウザの両方から証明書を信頼できるように設定します。通常の開発者には管理APIの接続情報とテナント用認証だけを渡します。
+
+導入先でDNS・証明書・実クラスタを設定した段階で、次の流れを別端末間の受入条件にします。
+
+1. PCから管理APIへログインしてアプリを配備し、ブラウザのコンソールでそのバージョンを確認できる。
+2. 配備したPCを停止しても、別のイントラネット端末からアプリにアクセスできる。
+3. コンソールで切り戻した状態をCLIでも確認できる。
 
 ## CLIの配布
 
@@ -49,14 +85,13 @@ JS/TSのビルドには同梱のoptionalDependenciesを使います。ビルド�
 
 ## 開発者の操作
 
-管理者から管理API URL・テナント名・アカウント・アプリのドメインを受け取ります。秘密値はコマンド引数へ渡さず、stdinまたは`HIBANA_PASSWORD`で渡します。
+管理者から管理API URL・テナント名・アカウント・アプリのドメインを受け取ります。通常のログインでは `Password:` に続けてパスワードを入力します。文字は表示されません。スクリプトでは `--password-stdin < /secure/login-password.txt` または `HIBANA_PASSWORD` を使えます。
 
 ```bash
 hibana login --profile onprem \
   --url https://api.example.internal \
   --tenant team --email developer@example.internal \
-  --ingress-domain apps.example.internal \
-  --password-stdin < /secure/login-password.txt
+  --ingress-domain apps.example.internal
 
 hibana profile list
 hibana profile use onprem
@@ -87,9 +122,9 @@ hibana logout --profile onprem
 | `HIBANA_URL` + `HIBANA_TOKEN` | 保存不要のCI用接続。明示した`--profile`がある場合、URLはそのプロファイルを優先 |
 | `HIBANA_CONFIG_HOME` | 設定ディレクトリ。既定は`${XDG_CONFIG_HOME:-$HOME/.config}/hibana` |
 
-URLは`--url` → 明示的な`--profile` → `HIBANA_URL` → 選択済みプロファイル → 旧プロジェクト認証の順です。トークンは明示的な`HIBANA_TOKEN`、接続URLと一致する保存トークンの順です。URL未設定時にlocalhostへ接続する暗黙の既定はありません。
+URLは`--url` → 明示的な`--profile` → `HIBANA_URL` → 選択済みプロファイルの順です。トークンは明示的な`HIBANA_TOKEN`、接続URLと一致する保存トークンの順です。URL未設定時にlocalhostへ接続する暗黙の既定はありません。
 
-`profiles.json`はディレクトリ0700・ファイル0600で保存し、書き換えは一時ファイルからのrenameで行います。プロジェクトの移動やディレクトリ変更でログインし直す必要はありません。パスワードは保存せず、URLごとのトークンを保存します。同じURLの別テナントは別のプロファイル名で管理します。旧`.hibana/auth.json`も互換用に読めますが、明示的に選んだプロファイルには混ぜません。`logout`は指定プロファイルのローカルトークンを削除します。旧認証ファイルやCI環境変数のトークン、サーバー側の他セッションには作用しません。
+`profiles.json`はディレクトリ0700・ファイル0600で保存し、書き換えは一時ファイルからのrenameで行います。プロジェクトの移動やディレクトリ変更でログインし直す必要はありません。パスワードは保存せず、URLごとのトークンを保存します。同じURLの別テナントは別のプロファイル名で管理します。旧`.hibana/auth.json`は読み書きしません。以前この形式を使っていた場合は`hibana login`でプロファイルへ移行してください。`logout`は指定プロファイルのローカルトークンを削除します。CI環境変数のトークン、サーバー側の他セッションには作用しません。
 
 HTTPはloopbackだけ許可し、それ以外はHTTPSが必要です。APIリダイレクトは追跡しません。社内CAの場合は、PCのNode.jsプロセスに`NODE_EXTRA_CA_CERTS=/path/to/company-ca.pem`を設定してからCLIを起動してください。TLS検証を無効化するオプションは設けていません。
 

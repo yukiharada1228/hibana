@@ -12,19 +12,18 @@ pub(crate) mod signing_keys;
 pub(crate) mod tenants;
 pub(crate) mod usage;
 
-fn map_unique_violation(e: sqlx::Error, msg: &str) -> AppError {
-    if let sqlx::Error::Database(db_err) = &e {
-        // Postgres unique_violation = 23505
-        if db_err.code().as_deref() == Some("23505") {
-            return FaasError::InvalidRequest(msg.into()).into();
-        }
+fn map_unique_violation(e: sea_orm::DbErr, msg: &str) -> AppError {
+    if is_unique_violation(&e) {
+        return FaasError::InvalidRequest(msg.to_string()).into();
     }
     e.into()
 }
 
-#[cfg(test)]
-fn is_unique_violation(e: &sqlx::Error) -> bool {
-    matches!(e, sqlx::Error::Database(db_err) if db_err.code().as_deref() == Some("23505"))
+fn is_unique_violation(e: &sea_orm::DbErr) -> bool {
+    matches!(
+        e.sql_err(),
+        Some(sea_orm::SqlErr::UniqueConstraintViolation(_))
+    )
 }
 
 #[cfg(test)]

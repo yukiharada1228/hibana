@@ -11,7 +11,7 @@
 #       → app.tenant_id を対象とする SET（LOCAL の有無を問わず）を全て検出する。
 #
 #   (2) ヒューリスティック: テナントスコープの db:: 書き込み/読み取りを `state.pool()` に
-#       直接渡すコードを検出する。これらは set_tenant_guc を設定した tx（&mut *tx）に
+#       直接渡すコードを検出する。これらは set_tenant_guc を設定した tx（&tx）に
 #       通さねばならない（FORCE RLS 下では GUC 未設定で ERROR=fail-closed）。
 #       認証前参照 find_token_by_hash/find_user_by_email/find_tenant_id_by_slug は
 #       SECURITY DEFINER 関数経由で GUC 不要のため、意図的に対象から除外する。
@@ -70,7 +70,7 @@ set2=$(
 )
 if [ -n "$set2" ]; then
   echo "ERROR(rls-lint 2): tenant-scoped db:: call passed state.pool() directly."
-  echo "  Must thread &mut *tx after set_tenant_guc (FORCE RLS requires the GUC on the same tx)."
+  echo "  Must thread &tx after set_tenant_guc (FORCE RLS requires the GUC on the same tx)."
   echo "$set2"
   fail=1
 fi

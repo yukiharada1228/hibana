@@ -9,6 +9,7 @@
 //!
 //! 外向き通信の制御は Worker の runtime が担当する。ここではテナントを解決し、
 //! admission / 受付記録 / 署名付き直接HTTP転送を行う。
+use sea_orm::TransactionTrait as _;
 
 use axum::{
     extract::State,
@@ -103,11 +104,11 @@ async fn db_find_component(
     tenant_id: &str,
     name: &str,
 ) -> Option<crate::db::IngressComponentRow> {
-    let mut tx = state.pool().begin().await.ok()?;
-    if crate::db::set_tenant_guc(&mut tx, tenant_id).await.is_err() {
+    let tx = state.pool().begin().await.ok()?;
+    if crate::db::set_tenant_guc(&tx, tenant_id).await.is_err() {
         return None;
     }
-    let row = crate::db::find_ingress_component(&mut *tx, tenant_id, name)
+    let row = crate::db::find_ingress_component(&tx, tenant_id, name)
         .await
         .ok()
         .flatten();

@@ -1,4 +1,5 @@
 //! Shared HTTP admission. Redis errors reject requests with 503; quotas return 429.
+use sea_orm::TransactionTrait as _;
 
 use axum::http::{header, StatusCode};
 use axum::response::{IntoResponse, Response};
@@ -87,17 +88,10 @@ async fn audit_degraded(state: &AppState, tenant: &str, class: &str, unavailable
         "reason": if unavailable { "store_unavailable" } else { "store_backend_error" },
     });
     let res: anyhow::Result<()> = async {
-        let mut tx = state.pool().begin().await?;
-        crate::db::set_tenant_guc(&mut tx, tenant).await?;
-        crate::db::insert_audit_log(
-            &mut *tx,
-            tenant,
-            None,
-            "admission_degraded",
-            None,
-            Some(&detail),
-        )
-        .await?;
+        let tx = state.pool().begin().await?;
+        crate::db::set_tenant_guc(&tx, tenant).await?;
+        crate::db::insert_audit_log(&tx, tenant, None, "admission_degraded", None, Some(&detail))
+            .await?;
         tx.commit().await?;
         Ok(())
     }

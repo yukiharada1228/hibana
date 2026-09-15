@@ -5,12 +5,8 @@
 !Cargo.lock
 !crates/
 !crates/**
-!components/
-!components/**
 !migrations/
 !migrations/**
-!wit/
-!wit/**
 **/*.wasm
 **/*.cwasm
 **/target

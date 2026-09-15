@@ -1,60 +1,72 @@
 //! Usage persistence.
+use hibana_database::prelude::*;
+
 use super::saturating_i64;
 use chrono::NaiveDate;
 use hibana_shared::ExecutionStatus;
 use hibana_shared::UsageMetrics;
-use sqlx::Row;
 
 pub async fn upsert_usage_rollup(
-    executor: impl sqlx::PgExecutor<'_>,
+    executor: &impl ConnectionTrait,
     tenant_id: &str,
     component_id: &str,
     period_start: NaiveDate,
     status: ExecutionStatus,
     usage: &UsageMetrics,
-) -> Result<(), sqlx::Error> {
+) -> Result<(), DbErr> {
     debug_assert!(status.is_terminal());
-
-    let succeeded_count: i64 = (status == ExecutionStatus::Succeeded) as i64;
-    let failed_count: i64 = (status == ExecutionStatus::Failed) as i64;
-    let timeout_count: i64 = (status == ExecutionStatus::Timeout) as i64;
-
-    sqlx::query(UPSERT_USAGE_ROLLUP_SQL)
-        .bind(tenant_id)
-        .bind(period_start)
-        .bind(component_id)
-        .bind(saturating_i64(usage.cpu_fuel_used))
-        .bind(saturating_i64(usage.wall_time_ms))
-        .bind(saturating_i64(usage.peak_memory_bytes))
-        .bind(saturating_i64(usage.output_bytes))
-        .bind(succeeded_count)
-        .bind(failed_count)
-        .bind(timeout_count)
-        .execute(executor)
-        .await?;
-
+    let mut conflict = OnConflict::columns([
+        usage_rollups::Column::TenantId,
+        usage_rollups::Column::PeriodStart,
+        usage_rollups::Column::ComponentId,
+    ]);
+    for column in [
+        usage_rollups::Column::InvocationCount,
+        usage_rollups::Column::CpuFuelUsed,
+        usage_rollups::Column::WallTimeMs,
+        usage_rollups::Column::OutputBytes,
+        usage_rollups::Column::SucceededCount,
+        usage_rollups::Column::FailedCount,
+        usage_rollups::Column::TimeoutCount,
+    ] {
+        conflict.value(
+            column,
+            Expr::col((usage_rollups::Entity, column)).add(Expr::col(("excluded", column))),
+        );
+    }
+    conflict
+        .value(
+            usage_rollups::Column::PeakMemoryBytesMax,
+            Func::greatest([
+                Expr::col((
+                    usage_rollups::Entity,
+                    usage_rollups::Column::PeakMemoryBytesMax,
+                )),
+                Expr::col(("excluded", usage_rollups::Column::PeakMemoryBytesMax)),
+            ]),
+        )
+        .value(usage_rollups::Column::UpdatedAt, now());
+    usage_rollups::Entity::insert(usage_rollups::ActiveModel {
+        tenant_id: Set(tenant_id.into()),
+        period_start: Set(period_start),
+        component_id: Set(component_id.into()),
+        invocation_count: Set(1_i64),
+        cpu_fuel_used: Set(saturating_i64(usage.cpu_fuel_used)),
+        wall_time_ms: Set(saturating_i64(usage.wall_time_ms)),
+        peak_memory_bytes_max: Set(saturating_i64(usage.peak_memory_bytes)),
+        output_bytes: Set(saturating_i64(usage.output_bytes)),
+        succeeded_count: Set((status == ExecutionStatus::Succeeded) as i64),
+        failed_count: Set((status == ExecutionStatus::Failed) as i64),
+        timeout_count: Set((status == ExecutionStatus::Timeout) as i64),
+        ..Default::default()
+    })
+    .on_conflict(conflict.to_owned())
+    .exec(executor)
+    .await?;
     Ok(())
 }
 
-/// `upsert_usage_rollup` が発行する増分 UPSERT SQL。複合 PK を競合ターゲットに、SUM 列は加算、
-/// `peak_memory_bytes_max` は `GREATEST`（MAX セマンティクス）で更新する。定数に切り出して
-/// DB 非依存のユニットテストで集計セマンティクスを静的検査できるようにする。
-pub(super) const UPSERT_USAGE_ROLLUP_SQL: &str = "INSERT INTO usage_rollups \
-     (tenant_id, period_start, component_id, invocation_count, cpu_fuel_used, wall_time_ms, \
-      peak_memory_bytes_max, output_bytes, succeeded_count, failed_count, timeout_count) \
-     VALUES ($1, $2, $3, 1, $4, $5, $6, $7, $8, $9, $10) \
-     ON CONFLICT (tenant_id, period_start, component_id) DO UPDATE SET \
-       invocation_count = usage_rollups.invocation_count + 1, \
-       cpu_fuel_used = usage_rollups.cpu_fuel_used + EXCLUDED.cpu_fuel_used, \
-       wall_time_ms = usage_rollups.wall_time_ms + EXCLUDED.wall_time_ms, \
-       peak_memory_bytes_max = GREATEST(usage_rollups.peak_memory_bytes_max, EXCLUDED.peak_memory_bytes_max), \
-       output_bytes = usage_rollups.output_bytes + EXCLUDED.output_bytes, \
-       succeeded_count = usage_rollups.succeeded_count + EXCLUDED.succeeded_count, \
-       failed_count = usage_rollups.failed_count + EXCLUDED.failed_count, \
-       timeout_count = usage_rollups.timeout_count + EXCLUDED.timeout_count, \
-       updated_at = now()";
-
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, FromQueryResult)]
 pub struct UsageRollupRow {
     pub component_id: String,
     pub invocation_count: i64,
@@ -74,51 +86,39 @@ pub struct UsageRollupRow {
 /// クエリ規約。文字列結合はしない: injection 防止）。`component_id` が `Some` なら単一 component に
 /// 絞り込む（`$4::text IS NULL OR ...` で NULL なら全件）。totals はハンドラ側で本行を畳んで算出する。
 pub async fn get_usage_rollups(
-    executor: impl sqlx::PgExecutor<'_>,
+    executor: &impl ConnectionTrait,
     tenant_id: &str,
     from: NaiveDate,
     to: NaiveDate,
     component_id: Option<&str>,
-) -> Result<Vec<UsageRollupRow>, sqlx::Error> {
-    let rows = sqlx::query(
-        // SUM(bigint) は Postgres では NUMERIC を返すため、各集計を ::bigint へ明示キャストして
-        // Rust 側の i64 デコード（UsageRollupRow）と型を一致させる（MAX は元の bigint を保つ）。
-        // 行数 × 各列とも実運用域では i64 に収まる（saturating_i64 で書込時に頭打ち済み）。
-        "SELECT component_id, \
-                SUM(invocation_count)::bigint AS invocation_count, \
-                SUM(cpu_fuel_used)::bigint AS cpu_fuel_used, \
-                SUM(wall_time_ms)::bigint AS wall_time_ms, \
-                MAX(peak_memory_bytes_max) AS peak_memory_bytes_max, \
-                SUM(output_bytes)::bigint AS output_bytes, \
-                SUM(succeeded_count)::bigint AS succeeded_count, \
-                SUM(failed_count)::bigint AS failed_count, \
-                SUM(timeout_count)::bigint AS timeout_count \
-         FROM usage_rollups \
-         WHERE tenant_id = $1 AND period_start >= $2 AND period_start <= $3 \
-           AND ($4::text IS NULL OR component_id = $4) \
-         GROUP BY component_id \
-         ORDER BY component_id",
-    )
-    .bind(tenant_id)
-    .bind(from)
-    .bind(to)
-    .bind(component_id)
-    .fetch_all(executor)
-    .await?;
-
-    rows.into_iter()
-        .map(|r| {
-            Ok(UsageRollupRow {
-                component_id: r.try_get("component_id")?,
-                invocation_count: r.try_get("invocation_count")?,
-                cpu_fuel_used: r.try_get("cpu_fuel_used")?,
-                wall_time_ms: r.try_get("wall_time_ms")?,
-                peak_memory_bytes_max: r.try_get("peak_memory_bytes_max")?,
-                output_bytes: r.try_get("output_bytes")?,
-                succeeded_count: r.try_get("succeeded_count")?,
-                failed_count: r.try_get("failed_count")?,
-                timeout_count: r.try_get("timeout_count")?,
-            })
-        })
-        .collect()
+) -> Result<Vec<UsageRollupRow>, DbErr> {
+    let mut query = usage_rollups::Entity::find()
+        .select_only()
+        .column(usage_rollups::Column::ComponentId)
+        .column_as(
+            usage_rollups::Column::PeakMemoryBytesMax.max(),
+            "peak_memory_bytes_max",
+        )
+        .filter(usage_rollups::Column::TenantId.eq(tenant_id))
+        .filter(usage_rollups::Column::PeriodStart.between(from, to));
+    if let Some(id) = component_id {
+        query = query.filter(usage_rollups::Column::ComponentId.eq(id));
+    }
+    for (column, name) in [
+        (usage_rollups::Column::InvocationCount, "invocation_count"),
+        (usage_rollups::Column::CpuFuelUsed, "cpu_fuel_used"),
+        (usage_rollups::Column::WallTimeMs, "wall_time_ms"),
+        (usage_rollups::Column::OutputBytes, "output_bytes"),
+        (usage_rollups::Column::SucceededCount, "succeeded_count"),
+        (usage_rollups::Column::FailedCount, "failed_count"),
+        (usage_rollups::Column::TimeoutCount, "timeout_count"),
+    ] {
+        query = query.column_as(column.sum().cast_as("bigint"), name);
+    }
+    query
+        .group_by(usage_rollups::Column::ComponentId)
+        .order_by_asc(usage_rollups::Column::ComponentId)
+        .into_model::<UsageRollupRow>()
+        .all(executor)
+        .await
 }

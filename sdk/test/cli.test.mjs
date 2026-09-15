@@ -81,12 +81,16 @@ test("invalid commands, flags and arguments fail before any project or network w
     [["delete", "hello", "--port", "3000"], /--port.*not supported.*delete/],
     [["dev", "--profile", "production"], /--profile.*not supported.*dev/],
     [["dev", "--no-runtime-install"], /Unknown option/],
+    [["delete", "hello", "--force"], /Unknown option/],
+    [["delete", "--name", "hello"], /Unknown option/],
+    [["platform", "status", "--local"], /Unknown option/],
     [["runtime", "instal"], /Did you mean 'install'/],
     [["profile", "ues", "prod"], /Unknown profile command/],
     [["dev", "extra"], /Usage: hibana dev/],
     [["deploy", "extra"], /Usage: hibana deploy/],
     [["rollback", "extra"], /Usage: hibana rollback/],
     [["list", "extra"], /Usage: hibana list/],
+    [["list", "--config", "hibana.json"], /--config.*not supported.*list/],
     [["logout", "extra"], /Usage: hibana logout/],
     [["profile", "remove"], /Usage: hibana profile remove NAME/],
     [["secret", "put"], /Usage: hibana secret put NAME/],
@@ -159,7 +163,7 @@ test("platform init creates a portable site with private keys and refuses to ove
   const directory = join(f.root, "site");
   const created = await f.invoke(["platform", "init", directory]);
   assert.equal(created.code, 0, created.stderr);
-  for (const file of ["kustomization.yaml", "base/kustomization.yaml", "migration/job.yaml", "ingress.yaml", "egress.yaml", "site.yaml", "README.md"]) {
+  for (const file of ["kustomization.yaml", "base/kustomization.yaml", "console/kustomization.yaml", "console/console.yaml", "console/ingress.yaml", "migration/job.yaml", "ingress.yaml", "egress.yaml", "site.yaml", "README.md"]) {
     assert.ok((await readFile(join(directory, file), "utf8")).length, file);
   }
   const credentials = await readFile(join(directory, "control-plane.env"), "utf8");

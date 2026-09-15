@@ -3,7 +3,7 @@ use crate::metrics::Metrics;
 use crate::signing::{Signer, Verifier};
 use crate::storage::Storage;
 use crate::store::{InflightParams, LockoutParams, RateLimitParams, Store};
-use sqlx::PgPool;
+use sea_orm::DatabaseConnection;
 use std::sync::Arc;
 use std::time::Duration;
 pub const QUOTA_MAX_INVOKE_RATE_PER_SEC: u64 = 500;
@@ -103,7 +103,7 @@ pub struct AppState {
 struct Inner {
     public_requests: Arc<crate::maintenance::Requests>,
     worker_http: reqwest::Client,
-    pool: PgPool,
+    pool: DatabaseConnection,
     storage: Storage,
     max_wasm_upload_bytes: u64,
     presign_ttl: Duration,
@@ -122,7 +122,7 @@ struct Inner {
 impl AppState {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
-        pool: PgPool,
+        pool: DatabaseConnection,
         storage: Storage,
         max_wasm_upload_bytes: u64,
         presign_ttl_secs: u64,
@@ -166,7 +166,7 @@ impl AppState {
             }),
         }
     }
-    pub fn pool(&self) -> &PgPool {
+    pub fn pool(&self) -> &DatabaseConnection {
         &self.inner.pool
     }
 

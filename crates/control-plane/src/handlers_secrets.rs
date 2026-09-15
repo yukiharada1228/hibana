@@ -19,6 +19,7 @@
 //!
 //! `detail` は `secrets::audit_detail`（**値を受け取らないシグネチャ**）だけを通す。生値が
 //! `db::insert_audit_log` に到達する型経路を消すのが目的。
+use hibana_database::prelude::*;
 
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
@@ -76,18 +77,13 @@ pub struct SecretKeyInfo {
 
 /// componentの生存確認とロック。Secret操作を同じアプリの配備・削除と直列化する。
 async fn require_component(
-    tx: &mut sqlx::PgConnection,
+    tx: &sea_orm::DatabaseTransaction,
     tenant: &str,
     component_id: &str,
 ) -> Result<(), AppError> {
-    sqlx::query(
-        "SELECT id FROM components WHERE tenant_id=$1 AND id=$2 AND deleted_at IS NULL FOR UPDATE",
-    )
-    .bind(tenant)
-    .bind(component_id)
-    .fetch_optional(&mut *tx)
-    .await?
-    .ok_or_else(|| FaasError::NotFound(format!("component '{component_id}'")))?;
+    if !db::lock_component(tx, tenant, component_id).await? {
+        return Err(FaasError::NotFound(format!("component '{component_id}'")).into());
+    }
     Ok(())
 }
 
@@ -121,12 +117,12 @@ fn validate_secret_input(name: &str, value: &str) -> Result<(), FaasError> {
 ///
 /// 「secret を上書きしたつもりの平文 config が注入される」事故を構造的に防ぐ。
 async fn reject_config_key_collision(
-    tx: &mut sqlx::PgConnection,
+    tx: &sea_orm::DatabaseTransaction,
     tenant: &str,
     component_id: &str,
     name: &str,
 ) -> Result<(), AppError> {
-    let configs = db::list_function_configs(&mut *tx, tenant, component_id).await?;
+    let configs = db::list_function_configs(tx, tenant, component_id).await?;
     if configs.iter().any(|c| c.key == name) {
         return Err(FaasError::Conflict(format!(
             "config key '{name}' already exists for this component; \
@@ -143,7 +139,7 @@ async fn reject_config_key_collision(
 /// ポインタを前進させる。**版台帳は追記専用**なので更新は常に INSERT になる。
 async fn write_secret_version(
     state: &AppState,
-    tx: &mut sqlx::PgConnection,
+    tx: &sea_orm::DatabaseTransaction,
     principal: &Principal,
     component_id: &str,
     name: &str,
@@ -153,7 +149,7 @@ async fn write_secret_version(
     let tenant = &principal.tenant_id;
     let keyring = state.secret_keyring();
 
-    let existing = db::find_live_secret_by_name(&mut *tx, tenant, component_id, name).await?;
+    let existing = db::find_live_secret_by_name(tx, tenant, component_id, name).await?;
 
     let (secret_id, version, created) = match &existing {
         Some(meta) => (meta.id.clone(), meta.current_version + 1, false),
@@ -173,10 +169,10 @@ async fn write_secret_version(
     .map_err(map_secret_error)?;
 
     if created {
-        db::insert_secret_meta(&mut *tx, tenant, &secret_id, component_id, name, version).await?;
+        db::insert_secret_meta(tx, tenant, &secret_id, component_id, name, version).await?;
     }
     db::insert_secret_version(
-        &mut *tx,
+        tx,
         tenant,
         &secret_id,
         version,
@@ -186,7 +182,7 @@ async fn write_secret_version(
     )
     .await?;
     if !created {
-        db::bump_secret_current_version(&mut *tx, tenant, &secret_id, version).await?;
+        db::bump_secret_current_version(tx, tenant, &secret_id, version).await?;
     }
 
     Ok((version, created))
@@ -217,16 +213,27 @@ pub async fn set_secret_deploy_access(
     require_admin_role(principal.role)?;
     validate_secret_name(&name)?;
     let tenant = &principal.tenant_id;
-    let mut tx = state.pool().begin().await?;
-    db::set_tenant_guc(&mut tx, tenant).await?;
-    require_component(&mut tx, tenant, &component_id).await?;
-    let changed = sqlx::query("UPDATE function_secrets SET deploy_allowed=$4, updated_at=now() WHERE tenant_id=$1 AND component_id=$2 AND name=$3 AND deleted_at IS NULL")
-        .bind(tenant).bind(&component_id).bind(&name).bind(req.allowed).execute(&mut *tx).await?;
-    if changed.rows_affected() != 1 {
+    let tx = state.pool().begin().await?;
+    db::set_tenant_guc(&tx, tenant).await?;
+    require_component(&tx, tenant, &component_id).await?;
+    let changed = function_secrets::Entity::update_many()
+        .col_expr(
+            function_secrets::Column::DeployAllowed,
+            Expr::val(req.allowed),
+        )
+        .col_expr(function_secrets::Column::UpdatedAt, now())
+        .filter(function_secrets::Column::TenantId.eq(tenant))
+        .filter(function_secrets::Column::ComponentId.eq(&component_id))
+        .filter(function_secrets::Column::Name.eq(&name))
+        .filter(function_secrets::Column::DeletedAt.is_null())
+        .exec(&tx)
+        .await?
+        .rows_affected;
+    if changed != 1 {
         return Err(FaasError::NotFound("Secret".into()).into());
     }
     db::insert_audit_log(
-        &mut *tx,
+        &tx,
         tenant,
         principal.user_id.as_deref(),
         "secret_deploy_access_changed",
@@ -251,21 +258,21 @@ pub async fn put_secret(
     validate_secret_input(&name, &req.value)?;
     let tenant = &principal.tenant_id;
 
-    let mut tx = state.pool().begin().await?;
-    db::set_tenant_guc(&mut tx, tenant).await?;
-    require_component(&mut tx, tenant, &component_id).await?;
-    reject_config_key_collision(&mut tx, tenant, &component_id, &name).await?;
+    let tx = state.pool().begin().await?;
+    db::set_tenant_guc(&tx, tenant).await?;
+    require_component(&tx, tenant, &component_id).await?;
+    reject_config_key_collision(&tx, tenant, &component_id, &name).await?;
 
     // 新規かどうかを先に確定して監査 reason を決める（write_secret_version も同じ判定を行うが、
     // 判定は同一 tx 内の同一スナップショットなので食い違わない）。
-    let is_new = db::find_live_secret_by_name(&mut *tx, tenant, &component_id, &name)
+    let is_new = db::find_live_secret_by_name(&tx, tenant, &component_id, &name)
         .await?
         .is_none();
     let reason = if is_new { "create" } else { "rotate" };
 
     let (version, created) = write_secret_version(
         &state,
-        &mut tx,
+        &tx,
         &principal,
         &component_id,
         &name,
@@ -275,7 +282,7 @@ pub async fn put_secret(
     .await?;
 
     db::insert_audit_log(
-        &mut *tx,
+        &tx,
         tenant,
         principal.user_id.as_deref(),
         "secret_updated",
@@ -313,12 +320,12 @@ pub async fn rotate_secret(
     validate_secret_input(&name, &req.value)?;
     let tenant = &principal.tenant_id;
 
-    let mut tx = state.pool().begin().await?;
-    db::set_tenant_guc(&mut tx, tenant).await?;
-    require_component(&mut tx, tenant, &component_id).await?;
+    let tx = state.pool().begin().await?;
+    db::set_tenant_guc(&tx, tenant).await?;
+    require_component(&tx, tenant, &component_id).await?;
 
     // rotate は既存が前提（不在は 404）。
-    if db::find_live_secret_by_name(&mut *tx, tenant, &component_id, &name)
+    if db::find_live_secret_by_name(&tx, tenant, &component_id, &name)
         .await?
         .is_none()
     {
@@ -329,7 +336,7 @@ pub async fn rotate_secret(
 
     let (version, _) = write_secret_version(
         &state,
-        &mut tx,
+        &tx,
         &principal,
         &component_id,
         &name,
@@ -339,7 +346,7 @@ pub async fn rotate_secret(
     .await?;
 
     db::insert_audit_log(
-        &mut *tx,
+        &tx,
         tenant,
         principal.user_id.as_deref(),
         "secret_rotated",
@@ -366,20 +373,20 @@ pub async fn delete_secret(
     require_admin_role(principal.role)?;
     let tenant = &principal.tenant_id;
 
-    let mut tx = state.pool().begin().await?;
-    db::set_tenant_guc(&mut tx, tenant).await?;
-    require_component(&mut tx, tenant, &component_id).await?;
+    let tx = state.pool().begin().await?;
+    db::set_tenant_guc(&tx, tenant).await?;
+    require_component(&tx, tenant, &component_id).await?;
 
-    let meta = db::find_live_secret_by_name(&mut *tx, tenant, &component_id, &name)
+    let meta = db::find_live_secret_by_name(&tx, tenant, &component_id, &name)
         .await?
         .ok_or_else(|| {
             FaasError::NotFound(format!("secret '{name}' of component '{component_id}'"))
         })?;
 
-    db::soft_delete_secret(&mut *tx, tenant, &meta.id).await?;
+    db::soft_delete_secret(&tx, tenant, &meta.id).await?;
 
     db::insert_audit_log(
-        &mut *tx,
+        &tx,
         tenant,
         principal.user_id.as_deref(),
         "secret_deleted",
@@ -406,11 +413,11 @@ pub async fn list_secrets(
 ) -> Result<impl IntoResponse, AppError> {
     let tenant = &principal.tenant_id;
 
-    let mut tx = state.pool().begin().await?;
-    db::set_tenant_guc(&mut tx, tenant).await?;
-    require_component(&mut tx, tenant, &component_id).await?;
+    let tx = state.pool().begin().await?;
+    db::set_tenant_guc(&tx, tenant).await?;
+    require_component(&tx, tenant, &component_id).await?;
 
-    let rows = db::list_secrets_meta(&mut *tx, tenant, &component_id).await?;
+    let rows = db::list_secrets_meta(&tx, tenant, &component_id).await?;
     tx.commit().await?;
 
     let out: Vec<SecretMeta> = rows
@@ -435,17 +442,15 @@ pub async fn list_secret_keys(
     require_admin_role(principal.role)?;
     let tenant = &principal.tenant_id;
 
-    let mut tx = state.pool().begin().await?;
-    db::set_tenant_guc(&mut tx, tenant).await?;
-    require_component(&mut tx, tenant, &component_id).await?;
+    let tx = state.pool().begin().await?;
+    db::set_tenant_guc(&tx, tenant).await?;
+    require_component(&tx, tenant, &component_id).await?;
 
-    let metas = db::list_secrets_meta(&mut *tx, tenant, &component_id).await?;
+    let metas = db::list_secrets_meta(&tx, tenant, &component_id).await?;
     let mut out = Vec::with_capacity(metas.len());
     for m in metas {
         // 版台帳から現行世代の暗号材料メタだけを引く（**平文は復号しない**）。
-        if let Some(env) =
-            db::find_secret_version(&mut *tx, tenant, &m.id, m.current_version).await?
-        {
+        if let Some(env) = db::find_secret_version(&tx, tenant, &m.id, m.current_version).await? {
             out.push(SecretKeyInfo {
                 name: m.name,
                 version: m.current_version,
@@ -498,15 +503,15 @@ fn env_tenant_rate_key(tenant: &str) -> String {
 
 /// 引き換え失敗を監査に残す（best-effort。理由は安定文字列のみ、値は載せない）。
 async fn audit_denied(state: &AppState, tenant: &str, target: Option<&str>, reason: &str) {
-    let mut tx = match state.pool().begin().await {
+    let tx = match state.pool().begin().await {
         Ok(t) => t,
         Err(_) => return,
     };
-    if db::set_tenant_guc(&mut tx, tenant).await.is_err() {
+    if db::set_tenant_guc(&tx, tenant).await.is_err() {
         return;
     }
     let _ = db::insert_audit_log(
-        &mut *tx,
+        &tx,
         tenant,
         None,
         "secret_material_denied",
@@ -525,7 +530,7 @@ pub async fn job_env(
 ) -> Result<impl IntoResponse, AppError> {
     // --- 1) per-IP レート制限（無認証面のグローバル保護。**最初に**行う） ---
     let ip = peer.ip().to_string();
-    let now_ms = chrono::Utc::now().timestamp_millis().max(0) as u64;
+    let now_ms = std::cmp::max(chrono::Utc::now().timestamp_millis(), 0) as u64;
     let per_min = state.job_env_exchange_rate_per_min() as f64;
     let ip_params = crate::store::RateLimitParams {
         refill_per_sec: per_min / 60.0,
@@ -567,12 +572,12 @@ pub async fn job_env(
 
     // --- 5) 以降すべて RLS 下 ---
     let tenant = claims.tenant_id.clone();
-    let mut tx = state.pool().begin().await?;
-    db::set_tenant_guc(&mut tx, &tenant).await?;
+    let tx = state.pool().begin().await?;
+    db::set_tenant_guc(&tx, &tenant).await?;
 
     // --- 6) executions 行と claim の突き合わせ ---
     // subscriber が result 側で行っている claim ↔ 行の照合と同じ思想。
-    let Some(exec) = db::secret_execution(&mut *tx, &tenant, &claims.execution_id).await? else {
+    let Some(exec) = db::secret_execution(&tx, &tenant, &claims.execution_id).await? else {
         drop(tx);
         audit_denied(
             &state,
@@ -620,14 +625,14 @@ pub async fn job_env(
     }
 
     // --- 8) 許可リスト（admin 承認）を解決。壊れた値は deny-all。 ---
-    let capabilities = db::version_capabilities(&mut *tx, &tenant, &claims.version_id)
+    let capabilities = db::version_capabilities(&tx, &tenant, &claims.version_id)
         .await?
         .unwrap_or(serde_json::Value::Null);
-    let allowed = crate::validation::parse_capabilities(&capabilities).env;
+    let allowed = hibana_shared::capabilities::parse_capabilities(&capabilities).env;
 
     // --- 9) 許可リストで絞って復号（**execution 基準の世代**, §4.7.1） ---
     let resolved = secrets::resolve_for_injection(
-        &mut tx,
+        &tx,
         state.secret_keyring(),
         &tenant,
         &claims.component_id,
@@ -650,7 +655,7 @@ pub async fn job_env(
     // --- 11) 監査（**値も件数以外の内訳も載せない**: 名前と件数まで） ---
     let names: Vec<&str> = resolved.iter().map(|r| r.name.as_str()).collect();
     db::insert_audit_log(
-        &mut *tx,
+        &tx,
         &tenant,
         None,
         "secret_material_issued",
@@ -721,14 +726,14 @@ pub async fn rekey_secrets(
     let mut rewrapped = 0usize;
     for secret_id in targets {
         // 各 secret を独立した tx で処理する（1 件の失敗が他を巻き込まない）。
-        let mut tx = state.pool().begin().await?;
-        db::set_tenant_guc(&mut tx, tenant).await?;
+        let tx = state.pool().begin().await?;
+        db::set_tenant_guc(&tx, tenant).await?;
 
-        let Some(meta) = db::find_secret_meta_by_id(&mut *tx, tenant, &secret_id).await? else {
+        let Some(meta) = db::find_secret_meta_by_id(&tx, tenant, &secret_id).await? else {
             continue;
         };
         let Some(current) =
-            db::find_secret_version(&mut *tx, tenant, &secret_id, meta.current_version).await?
+            db::find_secret_version(&tx, tenant, &secret_id, meta.current_version).await?
         else {
             continue;
         };
@@ -750,7 +755,7 @@ pub async fn rekey_secrets(
         .map_err(map_secret_error)?;
 
         db::insert_secret_version(
-            &mut *tx,
+            &tx,
             tenant,
             &secret_id,
             next_version,
@@ -759,10 +764,10 @@ pub async fn rekey_secrets(
             principal.user_id.as_deref(),
         )
         .await?;
-        db::bump_secret_current_version(&mut *tx, tenant, &secret_id, next_version).await?;
+        db::bump_secret_current_version(&tx, tenant, &secret_id, next_version).await?;
 
         db::insert_audit_log(
-            &mut *tx,
+            &tx,
             tenant,
             principal.user_id.as_deref(),
             "secret_rekeyed",

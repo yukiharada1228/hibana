@@ -10,6 +10,9 @@ path = "src/main.rs"
 
 [dependencies]
 hibana-shared = { workspace = true }
+hibana-database = { workspace = true }
+sea-orm = { workspace = true }
+hibana-migration = { workspace = true }
 
 # Web / 非同期（multipart: POST /components/{id}/versions のアップロード受信）
 axum = { workspace = true, features = ["multipart"] }
@@ -40,9 +43,6 @@ async-trait = { workspace = true }
 zeroize = { workspace = true }
 # M7c (§4.1): secret の封筒暗号（XChaCha20-Poly1305）。
 chacha20poly1305 = { workspace = true }
-
-# DB（query! マクロは使わずランタイム API のみ）
-sqlx = { workspace = true }
 
 # Async utilities.
 futures = "0.3"

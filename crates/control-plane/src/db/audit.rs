@@ -1,4 +1,6 @@
 //! Audit persistence.
+use hibana_database::prelude::*;
+
 use serde_json::Value;
 
 // ---------------------------------------------------------------------------
@@ -6,23 +8,22 @@ use serde_json::Value;
 // ---------------------------------------------------------------------------
 
 pub async fn insert_audit_log(
-    executor: impl sqlx::PgExecutor<'_>,
+    executor: &impl ConnectionTrait,
     tenant_id: &str,
     actor: Option<&str>,
     action: &str,
     target: Option<&str>,
     detail: Option<&Value>,
-) -> Result<(), sqlx::Error> {
-    sqlx::query(
-        "INSERT INTO audit_logs (tenant_id, actor, action, target, detail) \
-         VALUES ($1, $2, $3, $4, $5)",
-    )
-    .bind(tenant_id)
-    .bind(actor)
-    .bind(action)
-    .bind(target)
-    .bind(detail)
-    .execute(executor)
+) -> Result<(), DbErr> {
+    audit_logs::Entity::insert(audit_logs::ActiveModel {
+        tenant_id: Set(tenant_id.into()),
+        actor: Set(actor.map(str::to_owned)),
+        action: Set(action.into()),
+        target: Set(target.map(str::to_owned)),
+        detail: Set(detail.cloned()),
+        ..Default::default()
+    })
+    .exec(executor)
     .await?;
     Ok(())
 }

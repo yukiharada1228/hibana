@@ -1,14 +1,15 @@
 //! Capabilities management HTTP handlers.
 use crate::auth::Principal;
 use crate::authz::require_admin_role;
+use crate::db;
 use crate::error::AppError;
 use crate::extract::JsonBody;
 use crate::state::AppState;
-use crate::{db, validation};
 use axum::extract::{Path, State};
 use axum::response::IntoResponse;
 use axum::Json;
 use hibana_shared::FaasError;
+use sea_orm::TransactionTrait as _;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
@@ -32,18 +33,18 @@ pub async fn get_capabilities(
     Path((component_id, version)): Path<(String, String)>,
 ) -> Result<impl IntoResponse, AppError> {
     let tenant = &principal.tenant_id;
-    let mut tx = state.pool().begin().await?;
-    db::set_tenant_guc(&mut tx, tenant).await?;
-    let version_id = db::find_version_id(&mut *tx, tenant, &component_id, &version)
+    let tx = state.pool().begin().await?;
+    db::set_tenant_guc(&tx, tenant).await?;
+    let version_id = db::find_version_id(&tx, tenant, &component_id, &version)
         .await?
         .ok_or_else(|| {
             FaasError::NotFound(format!("version '{version}' of component '{component_id}'"))
         })?;
-    let current = db::version_capabilities(&mut *tx, tenant, &version_id)
+    let current = db::version_capabilities(&tx, tenant, &version_id)
         .await?
         .unwrap_or(Value::Null);
     tx.commit().await?;
-    let caps = validation::parse_capabilities(&current);
+    let caps = hibana_shared::capabilities::parse_capabilities(&current);
     Ok(Json(GetCapabilitiesResponse {
         component_id,
         version,
@@ -99,27 +100,27 @@ pub async fn approve_capability_egress(
         approved.insert(format!("{}:{}", ep.host, ep.port));
     }
 
-    let mut tx = state.pool().begin().await?;
-    db::set_tenant_guc(&mut tx, tenant).await?;
+    let tx = state.pool().begin().await?;
+    db::set_tenant_guc(&tx, tenant).await?;
 
-    db::find_component_by_id(&mut *tx, tenant, &component_id)
+    db::find_component_by_id(&tx, tenant, &component_id)
         .await?
         .ok_or_else(|| FaasError::NotFound(format!("component '{component_id}'")))?;
 
-    let version_id = db::find_version_id(&mut *tx, tenant, &component_id, &version)
+    let version_id = db::find_version_id(&tx, tenant, &component_id, &version)
         .await?
         .ok_or_else(|| {
             FaasError::NotFound(format!("version '{version}' of component '{component_id}'"))
         })?;
 
     // 既存の imports / env は保持し、net_allow_outbound だけを差し替える。
-    let current = db::version_capabilities(&mut *tx, tenant, &version_id)
+    let current = db::version_capabilities(&tx, tenant, &version_id)
         .await?
         .unwrap_or(Value::Null);
-    let mut caps = validation::parse_capabilities(&current);
+    let mut caps = hibana_shared::capabilities::parse_capabilities(&current);
     caps.net_allow_outbound = approved.clone();
 
-    if !db::set_version_capabilities(&mut *tx, tenant, &version_id, &caps.to_json()).await? {
+    if !db::set_version_capabilities(&tx, tenant, &version_id, &caps.to_json()).await? {
         return Err(FaasError::NotFound(format!(
             "version '{version}' of component '{component_id}'"
         ))
@@ -127,7 +128,7 @@ pub async fn approve_capability_egress(
     }
 
     db::insert_audit_log(
-        &mut *tx,
+        &tx,
         tenant,
         principal.user_id.as_deref(),
         "capability_egress_approved",

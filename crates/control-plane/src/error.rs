@@ -27,8 +27,8 @@ impl From<FaasError> for AppError {
     }
 }
 
-impl From<sqlx::Error> for AppError {
-    fn from(e: sqlx::Error) -> Self {
+impl From<sea_orm::DbErr> for AppError {
+    fn from(e: sea_orm::DbErr) -> Self {
         // 内部詳細（DB エラーの中身）はログにのみ残し、クライアントへは汎用 500 を返す。
         // 詳細メッセージを `Internal` に詰めるとボディに漏れるため、ここでは保持しない。
         tracing::error!(error = %e, "database error");
@@ -173,11 +173,11 @@ mod tests {
             .contains("secret table"));
     }
 
-    /// sqlx エラー由来の Internal もボディに詳細を載せない。
+    /// ORM エラー由来の Internal もボディに詳細を載せない。
     #[test]
-    fn sqlx_error_does_not_leak_detail() {
-        let app: AppError = sqlx::Error::RowNotFound.into();
-        // From<sqlx::Error> は詳細を保持しない（空文字 Internal）。
+    fn orm_error_does_not_leak_detail() {
+        let app: AppError = sea_orm::DbErr::Custom("missing fixture row".into()).into();
+        // From<sea_orm::DbErr> は詳細を保持しない（空文字 Internal）。
         let status = app.status();
         let message: String = if status.is_server_error() {
             "internal server error".to_string()

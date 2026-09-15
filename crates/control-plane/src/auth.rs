@@ -10,6 +10,7 @@
 //!   適用しない（ルータ側で分離）。
 //! - `Principal`: 認証済み呼び出し主体。`FromRequestParts` で各ハンドラへ注入する。
 //! - `require_scope`: スコープ不足を 403 にする route layer。
+use sea_orm::TransactionTrait as _;
 
 use axum::extract::{FromRequestParts, Request, State};
 use axum::http::header::AUTHORIZATION;
@@ -141,10 +142,10 @@ async fn audit_tenant_suspended_denied(state: &AppState, principal: &Principal) 
     use serde_json::json;
     let detail = json!({ "reason": "tenant_suspended", "token_id": principal.token_id });
     let res: anyhow::Result<()> = async {
-        let mut tx = state.pool().begin().await?;
-        db::set_tenant_guc(&mut tx, &principal.tenant_id).await?;
+        let tx = state.pool().begin().await?;
+        db::set_tenant_guc(&tx, &principal.tenant_id).await?;
         db::insert_audit_log(
-            &mut *tx,
+            &tx,
             &principal.tenant_id,
             principal.actor(),
             "tenant_suspended_denied",

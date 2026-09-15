@@ -9,6 +9,7 @@ use axum::{
     response::Response,
     Json,
 };
+use hibana_database::prelude::*;
 use hibana_shared::FaasError;
 
 /// Reuse the signed, idempotent finalizer over HTTP. NATS is not on the
@@ -29,11 +30,19 @@ pub async fn complete(
     {
         return Err(FaasError::Unauthorized.into());
     }
-    let mut tx = state.pool().begin().await?;
-    db::set_tenant_guc(&mut tx, &claims.tenant_id).await?;
-    let row = sqlx::query("SELECT e.status FROM executions e WHERE e.tenant_id=$1 AND e.id=$2 AND e.version_id=$3 AND e.http_request")
-        .bind(&claims.tenant_id).bind(&claims.execution_id).bind(&claims.version_id).fetch_optional(&mut *tx).await?.ok_or(FaasError::Unauthorized)?;
-    let status: String = row.get("status");
+    let tx = state.pool().begin().await?;
+    db::set_tenant_guc(&tx, &claims.tenant_id).await?;
+    let status = executions::Entity::find()
+        .select_only()
+        .column(executions::Column::Status)
+        .filter(executions::Column::TenantId.eq(&claims.tenant_id))
+        .filter(executions::Column::Id.eq(&claims.execution_id))
+        .filter(executions::Column::VersionId.eq(&claims.version_id))
+        .filter(executions::Column::HttpRequest.eq(true))
+        .into_tuple::<String>()
+        .one(&tx)
+        .await?
+        .ok_or(FaasError::Unauthorized)?;
     if status == result.status.as_str() {
         return Ok(StatusCode::NO_CONTENT);
     }
@@ -42,9 +51,9 @@ pub async fn complete(
     crate::completion::handle_message(&state, &claims.tenant_id, &payload)
         .await
         .map_err(|_| FaasError::Internal("HTTP result finalization failed".into()))?;
-    let mut tx = state.pool().begin().await?;
-    db::set_tenant_guc(&mut tx, &claims.tenant_id).await?;
-    let saved = db::get_execution(&mut *tx, &claims.tenant_id, &claims.execution_id)
+    let tx = state.pool().begin().await?;
+    db::set_tenant_guc(&tx, &claims.tenant_id).await?;
+    let saved = db::get_execution(&tx, &claims.tenant_id, &claims.execution_id)
         .await?
         .ok_or(FaasError::Unauthorized)?;
     tx.commit().await?;
@@ -54,31 +63,56 @@ pub async fn complete(
     Ok(StatusCode::NO_CONTENT)
 }
 use serde_json::Value;
-use sqlx::Row;
 
 pub async fn redeem(
     State(state): State<AppState>,
     headers: HeaderMap,
 ) -> Result<Json<hibana_shared::JobMessage>, AppError> {
     let claims = crate::job_auth::claims_from_token(&state, &headers).await?;
-    let mut tx = state.pool().begin().await?;
-    db::set_tenant_guc(&mut tx, &claims.tenant_id).await?;
-    let row = sqlx::query("SELECT e.component_id,e.input,c.name,v.version,v.wasm_sha256,v.resource_limits FROM executions e JOIN components c ON c.id=e.component_id AND c.tenant_id=e.tenant_id JOIN component_versions v ON v.id=e.version_id AND v.tenant_id=e.tenant_id AND v.component_id=e.component_id WHERE e.tenant_id=$1 AND e.id=$2 AND e.version_id=$3 AND e.status='pending' AND e.http_request AND c.deleted_at IS NULL AND v.deleted_at IS NULL")
-        .bind(&claims.tenant_id).bind(&claims.execution_id).bind(&claims.version_id)
-        .fetch_optional(&mut *tx).await?.ok_or(FaasError::Unauthorized)?;
+    let tx = state.pool().begin().await?;
+    db::set_tenant_guc(&tx, &claims.tenant_id).await?;
+    let row = hibana_database::queries::pinned_execution(&claims.tenant_id, &claims.execution_id)
+        .filter(executions::Column::VersionId.eq(&claims.version_id))
+        .select_only()
+        .column(executions::Column::ComponentId)
+        .column(executions::Column::Input)
+        .column_as(
+            Expr::col((components::Entity, components::Column::Name)),
+            "name",
+        )
+        .column_as(
+            Expr::col((
+                component_versions::Entity,
+                component_versions::Column::Version,
+            )),
+            "version",
+        )
+        .column_as(
+            Expr::col((
+                component_versions::Entity,
+                component_versions::Column::WasmSha256,
+            )),
+            "wasm_sha256",
+        )
+        .column_as(
+            Expr::col((
+                component_versions::Entity,
+                component_versions::Column::ResourceLimits,
+            )),
+            "resource_limits",
+        )
+        .into_model::<RedeemedExecution>()
+        .one(&tx)
+        .await?
+        .ok_or(FaasError::Unauthorized)?;
     let limits: hibana_shared::ResourceLimits =
-        serde_json::from_value(row.get::<Value, _>("resource_limits"))
-            .map_err(FaasError::Serialization)?;
+        serde_json::from_value(row.resource_limits).map_err(FaasError::Serialization)?;
     let iat = chrono::Utc::now().timestamp();
     let exp = iat + state.token_exp_offset_secs(limits.max_wall_time_ms);
-    let component_id: String = row.get("component_id");
-    let needs_env = db::version_has_live_secrets(
-        &mut *tx,
-        &claims.tenant_id,
-        &component_id,
-        &claims.version_id,
-    )
-    .await?;
+    let component_id: String = row.component_id;
+    let needs_env =
+        db::version_has_live_secrets(&tx, &claims.tenant_id, &component_id, &claims.version_id)
+            .await?;
     let env_token = needs_env.then(|| {
         state.signer().sign_env(&hibana_shared::EnvClaims {
             execution_id: claims.execution_id.clone(),
@@ -100,11 +134,11 @@ pub async fn redeem(
     let job = hibana_shared::JobMessage {
         execution_id: claims.execution_id,
         tenant_id: claims.tenant_id,
-        component: row.get("name"),
-        version: row.get("version"),
-        wasm_sha256: row.get("wasm_sha256"),
+        component: row.name,
+        version: row.version,
+        wasm_sha256: row.wasm_sha256,
         wasm_url: String::new(),
-        input: row.get("input"),
+        input: row.input,
         job_token,
         env_token,
     };
@@ -227,18 +261,28 @@ pub async fn accept(
             .inc();
         return Ok(r.into_response());
     }
-    let mut tx = state.pool().begin().await?;
-    db::set_tenant_guc(&mut tx, tenant).await?;
-    let row = sqlx::query("SELECT c.id AS component_id,v.id AS version_id FROM components c JOIN component_versions v ON v.id=c.active_version_id AND v.tenant_id=c.tenant_id AND v.component_id=c.id WHERE c.tenant_id=$1 AND c.name=$2 AND c.deleted_at IS NULL AND c.ingress_enabled AND v.deleted_at IS NULL FOR SHARE OF c")
-        .bind(tenant).bind(component).fetch_optional(&mut *tx).await?.ok_or_else(|| FaasError::NotFound("HTTP application".into()))?;
+    let tx = state.pool().begin().await?;
+    db::set_tenant_guc(&tx, tenant).await?;
+    let (component_id, version_id) = hibana_database::queries::active_versions(tenant)
+        .filter(components::Column::Name.eq(component))
+        .filter(components::Column::IngressEnabled.eq(true))
+        .select_only()
+        .column(component_versions::Column::ComponentId)
+        .column(component_versions::Column::Id)
+        .lock_shared()
+        .into_tuple::<(String, String)>()
+        .one(&tx)
+        .await?
+        .ok_or_else(|| FaasError::NotFound("HTTP application".into()))?;
     // Serialize only acceptance for this tenant, not guest execution. Redis can
     // temporarily undercount during reconciliation; the committed DB records
     // are the authoritative concurrency bound across Control Plane instances.
-    sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))")
-        .bind(format!("hibana:http-admission:{tenant}"))
-        .execute(&mut *tx)
-        .await?;
-    if db::count_inflight_executions(&mut *tx, tenant).await? >= resolved.inflight.max {
+    hibana_database::postgres::lock_tenant_admission(
+        &tx,
+        &format!("hibana:http-admission:{tenant}"),
+    )
+    .await?;
+    if db::count_inflight_executions(&tx, tenant).await? >= resolved.inflight.max {
         state
             .metrics()
             .admission_rejections_total
@@ -256,13 +300,23 @@ pub async fn accept(
         return Ok(r.into_response());
     }
     let id = hibana_shared::new_execution_id();
-    let version_id: String = row.get("version_id");
-    let inserted: Result<(), sqlx::Error> = async {
-        sqlx::query("INSERT INTO executions (id,tenant_id,component_id,version_id,status,input,job_token_kid,routing_reason,http_request) VALUES ($1,$2,$3,$4,'pending',$5,$6,'stable',true)")
-            .bind(&id).bind(tenant).bind(row.get::<String,_>("component_id")).bind(&version_id)
-            .bind(&input).bind(state.signer().kid()).execute(&mut *tx).await?;
+    let inserted: Result<(), sea_orm::DbErr> = async {
+        executions::Entity::insert(executions::ActiveModel {
+            id: Set(id.clone()),
+            tenant_id: Set(tenant.into()),
+            component_id: Set(component_id),
+            version_id: Set(version_id.clone()),
+            status: Set("pending".into()),
+            input: Set(Some(input.clone())),
+            job_token_kid: Set(Some(state.signer().kid().into())),
+            http_request: Set(true),
+            ..Default::default()
+        })
+        .exec(&tx)
+        .await?;
         tx.commit().await
-    }.await;
+    }
+    .await;
     if let Err(error) = inserted {
         if reserved {
             let _ = state.store().release_inflight(tenant).await;
@@ -295,11 +349,13 @@ pub(crate) async fn cancel_pending(
     tenant: &str,
     id: &str,
 ) -> Result<bool, AppError> {
-    let mut tx = state.pool().begin().await?;
-    db::set_tenant_guc(&mut tx, tenant).await?;
-    let changed = sqlx::query("UPDATE executions SET status='failed',finished_at=now(),error=$3 WHERE tenant_id=$1 AND id=$2 AND http_request AND status='pending'")
-        .bind(tenant).bind(id).bind(serde_json::json!({"code":"dispatch_not_started","message":"No Worker claimed the request"}))
-        .execute(&mut *tx).await?.rows_affected() == 1;
+    let tx = state.pool().begin().await?;
+    db::set_tenant_guc(&tx, tenant).await?;
+    let changed = executions::Entity::update_many().col_expr(executions::Column::Status,Expr::val("failed"))
+        .col_expr(executions::Column::FinishedAt,now()).col_expr(executions::Column::Error,Expr::val(serde_json::json!({"code":"dispatch_not_started","message":"No Worker claimed the request"})))
+        .filter(executions::Column::TenantId.eq(tenant)).filter(executions::Column::Id.eq(id))
+        .filter(executions::Column::HttpRequest.eq(true)).filter(executions::Column::Status.eq("pending"))
+        .exec(&tx).await?.rows_affected == 1;
     tx.commit().await?;
     if changed {
         state
@@ -343,4 +399,14 @@ mod tests {
         assert!(super::hop_header("transfer-encoding", ""));
         assert!(!super::hop_header("set-cookie", ""));
     }
+}
+
+#[derive(FromQueryResult)]
+struct RedeemedExecution {
+    component_id: String,
+    input: Value,
+    name: String,
+    version: String,
+    wasm_sha256: String,
+    resource_limits: Value,
 }

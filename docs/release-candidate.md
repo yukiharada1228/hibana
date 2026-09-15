@@ -1,5 +1,7 @@
 # Hibana 0.2.0-rc.1
 
+このソースの基盤DBは空DB用の新しい初期スキーマです。旧DBへの自動更新は拒否します。[DBの作成と切替](database.md)を確認し、既存の稼働DBとは別の検証先を指定してください。
+
 CLI・PC用Wasmtimeランタイム・Control Plane・Workerを`0.2.0-rc.1`に揃えた候補版です。npmレジストリには公開しません。GitHub Actionsで作成した候補を取得し、検証環境へ導入します。正式なReleaseを公開するまで、候補版のGitHub Release URLによる自動取得は使えません。
 
 ## 含まれる変更
@@ -7,7 +9,7 @@ CLI・PC用Wasmtimeランタイム・Control Plane・Workerを`0.2.0-rc.1`に揃
 - 単独CLIによるサイト設定生成、実際のKubernetes dry-run、導入段階の記録と修復。
 - 受付を閉じた後の処理完了待ち、停止・再開・撤去、複数CLIの操作競合防止。
 - 初回起動前のNetworkPolicy、更新中の旧Podの通信維持、最終ポリシー適用後の全Podの依存先検査。
-- アップロードの中断・公開・回収の競合対策と、削除失敗時の継続的な回収。マイグレーション`0029`・`0030`を追加。
+- アップロードの中断・公開・回収の競合対策と、削除失敗時の継続的な回収。必要なテーブルをSeaORMの初期スキーマへ統合。
 - 実行中・準備中のWasmキャッシュ保護、バージョン操作の直列化、CLIのヘルプ・エラー・開発サーバー停止の改善。
 
 個別の検証内容は[修正・検証記録](review-fixes-validation.md)と[導入CLI検証](cli-platform-validation.md)に記載しています。
@@ -23,7 +25,7 @@ cd .local/release/0.2.0-rc.1
 shasum -a 256 -c SHA256SUMS
 ```
 
-完全な候補は以下の8ファイルと`SHA256SUMS`です。
+完全な候補は以下の10ファイルと`SHA256SUMS`です。
 
 | 配布物 | ファイル |
 | --- | --- |
@@ -31,6 +33,7 @@ shasum -a 256 -c SHA256SUMS
 | Kubernetesマニフェスト | `hibana-kubernetes-0.2.0-rc.1.tar.gz` |
 | PC用ランタイム | `hibana-worker-0.2.0-rc.1-{darwin,linux}-{x64,arm64}`の4ファイル |
 | 基盤イメージ | `hibana-platform-0.2.0-rc.1-linux-{amd64,arm64}.tar`の2ファイル |
+| コンソールイメージ | `hibana-console-0.2.0-rc.1-linux-{amd64,arm64}.tar`の2ファイル |
 
 候補の作成元はActions実行のcommit SHAで確認できます。異なる実行・バージョンのファイルを混在させず、ハッシュ確認後に社内へ搬入してください。
 
@@ -68,7 +71,7 @@ hibana platform install --kubeconfig /secure/config --context staging \
   --overlay my-site --image registry.example.internal/hibana/platform@sha256:DIGEST
 ```
 
-既存環境を更新する場合は、保存済みのoverlayと鍵を使います。CLIと基盤を同じ候補から用意し、`platform install`でマイグレーション`0030`まで適用してから、新しい停止・再開コマンドを使ってください。DBマイグレーションの自動巻き戻しはありません。[バックアップ・復元手順](resilience.md)と[オンプレ導入条件](on-prem-production.md)を確認して検証環境から更新します。
+この候補は既存DBへの上書き移行を行いません。既存overlayと鍵を保管し、別の空DB・検証用依存サービスを指定してCLIと基盤を確認します。稼働DBの切替は後日の保守作業とし、[基盤DBの切替方針](database.md)・[バックアップと復元](resilience.md)に従います。
 
 基盤操作には予約済みConfigMap `hibana-platform-operation`の`get`・`create`・`update`権限が必要です。CLI強制終了後にロックが残った場合の解除条件と手順は[基盤管理ガイド](../deploy/kubernetes/README.md)に記載しています。
 

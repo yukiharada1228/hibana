@@ -1,7 +1,7 @@
 //! Version-scoped environment. The caller holds the component publication lock.
 use crate::{error::AppError, validation};
+use hibana_database::prelude::*;
 use hibana_shared::FaasError;
-use sqlx::Row;
 use std::collections::{BTreeMap, BTreeSet};
 
 #[derive(Default)]
@@ -28,42 +28,52 @@ impl VersionEnvironment {
 
     pub async fn save(
         &self,
-        tx: &mut sqlx::PgConnection,
+        tx: &sea_orm::DatabaseTransaction,
         tenant: &str,
         component: &str,
         version: &str,
     ) -> Result<(), AppError> {
-        // Secret administration also takes the component lock. FOR SHARE additionally
-        // serializes with metadata rotation/rekey. Never trust a caller's env capabilities.
-        let rows = sqlx::query(
-            "SELECT id, name, deploy_allowed FROM function_secrets \
-             WHERE tenant_id=$1 AND component_id=$2 AND deleted_at IS NULL ORDER BY name FOR SHARE",
-        )
-        .bind(tenant)
-        .bind(component)
-        .fetch_all(&mut *tx)
-        .await?;
+        let rows = function_secrets::Entity::find()
+            .filter(function_secrets::Column::TenantId.eq(tenant))
+            .filter(function_secrets::Column::ComponentId.eq(component))
+            .filter(function_secrets::Column::DeletedAt.is_null())
+            .order_by_asc(function_secrets::Column::Name)
+            .lock_shared()
+            .all(tx)
+            .await?;
         for row in &rows {
-            let name: &str = row.try_get("name")?;
-            if self.vars.contains_key(name) {
+            if self.vars.contains_key(&row.name) {
                 return Err(
                     FaasError::Conflict("a var conflicts with a stored Secret".into()).into(),
                 );
             }
         }
         for name in &self.secrets {
-            let row = rows.iter().find(|r| r.get::<&str, _>("name") == name);
-            let row = row
-                .filter(|r| r.get::<bool, _>("deploy_allowed"))
+            let row = rows
+                .iter()
+                .find(|r| &r.name == name && r.deploy_allowed)
                 .ok_or(FaasError::Forbidden)?;
-            sqlx::query("INSERT INTO version_secret_bindings (tenant_id,component_id,version_id,secret_id,name) VALUES ($1,$2,$3,$4,$5)")
-                .bind(tenant).bind(component).bind(version).bind(row.get::<&str, _>("id")).bind(name)
-                .execute(&mut *tx).await?;
+            version_secret_bindings::Entity::insert(version_secret_bindings::ActiveModel {
+                tenant_id: Set(tenant.into()),
+                component_id: Set(component.into()),
+                version_id: Set(version.into()),
+                secret_id: Set(row.id.clone()),
+                name: Set(name.clone()),
+            })
+            .exec(tx)
+            .await?;
         }
         for (key, value) in &self.vars {
-            sqlx::query("INSERT INTO version_configs (tenant_id,component_id,version_id,key,value) VALUES ($1,$2,$3,$4,$5)")
-                .bind(tenant).bind(component).bind(version).bind(key).bind(value)
-                .execute(&mut *tx).await?;
+            version_configs::Entity::insert(version_configs::ActiveModel {
+                tenant_id: Set(tenant.into()),
+                component_id: Set(component.into()),
+                version_id: Set(version.into()),
+                key: Set(key.clone()),
+                value: Set(value.clone()),
+                ..Default::default()
+            })
+            .exec(tx)
+            .await?;
         }
         Ok(())
     }

@@ -3,11 +3,11 @@
 use crate::{db, dispatch, error::AppError, state::AppState};
 use axum::{extract::State, http::HeaderMap, Json};
 use futures::{stream, StreamExt};
+use hibana_database::prelude::*;
 use hibana_shared::{
     preparation::{Artifact, Claims, TOKEN_HEADER},
     FaasError,
 };
-use sqlx::Row;
 use std::time::Duration;
 
 pub(crate) async fn redeem(
@@ -151,17 +151,21 @@ pub(crate) async fn prepare_active(
     }
     let mut artifacts = Vec::new();
     for tenant in db::list_active_tenant_ids(state.pool()).await? {
-        let mut tx = state.pool().begin().await?;
-        db::set_tenant_guc(&mut tx, &tenant).await?;
-        let rows = sqlx::query("SELECT DISTINCT v.storage_uri,v.wasm_sha256 FROM components c JOIN component_versions v ON v.id=c.active_version_id AND v.tenant_id=c.tenant_id AND v.component_id=c.id WHERE c.tenant_id=$1 AND c.deleted_at IS NULL AND v.deleted_at IS NULL")
-            .bind(&tenant).fetch_all(&mut *tx).await?;
+        let tx = state.pool().begin().await?;
+        db::set_tenant_guc(&tx, &tenant).await?;
+        let rows = hibana_database::queries::active_versions(&tenant)
+            .select_only()
+            .columns([
+                component_versions::Column::StorageUri,
+                component_versions::Column::WasmSha256,
+            ])
+            .distinct()
+            .into_tuple::<(String, String)>()
+            .all(&tx)
+            .await?;
         tx.commit().await?;
         for row in rows {
-            artifacts.push((
-                tenant.clone(),
-                row.get::<String, _>("storage_uri"),
-                row.get::<String, _>("wasm_sha256"),
-            ));
+            artifacts.push((tenant.clone(), row.0, row.1));
         }
     }
     for check_only in [false, true] {
@@ -184,47 +188,45 @@ pub(crate) async fn prepare_version(
     tenant: &str,
     version: &str,
 ) -> Result<crate::artifact_reservations::Reservation, AppError> {
-    let mut tx = state.pool().begin().await?;
-    db::set_tenant_guc(&mut tx, tenant).await?;
-    let row = sqlx::query("SELECT v.storage_uri,v.wasm_sha256 FROM component_versions v JOIN components c ON c.id=v.component_id AND c.tenant_id=v.tenant_id WHERE v.tenant_id=$1 AND v.id=$2 AND v.deleted_at IS NULL AND c.deleted_at IS NULL")
-        .bind(tenant).bind(version).fetch_optional(&mut *tx).await?.ok_or_else(|| FaasError::NotFound("version".into()))?;
+    let tx = state.pool().begin().await?;
+    db::set_tenant_guc(&tx, tenant).await?;
+    let row = hibana_database::queries::live_versions(tenant)
+        .filter(component_versions::Column::Id.eq(version))
+        .select_only()
+        .columns([
+            component_versions::Column::StorageUri,
+            component_versions::Column::WasmSha256,
+        ])
+        .into_tuple::<(String, String)>()
+        .one(&tx)
+        .await?
+        .ok_or_else(|| FaasError::NotFound("version".into()))?;
     tx.commit().await?;
-    let mut reservation = crate::artifact_reservations::Reservation::new(
-        state,
-        tenant,
-        version,
-        &row.get::<String, _>("storage_uri"),
-        &row.get::<String, _>("wasm_sha256"),
-    )
-    .await?;
+    let mut reservation =
+        crate::artifact_reservations::Reservation::new(state, tenant, version, &row.0, &row.1)
+            .await?;
     reservation.confirm_object();
-    prepare(
-        state,
-        tenant,
-        &row.get::<String, _>("storage_uri"),
-        &row.get::<String, _>("wasm_sha256"),
-    )
-    .await?;
+    prepare(state, tenant, &row.0, &row.1).await?;
     Ok(reservation)
 }
 
 async fn reconcile(state: &AppState) -> Result<(), AppError> {
     for tenant in db::list_active_tenant_ids(state.pool()).await? {
-        let mut tx = state.pool().begin().await?;
-        db::set_tenant_guc(&mut tx, &tenant).await?;
-        let rows = sqlx::query("SELECT DISTINCT v.storage_uri,v.wasm_sha256 FROM components c JOIN component_versions v ON v.id=c.active_version_id AND v.tenant_id=c.tenant_id AND v.component_id=c.id WHERE c.tenant_id=$1 AND c.deleted_at IS NULL AND v.deleted_at IS NULL")
-            .bind(&tenant).fetch_all(&mut *tx).await?;
+        let tx = state.pool().begin().await?;
+        db::set_tenant_guc(&tx, &tenant).await?;
+        let rows = hibana_database::queries::active_versions(&tenant)
+            .select_only()
+            .columns([
+                component_versions::Column::StorageUri,
+                component_versions::Column::WasmSha256,
+            ])
+            .distinct()
+            .into_tuple::<(String, String)>()
+            .all(&tx)
+            .await?;
         tx.commit().await?;
         for row in rows {
-            if prepare(
-                state,
-                &tenant,
-                &row.get::<String, _>("storage_uri"),
-                &row.get::<String, _>("wasm_sha256"),
-            )
-            .await
-            .is_err()
-            {
+            if prepare(state, &tenant, &row.0, &row.1).await.is_err() {
                 tracing::warn!("Active artifact preparation incomplete; will retry");
             }
         }

@@ -1,0 +1,23 @@
+{
+  "name": "@hibana/postgres",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Application-owned pg adapter with Rust/Wasm authentication for Hibana",
+  "license": "MIT",
+  "exports": {
+    ".": "./dist/pg.mjs",
+    "./hibana.extension.json": "./hibana.extension.json"
+  },
+  "files": ["hibana.extension.json", "dist/", "wit/", "README.md", "LICENSE"],
+  "scripts": {
+    "build": "node build.mjs",
+    "prepack": "npm run build",
+    "test": "node ../../scripts/test-postgres-compatibility.mjs"
+  },
+  "devDependencies": {
+    "esbuild": "0.28.2",
+    "events": "3.3.0",
+    "pg": "8.23.0"
+  }
+}

@@ -86,6 +86,10 @@ spec:
   podSelector:
     matchLabels:
       app.kubernetes.io/part-of: hibana
+    matchExpressions:
+      - key: app.kubernetes.io/name
+        operator: NotIn
+        values: [hibana-console]
   policyTypes: [Egress]
   egress:
     - to:

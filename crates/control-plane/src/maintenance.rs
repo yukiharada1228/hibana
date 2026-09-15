@@ -6,6 +6,7 @@ use axum::{
     middleware::Next,
     response::{IntoResponse, Response},
 };
+use hibana_database::prelude::*;
 use std::sync::{
     atomic::{AtomicUsize, Ordering},
     Arc,
@@ -34,11 +35,14 @@ impl Requests {
     }
 }
 
-pub(crate) async fn enabled(pool: &sqlx::PgPool) -> Result<bool, sqlx::Error> {
+pub(crate) async fn enabled(pool: &sea_orm::DatabaseConnection) -> Result<bool, sea_orm::DbErr> {
     // No cache: a new/restarted replica must immediately honor maintenance.
-    sqlx::query_scalar("SELECT owner IS NOT NULL FROM platform_maintenance WHERE singleton")
-        .fetch_one(pool)
-        .await
+    Ok(platform_maintenance::Entity::find_by_id(true)
+        .one(pool)
+        .await?
+        .ok_or_else(|| DbErr::Custom("maintenance state missing".into()))?
+        .owner
+        .is_some())
 }
 
 pub(crate) async fn public_gate(
@@ -88,9 +92,9 @@ pub(crate) async fn status(
     drop(checking);
     let mut executions = 0i64;
     for (tenant, _) in crate::db::list_tenants_for_admin(state.pool()).await? {
-        let mut tx = state.pool().begin().await?;
-        crate::db::set_tenant_guc(&mut tx, &tenant).await?;
-        executions += crate::db::count_inflight_executions(&mut *tx, &tenant).await?;
+        let tx = state.pool().begin().await?;
+        crate::db::set_tenant_guc(&tx, &tenant).await?;
+        executions += crate::db::count_inflight_executions(&tx, &tenant).await?;
         tx.commit().await?;
     }
     Ok(
@@ -120,11 +124,19 @@ pub(crate) async fn set(
     {
         return Ok(StatusCode::BAD_REQUEST.into_response());
     }
-    let changed: bool = sqlx::query_scalar("SELECT hibana_set_maintenance($1,$2)")
-        .bind(request.owner)
-        .bind(request.closed)
-        .fetch_one(state.pool())
-        .await?;
+    let changed: bool = state
+        .pool()
+        .query_one(
+            &Query::select()
+                .expr(
+                    Func::cust("hibana_set_maintenance")
+                        .args([Expr::val(request.owner), Expr::val(request.closed)]),
+                )
+                .to_owned(),
+        )
+        .await?
+        .ok_or_else(|| DbErr::Custom("maintenance result missing".into()))?
+        .try_get_by_index(0)?;
     Ok(if changed {
         StatusCode::NO_CONTENT
     } else {
@@ -145,10 +157,11 @@ pub(crate) async fn prepare(
     axum::Json(request): axum::Json<PreparationRequest>,
 ) -> Result<Response, AppError> {
     crate::handlers::tenants::require_bootstrap_admin(&headers, &state)?;
-    let owner: Option<String> =
-        sqlx::query_scalar("SELECT owner FROM platform_maintenance WHERE singleton")
-            .fetch_one(state.pool())
-            .await?;
+    let owner: Option<String> = platform_maintenance::Entity::find_by_id(true)
+        .one(state.pool())
+        .await?
+        .ok_or_else(|| DbErr::Custom("maintenance state missing".into()))?
+        .owner;
     if owner.as_deref() != Some(request.owner.as_str()) {
         return Ok((StatusCode::CONFLICT, "maintenance owner mismatch").into_response());
     }

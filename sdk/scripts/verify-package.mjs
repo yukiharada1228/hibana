@@ -32,6 +32,7 @@ try {
   assert.ok(paths.includes("platform/network.py"), "platform/network.py");
   assert.ok(paths.includes("platform/operation.py"), "platform/operation.py");
   assert.ok(paths.includes("platform/readiness.py"), "platform/readiness.py");
+  assert.ok(paths.includes("src/extension-manifest.mjs"), "src/extension-manifest.mjs");
   for (const required of ["LICENSE", "src/cli.mjs", "src/runtime.mjs", "src/profiles.mjs", "platform/remote.py", "platform/common.py", "platform/maintenance.py", "platform/preflight.py", "platform/existing.py", "platform/manifests/base/kustomization.yaml", "platform/manifests/remote/ingress.yaml", "platform/manifests/migration/job.yaml", "templates/hono/src/index.ts", "wit/world.wit"]) assert.ok(paths.includes(required), required);
   assert.ok(paths.every(path => !/^(examples|test|node_modules)\/|kubernetes\.py$|\.hibana|\.env$|Dockerfile|Cargo\.toml/.test(path) || path === "templates/rust/Cargo.toml"));
   const tarball = join(temporary, packed.filename);

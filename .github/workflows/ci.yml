@@ -14,6 +14,28 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  console:
+    name: Console browser tests & image
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+          cache: npm
+          cache-dependency-path: console/package-lock.json
+      - run: npm ci --prefix console --ignore-scripts
+      - run: npm run build --prefix console
+      - run: npx --prefix console playwright install --with-deps chromium
+      - run: npm test --prefix console
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/build-push-action@v6
+        with:
+          context: console
+          push: false
+          cache-from: type=gha,scope=console
+          cache-to: type=gha,mode=max,scope=console
   kubernetes:
     name: Kubernetes manifests & images
     runs-on: ubuntu-latest
@@ -42,7 +64,7 @@ jobs:
           cache-from: type=gha
           cache-to: type=gha,mode=max
   # ネイティブ crate（control-plane / worker / shared）のビルド・テスト。
-  # sqlx は query! マクロを使わないため DB なしでビルドできる（M1）。
+  # SeaORMの型とマイグレーションはDBなしでビルドし、実DB試験は隔離環境で行う。
   native:
     name: build & test (native)
     runs-on: ubuntu-latest
@@ -76,7 +98,13 @@ jobs:
         run: cargo test --workspace
 
       - name: HTTP acceptance and provenance (isolated PostgreSQL)
-        run: bash scripts/test-http.sh
+        env:
+          HIBANA_TEST_CONSOLE_IMAGE: hibana-console:verification
+        run: |
+          npm ci --prefix console --ignore-scripts
+          npx --prefix console playwright install --with-deps chromium
+          docker build -t hibana-console:verification console
+          bash scripts/test-http.sh
 
       # 品質ゲート（コンパイル後に評価。最初の skeleton では赤になりうる）。
       - name: clippy
@@ -195,12 +223,47 @@ jobs:
         working-directory: sdk
         run: npm ci
 
+      - name: Check JavaScript formatting
+        run: npm run format:check --prefix sdk
+
       - name: Test language-neutral CLI
         working-directory: sdk
         run: npm test
 
+      - name: Test application-owned JS and Rust Wasm extensions
+        run: |
+          cargo install wac-cli --version 0.11.0 --locked --no-default-features --features wit
+          npm run build --prefix sdk/examples/hono-extensions/extension
+          npm ci --prefix sdk/examples/hono-extensions
+          HIBANA_TEST_CP_BIN=target/release/hibana-control-plane node scripts/test-application-extensions.mjs
+
       - name: Verify distributable CLI outside the checkout
         run: HIBANA_RUNTIME_BIN="$GITHUB_WORKSPACE/target/release/hibana-worker" npm run test:package --prefix sdk
+
+      - name: Test optional application-owned TCP and TLS package
+        # No Worker/CLI dependencies. Official tool archives are checksum-pinned.
+        run: |
+          curl --fail --location --retry 3 https://github.com/WebAssembly/wasi-sdk/releases/download/wasi-sdk-34/wasi-sdk-34.0-x86_64-linux.tar.gz -o "$RUNNER_TEMP/wasi-sdk.tar.gz"
+          printf '%s  %s\n' b761e3a0721dbae9c09a0059e5fdb2bf917d1b4a8a7b430fb3b5aafb0984b2c4 "$RUNNER_TEMP/wasi-sdk.tar.gz" | sha256sum --check
+          tar -xzf "$RUNNER_TEMP/wasi-sdk.tar.gz" -C "$RUNNER_TEMP"
+          curl --fail --location --retry 3 https://github.com/bytecodealliance/wasmtime/releases/download/v36.0.14/wasmtime-v36.0.14-x86_64-linux.tar.xz -o "$RUNNER_TEMP/wasmtime.tar.xz"
+          printf '%s  %s\n' 74cf96775172c1a752a1cdabc7b10c5a83ce5149e47e9065b54f913c62f13a14 "$RUNNER_TEMP/wasmtime.tar.xz" | sha256sum --check
+          tar -xJf "$RUNNER_TEMP/wasmtime.tar.xz" -C "$RUNNER_TEMP"
+          npm ci --ignore-scripts --prefix extensions/node-net
+          WASI_SDK_PATH="$RUNNER_TEMP/wasi-sdk-34.0-x86_64-linux" npm run build --prefix extensions/node-net
+          CC_wasm32_wasip2="$RUNNER_TEMP/wasi-sdk-34.0-x86_64-linux/bin/clang" AR_wasm32_wasip2="$RUNNER_TEMP/wasi-sdk-34.0-x86_64-linux/bin/llvm-ar" cargo clippy --locked --release --target wasm32-wasip2 --manifest-path extensions/node-net/component/Cargo.toml -- -D warnings
+          cargo fmt --manifest-path extensions/node-net/component/Cargo.toml -- --check
+          WASMTIME_BIN="$RUNNER_TEMP/wasmtime-v36.0.14-x86_64-linux/wasmtime" HIBANA_TEST_CP_BIN=target/release/hibana-control-plane node scripts/test-node-net-extension.mjs
+
+      - name: Test optional PostgreSQL adapter and Drizzle on Wasm
+        run: |
+          npm ci --ignore-scripts --prefix extensions/postgres
+          npm ci --ignore-scripts --prefix scripts/fixtures/postgres
+          npm run build --prefix extensions/postgres
+          cargo test --locked --lib --manifest-path extensions/postgres/component/Cargo.toml
+          cargo clippy --locked --release --target wasm32-wasip2 --manifest-path extensions/postgres/component/Cargo.toml -- -D warnings
+          cargo fmt --manifest-path extensions/postgres/component/Cargo.toml -- --check
+          WASMTIME_BIN="$RUNNER_TEMP/wasmtime-v36.0.14-x86_64-linux/wasmtime" HIBANA_TEST_CP_BIN=target/release/hibana-control-plane node scripts/test-postgres-compatibility.mjs
 
       - name: Bounded operational commands
         run: node --test scripts/test-bounded-process.test.mjs

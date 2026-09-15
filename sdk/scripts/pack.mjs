@@ -4,7 +4,7 @@ import { access, cp, mkdir, rm } from "node:fs/promises";
 const license = new URL("../LICENSE", import.meta.url);
 try { await cp(new URL("../../LICENSE", import.meta.url), license); }
 catch (error) { if (error.code !== "ENOENT") throw error; await access(license); }
-for (const name of ["base", "migration", "remote"]) {
+for (const name of ["base", "migration", "remote", "console"]) {
   const destination = new URL(`../platform/manifests/${name}/`, import.meta.url);
   const source = new URL(`../../deploy/kubernetes/${name}/`, import.meta.url);
   try { await access(source); }

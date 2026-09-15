@@ -115,6 +115,15 @@ jobs:
           docker load --input "dist/hibana-platform-$VERSION-linux-$ARCH.tar"
           result=$(docker run --rm --entrypoint hibana-worker "hibana-platform:$VERSION-linux-$ARCH" --version)
           test "$result" = "hibana-worker $VERSION"
+      - uses: docker/build-push-action@v6
+        with:
+          context: console
+          platforms: linux/${{ matrix.arch }}
+          tags: hibana-console:${{ steps.version.outputs.value }}-linux-${{ matrix.arch }}
+          push: false
+          outputs: type=docker,dest=dist/hibana-console-${{ steps.version.outputs.value }}-linux-${{ matrix.arch }}.tar
+          cache-from: type=gha,scope=console-release-${{ matrix.arch }}
+          cache-to: type=gha,mode=max,scope=console-release-${{ matrix.arch }}
       - uses: actions/upload-artifact@v4
         with:
           name: release-image-${{ matrix.arch }}

@@ -9,6 +9,7 @@ use axum::extract::{Multipart, Path, State};
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
 use axum::Json;
+use hibana_database::prelude::*;
 use hibana_shared::{new_component_id, new_version_id, FaasError, ResourceLimits};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -46,9 +47,9 @@ pub async fn create_component(
 
     let component_id = new_component_id();
 
-    let mut tx = state.pool().begin().await?;
-    db::set_tenant_guc(&mut tx, tenant).await?;
-    db::create_component(&mut *tx, tenant, &component_id, &req.name)
+    let tx = state.pool().begin().await?;
+    db::set_tenant_guc(&tx, tenant).await?;
+    db::create_component(&tx, tenant, &component_id, &req.name)
         .await
         .map_err(|e| map_unique_violation(e, "component name already exists"))?;
     tx.commit().await?;
@@ -99,11 +100,11 @@ pub async fn upload_version(
 ) -> Result<impl IntoResponse, AppError> {
     let tenant = &principal.tenant_id;
 
-    let mut tx = state.pool().begin().await?;
-    db::set_tenant_guc(&mut tx, tenant).await?;
+    let tx = state.pool().begin().await?;
+    db::set_tenant_guc(&tx, tenant).await?;
 
     // 対象 component の存在確認（active 化先・名前解決のため）。
-    let component = db::find_component_by_id(&mut *tx, tenant, &component_id)
+    let component = db::find_component_by_id(&tx, tenant, &component_id)
         .await?
         .ok_or_else(|| FaasError::NotFound(format!("component '{component_id}'")))?;
 
@@ -233,13 +234,9 @@ pub async fn upload_version(
 
     // (2)(3)(4) 隔離検証 + §4.4 capability strict matching + sha256/サイズ確定。
     //
-    // §4.4 (M3d): capability は既定 **deny-all**。クライアント宣言値（multipart `capabilities`）は
-    // **信用しない**（承認は admin スコープの管理操作）。validate_wasm は WIT import を
-    // **admin 承認集合**（本スライスは標準 handler world 契約 + 標準 WASI の baseline）と厳密照合し、
-    // 未承認 import は 422 で拒否する。クライアント宣言値は受理してログに残すだけで、保存は
-    // **承認済みとして解決した import 集合**（validated.approved_imports）を使う。
-    let approved = validation::ApprovedCapabilities::baseline();
-    let validated = validation::validate_wasm(wasm_bytes.clone(), approved).await?;
+    // Persist imports validated against Hibana's WASI host contract. Client
+    // declarations cannot add host functions or grant runtime permissions.
+    let validated = validation::validate_wasm(wasm_bytes.clone()).await?;
 
     if let Some(caps) = &capabilities {
         // 宣言値は監査・観測用にログするのみ（保存・付与には使わない, §4.4）。
@@ -249,7 +246,7 @@ pub async fn upload_version(
     //
     // Plain vars and selected, separately authorized Secrets form the environment.
     // Egress stays deny-all until an administrator approves it.
-    let capabilities_json = validation::CapabilitySet {
+    let capabilities_json = hibana_shared::capabilities::CapabilitySet {
         imports: validated.approved_imports.clone(),
         env: allowed_env,
         net_allow_outbound: std::collections::BTreeSet::new(),
@@ -281,15 +278,12 @@ pub async fn upload_version(
 
     // Recheck the component and signing policy after external I/O. These locks
     // serialize publication with deletion and policy changes, in a short transaction.
-    let mut tx = state.pool().begin().await?;
-    db::set_tenant_guc(&mut tx, tenant).await?;
-    reservation.lock(&mut tx).await?;
-    sqlx::query("SELECT id FROM tenants WHERE id=$1 AND status='active' FOR SHARE")
-        .bind(tenant)
-        .fetch_optional(&mut *tx)
-        .await?
+    let tx = state.pool().begin().await?;
+    db::set_tenant_guc(&tx, tenant).await?;
+    reservation.lock(&tx).await?;
+    tenants::Entity::find_by_id(tenant.to_owned()).filter(tenants::Column::Status.eq("active")).lock_shared().one(&tx).await?
         .ok_or_else(|| FaasError::NotFound("active tenant".into()))?;
-    if !db::lock_component(&mut tx, tenant, &component_id).await? {
+    if !db::lock_component(&tx, tenant, &component_id).await? {
         return Err(FaasError::NotFound(format!("component '{component_id}'")).into());
     }
 
@@ -302,7 +296,7 @@ pub async fn upload_version(
     // どちらでも「署名が付いていて不正」は拒否する（誤検証を黙認しない）。
     //
     // 署名対象は本体そのものではなく `validated.sha256`（検証パイプラインが算出済みの 16 進文字列）。
-    let require_signed = db::require_signed_components(&mut *tx, tenant).await?;
+    let require_signed = db::require_signed_components(&tx, tenant).await?;
     if require_signed || signature.is_some() {
         let audit_reject = |reason: &'static str| {
             tracing::warn!(%component_id, reason, require_signed, "component signature rejected");
@@ -316,7 +310,7 @@ pub async fn upload_version(
             )
         })?;
 
-        let keys = db::list_signing_keys(&mut *tx, tenant)
+        let keys = db::list_signing_keys(&tx, tenant)
             .await?
             .into_iter()
             .map(|k| (k.key_id, k.public_key))
@@ -334,7 +328,7 @@ pub async fn upload_version(
         if let Err(e) = signing::verify_component_signature(&validated.sha256, sig, &keys) {
             audit_reject(e.reason());
             db::insert_audit_log(
-                &mut *tx,
+                &tx,
                 tenant,
                 principal.user_id.as_deref(),
                 "component_signature_rejected",
@@ -357,7 +351,7 @@ pub async fn upload_version(
     let limits_json = serde_json::to_value(resource_limits)?;
 
     db::insert_version(
-        &mut *tx,
+        &tx,
         tenant,
         &component.id,
         &version_id,
@@ -374,15 +368,15 @@ pub async fn upload_version(
     .map_err(|e| map_unique_violation(e, "version already exists for this component"))?;
 
     environment
-        .save(&mut tx, tenant, &component.id, &version_id)
+        .save(&tx, tenant, &component.id, &version_id)
         .await?;
     if let Some(enabled) = ingress {
-        db::set_component_ingress(&mut *tx, tenant, &component.id, enabled).await?;
+        db::set_component_ingress(&tx, tenant, &component.id, enabled).await?;
     }
-    db::insert_audit_log(&mut *tx, tenant, principal.user_id.as_deref(), "version_environment_published", Some(&component.id),
+    db::insert_audit_log(&tx, tenant, principal.user_id.as_deref(), "version_environment_published", Some(&component.id),
         Some(&json!({"version_id": version_id, "vars": environment.vars.keys().collect::<Vec<_>>(), "secrets": environment.secrets}))).await?;
     if activate {
-        db::switch_active_version(&mut *tx, tenant, &component.id, &version_id).await?;
+        db::switch_active_version(&tx, tenant, &component.id, &version_id).await?;
     }
 
     tx.commit().await?;
@@ -418,6 +412,7 @@ pub struct ComponentListItemResponse {
     pub component_id: String,
     pub name: String,
     pub active_version_id: Option<String>,
+    pub ingress_enabled: bool,
     pub created_at: String,
 }
 
@@ -428,9 +423,9 @@ pub async fn list_components(
 ) -> Result<impl IntoResponse, AppError> {
     let tenant = &principal.tenant_id;
 
-    let mut tx = state.pool().begin().await?;
-    db::set_tenant_guc(&mut tx, tenant).await?;
-    let items = db::list_components(&mut *tx, tenant).await?;
+    let tx = state.pool().begin().await?;
+    db::set_tenant_guc(&tx, tenant).await?;
+    let items = db::list_components(&tx, tenant).await?;
     tx.commit().await?;
     let body: Vec<ComponentListItemResponse> = items
         .into_iter()
@@ -438,6 +433,7 @@ pub async fn list_components(
             component_id: c.component_id,
             name: c.name,
             active_version_id: c.active_version_id,
+            ingress_enabled: c.ingress_enabled,
             created_at: c.created_at.to_rfc3339(),
         })
         .collect();
@@ -468,15 +464,15 @@ pub async fn list_versions(
 ) -> Result<impl IntoResponse, AppError> {
     let tenant = &principal.tenant_id;
 
-    let mut tx = state.pool().begin().await?;
-    db::set_tenant_guc(&mut tx, tenant).await?;
+    let tx = state.pool().begin().await?;
+    db::set_tenant_guc(&tx, tenant).await?;
 
     // component の存在確認（不在は 404）。
-    db::find_component_by_id(&mut *tx, tenant, &component_id)
+    db::find_component_by_id(&tx, tenant, &component_id)
         .await?
         .ok_or_else(|| FaasError::NotFound(format!("component '{component_id}'")))?;
 
-    let items = db::list_versions(&mut *tx, tenant, &component_id).await?;
+    let items = db::list_versions(&tx, tenant, &component_id).await?;
     tx.commit().await?;
     let body: Vec<VersionListItemResponse> = items
         .into_iter()
@@ -514,24 +510,24 @@ async fn delete_for_tenant(
     tenant: &str,
     component_id: &str,
 ) -> Result<(), AppError> {
-    let mut tx = state.pool().begin().await?;
-    db::set_tenant_guc(&mut tx, tenant).await?;
+    let tx = state.pool().begin().await?;
+    db::set_tenant_guc(&tx, tenant).await?;
 
     // Serialize deletion with HTTP admission so a new execution cannot slip
     // between the active-execution check and the tombstone update.
-    if !db::lock_component(&mut tx, tenant, component_id).await? {
+    if !db::lock_component(&tx, tenant, component_id).await? {
         return Err(FaasError::NotFound(format!("component '{component_id}'")).into());
     }
 
     // 参照中の実行があれば保護（§6.7）。
-    if db::has_active_executions_for_component(&mut *tx, tenant, component_id).await? {
+    if db::has_active_executions_for_component(&tx, tenant, component_id).await? {
         return Err(FaasError::Conflict(format!(
             "component '{component_id}' has pending/running executions"
         ))
         .into());
     }
 
-    db::soft_delete_component(&mut *tx, tenant, component_id).await?;
+    db::soft_delete_component(&tx, tenant, component_id).await?;
 
     tx.commit().await?;
 
@@ -547,9 +543,9 @@ pub async fn admin_list_components(
     super::tenants::require_bootstrap_admin(&headers, &state)?;
     let mut result = Vec::new();
     for (tenant_id, tenant_slug) in db::list_tenants_for_admin(state.pool()).await? {
-        let mut tx = state.pool().begin().await?;
-        db::set_tenant_guc(&mut tx, &tenant_id).await?;
-        for item in db::list_components(&mut *tx, &tenant_id).await? {
+        let tx = state.pool().begin().await?;
+        db::set_tenant_guc(&tx, &tenant_id).await?;
+        for item in db::list_components(&tx, &tenant_id).await? {
             result.push(json!({"tenant_id": tenant_id, "tenant_slug": tenant_slug,
                 "component_id": item.component_id, "name": item.name,
                 "active_version_id": item.active_version_id}));
@@ -585,20 +581,20 @@ pub async fn delete_version(
 ) -> Result<impl IntoResponse, AppError> {
     let tenant = &principal.tenant_id;
 
-    let mut tx = state.pool().begin().await?;
-    db::set_tenant_guc(&mut tx, tenant).await?;
+    let tx = state.pool().begin().await?;
+    db::set_tenant_guc(&tx, tenant).await?;
 
     // Hold the same parent lock as publication, rollback and HTTP admission.
     // Read active/previous/execution state only after any earlier publisher commits.
-    if !db::lock_component(&mut tx, tenant, &component_id).await? {
+    if !db::lock_component(&tx, tenant, &component_id).await? {
         return Err(FaasError::NotFound(format!("component '{component_id}'")).into());
     }
-    let component = db::find_component_by_id(&mut *tx, tenant, &component_id)
+    let component = db::find_component_by_id(&tx, tenant, &component_id)
         .await?
         .ok_or_else(|| FaasError::NotFound(format!("component '{component_id}'")))?;
 
     // 対象 version の解決（不在は 404）。
-    let target_version_id = db::find_version_id(&mut *tx, tenant, &component_id, &version)
+    let target_version_id = db::find_version_id(&tx, tenant, &component_id, &version)
         .await?
         .ok_or_else(|| {
             FaasError::NotFound(format!("version '{version}' of component '{component_id}'"))
@@ -622,14 +618,14 @@ pub async fn delete_version(
     }
 
     // 参照中の実行があれば保護（§6.7）。
-    if db::has_active_executions_for_version(&mut *tx, tenant, &target_version_id).await? {
+    if db::has_active_executions_for_version(&tx, tenant, &target_version_id).await? {
         return Err(FaasError::Conflict(format!(
             "version '{version}' has pending/running executions"
         ))
         .into());
     }
 
-    db::soft_delete_version(&mut *tx, tenant, &component_id, &target_version_id).await?;
+    db::soft_delete_version(&tx, tenant, &component_id, &target_version_id).await?;
 
     tx.commit().await?;
 
@@ -669,16 +665,16 @@ pub async fn set_active_version(
         return Err(FaasError::InvalidRequest("version must not be empty".into()).into());
     }
 
-    let mut tx = state.pool().begin().await?;
-    db::set_tenant_guc(&mut tx, tenant).await?;
+    let tx = state.pool().begin().await?;
+    db::set_tenant_guc(&tx, tenant).await?;
 
     // component の存在確認（不在は 404）。
-    db::find_component_by_id(&mut *tx, tenant, &component_id)
+    db::find_component_by_id(&tx, tenant, &component_id)
         .await?
         .ok_or_else(|| FaasError::NotFound(format!("component '{component_id}'")))?;
 
     // 指定 version が当該 component の未削除 version であること（不在は 404）。
-    let target_version_id = db::find_version_id(&mut *tx, tenant, &component_id, &req.version)
+    let target_version_id = db::find_version_id(&tx, tenant, &component_id, &req.version)
         .await?
         .ok_or_else(|| {
             FaasError::NotFound(format!(
@@ -690,15 +686,15 @@ pub async fn set_active_version(
     tx.commit().await?;
     let reservation =
         crate::preparation::prepare_version(&state, tenant, &target_version_id).await?;
-    let mut tx = state.pool().begin().await?;
-    db::set_tenant_guc(&mut tx, tenant).await?;
-    reservation.lock(&mut tx).await?;
+    let tx = state.pool().begin().await?;
+    db::set_tenant_guc(&tx, tenant).await?;
+    reservation.lock(&tx).await?;
 
-    if !db::lock_component(&mut tx, tenant, &component_id).await? {
+    if !db::lock_component(&tx, tenant, &component_id).await? {
         return Err(FaasError::NotFound(format!("component '{component_id}'")).into());
     }
 
-    if !db::switch_active_version(&mut *tx, tenant, &component_id, &target_version_id).await? {
+    if !db::switch_active_version(&tx, tenant, &component_id, &target_version_id).await? {
         return Err(FaasError::NotFound(format!(
             "version '{}' of component '{component_id}'",
             req.version
@@ -708,7 +704,7 @@ pub async fn set_active_version(
 
     // M7a: 版の切替は監査に残す（現行は tracing のみで audit_logs に痕跡が無かった）。
     db::insert_audit_log(
-        &mut *tx,
+        &tx,
         tenant,
         principal.user_id.as_deref(),
         "active_version_switched",
@@ -776,9 +772,9 @@ pub async fn set_component_ingress(
     JsonBody(req): JsonBody<SetIngressRequest>,
 ) -> Result<impl IntoResponse, AppError> {
     let tenant = &principal.tenant_id;
-    let mut tx = state.pool().begin().await?;
-    db::set_tenant_guc(&mut tx, tenant).await?;
-    let updated = db::set_component_ingress(&mut *tx, tenant, &component_id, req.enabled).await?;
+    let tx = state.pool().begin().await?;
+    db::set_tenant_guc(&tx, tenant).await?;
+    let updated = db::set_component_ingress(&tx, tenant, &component_id, req.enabled).await?;
     if !updated {
         return Err(FaasError::NotFound(format!("component '{component_id}'")).into());
     }
@@ -797,12 +793,12 @@ pub async fn rollback_version(
 ) -> Result<impl IntoResponse, AppError> {
     let tenant = &principal.tenant_id;
 
-    let mut tx = state.pool().begin().await?;
-    db::set_tenant_guc(&mut tx, tenant).await?;
+    let tx = state.pool().begin().await?;
+    db::set_tenant_guc(&tx, tenant).await?;
 
     let target_version_id: Option<String> = match req.version.as_deref().map(str::trim) {
         Some(v) if !v.is_empty() => Some(
-            db::find_version_id(&mut *tx, tenant, &component_id, v)
+            db::find_version_id(&tx, tenant, &component_id, v)
                 .await?
                 .ok_or_else(|| {
                     FaasError::NotFound(format!("version '{v}' of component '{component_id}'"))
@@ -813,7 +809,7 @@ pub async fn rollback_version(
 
     let prepared_target = match target_version_id.as_ref() {
         Some(id) => id.clone(),
-        None => db::find_component_by_id(&mut *tx, tenant, &component_id)
+        None => db::find_component_by_id(&tx, tenant, &component_id)
             .await?
             .ok_or_else(|| FaasError::NotFound("component".into()))?
             .previous_active_version_id
@@ -823,14 +819,21 @@ pub async fn rollback_version(
     };
     tx.commit().await?;
     let reservation = crate::preparation::prepare_version(&state, tenant, &prepared_target).await?;
-    let mut tx = state.pool().begin().await?;
-    db::set_tenant_guc(&mut tx, tenant).await?;
-    reservation.lock(&mut tx).await?;
+    let tx = state.pool().begin().await?;
+    db::set_tenant_guc(&tx, tenant).await?;
+    reservation.lock(&tx).await?;
     // An implicit rollback must not silently choose a different, unprepared target
     // if another publication completed while preparation was in flight.
-    let current_previous: Option<Option<String>> = sqlx::query_scalar(
-        "SELECT previous_active_version_id FROM components WHERE tenant_id=$1 AND id=$2 AND deleted_at IS NULL FOR UPDATE")
-        .bind(tenant).bind(&component_id).fetch_optional(&mut *tx).await?;
+    let current_previous: Option<Option<String>> = components::Entity::find()
+        .select_only()
+        .column(components::Column::PreviousActiveVersionId)
+        .filter(components::Column::TenantId.eq(tenant))
+        .filter(components::Column::Id.eq(&component_id))
+        .filter(components::Column::DeletedAt.is_null())
+        .lock_exclusive()
+        .into_tuple()
+        .one(&tx)
+        .await?;
     if target_version_id.is_none()
         && current_previous.flatten().as_deref() != Some(prepared_target.as_str())
     {
@@ -840,12 +843,11 @@ pub async fn rollback_version(
         .into());
     }
     let rolled =
-        db::rollback_active_version(&mut *tx, tenant, &component_id, Some(&prepared_target))
-            .await?;
+        db::rollback_active_version(&tx, tenant, &component_id, Some(&prepared_target)).await?;
 
     // 0 行のときだけ理由を確定する。
     let Some((active_version_id, rolled_back_from)) = rolled else {
-        let component = db::find_component_by_id(&mut *tx, tenant, &component_id)
+        let component = db::find_component_by_id(&tx, tenant, &component_id)
             .await?
             .ok_or_else(|| FaasError::NotFound(format!("component '{component_id}'")))?;
         return match (target_version_id, component.previous_active_version_id) {
@@ -863,7 +865,7 @@ pub async fn rollback_version(
     };
 
     db::insert_audit_log(
-        &mut *tx,
+        &tx,
         tenant,
         principal.user_id.as_deref(),
         "version_rollback",

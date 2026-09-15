@@ -42,10 +42,11 @@ async function holdComponent(pg, id) {
 async function waitForBlocked(sql, count) {
   const deadline = Date.now()+4000;
   while (Date.now()<deadline) {
-    // Only publication/deletion queries in this isolated CP use this parent lock.
+    // Observe PostgreSQL lock waits, independent of ORM SQL formatting.
+    // This isolated test has only the component fixture holding a blocking lock.
     const blocked = Number((await sql(`SELECT count(*) FROM pg_stat_activity
       WHERE usename='faas_app' AND wait_event_type='Lock'
-      AND (query LIKE '%FROM components%FOR UPDATE%' OR query LIKE 'UPDATE components %')`)).trim());
+      AND cardinality(pg_blocking_pids(pid)) > 0`)).trim());
     if (blocked===count) return;
     await sleep(20);
   }

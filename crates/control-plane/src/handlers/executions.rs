@@ -7,6 +7,7 @@ use axum::extract::{Path, State};
 use axum::response::IntoResponse;
 use axum::Json;
 use hibana_shared::FaasError;
+use sea_orm::TransactionTrait as _;
 use serde::Serialize;
 use serde_json::Value;
 
@@ -41,9 +42,9 @@ pub async fn get_execution(
 
     // GET も RLS 下では app.tenant_id を SELECT 実行接続にセットする必要がある
     // （GUC 未設定の bare 接続は fail-closed で ERROR）。
-    let mut tx = state.pool().begin().await?;
-    db::set_tenant_guc(&mut tx, tenant).await?;
-    let row = db::get_execution(&mut *tx, tenant, &id)
+    let tx = state.pool().begin().await?;
+    db::set_tenant_guc(&tx, tenant).await?;
+    let row = db::get_execution(&tx, tenant, &id)
         .await?
         .ok_or_else(|| FaasError::NotFound(format!("execution '{id}'")))?;
     tx.commit().await?;

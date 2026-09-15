@@ -59,7 +59,7 @@ hibana platform uninstall --kubeconfig FILE --context NAME --yes
 
 停止は新規受付を閉じ、処理と実行結果の保存が終わってからWorker・CPを停止します。再開は保存したレプリカ数を復元し、公開アプリの準備後にHPAと受付を戻します。撤去はCLIが管理するリソースを削除し、クラスタ・namespace・PVC・外部DB/Redis/S3を保持します。実サイトでの導入条件は[オンプレ運用ガイド](on-prem-production.md)を参照してください。
 
-この停止制御・失敗アップロード回収・キャッシュ保護の更新は、マイグレーション`0029`・`0030`と新しいCP内アダプターを含むソース候補の変更です。CLIと基盤イメージを同じ候補から用意し、`platform install`でDB更新を先に完了させてください。公開済みv0.1.0の基盤へ、新しい停止コマンドだけを先行適用する構成は対象外です。
+このソース候補では、停止制御・回収・キャッシュ保護に必要なテーブルもSeaORMの新しい初期スキーマへ含めています。CLIと基盤イメージを同じ候補から用意し、[空DBへの初期化](database.md)を先に完了させます。公開済みv0.1.0のDBへの上書き更新は行いません。
 
 ## ソースから候補を作る
 
@@ -86,7 +86,7 @@ node scripts/release.mjs checksums .local/release
 
 - Linux x64/arm64、macOS x64/arm64をネイティブビルド。各OSでtarballの独立インストール、HonoのWasm変換、ランタイム導入、実HTTP応答、Ctrl+C停止を検証。
 - Linux amd64/arm64の基盤イメージをDocker archiveで保存し、load後の起動とバージョンを確認。
-- CLI、Kubernetes archive、4つのランタイム、2つの基盤イメージの全8ファイルが揃った場合だけ`SHA256SUMS`を作成。
+- CLI、Kubernetes archive、4つのランタイム、2つの基盤イメージ、2つのコンソールイメージの全10ファイルが揃った場合だけ`SHA256SUMS`を作成。コンソールはLinux amd64 / arm64それぞれのイメージを別に配布し、サイトの`console/kustomization.yaml`へ設定する。
 - タグとパッケージの版が一致した場合だけ、同じコミットの成果物をReleaseへ添付。公開後にGitHub URLからCLIを再インストールし、既定の`init → dev`によるランタイムの自動取得と`HTTP → 停止`を確認。
 
 LinuxバイナリはUbuntu 22.04、MacはIntelがmacOS 15、arm64がmacOS 14でビルド・検証します。古いOS、Windowsネイティブ、MacのDeveloper ID署名・公証は対象外です。[GitHub公式runner一覧](https://docs.github.com/en/actions/reference/runners/github-hosted-runners)を参照してください。

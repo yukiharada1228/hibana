@@ -61,7 +61,7 @@ let remainder = "";
 for (;;) { const part = await reader.read(); if (part.done) break; remainder += new TextDecoder().decode(part.value); }
 assert.match(remainder, /data: second/);
 assert.ok(performance.now() - started >= 50, "response should stream before the delayed second chunk");
-const api = await apiClient(project);
+const api = await apiClient();
 for (const path of ["/cron-jobs", "/triggers", "/client/v4/accounts/local/workers/scripts"]) await assert.rejects(api.request(path), /HTTP 404/);
 console.log("PASS CLI deployment, Hono HTTP, binary POST, trusted environment, Secrets, SSE and removed API routes");
 

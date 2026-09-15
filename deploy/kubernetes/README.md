@@ -1,5 +1,7 @@
 # Kubernetes deployment
 
+このソースの基盤DBは空DB用の新しい初期スキーマです。旧DBへの自動更新は拒否します。[DBの作成と切替](../../docs/database.md)を確認し、既存の稼働DBとは別の検証先を指定してください。
+
 HibanaはControl PlaneとWasmtime Workerを各2 Pod配置します。アプリケーションごとにPodを作成する方式ではありません。JSは開発者のCLIでWasmにビルドするため、クラスタ内コンパイラーは不要です。
 
 [起動・停止・削除の実機検証結果](../../docs/lifecycle-validation.md)を記録しています。
@@ -11,6 +13,8 @@ HibanaはControl PlaneとWasmtime Workerを各2 Pod配置します。アプリ�
 ## CLI で基盤を管理する
 
 一般開発者は単体CLIからHTTPS管理APIを操作します。[CLI配布とオンプレ接続](../../docs/remote-cli.md)を参照してください。既存Kubernetesの基盤管理にはNode.js 24以上・kubectl・Python 3とPyYAMLを使います。以下のローカル基盤開発だけは追加でDocker・kind・基盤チェックアウトが必要です。
+
+remote overlayには[コンソールのDeployment・Service・Ingress・NetworkPolicy](console/)を含めています。ブラウザで画面を開き、CLIは同じホストの`/api`へ接続できます。コンソールイメージ、社内DNS、TLS証明書の設定は[導入手順](../../docs/console.md)を参照してください。停止操作はアプリの実行基盤を停止し、コンソールの静的配信は残します。基盤停止中の管理操作は失敗として表示されます。
 
 ```bash
 npm ci --prefix sdk

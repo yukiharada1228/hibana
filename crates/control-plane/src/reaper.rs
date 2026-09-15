@@ -1,3 +1,4 @@
+use sea_orm::TransactionTrait as _;
 use std::time::Duration;
 
 use crate::state::AppState;
@@ -82,20 +83,20 @@ async fn reconcile_tenant(
     stuck_deadline_secs: u64,
 ) -> anyhow::Result<()> {
     // executions は FORCE RLS 下 → sweep / COUNT は GUC を設定した同一 tx で実行する。
-    let mut tx = state.pool().begin().await?;
-    crate::db::set_tenant_guc(&mut tx, tenant).await?;
+    let tx = state.pool().begin().await?;
+    crate::db::set_tenant_guc(&tx, tenant).await?;
 
     // (1) stuck-execution sweep（§8 リーク回収）。deadline 0 ならスキップ。
     //     deadline を過ぎても終端化されない pending/running 行を failed に倒し、回収数を得る。
     let swept = if stuck_deadline_secs > 0 {
-        crate::db::finalize_stuck_executions(&mut *tx, tenant, stuck_deadline_secs as i64).await?
+        crate::db::finalize_stuck_executions(&tx, tenant, stuck_deadline_secs as i64).await?
     } else {
         Vec::new()
     };
 
     for row in &swept {
         crate::db::upsert_usage_rollup(
-            &mut *tx,
+            &tx,
             tenant,
             &row.component_id,
             row.period_start,
@@ -106,7 +107,7 @@ async fn reconcile_tenant(
     }
 
     // (2) DB COUNT（真実）を引く。sweep 済み行は除外されているので、孤立スロットは COUNT から消える。
-    let count = crate::db::count_inflight_executions(&mut *tx, tenant).await?;
+    let count = crate::db::count_inflight_executions(&tx, tenant).await?;
     tx.commit().await?;
 
     if !swept.is_empty() {

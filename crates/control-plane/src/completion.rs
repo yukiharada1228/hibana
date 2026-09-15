@@ -1,6 +1,7 @@
 //! Signed HTTP completion with a single CAS transition and accounting transaction.
 use crate::state::AppState;
 use hibana_shared::{ExecutionStatus, JobClaims, ResourceLimits, ResultMessage, UsageMetrics};
+use sea_orm::TransactionTrait as _;
 use serde_json::json;
 pub(crate) async fn handle_message(
     state: &AppState,
@@ -123,12 +124,12 @@ pub(crate) async fn handle_message(
 
     // M3b/M3c: finalize は FORCE RLS 下で走る。tx を開いて GUC を設定してから、
     // まず行をひいて claim を権威値と突き合わせ、exp 判定の後に CAS finalize する。
-    let mut tx = state.pool().begin().await?;
-    crate::db::set_tenant_guc(&mut tx, tenant).await?;
+    let tx = state.pool().begin().await?;
+    crate::db::set_tenant_guc(&tx, tenant).await?;
 
     // (4c) 行 SELECT で execution の存在 + version_id / status を取り、claim と照合する。
     let provenance =
-        crate::db::find_execution_provenance(&mut *tx, tenant, &result.execution_id).await?;
+        crate::db::find_execution_provenance(&tx, tenant, &result.execution_id).await?;
     let (row_component_id, row_version_id, row_status) = match provenance {
         Some(p) => p,
         None => {
@@ -195,8 +196,7 @@ pub(crate) async fn handle_message(
     //     後段の rollup で計上されるため欠落しないが、検証不能なコスト指標で課金しない。
     let clamped_usage = match result.usage {
         Some(raw) => {
-            match crate::db::find_version_resource_limits(&mut *tx, tenant, &row_version_id).await?
-            {
+            match crate::db::find_version_resource_limits(&tx, tenant, &row_version_id).await? {
                 Some(limits) => Some(clamp_usage(&raw, &limits)),
                 None => {
                     tracing::warn!(
@@ -229,7 +229,7 @@ pub(crate) async fn handle_message(
 #[allow(clippy::too_many_arguments)]
 async fn commit_finalize_and_release(
     state: &AppState,
-    mut tx: sqlx::Transaction<'_, sqlx::Postgres>,
+    tx: sea_orm::DatabaseTransaction,
     tenant: &str,
     execution_id: &str,
     component_id: &str,
@@ -240,7 +240,7 @@ async fn commit_finalize_and_release(
 ) -> anyhow::Result<()> {
     // 戻り値は CAS が遷移させたときだけ `Some(period_start)`（DB の finished_at::date = 単一時計源）。
     let finalized = crate::db::finalize_execution(
-        &mut *tx,
+        &tx,
         tenant,
         execution_id,
         status,
@@ -253,7 +253,7 @@ async fn commit_finalize_and_release(
     if let Some(outcome) = finalized {
         let usage_for_rollup = usage.unwrap_or_default();
         crate::db::upsert_usage_rollup(
-            &mut *tx,
+            &tx,
             tenant,
             component_id,
             outcome.period_start,
@@ -326,17 +326,10 @@ async fn write_audit(
     detail: serde_json::Value,
 ) {
     let res: anyhow::Result<()> = async {
-        let mut tx = state.pool().begin().await?;
-        crate::db::set_tenant_guc(&mut tx, tenant).await?;
-        crate::db::insert_audit_log(
-            &mut *tx,
-            tenant,
-            Some("worker"),
-            action,
-            target,
-            Some(&detail),
-        )
-        .await?;
+        let tx = state.pool().begin().await?;
+        crate::db::set_tenant_guc(&tx, tenant).await?;
+        crate::db::insert_audit_log(&tx, tenant, Some("worker"), action, target, Some(&detail))
+            .await?;
         tx.commit().await?;
         Ok(())
     }

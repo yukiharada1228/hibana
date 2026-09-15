@@ -1,7 +1,7 @@
 //! Immutable environment of the active version. Values are plaintext, never Secrets.
-use sqlx::Row;
+use hibana_database::prelude::*;
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, FromQueryResult)]
 pub struct FunctionConfigRow {
     pub key: String,
     pub value: String,
@@ -9,28 +9,32 @@ pub struct FunctionConfigRow {
 }
 
 pub async fn list_function_configs(
-    executor: impl sqlx::PgExecutor<'_>,
+    executor: &impl ConnectionTrait,
     tenant_id: &str,
     component_id: &str,
-) -> Result<Vec<FunctionConfigRow>, sqlx::Error> {
-    let rows = sqlx::query(
-        "SELECT v.key, v.value, v.updated_at FROM version_configs v \
-         JOIN components c ON c.tenant_id = v.tenant_id AND c.id = v.component_id \
-           AND c.active_version_id = v.version_id \
-         WHERE v.tenant_id = $1 AND v.component_id = $2 AND c.deleted_at IS NULL ORDER BY v.key",
-    )
-    .bind(tenant_id)
-    .bind(component_id)
-    .fetch_all(executor)
-    .await?;
-
-    rows.into_iter()
-        .map(|r| {
-            Ok(FunctionConfigRow {
-                key: r.try_get("key")?,
-                value: r.try_get("value")?,
-                updated_at: r.try_get("updated_at")?,
-            })
-        })
-        .collect()
+) -> Result<Vec<FunctionConfigRow>, DbErr> {
+    version_configs::Entity::find()
+        .select_only()
+        .columns([
+            version_configs::Column::Key,
+            version_configs::Column::Value,
+            version_configs::Column::UpdatedAt,
+        ])
+        .filter(version_configs::Column::TenantId.eq(tenant_id))
+        .filter(version_configs::Column::ComponentId.eq(component_id))
+        .filter(
+            version_configs::Column::VersionId.in_subquery(
+                components::Entity::find()
+                    .select_only()
+                    .column(components::Column::ActiveVersionId)
+                    .filter(components::Column::TenantId.eq(tenant_id))
+                    .filter(components::Column::Id.eq(component_id))
+                    .filter(components::Column::DeletedAt.is_null())
+                    .into_query(),
+            ),
+        )
+        .order_by_asc(version_configs::Column::Key)
+        .into_model::<FunctionConfigRow>()
+        .all(executor)
+        .await
 }

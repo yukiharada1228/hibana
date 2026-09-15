@@ -1,0 +1,23 @@
+[package]
+name = "hibana-node-net-transport"
+version = "0.1.0"
+edition = "2021"
+publish = false
+license = "MIT"
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+wasi = "=0.13.3"
+wit-bindgen = "=0.36.0"
+rustls = { version = "=0.23.45", default-features = false, features = ["std", "ring", "tls12"] }
+rustls-pemfile = "=2.2.0"
+webpki-roots = "=1.0.8"
+
+[profile.release]
+opt-level = "s"
+lto = true
+strip = true
+
+[workspace]

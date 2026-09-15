@@ -4,6 +4,14 @@
 
 Hibanaの実行契約はWebAssembly Componentです。Honoは対応するJavaScriptフレームワークの一つで、専用SDKのインポートは必要ありません。
 
+Node API などの追加機能は、ユーザーが用意した JS モジュールや Rust 製 Wasm 部品を `extensions` でアプリに同梱できます。本体に互換ランタイムを追加せず、合成した `.wasm` を通常の `deploy` でアップロードします。[設定と実装例](../docs/application-extensions.md)を参照してください。
+
+外向き TCP/TLS が必要なアプリには、任意パッケージ [@hibana/node-net](../extensions/node-net/README.md) を追加できます。対応する Node API は限定的で、通信には配備先の管理者による許可が必要です。
+
+PostgreSQL には [@hibana/postgres](../extensions/postgres/README.md) を併用できます。`pg` の適応版と Rust/Wasm の認証処理をアプリに同梱し、Drizzle の CRUD・トランザクションを Wasm 上で検証しています。[検証範囲](../docs/postgres-compatibility.md)を確認してください。
+
+配布された拡張パッケージを使う場合は、アプリにnpm依存として導入し、`extensions`配列にパッケージ名、または`./`で始まるローカル拡張のディレクトリを指定します。通常の`build`・`dev`・`deploy`が宣言ファイルを読み、JSの参照解決とWIT・Wasmの合成を行います。パッケージ名・バージョンはアプリのlockfileで管理し、CLIは拡張の自動取得やインストール処理を行いません。
+
 ```ts
 import { Hono } from 'hono'
 
@@ -19,6 +27,8 @@ export default app
 ## インストールとテンプレート
 
 CLIはNode.js 24以上が必要です。ローカル実行ランタイムは初回の`dev`で自動取得し、Kubernetes基盤は管理者が別途導入します。開発者のPCに基盤のソースやDocker/kubectlは不要です。[リモートCLI構成・配布・オンプレ接続](../docs/remote-cli.md)に全手順があります。配布先はGitHub Releasesです。npmレジストリへの公開は無効にしています。
+
+[コンソール](../docs/console.md)のある基盤には`hibana login --url https://hibana.example.internal/api ...`で接続できます。ブラウザでは同じホストの`https://hibana.example.internal/`を開きます。CLIとコンソールは同じ管理APIを使い、配備済みアプリの実行・配信は接続先のKubernetesが担当します。
 
 ```bash
 npm install -g https://github.com/yukiharada1228/hibana/releases/download/v0.1.0/hibana-cli-0.1.0.tgz
@@ -65,7 +75,7 @@ hibana deploy                      # hibana.jsonのアプリを配備
 hibana list                        # 現在のテナントのアプリ
 hibana delete                      # hibana.jsonのnameを削除
 hibana delete my-app --dry-run      # 削除対象を確認
-hibana delete --name my-app --yes   # 名前を指定して削除
+hibana delete my-app --yes   # 名前を指定して削除
 hibana delete --all --yes           # 現在のテナントの全アプリ
 hibana list --all-tenants
 hibana delete --all --all-tenants --yes
@@ -77,7 +87,7 @@ hibana platform start --kubeconfig /secure/config --context onprem
 hibana platform uninstall --kubeconfig /secure/config --context onprem --yes
 ```
 
-`delete [NAME]`、`--name`、`--config/-c`、`--dry-run`はWranglerに近い形式です。`--force`と`--yes/-y`は確認を省略しますが、実行中アプリの削除を拒否するサーバー側の保護は無効化しません。削除にはRead・Adminスコープを持つテナント管理者の認証情報が必要です。Read・Deployだけでは削除できません。ソースコードやビルドツールは不要です。`--all-tenants`はプラットフォーム管理者用の`BOOTSTRAP_ADMIN_TOKEN`が必要です。
+`delete [NAME]`で名前を指定し、省略時は`--config/-c`の設定から読みます。`--dry-run`で確認でき、`--yes/-y`は確認を省略しますが、実行中アプリの削除を拒否するサーバー側の保護は無効化しません。削除にはRead・Adminスコープを持つテナント管理者の認証情報が必要です。Read・Deployだけでは削除できません。ソースコードやビルドツールは不要です。`--all-tenants`はプラットフォーム管理者用の`BOOTSTRAP_ADMIN_TOKEN`が必要です。
 
 削除は公開URLと通常の一覧からアプリを除き、実行履歴とWasm成果物を残します。同じ名前で再デプロイ可能です。基盤の停止はデータを保持します。Kubernetesの導入条件・既存クラスタへの配備・撤去範囲は[基盤管理ガイド](../deploy/kubernetes/README.md)を参照してください。
 
@@ -127,7 +137,7 @@ CLIはComponentのヘッダーを確認します。WITの一致や全体の検�
 
 ローカル専用の秘密値は`.dev.vars`にdotenv形式で書きます。値は`vars`より優先します。`.hibana/`と`.dev.vars`をバージョン管理に含めないでください。サーバーのSecretsは管理者が`hibana secret put NAME`の標準入力から登録し、`hibana secret allow-deploy NAME`でそのアプリへの利用を許可します。`hibana.json`に`"secrets": ["NAME"]`を指定し、通常の開発者が`deploy`します。省略時は空配列で、Secretを自動列挙・注入しません。`secret deny-deploy NAME`は今後の配備だけを拒否します。既存バージョンでの利用も止める場合は`secret delete NAME`を使います。
 
-`hibana login --profile onprem --url https://api.example.internal --tenant team --email dev@example.internal --password-stdin`でログインします。`HIBANA_URL`・`HIBANA_TENANT`・`HIBANA_EMAIL`・`HIBANA_PASSWORD`でも設定できます。接続先と認証はPC共通のプロファイルに保存し、`--profile onprem`で選択できます。CIでは`HIBANA_TOKEN`を設定できます。配備先を変えた場合、保存済みの別サーバーのトークンは再利用しません。`deploy --version 1.0.0`で版を指定できます。省略時は一意な開発版を採番します。
+`hibana login --profile onprem --url https://api.example.internal --tenant team --email dev@example.internal`を実行し、`Password:` にパスワードを入力します（文字は非表示）。スクリプトでは末尾に `--password-stdin < password.txt` を付けます。`HIBANA_URL`・`HIBANA_TENANT`・`HIBANA_EMAIL`・`HIBANA_PASSWORD`でも設定できます。接続先と認証はPC共通のプロファイルに保存し、`--profile onprem`で選択できます。CIでは`HIBANA_TOKEN`を設定できます。配備先を変えた場合、保存済みの別サーバーのトークンは再利用しません。`deploy --version 1.0.0`で版を指定できます。省略時は一意な開発版を採番します。
 
 実行用Workerが設定された配備先では、`deploy`はWorkerでの事前コンパイルを待ってから公開します。初回HTTPへのコンパイル待ちを避けるため、その時間はデプロイ所要時間に含まれます。準備に失敗すると配備はエラーになり、旧版の公開設定を維持します。`rollback`も切替先を準備してから公開します。
 
@@ -148,3 +158,13 @@ HTTPの契約は`wasi:http/incoming-handler@0.2.3`です。Hono・JS系はesbuil
 基盤管理者がKubernetes上のHibana、管理APIのHTTPS、アプリ用DNS/TLS、テナントを用意します。アプリ開発者は配布された管理APIのURLとテナントの認証情報を設定して、同じ`hibana`コマンドで配備します。アプリの配備にkubeconfigやクラスタ管理権限は不要です。通常のdeploy・rollbackに必要なのはRead・Deployスコープです。Secretsの保存・利用許可はAdminスコープとAdminロールを持つテナント管理者が行います。トークンはテナント単位で、アプリ単位の権限制限はありません。
 
 Wranglerを参考にするのは、この短い開発・配備の流れです。サーバーの契約はWASI HTTPに統一し、Hono・JS/TS・Go・Rustのどれも共通の制限と認証を通します。ビルド工程と実行工程の信頼境界、本番前の検証項目は[セキュリティ境界](../docs/security.md)を参照してください。
+
+## 候補版の設定整理
+
+拡張は `"extensions": ["@hibana/node-net"]` に統一しました。旧 `extensions.packages` や直接の aliases/WIT 設定からの移行は[アプリ拡張](../docs/application-extensions.md#旧候補版の設定から移行する)を参照してください。
+
+重複していた `delete --name NAME` / `--force` は `delete NAME` / `--yes` に、`platform --local --source PATH` は `platform --source PATH` に統一しました。ログインはユーザー設定領域のプロファイル、CI は `HIBANA_URL` / `HIBANA_TOKEN` を使います。旧 `.hibana/auth.json` は読み書きしないため、使用していた場合は `hibana login` で再ログインしてください。既存の認証ファイル自体は削除しません。
+
+`list` は選択した接続先の一覧操作なので `--config` を受け付けません。接続先は `--profile` または `--url` で指定してください。
+
+ソースの整形は `npm run format`、検査は `npm run format:check`、回帰テストは `npm test` です。設定・拡張の検証、ビルド計画、コンパイル、合成の順に処理し、入力設定に生成パスを混ぜません。

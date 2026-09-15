@@ -1,5 +1,7 @@
 # 隔離・復元・障害試験の実測
 
+DB移行に関する以下の結果は旧SQLスキーマ時点の記録です。現行ソースでは[SeaORMの初期スキーマ](database.md)を空DBへ作成します。旧番号のマイグレーションを現在のコードから適用することはできません。
+
 2026-09-08、チェックアウト専用`kind-hibana-dev`で実施しました。Docker Desktopの単一物理ホスト上に、control-plane 1ノード・worker 2ノードを置いた構成です。Hibana CP/Workerは各2 Podです。
 
 ## 結果

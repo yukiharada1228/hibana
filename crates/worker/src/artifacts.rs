@@ -26,7 +26,7 @@ pub(crate) struct ArtifactCache {
     metrics: Arc<metrics::Metrics>,
     compiler_limits: crate::compiler::Limits,
     disk_writer: tokio::sync::Mutex<()>,
-    retention_pool: Option<sqlx::PgPool>,
+    retention_pool: Option<sea_orm::DatabaseConnection>,
 }
 impl ArtifactCache {
     pub(crate) fn new(
@@ -54,7 +54,7 @@ impl ArtifactCache {
             compilation_slots: Arc::new(tokio::sync::Semaphore::new(max_compilations)),
         })
     }
-    pub(crate) fn protect_versions(mut self, pool: sqlx::PgPool) -> Self {
+    pub(crate) fn protect_versions(mut self, pool: sea_orm::DatabaseConnection) -> Self {
         self.retention_pool = Some(pool);
         self
     }
@@ -175,14 +175,18 @@ impl ArtifactCache {
                 .retention_pool
                 .as_ref()
                 .ok_or_else(|| ExecError::Failed("Artifact retention is not configured".into()))?;
-            let protected: std::collections::HashSet<String> = sqlx::query_scalar::<_, String>(
-                "SELECT sha256 FROM hibana_protected_artifact_hashes()",
-            )
-            .fetch_all(pool)
-            .await
-            .map_err(|_| ExecError::Failed("Artifact retention unavailable".into()))?
-            .into_iter()
-            .collect();
+            let protected: std::collections::HashSet<String> =
+                hibana_database::postgres::function_rows(
+                    pool,
+                    "hibana_protected_artifact_hashes",
+                    vec![],
+                )
+                .await
+                .map_err(|_| ExecError::Failed("Artifact retention unavailable".into()))?
+                .into_iter()
+                .map(|r| r.try_get("", "sha256"))
+                .collect::<Result<_, _>>()
+                .map_err(|_| ExecError::Failed("Artifact retention unavailable".into()))?;
             crate::cache_storage::write(&self.wasm_cache_dir, &cwasm_path, &cwasm, &protected)
                 .map_err(|e| ExecError::Failed(format!("Artifact cache: {e}")))?;
         }

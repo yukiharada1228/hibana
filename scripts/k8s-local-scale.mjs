@@ -128,7 +128,7 @@ async function main() {
   await cp("scripts/fixtures/scale-http.rs", resolve(project, "src/lib.rs"));
   Object.assign(process.env, {HIBANA_URL: adminUrl, HIBANA_TENANT: slug, HIBANA_EMAIL: "scale@example.invalid", HIBANA_PASSWORD: password});
   delete process.env.HIBANA_TOKEN;
-  const api = await apiClient(project); await api.login();
+  const api = await apiClient(); await api.login();
   const config = await loadConfig(resolve(project, "hibana.json"));
   const artifact = await build(config);
   await deploy(api, config, artifact, `0.0.0-scale.${Date.now()}`);

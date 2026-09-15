@@ -5,7 +5,7 @@
 //! ## `auth::hash_token` との違い（混同しないこと）
 //!
 //! `auth::hash_token`（sha256）と `crypto::hash_password`（argon2id）は**不可逆**ハッシュであり、
-//! 「提示された値が正しいか」だけを判定する用途に使う（`0003_auth.sql` の一方向ハッシュ）。
+//! 「提示された値が正しいか」だけを判定する用途に使う（認証用の一方向ハッシュ）。
 //! secret は **復号して worker へ渡す必要がある**ため、まったく別系統の可逆暗号を使う。
 //! この 2 つを取り違えると「secret をハッシュして保存し、二度と取り出せない」か、逆に
 //! 「パスワードを可逆暗号で保存する」という重大な誤りになる。
@@ -408,7 +408,7 @@ pub struct ResolvedSecret {
 /// 版のversion_secret_bindingsが参照するSecret IDだけを解決する。`allowed`は
 /// capabilities.envによる追加のフィルタで、varsと同名のSecretを誤って取得しない。
 pub async fn resolve_for_injection(
-    tx: &mut sqlx::PgConnection,
+    tx: &sea_orm::DatabaseTransaction,
     keyring: &SecretKeyring,
     tenant_id: &str,
     component_id: &str,
@@ -416,47 +416,52 @@ pub async fn resolve_for_injection(
     execution_created_at: chrono::DateTime<chrono::Utc>,
     allowed: &std::collections::BTreeSet<String>,
 ) -> Result<Vec<ResolvedSecret>, SecretError> {
-    use sqlx::Row as _;
-
     if allowed.is_empty() {
         return Ok(Vec::new());
     }
     let names: Vec<String> = allowed.iter().cloned().collect();
 
-    let rows = sqlx::query(SECRET_INJECTION_SQL)
-        .bind(tenant_id)
-        .bind(component_id)
-        .bind(execution_created_at)
-        .bind(&names)
-        .bind(version_id)
-        .fetch_all(&mut *tx)
-        .await
-        .map_err(|_| SecretError::VersionUnresolved)?;
+    let rows = hibana_database::queries::secret_envelopes(
+        tx,
+        tenant_id,
+        component_id,
+        version_id,
+        execution_created_at,
+        &names,
+    )
+    .await
+    .map_err(|_| SecretError::VersionUnresolved)?;
 
     let mut out = Vec::with_capacity(rows.len());
     for r in rows {
         let version = r
-            .try_get::<Option<i32>, _>("version")
+            .try_get::<Option<i32>>("", "version")
             .map_err(|_| SecretError::BadEnvelope)?
             .ok_or(SecretError::VersionUnresolved)?;
         let secret_id: String = r
-            .try_get("secret_id")
+            .try_get("", "secret_id")
             .map_err(|_| SecretError::BadEnvelope)?;
-        let name: String = r.try_get("name").map_err(|_| SecretError::BadEnvelope)?;
+        let name: String = r
+            .try_get("", "name")
+            .map_err(|_| SecretError::BadEnvelope)?;
         let envelope = Envelope {
-            kek_kid: r.try_get("kek_kid").map_err(|_| SecretError::BadEnvelope)?,
+            kek_kid: r
+                .try_get("", "kek_kid")
+                .map_err(|_| SecretError::BadEnvelope)?,
             wrapped_dek: r
-                .try_get("wrapped_dek")
+                .try_get("", "wrapped_dek")
                 .map_err(|_| SecretError::BadEnvelope)?,
             dek_nonce: r
-                .try_get("dek_nonce")
+                .try_get("", "dek_nonce")
                 .map_err(|_| SecretError::BadEnvelope)?,
-            nonce: r.try_get("nonce").map_err(|_| SecretError::BadEnvelope)?,
+            nonce: r
+                .try_get("", "nonce")
+                .map_err(|_| SecretError::BadEnvelope)?,
             ciphertext: r
-                .try_get("ciphertext")
+                .try_get("", "ciphertext")
                 .map_err(|_| SecretError::BadEnvelope)?,
             value_len: r
-                .try_get("value_len")
+                .try_get("", "value_len")
                 .map_err(|_| SecretError::BadEnvelope)?,
         };
 
@@ -480,22 +485,6 @@ pub async fn resolve_for_injection(
     }
     Ok(out)
 }
-
-/// 注入クエリ (§4.7.1)。**`current_version` を参照しない**（execution 基準に固定する）。
-const SECRET_INJECTION_SQL: &str = "SELECT s.id AS secret_id, s.name, \
-        v.version, v.kek_kid, v.wrapped_dek, v.dek_nonce, v.nonce, v.ciphertext, v.value_len \
-   FROM function_secrets s \
-   JOIN version_secret_bindings b ON b.tenant_id=s.tenant_id AND b.component_id=s.component_id \
-     AND b.secret_id=s.id AND b.name=s.name AND b.version_id=$5 \
-   LEFT JOIN LATERAL ( \
-        SELECT * FROM function_secret_versions v2 \
-         WHERE v2.tenant_id = s.tenant_id AND v2.secret_id = s.id \
-           AND v2.created_at <= $3 \
-         ORDER BY v2.version DESC LIMIT 1 \
-   ) v ON TRUE \
-  WHERE s.tenant_id = $1 AND s.component_id = $2 \
-    AND s.deleted_at IS NULL AND s.name = ANY($4) \
-  ORDER BY s.name";
 
 /// 監査ログ `detail` の**唯一の構築点** (§5.3)。
 ///
@@ -651,35 +640,6 @@ mod tests {
         assert_ne!(dek_aad("t", "s", 1, "k"), dek_aad("t", "s", 2, "k"));
         // ドメインタグで用途が分離されている。
         assert_ne!(value_aad("t", "c", "n"), dek_aad("t", "c", 0, "n"));
-    }
-
-    /// 注入クエリは **execution 基準**（`current_version` を参照しない）。
-    ///
-    /// 参照してしまうと、worker 再配送中に rotate が走ったとき同一 execution の 1 回目と 2 回目で
-    /// 別の資格情報が外部へ出る（at-least-once なので両方到達しうる）。
-    #[test]
-    fn secret_injection_sql_is_execution_pinned() {
-        assert!(
-            SECRET_INJECTION_SQL.contains("v2.created_at <= $3"),
-            "the generation must be pinned to executions.created_at"
-        );
-        assert!(
-            !SECRET_INJECTION_SQL.contains("current_version"),
-            "resolving via current_version would break redelivery determinism"
-        );
-        assert!(
-            SECRET_INJECTION_SQL.contains("JOIN LATERAL")
-                && SECRET_INJECTION_SQL.contains("ON TRUE"),
-            "an INNER-equivalent LATERAL makes unresolvable generations disappear (fail-closed)"
-        );
-        assert!(
-            SECRET_INJECTION_SQL.contains("s.deleted_at IS NULL"),
-            "soft-deleted secrets must never be injected"
-        );
-        assert!(
-            SECRET_INJECTION_SQL.contains("s.tenant_id = $1"),
-            "the injection query must be tenant-scoped in the predicate as well as under RLS"
-        );
     }
 
     /// 監査 detail に値を載せる型経路が存在しない（シグネチャが値を受け取らない）。

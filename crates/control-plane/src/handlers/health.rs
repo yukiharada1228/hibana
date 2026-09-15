@@ -26,14 +26,9 @@ pub async fn readyz(State(state): State<AppState>) -> Response {
 /// 別関数に切り出すのは、ユニットテストで「接続できない / 閉じたプール」に対して 503 系の
 /// `Err` が返ることを直接検証するため。ハンドラ本体（[`readyz`]）は AppState を要求するため
 /// テスト時のセットアップが重く、肝心の DB-down 経路を覆えなくなる。
-pub(super) async fn check_db_ready(pool: &sqlx::PgPool) -> Result<(), String> {
+pub(super) async fn check_db_ready(pool: &sea_orm::DatabaseConnection) -> Result<(), String> {
     use std::time::Duration;
-    match tokio::time::timeout(
-        Duration::from_millis(500),
-        sqlx::query_scalar::<_, i32>("SELECT 1").fetch_one(pool),
-    )
-    .await
-    {
+    match tokio::time::timeout(Duration::from_millis(500), pool.ping()).await {
         Ok(Ok(_)) => Ok(()),
         Ok(Err(e)) => Err(format!("db: {e}")),
         Err(_) => Err("db: timeout".to_string()),

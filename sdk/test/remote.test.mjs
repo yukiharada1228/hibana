@@ -136,7 +136,7 @@ test("HTTPS verifies certificates and supports an explicitly trusted on-prem CA"
   assert.equal(f.calls[0].auth, "Bearer tls-token");
 });
 
-test("no implicit local target, unsafe URLs rejected, explicit CI token and legacy credentials supported", async t => {
+test("no implicit local target, unsafe URLs rejected, explicit CI token supported, project credentials ignored", async t => {
   const f = await fixture(t);
   assert.match((await f.invoke(["list"])).output, /No Hibana server selected/);
   for (const url of ["http://remote.example.com", "https://user:password@example.com", "https://example.com?q=secret", "https://example.com#fragment"])
@@ -145,6 +145,6 @@ test("no implicit local target, unsafe URLs rejected, explicit CI token and lega
   assert.equal((await f.invoke(["list"], { env: { HIBANA_URL: url, HIBANA_TOKEN: "ci-token" } })).code, 0);
   await mkdir(join(f.project, ".hibana"));
   await writeFile(join(f.project, ".hibana/auth.json"), JSON.stringify({ url, token: "ci-token" }));
-  assert.equal((await f.invoke(["list"])).code, 0);
+  assert.match((await f.invoke(["list"])).output, /No Hibana server selected/);
   assert.notEqual((await f.invoke(["list", "--profile", "missing"])).code, 0);
 });

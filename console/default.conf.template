@@ -1,0 +1,31 @@
+server {
+    listen 8080;
+    root /usr/share/nginx/html;
+    index index.html;
+    add_header X-Content-Type-Options nosniff always;
+    add_header X-Frame-Options DENY always;
+    add_header Referrer-Policy no-referrer always;
+    add_header Content-Security-Policy "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; font-src 'self'; connect-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'self'; object-src 'none'" always;
+    add_header Cache-Control "no-store" always;
+
+    location = /healthz { access_log off; return 200 'ok'; }
+    # Fixed upstream; /api/components becomes /components. Both clients use this path.
+    location /api/ {
+        proxy_pass ${HIBANA_API_UPSTREAM}/;
+        proxy_http_version 1.1;
+        proxy_set_header Connection "";
+        proxy_set_header Host $proxy_host;
+        # Do not forward untrusted client-supplied proxy identity headers.
+        proxy_set_header X-Forwarded-For $remote_addr;
+        proxy_set_header X-Forwarded-Proto $scheme;
+        proxy_set_header Forwarded "";
+        client_max_body_size 33m;
+        proxy_read_timeout 125s;
+        proxy_send_timeout 125s;
+        proxy_request_buffering off;
+        proxy_buffering off;
+        proxy_redirect off;
+    }
+    location /assets/ { try_files $uri =404; }
+    location / { try_files $uri $uri/ =404; }
+}

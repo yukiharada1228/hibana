@@ -11,6 +11,7 @@ use axum::http::{HeaderMap, StatusCode};
 use axum::response::IntoResponse;
 use axum::Json;
 use hibana_shared::{new_tenant_id, new_user_id, FaasError};
+use sea_orm::TransactionTrait as _;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
@@ -77,12 +78,12 @@ pub async fn create_tenant(
     let tenant_id = new_tenant_id();
     let admin_user_id = new_user_id();
     let admin_password_hash = hash_password(&req.admin_password)?;
-    let mut tx = state.pool().begin().await.map_err(AppError::from)?;
-    db::set_tenant_guc(&mut tx, &tenant_id)
+    let tx = state.pool().begin().await.map_err(AppError::from)?;
+    db::set_tenant_guc(&tx, &tenant_id)
         .await
         .map_err(AppError::from)?;
     db::bootstrap_tenant(
-        &mut tx,
+        &tx,
         &tenant_id,
         req.slug.trim(),
         req.name.trim(),
@@ -96,7 +97,7 @@ pub async fn create_tenant(
     // WITH CHECK を通る。bootstrap 主体由来であることを示し、target は新 tenant_id。
     // admin_password は決して載せない。
     db::insert_audit_log(
-        &mut *tx,
+        &tx,
         &tenant_id,
         Some("bootstrap"),
         "tenant_created",
@@ -175,10 +176,10 @@ pub async fn set_tenant_status(
     }
 
     // 監査は当該テナント GUC 下で書く（audit_logs は FORCE RLS）。
-    let mut tx = state.pool().begin().await?;
-    db::set_tenant_guc(&mut tx, &tenant_id).await?;
+    let tx = state.pool().begin().await?;
+    db::set_tenant_guc(&tx, &tenant_id).await?;
     db::insert_audit_log(
-        &mut *tx,
+        &tx,
         &tenant_id,
         None,
         "tenant_status_updated",
@@ -233,10 +234,10 @@ pub async fn set_tenant_quotas(
         return Err(FaasError::NotFound(format!("tenant '{tenant_id}'")).into());
     }
 
-    let mut tx = state.pool().begin().await?;
-    db::set_tenant_guc(&mut tx, &tenant_id).await?;
+    let tx = state.pool().begin().await?;
+    db::set_tenant_guc(&tx, &tenant_id).await?;
     db::insert_audit_log(
-        &mut *tx,
+        &tx,
         &tenant_id,
         None,
         "tenant_quotas_updated",

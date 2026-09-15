@@ -2,9 +2,21 @@
 use crate::auth::Principal;
 use chrono::DateTime;
 use chrono::Utc;
+use hibana_database::prelude::*;
 use hibana_shared::Role;
 use hibana_shared::Scope;
-use sqlx::Row;
+
+pub async fn session_tenant(
+    executor: &impl ConnectionTrait,
+    tenant_id: &str,
+) -> Result<Option<(String, String)>, DbErr> {
+    tenants::Entity::find_by_id(tenant_id)
+        .select_only()
+        .columns([tenants::Column::Slug, tenants::Column::Name])
+        .into_tuple()
+        .one(executor)
+        .await
+}
 
 // ---------------------------------------------------------------------------
 // 認証・認可: users / api_tokens (§3.3 / §6.0)
@@ -94,28 +106,27 @@ impl TokenRow {
 /// M3b: これは**テナントコンテキスト確立前**に走る（戻り値の tenant_id がこの後の
 /// リクエストで GUC を設定する）。よって FORCE RLS 下では GUC 未設定で api_tokens を
 /// 読めない。SECURITY DEFINER 関数 `auth_lookup_token_by_hash`（所有者権限で実行され
-/// RLS 対象外）を呼ぶことで、GUC 無しの認証前参照を成立させる（migrations/0004_rls.sql）。
+/// RLS 対象外）を呼ぶことで、GUC 無しの認証前参照を成立させる（migrations/src/m20260915_000001_security.sql）。
 pub async fn find_token_by_hash(
-    executor: impl sqlx::PgExecutor<'_>,
+    executor: &impl ConnectionTrait,
     token_hash: &str,
-) -> Result<Option<TokenRow>, sqlx::Error> {
-    let row = sqlx::query(
-        "SELECT id, tenant_id, user_id, scopes, expires_at, revoked_at, user_role \
-         FROM auth_lookup_token_by_hash($1)",
+) -> Result<Option<TokenRow>, DbErr> {
+    function_rows(
+        executor,
+        "auth_lookup_token_by_hash",
+        vec![token_hash.into()],
     )
-    .bind(token_hash)
-    .fetch_optional(executor)
-    .await?;
-
-    row.map(|r| {
+    .await?
+    .first()
+    .map(|r| {
         Ok(TokenRow {
-            token_id: r.try_get("id")?,
-            tenant_id: r.try_get("tenant_id")?,
-            user_id: r.try_get("user_id")?,
-            scopes: r.try_get("scopes")?,
-            expires_at: r.try_get("expires_at")?,
-            revoked_at: r.try_get("revoked_at")?,
-            user_role: r.try_get("user_role")?,
+            token_id: r.try_get("", "id")?,
+            tenant_id: r.try_get("", "tenant_id")?,
+            user_id: r.try_get("", "user_id")?,
+            scopes: r.try_get("", "scopes")?,
+            expires_at: r.try_get("", "expires_at")?,
+            revoked_at: r.try_get("", "revoked_at")?,
+            user_role: r.try_get("", "user_role")?,
         })
     })
     .transpose()
@@ -136,52 +147,54 @@ pub async fn find_token_by_hash(
 /// WITH CHECK が GUC と一致する必要がある（tenants には RLS は無い）。
 #[allow(clippy::too_many_arguments)]
 pub async fn bootstrap_tenant(
-    conn: &mut sqlx::PgConnection,
+    conn: &impl ConnectionTrait,
     tenant_id: &str,
     slug: &str,
     name: &str,
     admin_user_id: &str,
     admin_email: &str,
     admin_password_hash: &str,
-) -> Result<(), sqlx::Error> {
-    sqlx::query("INSERT INTO tenants (id, slug, name, status) VALUES ($1, $2, $3, 'active')")
-        .bind(tenant_id)
-        .bind(slug)
-        .bind(name)
-        .execute(&mut *conn)
-        .await?;
-    sqlx::query(
-        "INSERT INTO users (id, tenant_id, email, password_hash, role) \
-         VALUES ($1, $2, $3, $4, 'admin')",
-    )
-    .bind(admin_user_id)
-    .bind(tenant_id)
-    .bind(admin_email)
-    .bind(admin_password_hash)
-    .execute(&mut *conn)
+) -> Result<(), DbErr> {
+    tenants::Entity::insert(tenants::ActiveModel {
+        id: Set(tenant_id.into()),
+        slug: Set(slug.into()),
+        name: Set(name.into()),
+        status: Set("active".into()),
+        ..Default::default()
+    })
+    .exec(conn)
+    .await?;
+    users::Entity::insert(users::ActiveModel {
+        id: Set(admin_user_id.into()),
+        tenant_id: Set(tenant_id.into()),
+        email: Set(admin_email.into()),
+        password_hash: Set(admin_password_hash.into()),
+        role: Set("admin".into()),
+        ..Default::default()
+    })
+    .exec(conn)
     .await?;
     Ok(())
 }
 
 /// ユーザを作成する（POST /tenants/{id}/users）。`tenant_id` でスコープする。
 pub async fn create_user(
-    executor: impl sqlx::PgExecutor<'_>,
+    executor: &impl ConnectionTrait,
     user_id: &str,
     tenant_id: &str,
     email: &str,
     password_hash: &str,
     role: Role,
-) -> Result<(), sqlx::Error> {
-    sqlx::query(
-        "INSERT INTO users (id, tenant_id, email, password_hash, role) \
-         VALUES ($1, $2, $3, $4, $5)",
-    )
-    .bind(user_id)
-    .bind(tenant_id)
-    .bind(email)
-    .bind(password_hash)
-    .bind(role.as_str())
-    .execute(executor)
+) -> Result<(), DbErr> {
+    users::Entity::insert(users::ActiveModel {
+        id: Set(user_id.into()),
+        tenant_id: Set(tenant_id.into()),
+        email: Set(email.into()),
+        password_hash: Set(password_hash.into()),
+        role: Set(role.as_str().into()),
+        ..Default::default()
+    })
+    .exec(executor)
     .await?;
     Ok(())
 }
@@ -198,23 +211,24 @@ pub struct UserRow {
 ///
 /// M3b: login の認証前参照（Principal 確立前。slug 解決の後だが GUC はまだ無い）。
 /// users は FORCE RLS のため GUC 無しでは読めないので、SECURITY DEFINER 関数
-/// `auth_lookup_user_by_email` を呼ぶ（migrations/0004_rls.sql）。
+/// `auth_lookup_user_by_email` を呼ぶ（migrations/src/m20260915_000001_security.sql）。
 pub async fn find_user_by_email(
-    executor: impl sqlx::PgExecutor<'_>,
+    executor: &impl ConnectionTrait,
     tenant_id: &str,
     email: &str,
-) -> Result<Option<UserRow>, sqlx::Error> {
-    let row = sqlx::query("SELECT id, password_hash, role FROM auth_lookup_user_by_email($1, $2)")
-        .bind(tenant_id)
-        .bind(email)
-        .fetch_optional(executor)
-        .await?;
-
-    row.map(|r| {
+) -> Result<Option<UserRow>, DbErr> {
+    function_rows(
+        executor,
+        "auth_lookup_user_by_email",
+        vec![tenant_id.into(), email.into()],
+    )
+    .await?
+    .first()
+    .map(|r| {
         Ok(UserRow {
-            id: r.try_get("id")?,
-            password_hash: r.try_get("password_hash")?,
-            role: r.try_get("role")?,
+            id: r.try_get("", "id")?,
+            password_hash: r.try_get("", "password_hash")?,
+            role: r.try_get("", "role")?,
         })
     })
     .transpose()
@@ -224,20 +238,19 @@ pub async fn find_user_by_email(
 ///
 /// テナント外/不在は `None`（IDOR: 存在秘匿のため呼び出し側で 404 にする）。
 pub async fn find_user_role(
-    executor: impl sqlx::PgExecutor<'_>,
+    executor: &impl ConnectionTrait,
     tenant_id: &str,
     user_id: &str,
-) -> Result<Option<String>, sqlx::Error> {
-    let row = sqlx::query(
-        "SELECT role FROM users \
-         WHERE tenant_id = $1 AND id = $2 AND deleted_at IS NULL",
-    )
-    .bind(tenant_id)
-    .bind(user_id)
-    .fetch_optional(executor)
-    .await?;
-
-    row.map(|r| r.try_get::<String, _>("role")).transpose()
+) -> Result<Option<String>, DbErr> {
+    users::Entity::find()
+        .select_only()
+        .column(users::Column::Role)
+        .filter(users::Column::TenantId.eq(tenant_id))
+        .filter(users::Column::Id.eq(user_id))
+        .filter(users::Column::DeletedAt.is_null())
+        .into_tuple::<String>()
+        .one(executor)
+        .await
 }
 
 /// slug からテナントを解決する（login のテナント解決, §3.3）。active のみ。
@@ -245,23 +258,22 @@ pub async fn find_user_role(
 /// M3b: login の最初の認証前参照（GUC 無し）。tenants 自体には RLS は無いが、規約として
 /// 3 つの認証前参照を SECURITY DEFINER 関数経由に統一する。`auth_lookup_tenant_id_by_slug`
 /// は `RETURNS TABLE(id text)` のため、未一致は 0 行 → `fetch_optional` で `None`（スカラ
-/// NULL 行の誤判定を避ける, migrations/0004_rls.sql）。
+/// NULL 行の誤判定を避ける, migrations/src/m20260915_000001_security.sql）。
 pub async fn find_tenant_id_by_slug(
-    executor: impl sqlx::PgExecutor<'_>,
+    executor: &impl ConnectionTrait,
     slug: &str,
-) -> Result<Option<String>, sqlx::Error> {
-    let row = sqlx::query("SELECT id FROM auth_lookup_tenant_id_by_slug($1)")
-        .bind(slug)
-        .fetch_optional(executor)
-        .await?;
-
-    row.map(|r| r.try_get::<String, _>("id")).transpose()
+) -> Result<Option<String>, DbErr> {
+    function_rows(executor, "auth_lookup_tenant_id_by_slug", vec![slug.into()])
+        .await?
+        .first()
+        .map(|r| r.try_get("", "id"))
+        .transpose()
 }
 
 /// API トークン行を作成する。`scopes` は文字列配列で渡す（CHECK 制約に合致させる）。
 #[allow(clippy::too_many_arguments)]
 pub async fn create_token(
-    executor: impl sqlx::PgExecutor<'_>,
+    executor: &impl ConnectionTrait,
     token_id: &str,
     tenant_id: &str,
     user_id: Option<&str>,
@@ -269,20 +281,18 @@ pub async fn create_token(
     scopes: &[String],
     name: Option<&str>,
     expires_at: DateTime<Utc>,
-) -> Result<(), sqlx::Error> {
-    sqlx::query(
-        "INSERT INTO api_tokens \
-         (id, tenant_id, user_id, token_hash, scopes, name, expires_at) \
-         VALUES ($1, $2, $3, $4, $5, $6, $7)",
-    )
-    .bind(token_id)
-    .bind(tenant_id)
-    .bind(user_id)
-    .bind(token_hash)
-    .bind(scopes)
-    .bind(name)
-    .bind(expires_at)
-    .execute(executor)
+) -> Result<(), DbErr> {
+    api_tokens::Entity::insert(api_tokens::ActiveModel {
+        id: Set(token_id.into()),
+        tenant_id: Set(tenant_id.into()),
+        user_id: Set(user_id.map(str::to_owned)),
+        token_hash: Set(token_hash.into()),
+        scopes: Set(scopes.to_vec()),
+        name: Set(name.map(str::to_owned)),
+        expires_at: Set(expires_at),
+        ..Default::default()
+    })
+    .exec(executor)
     .await?;
     Ok(())
 }
@@ -292,33 +302,30 @@ pub async fn create_token(
 /// IDOR 対策: 必ず呼び出し主体の `tenant_id` でスコープする。更新 0 行なら
 /// テナント外/不在（呼び出し側は 404 にする＝存在秘匿）。
 pub async fn revoke_token(
-    executor: impl sqlx::PgExecutor<'_>,
+    executor: &impl ConnectionTrait,
     tenant_id: &str,
     token_id: &str,
-) -> Result<u64, sqlx::Error> {
-    let result = sqlx::query(
-        "UPDATE api_tokens SET revoked_at = now() \
-         WHERE tenant_id = $1 AND id = $2 AND revoked_at IS NULL",
-    )
-    .bind(tenant_id)
-    .bind(token_id)
-    .execute(executor)
-    .await?;
-    Ok(result.rows_affected())
+) -> Result<u64, DbErr> {
+    Ok(api_tokens::Entity::update_many()
+        .col_expr(api_tokens::Column::RevokedAt, now())
+        .filter(api_tokens::Column::TenantId.eq(tenant_id))
+        .filter(api_tokens::Column::Id.eq(token_id))
+        .filter(api_tokens::Column::RevokedAt.is_null())
+        .exec(executor)
+        .await?
+        .rows_affected)
 }
 
 /// 指定 token_id がテナント内に存在するか（revoke の 404/204 判定補助）。
 pub async fn token_exists(
-    executor: impl sqlx::PgExecutor<'_>,
+    executor: &impl ConnectionTrait,
     tenant_id: &str,
     token_id: &str,
-) -> Result<bool, sqlx::Error> {
-    let row = sqlx::query(
-        "SELECT EXISTS (SELECT 1 FROM api_tokens WHERE tenant_id = $1 AND id = $2) AS present",
-    )
-    .bind(tenant_id)
-    .bind(token_id)
-    .fetch_one(executor)
-    .await?;
-    row.try_get("present")
+) -> Result<bool, DbErr> {
+    Ok(api_tokens::Entity::find()
+        .filter(api_tokens::Column::TenantId.eq(tenant_id))
+        .filter(api_tokens::Column::Id.eq(token_id))
+        .count(executor)
+        .await?
+        > 0)
 }

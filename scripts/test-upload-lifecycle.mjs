@@ -12,12 +12,16 @@ import {loadConfig} from '../sdk/src/config.mjs';
 import {runCommand} from './bounded-process.mjs';
 import {testVersionEnvironment} from './test-version-environment.mjs';
 import {testVersionLifecycle} from './test-version-lifecycle.mjs';
+import {testConsole} from './test-console.mjs';
 
 const pg = process.env.HTTP_TEST_PG_CONTAINER;
 assert.match(pg || '', /^hibana-http-pg-[0-9]+$/);
 assert.ok(process.env.HTTP_TEST_DATABASE_URL.endsWith('/hibana_http'));
 const sql = query => runCommand('docker', ['exec', pg, 'psql', '-XqAt', '-U', 'postgres', '-d', 'hibana_http', '-v', 'ON_ERROR_STOP=1', '-c', query]);
 const folder = await mkdtemp(join(tmpdir(), 'hibana-upload-test-'));
+const nativeTarget = resolve(process.env.CARGO_TARGET_DIR || 'target', 'debug');
+// Keep the native workspace's target override out of the temporary app build.
+delete process.env.CARGO_TARGET_DIR;
 const log = await open(join(folder, 'cp.log'), 'w');
 const objects = new Map();
 const deniedDeletes = new Set();
@@ -44,7 +48,7 @@ const s3Port = await listen(s3);
 const vacantPort = async () => { const server = createServer(); const port = await listen(server); await new Promise(done => server.close(done)); return port; };
 const port = await vacantPort(), internalPort = await vacantPort(), workerPort = await vacantPort(), metricsPort = await vacantPort();
 const url = `http://127.0.0.1:${port}`, internal = `http://127.0.0.1:${internalPort}`;
-const operator = (...args) => runCommand(resolve('target/debug/hibana-control-plane'), ['--maintenance', ...args], {
+const operator = (...args) => runCommand(join(nativeTarget, 'hibana-control-plane'), ['--maintenance', ...args], {
   env: {...process.env, INTERNAL_BIND_ADDR: `127.0.0.1:${internalPort}`},
 });
 async function stop(process = cp) {
@@ -54,7 +58,7 @@ async function stop(process = cp) {
   await new Promise(done => process.once('exit', done)); clearTimeout(timer);
 }
 async function start() {
-  cp = spawn(resolve('target/debug/hibana-control-plane'), [], {
+  cp = spawn(join(nativeTarget, 'hibana-control-plane'), [], {
     stdio: ['ignore', log.fd, log.fd], env: {...process.env, BIND_ADDR: `127.0.0.1:${port}`,
       INTERNAL_BIND_ADDR: `127.0.0.1:${internalPort}`, S3_ENDPOINT: `http://127.0.0.1:${s3Port}`,
       RUN_MIGRATIONS: 'false', LOG_FORMAT: 'json', SECRETS_MASTER_KID: 'rotated-test',
@@ -69,7 +73,7 @@ async function start() {
   throw new Error('Test Control Plane startup deadline');
 }
 async function startWorker() {
-  worker = spawn(resolve('target/debug/hibana-worker'), [], {
+  worker = spawn(join(nativeTarget, 'hibana-worker'), [], {
     stdio: ['ignore', log.fd, log.fd], env: {...process.env,
       WORKER_HTTP_BIND_ADDR: `127.0.0.1:${workerPort}`, METRICS_BIND_ADDR: `127.0.0.1:${metricsPort}`,
       CONTROL_PLANE_INTERNAL_URL: internal, WASM_CACHE_DIR: join(folder, 'cache'), LOG_FORMAT: 'json'},
@@ -135,8 +139,8 @@ try {
     WHERE s.component_id='${id}' AND s.deleted_at IS NULL`);
   const keys = {active_kid:'rotated-test',active_key:process.env.SECRETS_MASTER_KEY,retired:''};
   const verifier = ['--verify-backup-secrets'];
-  assert.equal((await runCommand(resolve('target/debug/hibana-control-plane'), verifier, {input:JSON.stringify(keys)+'\n'+rows})).trim(),'1');
-  await assert.rejects(runCommand(resolve('target/debug/hibana-control-plane'), verifier,
+  assert.equal((await runCommand(join(nativeTarget, 'hibana-control-plane'), verifier, {input:JSON.stringify(keys)+'\n'+rows})).trim(),'1');
+  await assert.rejects(runCommand(join(nativeTarget, 'hibana-control-plane'), verifier,
     {input:JSON.stringify({...keys,active_kid:'k1'})+'\n'+rows}));
   console.log('PASS offline verifier decrypts real persisted secrets with rotated key ID and refuses a mismatched ID');
   const slow = upload(id,token,'1',wasm,16500);
@@ -267,6 +271,7 @@ try {
   });
   await testVersionEnvironment({api, sql, token, id, wasm, upload, app, holdStorage, releaseStorage:() => releasePut(), url, root:join(folder, 'app'), artifact});
   await testVersionLifecycle({api, sql, pg, token, wasm, upload, app});
+  await testConsole({api, token, url, app, wasm, folder});
 
   const acceptedObjects = objects.size;
   const waitingPolicy = holdStorage();

@@ -10,6 +10,8 @@ GitHubから導入できるMVP v0.1.0です。2時間のHTTP負荷と、配備�
 
 このソースは次期候補`0.2.0-rc.1`です。停止・導入・回収処理の修正を含み、以下の公開済みv0.1.0とは配布物が異なります。候補版を試す場合は[候補版の導入手順](docs/release-candidate.md)でCLIと基盤を揃えてください。
 
+この候補の基盤DBはSeaORMの初期スキーマへ整理しています。検証には空のDBを使い、既存の稼働DBは後から切り替えます。[DB構成・マイグレーション](docs/database.md)を参照してください。
+
 ## できること
 
 - **CLIで開発から配備まで。** `init`で雛形を作成し、`dev`で変更を確認、`deploy`でビルドと配備を実行します。
@@ -122,7 +124,7 @@ npx hibana deploy
 npx hibana secret list
 ```
 
-`hibana.json`の`secrets`には使用する名前だけを列挙します。管理者が許可したSecretのうち、列挙したものだけを配備先へ渡します。通常の`deploy`・`rollback`はRead・Deployスコープで実行でき、Adminは不要です。`secret deny-deploy API_KEY`は今後の配備への許可を止めます。既存バージョンからも利用を止める場合は`secret delete API_KEY`を使います。ローカル専用の秘密値は`.dev.vars`にdotenv形式で記述できます。`.dev.vars`と、成果物・認証情報を格納する`.hibana/`はGitに含めません。
+`hibana.json`の`secrets`には使用する名前だけを列挙します。管理者が許可したSecretのうち、列挙したものだけを配備先へ渡します。通常の`deploy`・`rollback`はRead・Deployスコープで実行でき、Adminは不要です。`secret deny-deploy API_KEY`は今後の配備への許可を止めます。既存バージョンからも利用を止める場合は`secret delete API_KEY`を使います。ローカル専用の秘密値は`.dev.vars`にdotenv形式で記述できます。`.dev.vars`と、ビルド成果物を格納する`.hibana/`はGitに含めません。
 
 コードを以前の状態に戻すときは次のコマンドを使います。
 
@@ -156,6 +158,8 @@ PostgreSQLは配備・実行記録・テナント情報、Redisは共有の受�
 
 CLIはGitHubのtarballからPCへ導入でき、`hibana login --profile onprem --url https://api.example.internal`でリモート基盤を選択できます。開発者のアプリ操作にDockerやKubernetes資格情報は不要です。[CLI配布・接続プロファイル・オンプレ構成](docs/remote-cli.md)を参照してください。
 
+イントラネットのブラウザから使う[コンソール](docs/console.md)を`console/`に用意しています。Kubernetesが画面と管理APIを提供し、CLIで配備したアプリの一覧・バージョン・切り戻し・利用量を確認できます。アプリの実行・配信は基盤側で継続します。
+
 基盤管理者は[GitHubの配布ガイド](docs/releases.md)に従ってイメージを社内レジストリへ搬入し、DNS・TLS・依存サービスを設定したoverlayで既存クラスタへ導入します。基盤の操作にはkubectl・Python 3・PyYAMLと、管理者用のKubernetes資格情報が必要です。
 
 ```bash
@@ -173,6 +177,8 @@ hibana platform uninstall --kubeconfig FILE --context onprem --yes
 現在の実行対象は`wasi:http/incoming-handler@0.2.3`を実装するWebAssembly Componentです。JS/TSはCLIがJavaScriptエンジンを含むComponentへ変換し、Rust・Goも同じHTTP契約で動作します。既存アプリを移す場合は、対応するAPIとビルド形式の確認が必要です。
 
 Cloudflare Workers / WranglerやNode.js APIの完全互換は提供しません。WebSocket、WASI Preview 1単体、任意のWIT、KV・DB・Queueなどのアプリ向けBindingも現在の対象外です。
+
+追加機能はユーザーが選んだ JS モジュールや Rust 製 Wasm 部品をアプリへ同梱します。拡張パッケージをnpm依存として導入し、`extensions`配列に名前を指定すると、CLIが対応する契約・必要権限を確認してHonoと合成し、一つの `.wasm` として配備できます。ローカル拡張も`"./extensions/foo"`として同じ形式で指定できます。[アプリ拡張の設定と動作例](docs/application-extensions.md)を参照してください。
 
 外向き通信は既定で拒否します。配備先では管理者が許可先を承認でき、ローカル`dev`では外向き通信を許可する設定をまだ提供していません。
 

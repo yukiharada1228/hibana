@@ -1,6 +1,6 @@
 # Hibana のスケールと過負荷制御
 
-HibanaはWorker Podを増減してHTTP実行枠を増やします。アプリごとにDeploymentを作る方式ではありません。基盤管理者がKubernetesを運用し、アプリ開発者は従来どおり`hibana deploy`を使います。
+Hibanaの本番基盤はKubernetesを前提とし、常駐Worker Podを増減してHTTP実行枠を増やします。複数アプリがWorker群を共有し、呼び出しごとのWasmインスタンスはWorker内で生成します。アプリやリクエストごとにDeployment・Pod・Jobを作る方式ではありません。基盤管理者がKubernetesを運用し、アプリ開発者は従来どおり`hibana deploy`を使います。
 
 2・4・8 Podの測定値とHPAの実機確認は[検証記録](scaling-validation.md)に記載しています。
 

@@ -10,6 +10,7 @@ use axum::http::StatusCode;
 use axum::response::IntoResponse;
 use axum::Json;
 use hibana_shared::FaasError;
+use sea_orm::TransactionTrait as _;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 
@@ -54,10 +55,10 @@ pub async fn register_signing_key(
         return Err(FaasError::InvalidRequest("key_id must be 1..=128 chars".into()).into());
     }
 
-    let mut tx = state.pool().begin().await?;
-    db::set_tenant_guc(&mut tx, tenant).await?;
+    let tx = state.pool().begin().await?;
+    db::set_tenant_guc(&tx, tenant).await?;
     db::upsert_signing_key(
-        &mut *tx,
+        &tx,
         tenant,
         &key_id,
         &req.public_key,
@@ -65,7 +66,7 @@ pub async fn register_signing_key(
     )
     .await?;
     db::insert_audit_log(
-        &mut *tx,
+        &tx,
         tenant,
         principal.user_id.as_deref(),
         "signing_key_registered",
@@ -92,9 +93,9 @@ pub async fn list_signing_keys(
     require_admin_role(principal.role)?;
     let tenant = &principal.tenant_id;
 
-    let mut tx = state.pool().begin().await?;
-    db::set_tenant_guc(&mut tx, tenant).await?;
-    let keys = db::list_signing_keys(&mut *tx, tenant).await?;
+    let tx = state.pool().begin().await?;
+    db::set_tenant_guc(&tx, tenant).await?;
+    let keys = db::list_signing_keys(&tx, tenant).await?;
     tx.commit().await?;
 
     let out: Vec<SigningKeyView> = keys
@@ -120,14 +121,14 @@ pub async fn retire_signing_key(
     require_admin_role(principal.role)?;
     let tenant = &principal.tenant_id;
 
-    let mut tx = state.pool().begin().await?;
-    db::set_tenant_guc(&mut tx, tenant).await?;
-    let found = db::retire_signing_key(&mut *tx, tenant, &key_id).await?;
+    let tx = state.pool().begin().await?;
+    db::set_tenant_guc(&tx, tenant).await?;
+    let found = db::retire_signing_key(&tx, tenant, &key_id).await?;
     if !found {
         return Err(FaasError::NotFound(format!("signing key '{key_id}'")).into());
     }
     db::insert_audit_log(
-        &mut *tx,
+        &tx,
         tenant,
         principal.user_id.as_deref(),
         "signing_key_retired",
@@ -164,15 +165,14 @@ pub async fn set_signing_policy(
     require_admin_role(principal.role)?;
     let tenant = &principal.tenant_id;
 
-    let mut tx = state.pool().begin().await?;
-    db::set_tenant_guc(&mut tx, tenant).await?;
-    let ok =
-        db::set_require_signed_components(&mut *tx, tenant, req.require_signed_components).await?;
+    let tx = state.pool().begin().await?;
+    db::set_tenant_guc(&tx, tenant).await?;
+    let ok = db::set_require_signed_components(&tx, tenant, req.require_signed_components).await?;
     if !ok {
         return Err(FaasError::NotFound(format!("tenant '{tenant}'")).into());
     }
     db::insert_audit_log(
-        &mut *tx,
+        &tx,
         tenant,
         principal.user_id.as_deref(),
         "signing_policy_updated",

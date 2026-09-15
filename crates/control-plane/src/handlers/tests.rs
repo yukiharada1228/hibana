@@ -143,7 +143,9 @@ fn create_token_target_role_ceiling_enforced() {
 #[test]
 fn unique_violation_detection() {
     // RowNotFound は unique violation ではない。
-    assert!(!is_unique_violation(&sqlx::Error::RowNotFound));
+    assert!(!is_unique_violation(&sea_orm::DbErr::Custom(
+        "missing fixture row".into()
+    )));
 }
 
 /// `build_readyz_response`: 全 hop が Ok のとき 200 + ボディに "ok"。
@@ -191,7 +193,7 @@ async fn readyz_returns_503_when_store_fails() {
     );
 }
 
-/// `check_db_ready`: 閉じた / 到達不能な PgPool に対しては `Err` を返す（hang しない）。
+/// `check_db_ready`: 閉じた / 到達不能な DatabaseConnection に対しては `Err` を返す（hang しない）。
 ///
 /// `connect_lazy` で実接続を作らない pool に対して `SELECT 1` を投げると即 fail
 /// する（unreachable host + 短いタイムアウト）。これにより「DB が落ちたとき /readyz は
@@ -199,11 +201,13 @@ async fn readyz_returns_503_when_store_fails() {
 #[tokio::test]
 async fn check_db_ready_errors_when_pool_unreachable() {
     // unreachable な URL（接続不可ポート）。connect_lazy なので構築自体は成功する。
-    let pool = sqlx::postgres::PgPoolOptions::new()
+    let mut options = sea_orm::ConnectOptions::new("postgres://faas:faas@127.0.0.1:1/faas");
+    options
         .max_connections(1)
+        .min_connections(0)
         .acquire_timeout(std::time::Duration::from_millis(100))
-        .connect_lazy("postgres://faas:faas@127.0.0.1:1/faas")
-        .expect("connect_lazy never fails on parse-valid URLs");
+        .connect_lazy(true);
+    let pool = sea_orm::Database::connect(options).await.unwrap();
     let res = check_db_ready(&pool).await;
     assert!(
         res.is_err(),

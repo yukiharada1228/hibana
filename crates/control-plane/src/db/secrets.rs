@@ -1,8 +1,8 @@
 //! Secrets persistence.
-use sqlx::Row;
+use hibana_database::prelude::*;
 
 // ---------------------------------------------------------------------------
-// M7c: Secrets Manager（function_secrets / function_secret_versions, migration 0011）
+// M7c: Secrets Manager（function_secrets / function_secret_versions）
 //
 // **平文も暗号文もこの層より上へ素で流さない**。値は `secrets.rs` の封筒 [`crate::secrets::Envelope`]
 // としてのみ受け渡す。版台帳は追記専用（faas_app に UPDATE/DELETE が無い）なので、値の更新
@@ -11,7 +11,7 @@ use sqlx::Row;
 // ---------------------------------------------------------------------------
 
 /// `function_secrets` のメタデータ 1 行（**値は含まない**）。
-#[derive(Debug, Clone, sqlx::FromRow)]
+#[derive(Debug, Clone, FromQueryResult)]
 pub struct SecretMetaRow {
     pub id: String,
     pub name: String,
@@ -24,171 +24,186 @@ pub struct SecretMetaRow {
 /// 生存行の同名重複は部分 UNIQUE index 違反（23505）。呼び出し側が捕捉して
 /// 「既存 → rotate」へ倒す。
 pub async fn insert_secret_meta(
-    executor: impl sqlx::PgExecutor<'_>,
+    executor: &impl ConnectionTrait,
     tenant_id: &str,
     secret_id: &str,
     component_id: &str,
     name: &str,
     current_version: i32,
-) -> Result<(), sqlx::Error> {
-    sqlx::query(
-        "INSERT INTO function_secrets \
-         (id, tenant_id, component_id, name, current_version) \
-         VALUES ($1, $2, $3, $4, $5)",
-    )
-    .bind(secret_id)
-    .bind(tenant_id)
-    .bind(component_id)
-    .bind(name)
-    .bind(current_version)
-    .execute(executor)
+) -> Result<(), DbErr> {
+    function_secrets::Entity::insert(function_secrets::ActiveModel {
+        id: Set(secret_id.into()),
+        tenant_id: Set(tenant_id.into()),
+        component_id: Set(component_id.into()),
+        name: Set(name.into()),
+        current_version: Set(current_version),
+        ..Default::default()
+    })
+    .exec(executor)
     .await?;
     Ok(())
 }
 
 /// 生存している secret を名前で引く（**メタのみ**）。
 pub async fn find_live_secret_by_name(
-    executor: impl sqlx::PgExecutor<'_>,
+    executor: &impl ConnectionTrait,
     tenant_id: &str,
     component_id: &str,
     name: &str,
-) -> Result<Option<SecretMetaRow>, sqlx::Error> {
-    sqlx::query_as(
-        "SELECT id, name, current_version, updated_at FROM function_secrets \
-          WHERE tenant_id = $1 AND component_id = $2 AND name = $3 AND deleted_at IS NULL",
-    )
-    .bind(tenant_id)
-    .bind(component_id)
-    .bind(name)
-    .fetch_optional(executor)
-    .await
+) -> Result<Option<SecretMetaRow>, DbErr> {
+    function_secrets::Entity::find()
+        .select_only()
+        .columns([
+            function_secrets::Column::Id,
+            function_secrets::Column::Name,
+            function_secrets::Column::CurrentVersion,
+            function_secrets::Column::UpdatedAt,
+        ])
+        .filter(function_secrets::Column::TenantId.eq(tenant_id))
+        .filter(function_secrets::Column::DeletedAt.is_null())
+        .filter(function_secrets::Column::ComponentId.eq(component_id))
+        .filter(function_secrets::Column::Name.eq(name))
+        .into_model::<SecretMetaRow>()
+        .one(executor)
+        .await
 }
 
 /// component の生存 secret を全件引く（**メタのみ**。値も value_len も kek_kid も返さない）。
 pub async fn list_secrets_meta(
-    executor: impl sqlx::PgExecutor<'_>,
+    executor: &impl ConnectionTrait,
     tenant_id: &str,
     component_id: &str,
-) -> Result<Vec<SecretMetaRow>, sqlx::Error> {
-    sqlx::query_as(
-        "SELECT id, name, current_version, updated_at FROM function_secrets \
-          WHERE tenant_id = $1 AND component_id = $2 AND deleted_at IS NULL ORDER BY name",
-    )
-    .bind(tenant_id)
-    .bind(component_id)
-    .fetch_all(executor)
-    .await
+) -> Result<Vec<SecretMetaRow>, DbErr> {
+    function_secrets::Entity::find()
+        .select_only()
+        .columns([
+            function_secrets::Column::Id,
+            function_secrets::Column::Name,
+            function_secrets::Column::CurrentVersion,
+            function_secrets::Column::UpdatedAt,
+        ])
+        .filter(function_secrets::Column::TenantId.eq(tenant_id))
+        .filter(function_secrets::Column::DeletedAt.is_null())
+        .filter(function_secrets::Column::ComponentId.eq(component_id))
+        .order_by_asc(function_secrets::Column::Name)
+        .into_model::<SecretMetaRow>()
+        .all(executor)
+        .await
 }
 
 /// 版台帳へ 1 行 INSERT する（追記専用）。`reason` は `'create' | 'rotate' | 'rekey'`。
 pub async fn insert_secret_version(
-    executor: impl sqlx::PgExecutor<'_>,
+    executor: &impl ConnectionTrait,
     tenant_id: &str,
     secret_id: &str,
     version: i32,
     env: &crate::secrets::Envelope,
     reason: &str,
     created_by: Option<&str>,
-) -> Result<(), sqlx::Error> {
-    sqlx::query(
-        "INSERT INTO function_secret_versions \
-         (tenant_id, secret_id, version, kek_kid, wrapped_dek, dek_nonce, nonce, ciphertext, \
-          value_len, reason, created_by) \
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)",
-    )
-    .bind(tenant_id)
-    .bind(secret_id)
-    .bind(version)
-    .bind(&env.kek_kid)
-    .bind(&env.wrapped_dek)
-    .bind(&env.dek_nonce)
-    .bind(&env.nonce)
-    .bind(&env.ciphertext)
-    .bind(env.value_len)
-    .bind(reason)
-    .bind(created_by)
-    .execute(executor)
+) -> Result<(), DbErr> {
+    function_secret_versions::Entity::insert(function_secret_versions::ActiveModel {
+        tenant_id: Set(tenant_id.into()),
+        secret_id: Set(secret_id.into()),
+        version: Set(version),
+        kek_kid: Set(env.kek_kid.clone()),
+        wrapped_dek: Set(env.wrapped_dek.clone()),
+        dek_nonce: Set(env.dek_nonce.clone()),
+        nonce: Set(env.nonce.clone()),
+        ciphertext: Set(env.ciphertext.clone()),
+        value_len: Set(env.value_len),
+        reason: Set(reason.into()),
+        created_by: Set(created_by.map(str::to_owned)),
+        ..Default::default()
+    })
+    .exec(executor)
     .await?;
     Ok(())
 }
 
 /// `current_version` を前進させる（rotate / rekey 後の切替）。
 pub async fn bump_secret_current_version(
-    executor: impl sqlx::PgExecutor<'_>,
+    executor: &impl ConnectionTrait,
     tenant_id: &str,
     secret_id: &str,
     version: i32,
-) -> Result<bool, sqlx::Error> {
-    let r = sqlx::query(
-        "UPDATE function_secrets SET current_version = $3, updated_at = now() \
-          WHERE tenant_id = $1 AND id = $2 AND deleted_at IS NULL",
-    )
-    .bind(tenant_id)
-    .bind(secret_id)
-    .bind(version)
-    .execute(executor)
-    .await?;
-    Ok(r.rows_affected() > 0)
+) -> Result<bool, DbErr> {
+    Ok(function_secrets::Entity::update_many()
+        .col_expr(function_secrets::Column::CurrentVersion, Expr::val(version))
+        .col_expr(function_secrets::Column::UpdatedAt, now())
+        .filter(function_secrets::Column::TenantId.eq(tenant_id))
+        .filter(function_secrets::Column::Id.eq(secret_id))
+        .filter(function_secrets::Column::DeletedAt.is_null())
+        .exec(executor)
+        .await?
+        .rows_affected
+        > 0)
 }
 
 /// secret を soft delete する。版台帳は残る（追記専用なので消せない ＝ 監査上も残す）。
 ///
 /// 生存行の部分 UNIQUE index から外れるため、**同名で作り直せる**（インシデント対応の基本操作）。
 pub async fn soft_delete_secret(
-    executor: impl sqlx::PgExecutor<'_>,
+    executor: &impl ConnectionTrait,
     tenant_id: &str,
     secret_id: &str,
-) -> Result<bool, sqlx::Error> {
-    let r = sqlx::query(
-        "UPDATE function_secrets SET deleted_at = now(), updated_at = now() \
-          WHERE tenant_id = $1 AND id = $2 AND deleted_at IS NULL",
-    )
-    .bind(tenant_id)
-    .bind(secret_id)
-    .execute(executor)
-    .await?;
-    Ok(r.rows_affected() > 0)
+) -> Result<bool, DbErr> {
+    Ok(function_secrets::Entity::update_many()
+        .col_expr(function_secrets::Column::DeletedAt, now())
+        .col_expr(function_secrets::Column::UpdatedAt, now())
+        .filter(function_secrets::Column::TenantId.eq(tenant_id))
+        .filter(function_secrets::Column::Id.eq(secret_id))
+        .filter(function_secrets::Column::DeletedAt.is_null())
+        .exec(executor)
+        .await?
+        .rows_affected
+        > 0)
 }
 
 pub async fn version_has_live_secrets(
-    executor: impl sqlx::PgExecutor<'_>,
+    executor: &impl ConnectionTrait,
     tenant_id: &str,
     component_id: &str,
     version_id: &str,
-) -> Result<bool, sqlx::Error> {
-    let row = sqlx::query(
-        "SELECT EXISTS ( \
-             SELECT 1 FROM function_secrets s \
-             JOIN version_secret_bindings b ON b.tenant_id=s.tenant_id AND b.component_id=s.component_id AND b.secret_id=s.id AND b.name=s.name \
-             WHERE s.tenant_id=$1 AND s.component_id=$2 AND b.version_id=$3 AND s.deleted_at IS NULL \
-         ) AS present",
-    )
-    .bind(tenant_id)
-    .bind(component_id)
-    .bind(version_id)
-    .fetch_one(executor)
-    .await?;
-    row.try_get("present")
+) -> Result<bool, DbErr> {
+    Ok(function_secrets::Entity::find()
+        .filter(function_secrets::Column::TenantId.eq(tenant_id))
+        .filter(function_secrets::Column::ComponentId.eq(component_id))
+        .filter(function_secrets::Column::DeletedAt.is_null())
+        .filter(
+            function_secrets::Column::Id.in_subquery(
+                version_secret_bindings::Entity::find()
+                    .select_only()
+                    .column(version_secret_bindings::Column::SecretId)
+                    .filter(version_secret_bindings::Column::TenantId.eq(tenant_id))
+                    .filter(version_secret_bindings::Column::ComponentId.eq(component_id))
+                    .filter(version_secret_bindings::Column::VersionId.eq(version_id))
+                    .into_query(),
+            ),
+        )
+        .count(executor)
+        .await?
+        > 0)
 }
 
 /// 現行 kid でない current 世代を持つ secret の id を引く（M7c-4: rekey 対象）。
 ///
 /// `secrets_stale_kek(p_tenant, p_active_kid)` は SECURITY DEFINER（faas_app は FORCE RLS 下で
 /// 巡回できない）。**テナント引数を取る版**なので GUC 前でも呼べるが、返すのは
-/// `(tenant_id, secret_id)` だけで暗号文も名前も返さない（0004 の認証前参照 3 関数と同じ作法）。
+/// `(tenant_id, secret_id)` だけで暗号文も名前も返さない（認証前参照の3関数と同じ作法）。
 pub async fn secrets_stale_kek(
-    executor: impl sqlx::PgExecutor<'_>,
+    executor: &impl ConnectionTrait,
     tenant_id: &str,
     active_kid: &str,
-) -> Result<Vec<String>, sqlx::Error> {
-    let rows = sqlx::query("SELECT secret_id FROM secrets_stale_kek($1, $2)")
-        .bind(tenant_id)
-        .bind(active_kid)
-        .fetch_all(executor)
-        .await?;
-    rows.into_iter()
-        .map(|r| r.try_get::<String, _>("secret_id"))
-        .collect()
+) -> Result<Vec<String>, DbErr> {
+    function_rows(
+        executor,
+        "secrets_stale_kek",
+        vec![tenant_id.into(), active_kid.into()],
+    )
+    .await?
+    .into_iter()
+    .map(|r| r.try_get("", "secret_id"))
+    .collect()
 }
 
 /// kid 別の current 世代件数（M7c-4: Prometheus gauge の内部更新専用）。
@@ -196,59 +211,57 @@ pub async fn secrets_stale_kek(
 /// **HTTP 応答に載せてはならない** (MUST NOT)。全テナント横断の集計であり、テナント管理者へ
 /// 返すと他テナントの secret 総数が漏れる。
 pub async fn secrets_kek_kid_counts_all(
-    executor: impl sqlx::PgExecutor<'_>,
-) -> Result<Vec<(String, i64)>, sqlx::Error> {
-    let rows = sqlx::query("SELECT kek_kid, n FROM secrets_kek_kid_counts_all()")
-        .fetch_all(executor)
-        .await?;
-    rows.into_iter()
-        .map(|r| Ok((r.try_get("kek_kid")?, r.try_get("n")?)))
+    executor: &impl ConnectionTrait,
+) -> Result<Vec<(String, i64)>, DbErr> {
+    function_rows(executor, "secrets_kek_kid_counts_all", vec![])
+        .await?
+        .into_iter()
+        .map(|r| Ok((r.try_get("", "kek_kid")?, r.try_get("", "n")?)))
         .collect()
 }
 
 /// secret メタ行を id で引く（rekey が current 世代を解決するのに使う）。
 pub async fn find_secret_meta_by_id(
-    executor: impl sqlx::PgExecutor<'_>,
+    executor: &impl ConnectionTrait,
     tenant_id: &str,
     secret_id: &str,
-) -> Result<Option<SecretMetaRow>, sqlx::Error> {
-    sqlx::query_as(
-        "SELECT id, name, current_version, updated_at FROM function_secrets \
-          WHERE tenant_id = $1 AND id = $2 AND deleted_at IS NULL",
-    )
-    .bind(tenant_id)
-    .bind(secret_id)
-    .fetch_optional(executor)
-    .await
+) -> Result<Option<SecretMetaRow>, DbErr> {
+    function_secrets::Entity::find()
+        .select_only()
+        .columns([
+            function_secrets::Column::Id,
+            function_secrets::Column::Name,
+            function_secrets::Column::CurrentVersion,
+            function_secrets::Column::UpdatedAt,
+        ])
+        .filter(function_secrets::Column::TenantId.eq(tenant_id))
+        .filter(function_secrets::Column::DeletedAt.is_null())
+        .filter(function_secrets::Column::Id.eq(secret_id))
+        .into_model::<SecretMetaRow>()
+        .one(executor)
+        .await
 }
 
 /// 指定 secret の指定版の封筒を引く。
 pub async fn find_secret_version(
-    executor: impl sqlx::PgExecutor<'_>,
+    executor: &impl ConnectionTrait,
     tenant_id: &str,
     secret_id: &str,
     version: i32,
-) -> Result<Option<crate::secrets::Envelope>, sqlx::Error> {
-    let row = sqlx::query(
-        "SELECT kek_kid, wrapped_dek, dek_nonce, nonce, ciphertext, value_len \
-           FROM function_secret_versions \
-          WHERE tenant_id = $1 AND secret_id = $2 AND version = $3",
-    )
-    .bind(tenant_id)
-    .bind(secret_id)
-    .bind(version)
-    .fetch_optional(executor)
-    .await?;
-
-    row.map(|r| {
-        Ok(crate::secrets::Envelope {
-            kek_kid: r.try_get("kek_kid")?,
-            wrapped_dek: r.try_get("wrapped_dek")?,
-            dek_nonce: r.try_get("dek_nonce")?,
-            nonce: r.try_get("nonce")?,
-            ciphertext: r.try_get("ciphertext")?,
-            value_len: r.try_get("value_len")?,
-        })
-    })
-    .transpose()
+) -> Result<Option<crate::secrets::Envelope>, DbErr> {
+    Ok(function_secret_versions::Entity::find_by_id((
+        tenant_id.to_owned(),
+        secret_id.to_owned(),
+        version,
+    ))
+    .one(executor)
+    .await?
+    .map(|r| crate::secrets::Envelope {
+        kek_kid: r.kek_kid,
+        wrapped_dek: r.wrapped_dek,
+        dek_nonce: r.dek_nonce,
+        nonce: r.nonce,
+        ciphertext: r.ciphertext,
+        value_len: r.value_len,
+    }))
 }

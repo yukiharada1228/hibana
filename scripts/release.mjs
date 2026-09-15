@@ -16,6 +16,7 @@ assert.equal(/\[workspace.package\][\s\S]*?version\s*=\s*"([^"]+)"/.exec(cargo)?
 assert.equal(lock.packages[""].version, version, "npm lock version differs");
 assert.equal(lock.packages[""].name, pkg.name, "npm lock name differs");
 assert.equal(pkg.private, true, "Hibana is distributed through GitHub; npm publication must stay disabled");
+assert.equal(JSON.parse(await readFile(join(root, "console/package.json"), "utf8")).version, version, "Console and platform versions differ");
 if (process.env.GITHUB_REF_TYPE === "tag") assert.equal(process.env.GITHUB_REF_NAME, `v${version}`, "Release tag and package version differ");
 
 const targets = ["linux-x64", "linux-arm64", "darwin-x64", "darwin-arm64"];
@@ -33,11 +34,11 @@ else if (command === "runtime" && args.length === 2) {
 } else if (command === "platform" && args.length === 1) {
   const output = resolve(args[0]); await mkdir(output, { recursive: true });
   const destination = join(output, `hibana-kubernetes-${version}.tar.gz`);
-  execFileSync("tar", ["-czf", destination, "LICENSE", "deploy/kubernetes/README.md", "deploy/kubernetes/base", "deploy/kubernetes/remote", "deploy/kubernetes/migration", "deploy/kubernetes/autoscaling", "docs/remote-cli.md", "docs/on-prem-production.md", "docs/releases.md", "docs/release-candidate.md"], { cwd: root, timeout: 30000 });
+  execFileSync("tar", ["-czf", destination, "LICENSE", "deploy/kubernetes/README.md", "deploy/kubernetes/base", "deploy/kubernetes/remote", "deploy/kubernetes/console", "deploy/kubernetes/migration", "deploy/kubernetes/autoscaling", "docs/console.md", "docs/database.md", "docs/remote-cli.md", "docs/on-prem-production.md", "docs/releases.md", "docs/release-candidate.md"], { cwd: root, timeout: 30000 });
   console.log(destination);
 } else if (command === "checksums" && (args.length === 1 || (args.length === 2 && args[1] === "--complete"))) {
   const directory = resolve(args[0]);
-  const expected = [...targets.map(target => `hibana-worker-${version}-${target}`), `hibana-cli-${version}.tgz`, `hibana-kubernetes-${version}.tar.gz`, ...["amd64", "arm64"].map(arch => `hibana-platform-${version}-linux-${arch}.tar`)];
+  const expected = [...targets.map(target => `hibana-worker-${version}-${target}`), `hibana-cli-${version}.tgz`, `hibana-kubernetes-${version}.tar.gz`, ...["platform", "console"].flatMap(image => ["amd64", "arm64"].map(arch => `hibana-${image}-${version}-linux-${arch}.tar`))];
   const names = (await readdir(directory)).filter(name => name !== "SHA256SUMS").sort();
   assert.ok(names.length > 0, "No release files");
   for (const name of names) assert.ok(expected.includes(name), `Unexpected release file: ${name}`);

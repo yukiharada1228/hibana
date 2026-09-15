@@ -26,31 +26,15 @@ impl Worker {
         settings: &Settings,
         metrics: Arc<metrics::Metrics>,
     ) -> anyhow::Result<Self> {
-        let pool = sqlx::postgres::PgPoolOptions::new()
-            .max_connections(settings.db_max_connections)
-            // Admission returns its connection asynchronously, while the spawned
-            // invocation can already be acquiring one to claim the execution.
-            // Keep both ready instead of opening a new connection on that path.
-            .min_connections(settings.db_max_connections.min(2))
-            .acquire_timeout(Duration::from_secs(3))
-            .after_connect(|connection, _| Box::pin(repository::prepare_connection(connection)))
-            .connect_with(
-                settings
-                    .database_url
-                    .parse::<sqlx::postgres::PgConnectOptions>()?
-                    .options([
-                        ("statement_timeout", "10000"),
-                        ("lock_timeout", "3000"),
-                        ("idle_in_transaction_session_timeout", "15000"),
-                        ("tcp_keepalives_idle", "10"),
-                        ("tcp_keepalives_interval", "3"),
-                        ("tcp_keepalives_count", "3"),
-                        ("tcp_user_timeout", "10000"),
-                    ]),
-            )
-            .await
-            .context("failed to connect to Postgres")?;
-        repository::assert_non_privileged_runtime_role(&pool).await?;
+        let pool = hibana_database::postgres::connect(
+            &settings.database_url,
+            settings.db_max_connections,
+            2,
+        )
+        .await
+        .context("failed to connect to Postgres")?;
+        hibana_database::postgres::assert_runtime_role(&pool).await?;
+        hibana_database::postgres::assert_runtime_schema(&pool).await?;
         let engine = build_engine()?;
         let http = reqwest::Client::builder()
             .no_proxy()

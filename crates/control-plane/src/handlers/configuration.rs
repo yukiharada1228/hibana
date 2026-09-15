@@ -7,6 +7,7 @@ use axum::extract::{Path, State};
 use axum::response::IntoResponse;
 use axum::Json;
 use hibana_shared::FaasError;
+use sea_orm::TransactionTrait as _;
 use serde::Serialize;
 
 // ---------------------------------------------------------------------------
@@ -73,14 +74,14 @@ pub async fn get_function_config(
 ) -> Result<impl IntoResponse, AppError> {
     let tenant = &principal.tenant_id;
 
-    let mut tx = state.pool().begin().await?;
-    db::set_tenant_guc(&mut tx, tenant).await?;
+    let tx = state.pool().begin().await?;
+    db::set_tenant_guc(&tx, tenant).await?;
 
-    db::find_component_by_id(&mut *tx, tenant, &component_id)
+    db::find_component_by_id(&tx, tenant, &component_id)
         .await?
         .ok_or_else(|| FaasError::NotFound(format!("component '{component_id}'")))?;
 
-    let rows = db::list_function_configs(&mut *tx, tenant, &component_id).await?;
+    let rows = db::list_function_configs(&tx, tenant, &component_id).await?;
     tx.commit().await?;
 
     let updated_at = rows.iter().map(|r| r.updated_at).max();
