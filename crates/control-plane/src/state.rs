@@ -117,7 +117,7 @@ struct Inner {
     secret_keyring: Arc<crate::secrets::SecretKeyring>,
     job_env_exchange_rate_per_min: u64,
     metrics_include_tenant_label: bool,
-    ingress_base_domain: Option<String>,
+    public_apps: crate::public_apps::PublicApps,
 }
 impl AppState {
     #[allow(clippy::too_many_arguments)]
@@ -136,7 +136,7 @@ impl AppState {
         secret_keyring: Arc<crate::secrets::SecretKeyring>,
         job_env_exchange_rate_per_min: u64,
         metrics_include_tenant_label: bool,
-        ingress_base_domain: Option<String>,
+        public_apps: crate::public_apps::PublicApps,
     ) -> Self {
         Self {
             inner: Arc::new(Inner {
@@ -162,7 +162,7 @@ impl AppState {
                 secret_keyring,
                 job_env_exchange_rate_per_min,
                 metrics_include_tenant_label,
-                ingress_base_domain,
+                public_apps,
             }),
         }
     }
@@ -185,8 +185,12 @@ impl AppState {
     }
 
     /// M11 (§4.2): 公開 ingress gateway のベースドメイン。None なら gateway 無効。
+    pub fn app_url(&self, app: &str, tenant: &str) -> Option<String> {
+        self.inner.public_apps.url(app, tenant)
+    }
+
     pub fn ingress_base_domain(&self) -> Option<&str> {
-        self.inner.ingress_base_domain.as_deref()
+        self.inner.public_apps.domain()
     }
 
     /// `/internal/job-env` のレート上限（req/分）。

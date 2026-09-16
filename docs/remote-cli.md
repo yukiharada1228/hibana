@@ -85,29 +85,27 @@ JS/TSのビルドには同梱のoptionalDependenciesを使います。ビルド�
 
 ## 開発者の操作
 
-管理者から管理API URL・テナント名・アカウント・アプリのドメインを受け取ります。通常のログインでは `Password:` に続けてパスワードを入力します。文字は表示されません。スクリプトでは `--password-stdin < /secure/login-password.txt` または `HIBANA_PASSWORD` を使えます。
+管理者から管理API URL・テナント名・アカウントを受け取ります。公開 URL は基盤から自動取得します。通常のログインでは `Password:` に続けてパスワードを入力します。文字は表示されません。スクリプトでは `--password-stdin < /secure/login-password.txt` または `HIBANA_PASSWORD` を使えます。
 
 ```bash
-hibana login --profile onprem \
+hibana login \
   --url https://api.example.internal \
-  --tenant team --email developer@example.internal \
-  --ingress-domain apps.example.internal
-
-hibana profile list
-hibana profile use onprem
+  --tenant team --email developer@example.internal
 
 hibana init hello
 cd hello
-hibana deploy --profile onprem --version 1.0.0
+hibana deploy
 curl https://hello.team.apps.example.internal/
-hibana list --profile onprem
-hibana rollback --profile onprem
+hibana list
+hibana rollback
 # 削除はテナント管理者として別途ログインしたプロファイルで実行
 hibana delete hello --profile onprem-admin --yes
-hibana logout --profile onprem
+hibana logout
 ```
 
-`init`の既定はCLIと同じバージョンのGitHub Release URLを依存として指定し、開発チェックアウトへの`file:`依存を生成しません。`--cli-package PATH`だけがローカルtarballや開発用ディレクトリを明示的に参照する選択肢です。通常のHonoをWasm Componentへ変換してアップロードし、実行・配置・準備済みコードの管理はオンプレのWorker群が担当します。
+複数の接続先を使う場合だけ `hibana login --profile NAME ...` で名前を付け、`hibana profile use NAME` で切り替えます。`--version` も任意で、省略すると自動生成されます。
+
+`init`のnpm scriptsはPCに導入済みのHibana CLIを使用します。未公開の候補版でもCLIの再ダウンロードは発生しません。別のPCで作業する場合もCLIを導入してください。`--cli-package PATH`を指定した場合だけ、tarballや開発用ディレクトリをプロジェクトのCLI依存として追加します。通常のHonoをWasm Componentへ変換してアップロードし、実行・配置・準備済みコードの管理はオンプレのWorker群が担当します。
 
 通常の配備はRead・Deploy、アプリ削除はRead・Adminのスコープが必要です。`onprem-admin`には同じテナントの管理者でログインしてください。
 

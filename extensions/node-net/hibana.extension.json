@@ -1,15 +1,14 @@
 {
-  "schemaVersion": 1,
+  "schemaVersion": 2,
   "runtime": "wasi:http/incoming-handler@0.2.3",
+  "dependencies": [
+    "@hibana/node-stream",
+    "@hibana/node-buffer",
+    "@hibana/tcp",
+    "@hibana/dns"
+  ],
   "aliases": {
-    "net": "./compat/net.mjs", "node:net": "./compat/net.mjs",
-    "tls": "./compat/tls.mjs", "node:tls": "./compat/tls.mjs",
-    "stream": "./compat/stream.mjs", "node:stream": "./compat/stream.mjs",
-    "node:buffer": "./compat/buffer.mjs"
-  },
-  "preload": ["./compat/globals.mjs"],
-  "imports": ["hibana:node-net/transport@0.1.0"],
-  "wit": "./wit",
-  "components": ["./dist/transport.wasm"],
-  "permissions": ["outbound-network"]
+    "net": "./src/index.mjs",
+    "node:net": "./src/index.mjs"
+  }
 }

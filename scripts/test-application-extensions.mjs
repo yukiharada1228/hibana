@@ -1,6 +1,6 @@
-// Prerequisites: npm ci in sdk and sdk/examples/hono-extensions, npm run build
-// in the example's extension directory, wac on PATH, release hibana-worker and
-// debug hibana-control-plane built.
+// Prerequisites: SDK dependencies and the built PostgreSQL Rust crypto component.
+// This disposable fixture exercises generic JS/Wasm packaging without a sample app.
+// Also requires wac on PATH and built hibana-worker / hibana-control-plane.
 // Uses only a temporary directory and loopback HTTP; no platform DB or credentials.
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
@@ -72,12 +72,53 @@ const stop = async () => {
 try {
   // Install the actual distribution outside the checkout. Consumers need no
   // Rust compiler, author build scripts, manual WIT or platform source changes.
-  const example = resolve("sdk/examples/hono-extensions");
+  const publisher = join(folder, "publisher");
+  await mkdir(join(publisher, "dist"), { recursive: true });
+  await mkdir(join(publisher, "wit"));
+  await copyFile(
+    resolve("extensions/sha256/dist/sha256.wasm"),
+    join(publisher, "dist/crypto.wasm"),
+  );
+  await copyFile(
+    resolve("extensions/sha256/wit/world.wit"),
+    join(publisher, "wit/world.wit"),
+  );
+  await writeFile(
+    join(publisher, "package.json"),
+    JSON.stringify({
+      name: "@hibana-test/crypto",
+      version: "1.0.0",
+      type: "module",
+      exports: { "./hibana.extension.json": "./hibana.extension.json" },
+      files: ["hibana.extension.json", "compat.mjs", "dist", "wit"],
+      dependencies: { buffer: "6.0.3" },
+    }),
+  );
+  await writeFile(
+    join(publisher, "hibana.extension.json"),
+    JSON.stringify({
+      schemaVersion: 1,
+      runtime: HTTP_CONTRACT,
+      aliases: { "node:example-crypto": "./compat.mjs" },
+      imports: ["hibana:sha256/api@0.5.0"],
+      wit: "./wit",
+      components: ["./dist/crypto.wasm"],
+    }),
+  );
+  await writeFile(
+    join(publisher, "compat.mjs"),
+    `
+    import { Buffer } from 'buffer/';
+    import { digest as sha256 } from 'hibana:sha256/api@0.5.0';
+    export const hash = text => Buffer.from(sha256(Buffer.from(text))).toString('hex');
+    export const base64 = text => Buffer.from(text).toString('base64');
+  `,
+  );
   const packed = JSON.parse(
     await runCommand(
       "npm",
       ["pack", "--ignore-scripts", "--json", "--pack-destination", folder],
-      { cwd: join(example, "extension") },
+      { cwd: publisher },
     ),
   )[0];
   assert.ok(packed.files.some((file) => file.path === "dist/crypto.wasm"));
@@ -85,23 +126,39 @@ try {
   assert.ok(
     packed.files.every(
       (file) =>
-        !file.path.startsWith("rust-crypto/") && file.path !== "build.mjs",
+        !file.path.startsWith("component/") && file.path !== "build.mjs",
     ),
   );
   const application = join(folder, "application");
   await mkdir(join(application, "src"), { recursive: true });
-  const metadata = JSON.parse(await readFile(join(example, "package.json")));
-  metadata.dependencies["@hibana-example/node-compat"] =
-    `file:${join(folder, packed.filename)}`;
-  metadata.devDependencies["@hibana/cli"] = `file:${resolve("sdk")}`;
-  await writeFile(join(application, "package.json"), JSON.stringify(metadata));
-  await copyFile(
-    join(example, "hibana.json"),
-    join(application, "hibana.json"),
+  await writeFile(
+    join(application, "package.json"),
+    JSON.stringify({
+      private: true,
+      type: "module",
+      dependencies: {
+        hono: "4.13.7",
+        "@hibana-test/crypto": `file:${join(folder, packed.filename)}`,
+      },
+    }),
   );
-  await copyFile(
-    join(example, "src/index.ts"),
+  await writeFile(
+    join(application, "hibana.json"),
+    JSON.stringify({
+      name: "extension-fixture",
+      main: "src/index.ts",
+      extensions: ["@hibana-test/crypto"],
+    }),
+  );
+  await writeFile(
     join(application, "src/index.ts"),
+    `
+    import { Hono } from 'hono';
+    import { hash, base64 } from 'node:example-crypto';
+    const app = new Hono();
+    app.get('/', c => { const text = c.req.query('text') ?? ''; return c.json({ sha256: hash(text), base64: base64(text) }); });
+    export default app;
+  `,
   );
   await runCommand(
     "npm",
@@ -109,9 +166,7 @@ try {
     { cwd: application },
   );
   await assert.rejects(
-    access(
-      join(application, "node_modules/@hibana-example/node-compat/build.mjs"),
-    ),
+    access(join(application, "node_modules/@hibana-test/crypto/build.mjs")),
   );
   await runCommand(process.execPath, [resolve("sdk/src/cli.mjs"), "build"], {
     cwd: application,
@@ -230,7 +285,7 @@ try {
   const rejected = await validate(unplugged);
   assert.match(
     rejected.Rejected?.message || "",
-    /unapproved host import 'example:crypto\/hash@1.0.0'/,
+    /unapproved host import 'hibana:sha256\/api@0.5.0'/,
   );
   await assert.rejects(
     runCommand(worker, workerArgs(unplugged), { timeoutMs: 120000 }),

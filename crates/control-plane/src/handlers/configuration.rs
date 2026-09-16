@@ -1,4 +1,4 @@
-//! Configuration management HTTP handlers.
+//! Read the active version's configuration and validate deployment vars.
 use crate::auth::Principal;
 use crate::db;
 use crate::error::AppError;
@@ -6,26 +6,28 @@ use crate::state::AppState;
 use axum::extract::{Path, State};
 use axum::response::IntoResponse;
 use axum::Json;
+use hibana_database::prelude::*;
 use hibana_shared::FaasError;
-use sea_orm::TransactionTrait as _;
 use serde::Serialize;
 
-// ---------------------------------------------------------------------------
-// M7b: per-function 環境変数（平文 config）の CRUD（§15 / §4.4）
-//
-// スコープは **deploy**（読み書きとも）。読み取りを read に置かない理由: config は平文であり、
-// 注入時に secret と同じ env 名前空間へ混ざる。運用者が資格情報を誤って config 側に入れる確率は
-// 現実的に高く、その瞬間 read スコープ（監視・ダッシュボード用途で最も広く配られる）が
-// 資格情報の読み取り権限になってしまう。1 段引き上げて被害面を縮める。
-// → README の露出ガード節に「config は平文であり deploy スコープで読める。資格情報は必ず
-//    secrets 側に置くこと」を明記する。
-// ---------------------------------------------------------------------------
+// Config may contain sensitive plaintext, so reading it requires Deploy scope.
+// Changes are published with a new version; this API has no write operations.
 
 #[derive(Debug, Serialize)]
 pub struct FunctionConfigResponse {
     pub component_id: String,
+    pub version_id: Option<String>,
+    pub resource_limits: Option<serde_json::Value>,
+    pub net_allow_outbound: Vec<String>,
+    pub secrets: Vec<SecretBindingResponse>,
     pub env: std::collections::BTreeMap<String, String>,
     pub updated_at: Option<chrono::DateTime<chrono::Utc>>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct SecretBindingResponse {
+    pub name: String,
+    pub available: bool,
 }
 
 /// config の入力（キー名・値長・件数・総バイト）を検証する純関数（DB / ストア非依存）。
@@ -77,29 +79,71 @@ pub async fn get_function_config(
     let tx = state.pool().begin().await?;
     db::set_tenant_guc(&tx, tenant).await?;
 
-    db::find_component_by_id(&tx, tenant, &component_id)
+    // Hold the publication lock so vars, bindings and limits describe one version.
+    let component = components::Entity::find_by_id(component_id.clone())
+        .filter(components::Column::TenantId.eq(tenant))
+        .filter(components::Column::DeletedAt.is_null())
+        .lock_shared()
+        .one(&tx)
         .await?
         .ok_or_else(|| FaasError::NotFound(format!("component '{component_id}'")))?;
-
     let rows = db::list_function_configs(&tx, tenant, &component_id).await?;
+    let mut secrets = Vec::new();
+    let mut resource_limits = None;
+    let mut net_allow_outbound = Vec::new();
+    if let Some(id) = &component.active_version_id {
+        let version = component_versions::Entity::find_by_id(id)
+            .filter(component_versions::Column::TenantId.eq(tenant))
+            .filter(component_versions::Column::ComponentId.eq(&component_id))
+            .filter(component_versions::Column::DeletedAt.is_null())
+            .one(&tx)
+            .await?
+            .ok_or_else(|| FaasError::NotFound("active version".into()))?;
+        resource_limits = Some(version.resource_limits);
+        net_allow_outbound = hibana_shared::capabilities::parse_capabilities(&version.capabilities)
+            .net_allow_outbound
+            .into_iter()
+            .collect();
+        let available: std::collections::BTreeSet<String> = function_secrets::Entity::find()
+            .select_only()
+            .column(function_secrets::Column::Id)
+            .filter(function_secrets::Column::TenantId.eq(tenant))
+            .filter(function_secrets::Column::ComponentId.eq(&component_id))
+            .filter(function_secrets::Column::DeletedAt.is_null())
+            .into_tuple::<String>()
+            .all(&tx)
+            .await?
+            .into_iter()
+            .collect();
+        secrets = version_secret_bindings::Entity::find()
+            .select_only()
+            .columns([
+                version_secret_bindings::Column::Name,
+                version_secret_bindings::Column::SecretId,
+            ])
+            .filter(version_secret_bindings::Column::TenantId.eq(tenant))
+            .filter(version_secret_bindings::Column::ComponentId.eq(&component_id))
+            .filter(version_secret_bindings::Column::VersionId.eq(id))
+            .order_by_asc(version_secret_bindings::Column::Name)
+            .into_tuple::<(String, String)>()
+            .all(&tx)
+            .await?
+            .into_iter()
+            .map(|(name, id)| SecretBindingResponse {
+                name,
+                available: available.contains(&id),
+            })
+            .collect();
+    }
     tx.commit().await?;
-
     let updated_at = rows.iter().map(|r| r.updated_at).max();
     Ok(Json(FunctionConfigResponse {
         component_id,
+        version_id: component.active_version_id,
+        resource_limits,
+        net_allow_outbound,
+        secrets,
         env: rows.into_iter().map(|r| (r.key, r.value)).collect(),
         updated_at,
     }))
-}
-
-/// Legacy writes fail explicitly: vars can only be changed by publishing a version.
-pub async fn put_function_config() -> Result<(), AppError> {
-    Err(FaasError::Conflict(
-        "vars are versioned; deploy a new version with the vars multipart field".into(),
-    )
-    .into())
-}
-
-pub async fn delete_function_config() -> Result<(), AppError> {
-    put_function_config().await
 }

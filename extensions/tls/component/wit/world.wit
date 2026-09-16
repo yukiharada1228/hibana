@@ -1,0 +1,21 @@
+package hibana:tls@0.5.0;
+
+interface api {
+  record failure { code: string, message: string }
+  record options { server-name: string, ca-pem: option<string>, alpn: list<string> }
+  record state { secure: bool, wants-input: bool, wants-output: bool, alpn: option<string> }
+  resource session {
+    status: func() -> result<state, failure>;
+    receive: func(data: list<u8>) -> result<_, failure>;
+    receive-eof: func() -> result<_, failure>;
+    take-output: func() -> result<option<list<u8>>, failure>;
+    read: func() -> result<option<list<u8>>, failure>;
+    write: func(data: list<u8>) -> result<u32, failure>;
+    end: func() -> result<_, failure>;
+    peer-certificate: func() -> result<option<list<u8>>, failure>;
+    close: func();
+  }
+  create-client: func(config: options) -> result<session, failure>;
+}
+
+world tls-component { export api; }

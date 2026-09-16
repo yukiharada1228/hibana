@@ -115,9 +115,7 @@ export async function profileCommand([action, name, ...extra]) {
         `${key === state.current ? "*" : " "} ${key}\t${value.url}\t${value.tenant || ""}\t${value.token ? "logged in" : "logged out"}`,
       );
     if (!Object.keys(state.profiles).length)
-      console.log(
-        "No profiles. Run hibana login --profile NAME --url https://API_HOST",
-      );
+      console.log("No profiles. Run hibana login --url https://API_HOST");
     return;
   }
   profileName(name);
@@ -163,7 +161,7 @@ export async function connection(options = {}) {
     saved?.url;
   if (!endpoint)
     throw new Error(
-      "No Hibana server selected. Run hibana login --profile NAME --url https://API_HOST, or set HIBANA_URL",
+      "No Hibana server selected. Run hibana login --url https://API_HOST, or set HIBANA_URL",
     );
   const url = serverUrl(endpoint);
   const selected = saved?.url && serverUrl(saved.url) === url ? saved : {};
@@ -185,9 +183,5 @@ export async function connection(options = {}) {
       options.email ||
       process.env.HIBANA_EMAIL ||
       (matches ? selected.email : undefined),
-    ingressDomain:
-      options["ingress-domain"] ||
-      process.env.HIBANA_INGRESS_DOMAIN ||
-      (matches ? selected.ingressDomain : undefined),
   };
 }

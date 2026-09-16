@@ -44,7 +44,7 @@ export async function apiClient(options = {}) {
       const { tenant, email } = selected;
       if (!tenant || !email || !password)
         throw new Error(
-          "Specify --tenant, --email and --password-stdin (or HIBANA_TENANT, HIBANA_EMAIL and HIBANA_PASSWORD) to log in",
+          "Specify --tenant and --email, then enter the password (scripts can use --password-stdin or HIBANA_PASSWORD)",
         );
       const result = await request("/auth/login", {
         method: "POST",
@@ -91,8 +91,11 @@ export async function deploy(api, config, artifact, version) {
     new Blob([await readFile(artifact)], { type: "application/wasm" }),
     "component.wasm",
   );
-  await api.request(`${base}/versions`, { method: "POST", body: form });
-  return { component_id: id, version };
+  const result = await api.request(`${base}/versions`, {
+    method: "POST",
+    body: form,
+  });
+  return { ...result, component_id: id, version };
 }
 
 export async function rollback(api, config, version) {

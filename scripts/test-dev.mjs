@@ -11,7 +11,7 @@ const server = net.createServer();
 await new Promise((done, fail) => { server.once("error", fail); server.listen(0, "127.0.0.1", done); });
 const port = server.address().port;
 await new Promise(done => server.close(done));
-const config = { name: "dev-test", main: resolve(root, "sdk/examples/hono/src/index.ts"), vars: { GREETING: "Local Wasmtime" } };
+const config = { name: "dev-test", main: resolve(root, "sdk/test/fixtures/hono-http.ts"), vars: { GREETING: "Local Wasmtime" } };
 const path = join(directory, "hibana.json");
 await writeFile(path, JSON.stringify(config));
 await writeFile(join(directory, ".dev.vars"), 'TEST_SECRET="hibana-test-secret"\n', { mode: 0o600 });

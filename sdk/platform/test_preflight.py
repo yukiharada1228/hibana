@@ -32,7 +32,7 @@ class FakeCluster(ExistingCluster):
         (root / "migration").mkdir()
         super().__init__(root / "config", "test", root, "registry.test/hibana:v1")
         self.docs = [resource("Namespace", "hibana"), resource("ConfigMap", "hibana-config", data={
-            "S3_ENDPOINT": "https://objects.test", "S3_BUCKET": "bucket", "INGRESS_BASE_DOMAIN": "apps.test"}),
+            "S3_ENDPOINT": "https://objects.test", "S3_BUCKET": "bucket", "APP_PUBLIC_ORIGIN": "https://apps.test"}),
             resource("Secret", "hibana-runtime", stringData={"DATABASE_URL": "postgres://private-credential@db/hibana"}),
             resource("Secret", "hibana-control-plane", stringData={key: "private-credential" for key in
                 ["REDIS_URL", "S3_ACCESS_KEY", "S3_SECRET_KEY", "BOOTSTRAP_ADMIN_TOKEN", "JOB_SIGNING_KEY", "SECRETS_MASTER_KEY"]}),

@@ -124,6 +124,25 @@ pub async fn has_active_executions_for_component(
         > 0)
 }
 
+/// List versions protected by pending/running HTTP executions in one query.
+pub async fn active_execution_version_ids(
+    executor: &impl ConnectionTrait,
+    tenant_id: &str,
+    component_id: &str,
+) -> Result<Vec<String>, DbErr> {
+    executions::Entity::find()
+        .select_only()
+        .column(executions::Column::VersionId)
+        .distinct()
+        .filter(executions::Column::TenantId.eq(tenant_id))
+        .filter(executions::Column::ComponentId.eq(component_id))
+        .filter(executions::Column::HttpRequest.eq(true))
+        .filter(executions::Column::Status.is_in(["pending", "running"]))
+        .into_tuple::<String>()
+        .all(executor)
+        .await
+}
+
 /// 当該 version を参照する pending/running の execution が存在するか (§6.7 削除保護)。
 pub async fn has_active_executions_for_version(
     executor: &impl ConnectionTrait,

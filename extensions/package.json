@@ -1,0 +1,42 @@
+{
+  "name": "hibana-extension-workspace",
+  "private": true,
+  "type": "module",
+  "workspaces": [
+    "tcp",
+    "dns",
+    "tls",
+    "random",
+    "sha224",
+    "sha256",
+    "sha384",
+    "sha512",
+    "sha512-224",
+    "sha512-256",
+    "md5",
+    "hmac-sha256",
+    "pbkdf2-sha256",
+    "unicode-nfkc",
+    "node-buffer",
+    "node-events",
+    "node-process",
+    "node-stream",
+    "node-net",
+    "node-tls",
+    "postgres-core",
+    "postgres-pool",
+    "postgres-transport-tcp",
+    "postgres-transport-tls",
+    "postgres-auth-md5",
+    "postgres-auth-scram",
+    "postgres",
+    "postgres-tcp"
+  ],
+  "devDependencies": {
+    "esbuild": "0.28.2"
+  },
+  "scripts": {
+    "build": "npm run build --workspaces --if-present",
+    "pack": "npm pack --workspaces"
+  }
+}

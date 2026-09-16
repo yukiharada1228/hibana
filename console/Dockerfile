@@ -8,8 +8,6 @@ RUN npm ci --ignore-scripts
 COPY tsconfig.json vite.config.ts index.html ./
 COPY src ./src
 COPY public ./public
-ARG VITE_APP_ORIGIN
-ENV VITE_APP_ORIGIN=${VITE_APP_ORIGIN}
 RUN npm run build
 
 FROM ${NGINX_IMAGE}

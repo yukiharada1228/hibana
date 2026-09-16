@@ -54,9 +54,21 @@ test("init scaffolds ordinary Hono and refuses to overwrite files", async () => 
     assert.equal((await loadConfig(join(dir, "hibana.json"))).main, "src/index.ts");
     const pkg = JSON.parse(await readFile(join(dir, "package.json"), "utf8"));
     assert.deepEqual(Object.keys(pkg.dependencies), ["hono"]);
-    const metadata = JSON.parse(await readFile(new URL("../package.json", import.meta.url), "utf8"));
-    assert.equal(metadata.private, true, "The CLI must not be published to npm");
-    assert.equal(pkg.devDependencies["@hibana/cli"], `https://github.com/yukiharada1228/hibana/releases/download/v${metadata.version}/hibana-cli-${metadata.version}.tgz`);
+    assert.equal(JSON.parse(await readFile(new URL("../package.json", import.meta.url), "utf8")).private, true, "The CLI must not be published to npm");
+    assert.equal(pkg.devDependencies?.["@hibana/cli"], undefined, "init uses the installed CLI, including unpublished versions");
+    assert.deepEqual(pkg.scripts, { dev: "hibana dev", build: "hibana build", deploy: "hibana deploy" });
     assert.throws(() => execFileSync(process.execPath, [cli.pathname, "init", dir, "--no-install"], { stdio: "pipe" }));
+  } finally { await rm(dir, { recursive: true, force: true }); }
+});
+
+test("init can explicitly pin a project-local CLI without changing the default", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "hibana-pin-"));
+  try {
+    const cli = new URL("../src/cli.mjs", import.meta.url);
+    const supplied = join(dir, "private-cli.tgz");
+    const project = join(dir, "app");
+    execFileSync(process.execPath, [cli.pathname, "init", project, "--cli-package", supplied, "--no-install"]);
+    const pkg = JSON.parse(await readFile(join(project, "package.json"), "utf8"));
+    assert.equal(pkg.devDependencies["@hibana/cli"], `file:${supplied}`);
   } finally { await rm(dir, { recursive: true, force: true }); }
 });

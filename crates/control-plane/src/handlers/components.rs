@@ -69,6 +69,7 @@ pub async fn create_component(
 
 #[derive(Debug, Serialize)]
 pub struct UploadVersionResponse {
+    pub public_url: Option<String>,
     pub version_id: String,
     pub version: String,
     pub status: &'static str,
@@ -281,7 +282,7 @@ pub async fn upload_version(
     let tx = state.pool().begin().await?;
     db::set_tenant_guc(&tx, tenant).await?;
     reservation.lock(&tx).await?;
-    tenants::Entity::find_by_id(tenant.to_owned()).filter(tenants::Column::Status.eq("active")).lock_shared().one(&tx).await?
+    let tenant_info = tenants::Entity::find_by_id(tenant.to_owned()).filter(tenants::Column::Status.eq("active")).lock_shared().one(&tx).await?
         .ok_or_else(|| FaasError::NotFound("active tenant".into()))?;
     if !db::lock_component(&tx, tenant, &component_id).await? {
         return Err(FaasError::NotFound(format!("component '{component_id}'")).into());
@@ -379,6 +380,11 @@ pub async fn upload_version(
         db::switch_active_version(&tx, tenant, &component.id, &version_id).await?;
     }
 
+    let published = components::Entity::find_by_id(component.id.clone()).one(&tx).await?
+        .ok_or_else(|| FaasError::NotFound("component".into()))?;
+    let public_url = if published.ingress_enabled && published.active_version_id.is_some() {
+        state.app_url(&component.name, &tenant_info.slug)
+    } else { None };
     tx.commit().await?;
 
     tracing::info!(
@@ -393,6 +399,7 @@ pub async fn upload_version(
     Ok((
         StatusCode::CREATED,
         Json(UploadVersionResponse {
+            public_url,
             version_id,
             version,
             status: "active",
@@ -409,6 +416,9 @@ pub async fn upload_version(
 
 #[derive(Debug, Serialize)]
 pub struct ComponentListItemResponse {
+    pub public_url: Option<String>,
+    pub active_version: Option<String>,
+    pub active_version_created_at: Option<String>,
     pub component_id: String,
     pub name: String,
     pub active_version_id: Option<String>,
@@ -426,10 +436,48 @@ pub async fn list_components(
     let tx = state.pool().begin().await?;
     db::set_tenant_guc(&tx, tenant).await?;
     let items = db::list_components(&tx, tenant).await?;
+    let active_ids: Vec<_> = items
+        .iter()
+        .filter_map(|c| c.active_version_id.clone())
+        .collect();
+    let active: std::collections::HashMap<_, _> = component_versions::Entity::find()
+        .select_only()
+        .columns([
+            component_versions::Column::Id,
+            component_versions::Column::Version,
+            component_versions::Column::CreatedAt,
+        ])
+        .filter(component_versions::Column::TenantId.eq(tenant))
+        .filter(component_versions::Column::Id.is_in(active_ids))
+        .filter(component_versions::Column::DeletedAt.is_null())
+        .into_tuple::<(String, String, chrono::DateTime<chrono::Utc>)>()
+        .all(&tx)
+        .await?
+        .into_iter()
+        .map(|(id, version, created)| (id, (version, created)))
+        .collect();
+    let tenant_info = db::session_tenant(&tx, tenant)
+        .await?
+        .ok_or(FaasError::Unauthorized)?;
     tx.commit().await?;
     let body: Vec<ComponentListItemResponse> = items
         .into_iter()
         .map(|c| ComponentListItemResponse {
+            public_url: if c.ingress_enabled && c.active_version_id.is_some() {
+                state.app_url(&c.name, &tenant_info.0)
+            } else {
+                None
+            },
+            active_version: c
+                .active_version_id
+                .as_ref()
+                .and_then(|id| active.get(id))
+                .map(|v| v.0.clone()),
+            active_version_created_at: c
+                .active_version_id
+                .as_ref()
+                .and_then(|id| active.get(id))
+                .map(|v| v.1.to_rfc3339()),
             component_id: c.component_id,
             name: c.name,
             active_version_id: c.active_version_id,
@@ -453,6 +501,8 @@ pub struct VersionListItemResponse {
     pub size_bytes: i64,
     pub wasm_sha256: String,
     pub created_at: String,
+    /// Snapshot for the console; DELETE rechecks protection under the component lock.
+    pub deletion_blocked_reason: Option<&'static str>,
 }
 
 /// GET /components/{id}/versions — 当該 component の version 一覧 (deleted_at IS NULL, §6.7)。
@@ -468,15 +518,32 @@ pub async fn list_versions(
     db::set_tenant_guc(&tx, tenant).await?;
 
     // component の存在確認（不在は 404）。
-    db::find_component_by_id(&tx, tenant, &component_id)
+    let component = db::find_component_by_id(&tx, tenant, &component_id)
         .await?
         .ok_or_else(|| FaasError::NotFound(format!("component '{component_id}'")))?;
 
     let items = db::list_versions(&tx, tenant, &component_id).await?;
+    let executing: std::collections::HashSet<String> =
+        db::active_execution_version_ids(&tx, tenant, &component_id)
+            .await?
+            .into_iter()
+            .collect();
     tx.commit().await?;
     let body: Vec<VersionListItemResponse> = items
         .into_iter()
         .map(|v| VersionListItemResponse {
+            deletion_blocked_reason: if component.active_version_id.as_deref()
+                == Some(v.version_id.as_str())
+            {
+                Some("active_version")
+            } else if component.previous_active_version_id.as_deref() == Some(v.version_id.as_str())
+            {
+                Some("rollback_target")
+            } else if executing.contains(&v.version_id) {
+                Some("active_executions")
+            } else {
+                None
+            },
             version_id: v.version_id,
             version: v.version,
             status: v.status,

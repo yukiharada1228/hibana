@@ -113,7 +113,7 @@ pub(crate) async fn run() -> anyhow::Result<()> {
         secret_keyring,
         config.job_env_exchange_rate_per_min,
         config.metrics_include_tenant_label,
-        config.ingress_base_domain.clone(),
+        config.public_apps.clone(),
     );
 
     // --- in-flight reaper タスク (M3d, §8) ---

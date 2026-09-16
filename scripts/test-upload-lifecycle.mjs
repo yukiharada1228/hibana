@@ -62,7 +62,7 @@ async function start() {
     stdio: ['ignore', log.fd, log.fd], env: {...process.env, BIND_ADDR: `127.0.0.1:${port}`,
       INTERNAL_BIND_ADDR: `127.0.0.1:${internalPort}`, S3_ENDPOINT: `http://127.0.0.1:${s3Port}`,
       RUN_MIGRATIONS: 'false', LOG_FORMAT: 'json', SECRETS_MASTER_KID: 'rotated-test',
-      WORKER_HTTP_URL: `http://127.0.0.1:${workerPort}`, INGRESS_BASE_DOMAIN: 'hibana.test'},
+      WORKER_HTTP_URL: `http://127.0.0.1:${workerPort}`, APP_PUBLIC_ORIGIN: 'https://hibana.test'},
   });
   // An absent APP_BIND_ADDR selects the combined management/app listener.
   for (let attempt = 0; attempt < 100; attempt++) {

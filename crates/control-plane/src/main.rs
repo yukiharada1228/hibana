@@ -23,6 +23,7 @@ mod login;
 mod maintenance;
 mod metrics;
 mod preparation;
+mod public_apps;
 mod reaper;
 mod secrets;
 mod signing;

@@ -229,7 +229,7 @@ def main():
             def slow_request():
                 try:
                     request = Request(apps + '/items/DRAIN', headers={
-                        'Host': 'inventory-api.smoke.hibana.local',
+                        'Host': 'inventory-api.smoke.localhost',
                         'Authorization': 'Bearer ' + state['apiToken']})
                     with urlopen(request, timeout=20) as response:
                         drain['status'] = response.status

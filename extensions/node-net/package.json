@@ -1,12 +1,24 @@
 {
   "name": "@hibana/node-net",
-  "version": "0.1.0",
+  "version": "0.6.3",
   "private": true,
   "type": "module",
-  "description": "Optional outbound Node-style TCP/TLS clients for Hibana, implemented in application-owned Wasm",
   "license": "MIT",
-  "exports": { "./hibana.extension.json": "./hibana.extension.json" },
-  "files": ["hibana.extension.json", "compat/", "dist/", "wit/", "README.md", "LICENSE"],
-  "scripts": { "build": "node build.mjs", "prepack": "npm run build", "test": "node ../../scripts/test-node-net-extension.mjs" },
-  "dependencies": { "buffer": "6.0.3", "process": "0.11.10", "readable-stream": "4.7.0" }
+  "exports": {
+    ".": "./src/index.mjs",
+    "./hibana.extension.json": "./hibana.extension.json",
+    "./socket": "./src/socket.mjs"
+  },
+  "files": [
+    "hibana.extension.json",
+    "README.md",
+    "LICENSE",
+    "src/"
+  ],
+  "dependencies": {
+    "@hibana/node-stream": "0.7.0",
+    "@hibana/node-buffer": "0.5.0",
+    "@hibana/tcp": "0.5.0",
+    "@hibana/dns": "0.5.0"
+  }
 }

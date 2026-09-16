@@ -383,11 +383,9 @@ pub async fn version_capabilities(
         .await
 }
 
-/// version の `capabilities.env`（注入を許可する env 名）を全置換する (M7b, §4.4)。
-///
-/// **admin 承認の唯一の書き込み点**。`imports` 側（strict matching の結果）は保持したまま
-/// `env` キーだけを差し替える（jsonb_set 相当をアプリ側で組み立てて渡す）。
-/// 戻り値は更新が起きたか（0 行 = version 不在 / soft delete 済み → 呼び出し側が 404）。
+/// Replace a version's capability document when an administrator changes egress.
+/// The caller preserves imports and the environment fixed at deployment.
+/// Returns false if the version does not exist or has been deleted.
 pub async fn set_version_capabilities(
     executor: &impl ConnectionTrait,
     tenant_id: &str,

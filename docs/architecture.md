@@ -112,8 +112,6 @@ S3へのPUT前に`artifact_reservations`へ保存先・版ID・ハッシュを�
 
 `PreparedComponent`の生成時には、Wasmtimeの`initialize_copy_on_write_image`で初期メモリの共有用イメージも準備します。特にLinuxでメモリ上のcwasmから読み込む場合、最初のインスタンス生成まで遅延されるmemfdへの書込みをここで済ませます。コンパイル後の読込み・メモリイメージ作成はblockingタスクで行い、HTTPを処理する非同期実行スレッドを占有しません。ゲストのstart関数・handlerは事前に実行しません。
 
-同一Hono成果物での初回応答とWorker追加・交換の記録は[事前コンパイルの実機検証](../demo/preparation-verification.md)を参照してください。
-
 ## HTTP経路の固定費と計測
 
 Control Planeは受付トランザクションで確定した版IDをそのまま署名処理へ渡し、転送直前の実行レコード再読込を行いません。成果物ダウンロードURLの発行は準備用APIに限定します。`JobMessage.wasm_url`はローリング更新時の互換性のため空文字で残しています。トークン検証、テナント境界、Workerの一度だけの実行取得、応答EOF前の結果保存は維持します。
@@ -122,9 +120,9 @@ Workerとローカル開発の各Runtimeは、10ms間隔でWasmtimeのepochを�
 
 WorkerはSeaORMの接続プールを使用し、起動時から2本の接続を維持します。最大接続数が1本なら1本です。テナント設定は各トランザクション内だけに適用します。SQL文を固定した手動のprepare処理は持たず、ORMとPostgreSQLドライバーがクエリを管理します。
 
-`RUST_LOG=info,hibana_latency=debug`で、受付・転送準備・Worker発見・トークン引換え・設定取得・キャッシュ取得・実行取得・Runtime・結果保存の所要時間をマイクロ秒単位で記録できます。実行IDで関連づけ、トークン・Secrets・本文はこの計測ログに出しません。`wall_time_ms`はWorker内の実行取得・環境構築・Runtime呼出しの範囲であり、HTTP全体や結果保存の時間とは異なります。[同一環境での応答時間の比較](../demo/latency-verification.md)を参照してください。
+`RUST_LOG=info,hibana_latency=debug`で、受付・転送準備・Worker発見・トークン引換え・設定取得・キャッシュ取得・実行取得・Runtime・結果保存の所要時間をマイクロ秒単位で記録できます。実行IDで関連づけ、トークン・Secrets・本文はこの計測ログに出しません。`wall_time_ms`はWorker内の実行取得・環境構築・Runtime呼出しの範囲であり、HTTP全体や結果保存の時間とは異なります。
 
-初回のメモリイメージ準備は`component_preparation`、WorkerのDB接続取得・BEGIN・テナント設定・UPDATE・COMMITは`worker_claim_db`としてさらに分けて記録します。[初回応答の追加改善](../demo/first-request-verification.md)に実測結果を保存しています。
+初回のメモリイメージ準備は`component_preparation`、WorkerのDB接続取得・BEGIN・テナント設定・UPDATE・COMMITは`worker_claim_db`としてさらに分けて記録します。
 
 CPの管理・内部・アプリHTTP、Workerの実行HTTP、ローカルdevは、受け付けたTCP接続で`TCP_NODELAY`を有効にします。ヘッダー・本文のチャンク・完了を分けて送る際に、小さな送信がNagleのアルゴリズムによって待たされることを避けます。本文のバッファ上限や結果保存後にEOFを返す順序は維持します。
 

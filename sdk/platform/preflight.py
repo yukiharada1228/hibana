@@ -164,7 +164,9 @@ class Preflight:
                 env = environment_values(container, require)
                 keys = list(required["hibana-migration"] if name == "migrate" else required["hibana-runtime"])
                 if name == "control-plane":
-                    keys += required["hibana-control-plane"] + ["S3_ENDPOINT", "S3_BUCKET", "INGRESS_BASE_DOMAIN"]
+                    keys += required["hibana-control-plane"] + ["S3_ENDPOINT", "S3_BUCKET"]
+                    if not env.get("INGRESS_BASE_DOMAIN"):
+                        keys.append("APP_PUBLIC_ORIGIN")
                 for key in keys:
                     if not str(env.get(key, "")).strip():
                         errors.append(f"{doc['kind']}/{doc['metadata']['name']}: missing environment setting {key}")

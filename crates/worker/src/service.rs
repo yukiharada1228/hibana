@@ -57,7 +57,8 @@ impl Worker {
             metrics.clone(),
         );
         Ok(Self {
-            runtime: Runtime::new(engine, metrics.clone())?,
+            runtime: Runtime::new(engine, metrics.clone())?
+                .with_tcp_policy(settings.tcp_policy.clone()),
             repository: ExecutionRepository::new(pool),
             artifacts,
             control_plane,
@@ -272,7 +273,7 @@ impl Worker {
             match tokio::net::lookup_host((ep.host.as_str(), ep.port)).await {
                 Ok(addrs) => {
                     for addr in addrs {
-                        if hibana_shared::egress::is_hard_denied(addr.ip()) {
+                        if !self.runtime.tcp_destination_allowed(addr) {
                             tracing::warn!(
                                 host = %ep.host, port = ep.port, ip = %addr.ip(),
                                 "approved egress host resolved to a hard-denied IP; dropping (possible rebinding)"

@@ -1,0 +1,23 @@
+{
+  "name": "@hibana/tls",
+  "version": "0.5.1",
+  "private": true,
+  "type": "module",
+  "license": "MIT",
+  "exports": {
+    ".": "./src/index.mjs",
+    "./hibana.extension.json": "./hibana.extension.json"
+  },
+  "files": [
+    "hibana.extension.json",
+    "README.md",
+    "LICENSE",
+    "src/",
+    "dist/",
+    "wit/"
+  ],
+  "scripts": {
+    "build": "node build.mjs",
+    "prepack": "npm run build"
+  }
+}

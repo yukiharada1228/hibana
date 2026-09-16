@@ -4,7 +4,7 @@ import { spawn } from "node:child_process";
 import { mkdtemp, mkdir, readFile, rm } from "node:fs/promises";
 import { createServer } from "node:net";
 import { tmpdir } from "node:os";
-import { join, resolve } from "node:path";
+import { join, resolve, delimiter } from "node:path";
 import { fileURLToPath } from "node:url";
 import { createHash } from "node:crypto";
 import { cliRelease, releaseBase } from "../src/package.mjs";
@@ -46,6 +46,7 @@ try {
   const npmFlags = ["--no-audit", "--no-fund", ...(process.env.HIBANA_PACKAGE_OFFLINE ? ["--offline"] : [])];
   await run("npm", ["install", "--omit=optional", "--ignore-scripts", ...npmFlags, github ? release : tarball], installation);
   const cli = join(installation, "node_modules/@hibana/cli/src/cli.mjs");
+  env.PATH = [join(installation, "node_modules/.bin"), process.env.PATH].filter(Boolean).join(delimiter);
   assert.equal((await run(process.execPath, [cli, "--version"])).trim(), `hibana ${packed.version}`);
   assert.match(await run(process.execPath, [cli, "--help"]), /--profile/);
   console.log("Packed CLI installed without JS compilers, Docker, platform source or a local runtime.");
@@ -53,10 +54,13 @@ try {
   assert.match(await run(process.execPath, [cli, "platform", "install", "--help"]), /--kubeconfig/);
 
   const project = join(temporary, "hello");
-  await run(process.execPath, [cli, "init", project, "--template", "hono", ...(github ? [] : ["--cli-package", tarball]), "--no-install"]);
+  await run(process.execPath, [cli, "init", project, "--template", "hono", "--no-install"]);
+  const projectPackage = JSON.parse(await readFile(join(project, "package.json"), "utf8"));
+  assert.equal(projectPackage.devDependencies?.["@hibana/cli"], undefined);
+  assert.deepEqual(Object.keys(projectPackage.dependencies), ["hono"]);
   await run("npm", ["install", ...npmFlags], project);
-  const projectCli = join(project, "node_modules/@hibana/cli/src/cli.mjs");
-  await run(process.execPath, [projectCli, "build"], project);
+  await run("npm", ["install", "--include=optional", ...npmFlags], installation);
+  await run("npm", ["run", "build"], project);
   const wasm = await readFile(join(project, ".hibana/build/app.wasm"));
   assert.deepEqual(wasm.subarray(0, 8), Buffer.from([0, 97, 115, 109, 13, 0, 1, 0]));
   console.log(`Installed Hono project built a ${wasm.length}-byte Wasm Component (SHA-256 ${createHash("sha256").update(wasm).digest("hex")}).`);
@@ -70,10 +74,10 @@ try {
       const runtime = resolve(process.env.HIBANA_RUNTIME_BIN);
       assert.equal((await run(runtime, ["--version"])).trim(), `hibana-worker ${packed.version}`);
       const checksum = createHash("sha256").update(await readFile(runtime)).digest("hex");
-      await run(process.execPath, [projectCli, "runtime", "install", "--from", runtime, "--sha256", checksum]);
+      await run(process.execPath, [cli, "runtime", "install", "--from", runtime, "--sha256", checksum]);
     }
     const managedRuntime = join(env.HIBANA_RUNTIME_HOME, packed.version, `${process.platform}-${process.arch}`, "hibana-worker");
-    const child = spawn(process.execPath, [projectCli, "dev", "--no-watch", "--port", String(port)], { cwd: project, env, stdio: ["ignore", "pipe", "pipe"] });
+    const child = spawn(process.execPath, [cli, "dev", "--no-watch", "--port", String(port)], { cwd: project, env, stdio: ["ignore", "pipe", "pipe"] });
     let output = ""; child.stdout.on("data", b => output += b); child.stderr.on("data", b => output += b);
     const exited = new Promise(resolve => child.once("exit", (code, signal) => resolve({ code, signal })));
     child.once("error", error => { output += error.message; });

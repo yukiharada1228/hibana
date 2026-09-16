@@ -1,5 +1,5 @@
 import { useEffect, useState } from "react";
-import { Api, appUrl, errorMessage } from "./api";
+import { Api, ApiError, appUrl, publication, errorMessage } from "./api";
 import type { Component, Session, Version } from "./types";
 import { Button } from "./components/ui/button";
 import { Input } from "./components/ui/input";
@@ -17,17 +17,71 @@ import {
   Confirm,
   date,
   Empty,
-  Icon,
   Notice,
+  versionLabel,
 } from "./components/common";
+import { ApplicationSettings } from "./ApplicationSettings";
+import { Executions } from "./Executions";
 
-export function Applications({
-  components,
-  session,
-}: {
-  components: Component[];
-  session: Session;
-}) {
+function deletionReason(version: Version, component: Component): string | null {
+  const reason = version.deletion_blocked_reason;
+  if (
+    reason === "active_version" ||
+    version.version_id === component.active_version_id
+  )
+    return "現在のバージョンのため削除できません。";
+  if (reason === "rollback_target")
+    return "直前のバージョンは切り戻し先として保護されています。";
+  if (reason === "active_executions")
+    return "実行中・実行待ちの処理があるため削除できません。処理の完了後に更新してください。";
+  return reason
+    ? "現在の状態では削除できません。一覧を更新してください。"
+    : null;
+}
+
+type Confirmation =
+  | { action: "delete-component" }
+  | { action: "rollback" | "delete-version"; version: string };
+
+function PublicUrl({ component }: { component: Component }) {
+  const url = appUrl(component);
+  const [message, setMessage] = useState("");
+  if (!url) return <span className="muted">—</span>;
+  return (
+    <div className="public-url">
+      <a
+        href={url}
+        target="_blank"
+        rel="noopener noreferrer"
+        aria-label={`${component.name} を開く`}
+      >
+        {url}
+      </a>
+      <Button
+        variant="text"
+        size="sm"
+        aria-label={`${component.name} の URL をコピー`}
+        onClick={async () => {
+          try {
+            await navigator.clipboard.writeText(url);
+            setMessage("コピーしました");
+          } catch {
+            setMessage("URL を選択してコピーしてください");
+          }
+        }}
+      >
+        コピー
+      </Button>
+      {message && (
+        <span role="status" className="small">
+          {message}
+        </span>
+      )}
+    </div>
+  );
+}
+
+export function Applications({ components }: { components: Component[] }) {
   const [query, setQuery] = useState("");
   const filtered = components.filter((item) =>
     item.name.toLowerCase().includes(query.toLowerCase()),
@@ -35,41 +89,7 @@ export function Applications({
   return (
     <>
       <div className="page-title">
-        <div>
-          <p className="eyebrow">APPLICATIONS</p>
-          <h1>アプリケーション</h1>
-          <p className="muted">このテナントに配備されたアプリを管理します。</p>
-        </div>
-        <Button asChild>
-          <a href="#deploy">
-            <Icon name="deploy" />
-            デプロイする
-          </a>
-        </Button>
-      </div>
-      <div className="stats">
-        <div>
-          <span>アプリケーション</span>
-          <strong>
-            {components.length}
-            <small>件</small>
-          </strong>
-        </div>
-        <div>
-          <span>HTTP 配信中</span>
-          <strong>
-            {
-              components.filter((c) => c.active_version_id && c.ingress_enabled)
-                .length
-            }
-            <small>件</small>
-          </strong>
-        </div>
-        <div className="stat-context">
-          <span>実行環境</span>
-          <strong>WebAssembly</strong>
-          <p>接続先の Hibana 基盤で実行</p>
-        </div>
+        <h1>アプリケーション</h1>
       </div>
       <section className="panel">
         <div className="panel-toolbar">
@@ -82,7 +102,7 @@ export function Applications({
               id="app-search"
               blockSize="sm"
               value={query}
-              onChange={(event) => setQuery(event.target.value)}
+              onChange={(e) => setQuery(e.target.value)}
             />
           </div>
         </div>
@@ -100,72 +120,47 @@ export function Applications({
               <TableHeader>
                 <TableRow>
                   <TableHead>アプリ名</TableHead>
-                  <TableHead>状態</TableHead>
-                  <TableHead>作成日時</TableHead>
-                  <TableHead>
-                    <span className="sr-only">アプリを開く</span>
-                  </TableHead>
+                  <TableHead>現在のバージョン</TableHead>
+                  <TableHead>公開設定</TableHead>
+                  <TableHead>公開 URL</TableHead>
                 </TableRow>
               </TableHeader>
               <TableBody>
-                {filtered.map((component) => {
-                  const url = appUrl(component, session);
-                  return (
-                    <TableRow key={component.component_id}>
-                      <TableCell>
-                        <a
-                          className="app-name"
-                          href={`#apps/${component.component_id}`}
-                        >
-                          <span className="app-icon">
-                            <Icon name="apps" />
-                          </span>
-                          {component.name}
-                        </a>
-                      </TableCell>
-                      <TableCell>
-                        <Badge active={!!url}>
-                          {url
-                            ? "配信中"
-                            : component.active_version_id
-                              ? "配備済み"
-                              : "未配備"}
-                        </Badge>
-                      </TableCell>
-                      <TableCell className="muted nowrap">
-                        {date(component.created_at)}
-                      </TableCell>
-                      <TableCell>
-                        {url && (
-                          <a
-                            className="external-link"
-                            href={url}
-                            target="_blank"
-                            rel="noopener noreferrer"
-                            aria-label={`${component.name} を開く`}
-                          >
-                            <Icon name="arrow" />
-                          </a>
-                        )}
-                      </TableCell>
-                    </TableRow>
-                  );
-                })}
+                {filtered.map((component) => (
+                  <TableRow key={component.component_id}>
+                    <TableCell>
+                      <a
+                        className="app-name"
+                        href={`#apps/${component.component_id}`}
+                      >
+                        {component.name}
+                      </a>
+                    </TableCell>
+                    <TableCell>
+                      <strong title={component.active_version || undefined}>
+                        {component.active_version
+                          ? versionLabel(component.active_version)
+                          : "—"}
+                      </strong>
+                      {component.active_version_created_at && (
+                        <div className="muted small nowrap">
+                          登録 {date(component.active_version_created_at)}
+                        </div>
+                      )}
+                    </TableCell>
+                    <TableCell>
+                      <Badge>{publication(component)}</Badge>
+                    </TableCell>
+                    <TableCell>
+                      <PublicUrl component={component} />
+                    </TableCell>
+                  </TableRow>
+                ))}
               </TableBody>
             </Table>
           </div>
         )}
       </section>
-      <div className="info-strip">
-        <Icon name="deploy" />
-        <div>
-          <strong>いつものターミナルから、デプロイ。</strong>
-          <p>
-            <code>hibana deploy</code> で配備したアプリがここに表示されます。
-          </p>
-        </div>
-        <a href="#deploy">接続方法を見る →</a>
-      </div>
     </>
   );
 }
@@ -183,34 +178,35 @@ export function Application({
 }) {
   const [versions, setVersions] = useState<Version[]>([]),
     [tab, setTab] = useState("versions");
-  const [env, setEnv] = useState<Record<string, string>>({}),
-    [error, setError] = useState(""),
+  const [error, setError] = useState(""),
     [message, setMessage] = useState("");
+  const [loadError, setLoadError] = useState("");
   const [loading, setLoading] = useState(true),
     [busy, setBusy] = useState(false);
-  const [confirm, setConfirm] = useState<{ version: string } | "delete" | null>(
-    null,
-  );
+  const [confirm, setConfirm] = useState<Confirmation | null>(null);
   const canDeploy = session.scopes.includes("deploy"),
     canAdmin = session.scopes.includes("admin");
+  const deleteTarget =
+    confirm?.action === "delete-version"
+      ? versions.find((version) => version.version === confirm.version)
+      : undefined;
+  const deleteBlocked =
+    confirm?.action === "delete-version"
+      ? deleteTarget
+        ? deletionReason(deleteTarget, component)
+        : "このバージョンは一覧にありません。削除済みの可能性があります。"
+      : null;
   useEffect(() => {
     let current = true;
     setLoading(true);
-    setError("");
-    setEnv({});
-    const request =
-      tab === "settings"
-        ? api.config(component.component_id)
-        : api.versions(component.component_id);
-    request
+    setLoadError("");
+    api
+      .versions(component.component_id)
       .then((result) => {
-        if (current) {
-          if (Array.isArray(result)) setVersions(result);
-          else setEnv(result.env);
-        }
+        if (current) setVersions(result);
       })
       .catch((error) => {
-        if (current) setError(errorMessage(error));
+        if (current) setLoadError(errorMessage(error));
       })
       .finally(() => {
         if (current) setLoading(false);
@@ -218,29 +214,53 @@ export function Application({
     return () => {
       current = false;
     };
-  }, [api, component, tab]);
+  }, [api, component]);
   async function apply() {
-    if (!confirm) return;
+    if (
+      !confirm ||
+      busy ||
+      deleteBlocked ||
+      (confirm.action === "delete-version" && (loading || loadError))
+    )
+      return;
     setBusy(true);
     setError("");
     setMessage("");
     try {
-      if (confirm === "delete") {
+      if (confirm.action === "delete-component") {
         await api.deleteComponent(component.component_id);
         location.hash = "apps";
+      } else if (confirm.action === "delete-version") {
+        await api.deleteVersion(component.component_id, confirm.version);
+        setVersions((items) =>
+          items.filter((item) => item.version !== confirm.version),
+        );
+        setMessage(
+          `バージョン ${versionLabel(confirm.version)} を削除しました。`,
+        );
       } else {
         await api.rollback(component.component_id, confirm.version);
-        setMessage(`バージョン ${confirm.version} に切り戻しました。`);
+        setMessage(
+          `バージョン ${versionLabel(confirm.version)} に切り戻しました。`,
+        );
       }
       setConfirm(null);
       await onChange();
     } catch (error) {
       setError(errorMessage(error));
+      if (
+        confirm.action === "delete-version" &&
+        error instanceof ApiError &&
+        [404, 409].includes(error.status)
+      ) {
+        // The version may have become active or started executing since the list loaded.
+        // Keep the confirmation open with the refreshed protection reason.
+        await onChange();
+      }
     } finally {
       setBusy(false);
     }
   }
-  const url = appUrl(component, session);
   return (
     <>
       <a className="back" href="#apps">
@@ -248,20 +268,24 @@ export function Application({
       </a>
       <div className="page-title">
         <div>
-          <p className="eyebrow">APPLICATION</p>
           <h1>{component.name}</h1>
-          <p className="muted">
-            {url ? (
-              <a href={url} target="_blank" rel="noopener noreferrer">
-                {url} ↗
-              </a>
-            ) : (
-              "HTTP 配信は有効になっていません。"
-            )}
-          </p>
+          <PublicUrl component={component} />
         </div>
-        <Badge active={!!url}>{url ? "配信中" : "配信停止中"}</Badge>
+        <Badge>{publication(component)}</Badge>
       </div>
+      <p className="muted">
+        現在のバージョン：
+        <strong title={component.active_version || undefined}>
+          {component.active_version
+            ? versionLabel(component.active_version)
+            : "未配備"}
+        </strong>
+        {component.active_version_created_at && (
+          <span className="version-date">
+            登録 {date(component.active_version_created_at)}
+          </span>
+        )}
+      </p>
       <div className="tabs" role="tablist" aria-label="アプリの詳細">
         <button
           role="tab"
@@ -270,27 +294,59 @@ export function Application({
         >
           バージョン
         </button>
-        {canDeploy && (
+        <button
+          role="tab"
+          aria-selected={tab === "executions"}
+          onClick={() => setTab("executions")}
+        >
+          実行履歴
+        </button>
+        {(canDeploy || canAdmin) && (
           <button
             role="tab"
             aria-selected={tab === "settings"}
             onClick={() => setTab("settings")}
           >
-            環境変数
+            設定
           </button>
         )}
       </div>
       {error && !confirm && <Notice error>{error}</Notice>}
       {message && <Notice>{message}</Notice>}
-      {loading ? (
+      {tab === "executions" ? (
+        <Executions api={api} component={component} versions={versions} />
+      ) : tab === "settings" ? (
+        <>
+          {canDeploy && <ApplicationSettings api={api} component={component} />}
+          {canAdmin && (
+            <div className="danger-zone">
+              <div>
+                <strong>アプリを削除</strong>
+                <p>公開が停止し、一覧から削除されます。</p>
+              </div>
+              <Button
+                variant="outline"
+                onClick={() => {
+                  setError("");
+                  setConfirm({ action: "delete-component" });
+                }}
+              >
+                アプリを削除
+              </Button>
+            </div>
+          )}
+        </>
+      ) : loadError ? (
+        <Notice error>{loadError}</Notice>
+      ) : loading ? (
         <Notice>読み込み中…</Notice>
-      ) : error && !confirm ? null : tab === "versions" ? (
+      ) : (
         <section className="panel">
           <div className="panel-toolbar">
             <div>
-              <h2>デプロイ履歴</h2>
-              <p className="muted">
-                配備したバージョンを確認し、実行するバージョンを切り替えます。
+              <h2>バージョン履歴</h2>
+              <p className="muted small">
+                登録日時はバージョンを初めて配備した日時です。切り戻しても変わりません。
               </p>
             </div>
           </div>
@@ -300,13 +356,12 @@ export function Application({
             </Empty>
           ) : (
             <div className="table-scroll">
-              <Table>
+              <Table className="version-table">
                 <TableHeader>
                   <TableRow>
                     <TableHead>バージョン</TableHead>
-                    <TableHead>状態</TableHead>
-                    <TableHead>サイズ</TableHead>
-                    <TableHead>配備日時</TableHead>
+                    <TableHead>選択状態</TableHead>
+                    <TableHead>登録日時</TableHead>
                     <TableHead>操作</TableHead>
                   </TableRow>
                 </TableHeader>
@@ -314,10 +369,17 @@ export function Application({
                   {versions.map((version) => (
                     <TableRow key={version.version_id}>
                       <TableCell>
-                        <strong>{version.version}</strong>
-                        <div className="hash" title={version.wasm_sha256}>
-                          SHA-256 {version.wasm_sha256.slice(0, 12)}
-                        </div>
+                        <strong title={version.version}>
+                          {versionLabel(version.version)}
+                        </strong>
+                        <details className="artifact-details">
+                          <summary>バージョンの詳細</summary>
+                          <p className="hash">
+                            完全なバージョン <code>{version.version}</code>
+                          </p>
+                          <p>{bytes(version.size_bytes)}</p>
+                          <p className="hash">SHA-256 {version.wasm_sha256}</p>
+                        </details>
                       </TableCell>
                       <TableCell>
                         <Badge
@@ -328,31 +390,70 @@ export function Application({
                           {version.version_id === component.active_version_id
                             ? "現在のバージョン"
                             : ["ready", "active"].includes(version.status)
-                              ? "待機中"
-                              : version.status}
+                              ? version.deletion_blocked_reason ===
+                                "rollback_target"
+                                ? "切り戻し先"
+                                : "未選択"
+                              : "利用不可"}
                         </Badge>
-                      </TableCell>
-                      <TableCell className="nowrap">
-                        {bytes(version.size_bytes)}
                       </TableCell>
                       <TableCell className="nowrap muted">
                         {date(version.created_at)}
                       </TableCell>
                       <TableCell>
-                        {canDeploy &&
-                          version.version_id !==
-                            component.active_version_id && (
+                        <div className="version-actions">
+                          {canDeploy &&
+                            version.version_id !==
+                              component.active_version_id &&
+                            ["ready", "active"].includes(version.status) && (
+                              <Button
+                                size="sm"
+                                variant="outline"
+                                onClick={() => {
+                                  setError("");
+                                  setConfirm({
+                                    action: "rollback",
+                                    version: version.version,
+                                  });
+                                }}
+                              >
+                                切り戻す
+                              </Button>
+                            )}
+                          {canAdmin && (
                             <Button
                               size="sm"
-                              variant="outline"
+                              variant="text"
+                              className="version-delete"
+                              disabled={
+                                busy ||
+                                Boolean(deletionReason(version, component))
+                              }
+                              aria-describedby={
+                                deletionReason(version, component)
+                                  ? `delete-reason-${version.version_id}`
+                                  : undefined
+                              }
                               onClick={() => {
                                 setError("");
-                                setConfirm({ version: version.version });
+                                setConfirm({
+                                  action: "delete-version",
+                                  version: version.version,
+                                });
                               }}
                             >
-                              切り戻す
+                              削除
                             </Button>
                           )}
+                        </div>
+                        {canAdmin && deletionReason(version, component) && (
+                          <p
+                            className="version-delete-reason muted small"
+                            id={`delete-reason-${version.version_id}`}
+                          >
+                            {deletionReason(version, component)}
+                          </p>
+                        )}
                       </TableCell>
                     </TableRow>
                   ))}
@@ -361,71 +462,23 @@ export function Application({
             </div>
           )}
         </section>
-      ) : (
-        <section className="panel">
-          <div className="panel-toolbar">
-            <div>
-              <h2>現在のバージョンの環境変数</h2>
-              <p className="muted">
-                変更は <code>hibana.json</code> の <code>vars</code>{" "}
-                を更新し、新しいバージョンをデプロイします。
-              </p>
-            </div>
-          </div>
-          {Object.keys(env).length ? (
-            <div className="table-scroll">
-              <Table>
-                <TableHeader>
-                  <TableRow>
-                    <TableHead>名前</TableHead>
-                    <TableHead>値</TableHead>
-                  </TableRow>
-                </TableHeader>
-                <TableBody>
-                  {Object.entries(env).map(([key, value]) => (
-                    <TableRow key={key}>
-                      <TableCell>
-                        <code>{key}</code>
-                      </TableCell>
-                      <TableCell className="env-value">{value}</TableCell>
-                    </TableRow>
-                  ))}
-                </TableBody>
-              </Table>
-            </div>
-          ) : (
-            <Empty title="環境変数はありません">
-              Secrets の値はこの画面には表示されません。
-            </Empty>
-          )}
-        </section>
-      )}
-      {canAdmin && (
-        <div className="danger-zone">
-          <div>
-            <strong>アプリを削除</strong>
-            <p>HTTP 配信が停止し、一覧から削除されます。</p>
-          </div>
-          <Button
-            variant="outline"
-            onClick={() => {
-              setError("");
-              setConfirm("delete");
-            }}
-          >
-            アプリを削除
-          </Button>
-        </div>
       )}
       {confirm && (
         <Confirm
           title={
-            confirm === "delete"
+            confirm.action === "delete-component"
               ? `${component.name} を削除しますか？`
-              : `バージョン ${confirm.version} に切り戻しますか？`
+              : confirm.action === "delete-version"
+                ? `バージョン ${versionLabel(confirm.version)} を削除しますか？`
+                : `バージョン ${versionLabel(confirm.version)} に切り戻しますか？`
           }
           busy={busy}
-          confirmLabel={confirm === "delete" ? "削除する" : "切り戻す"}
+          confirmLabel={confirm.action === "rollback" ? "切り戻す" : "削除する"}
+          confirmDisabled={
+            Boolean(deleteBlocked) ||
+            (confirm.action === "delete-version" &&
+              (loading || Boolean(loadError)))
+          }
           onCancel={() => {
             setConfirm(null);
             setError("");
@@ -433,10 +486,21 @@ export function Application({
           onConfirm={apply}
         >
           <p>
-            {confirm === "delete"
+            {confirm.action === "delete-component"
               ? "このアプリへのアクセスはできなくなります。"
-              : "コードと、そのバージョンに保存された環境変数・Secret の参照が切り替わります。"}
+              : confirm.action === "delete-version"
+                ? "このバージョンは一覧から削除され、この版へ切り戻せなくなります。現在のバージョンの公開は継続します。"
+                : "コードと、そのバージョンに保存された環境変数・Secret の参照が切り替わります。"}
           </p>
+          {confirm.action !== "delete-component" && (
+            <p className="hash">
+              完全なバージョン <code>{confirm.version}</code>
+            </p>
+          )}
+          {deleteBlocked && <Notice>{deleteBlocked}</Notice>}
+          {confirm.action === "delete-version" && loadError && (
+            <Notice error>{loadError}</Notice>
+          )}
           {error && <Notice error>{error}</Notice>}
         </Confirm>
       )}

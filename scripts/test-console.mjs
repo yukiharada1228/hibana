@@ -49,6 +49,11 @@ export async function testConsole({ api, token, url, app, wasm, folder }) {
   );
   const list = await (await api("/components", { token })).json();
   assert.ok(list.every((c) => typeof c.ingress_enabled === "boolean"));
+  for (const c of list.filter(c => c.ingress_enabled && c.active_version_id)) {
+    assert.equal(c.public_url, `https://${c.name}.upload.hibana.test/`);
+    assert.ok(c.active_version);
+    assert.ok(c.active_version_created_at);
+  }
   console.log(
     "PASS console session uses authenticated tenant and Read users revoke only their own token",
   );
@@ -129,7 +134,6 @@ export async function testConsole({ api, token, url, app, wasm, folder }) {
       HIBANA_URL: `${consoleUrl}/api`,
       HIBANA_TOKEN: token,
       HIBANA_TENANT: "upload",
-      HIBANA_INGRESS_DOMAIN: "hibana.test",
       HIBANA_PROFILE: "",
       HIBANA_CONFIG_HOME: project,
     };

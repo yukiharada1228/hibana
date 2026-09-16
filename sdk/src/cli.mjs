@@ -94,10 +94,7 @@ async function main() {
       `Deployed ${config.name} (${result.component_id}) version ${result.version}`,
     );
     console.log(`Server: ${api.url}`);
-    if (api.ingressDomain && api.tenant)
-      console.log(
-        `HTTP host: ${config.name}.${api.tenant}.${api.ingressDomain}`,
-      );
+    if (result.public_url) console.log(`URL: ${result.public_url}`);
     return;
   }
   if (command === "rollback") {

@@ -1,0 +1,11 @@
+{
+  "schemaVersion": 2,
+  "runtime": "wasi:http/incoming-handler@0.2.3",
+  "imports": [
+    "hibana:md5/api@0.5.0"
+  ],
+  "wit": "./wit",
+  "components": [
+    "./dist/md5.wasm"
+  ]
+}

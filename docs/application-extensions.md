@@ -34,9 +34,9 @@ npm install --save-exact @your-org/hono-compat
 
 あとは通常の`npx hibana build`・`npx hibana dev`・`npx hibana deploy`を使います。CLIがパッケージの宣言からJSの参照先、事前読込、WIT、ビルド済みWasmを取り込みます。Wasm部品を合成する場合は利用者のビルド環境にWACが必要ですが、配布済み部品の利用にRustのコンパイルは不要です。
 
-パッケージの版は`package.json`とlockfileで管理します。CLIは指定されたインストール済みパッケージだけを読み、パッケージのエントリーポイントや独自のインストールフックを実行しません。通常のnpmのインストール処理は利用者の開発環境で行います。`dev`はプロジェクトのパッケージ設定・lockfileの変更で再ビルドし、`node_modules`内やリンク先のソース変更そのものは監視しません。
+パッケージの版は`package.json`とlockfileで管理します。CLIは指定された拡張と、その宣言に列挙されたインストール済み依存拡張だけを読み、パッケージのエントリーポイントや独自のインストールフックを実行しません。通常のnpmのインストール処理は利用者の開発環境で行います。`dev`はプロジェクトのパッケージ設定・lockfileの変更で再ビルドし、`node_modules`内やリンク先のソース変更そのものは監視しません。
 
-配布方法まで試せる例は[Hono + 拡張パッケージ](../sdk/examples/hono-extensions/README.md)です。BufferとRust製SHA-256を、Hibana本体から独立した一つの任意パッケージにしています。
+実際の外部パッケージの責務と配布手順は[任意拡張](../extensions/README.md)にまとめています。PostgreSQL と TCP/TLS を別パッケージにし、依存する版は npm と lockfile で管理します。
 
 ## 拡張パッケージを作る
 
@@ -58,10 +58,11 @@ npm install --save-exact @your-org/hono-compat
 
 | 宣言 | 内容 |
 |---|---|
-| `schemaVersion` | 必須。CLIが読む拡張形式の版。現在は`1` |
+| `schemaVersion` | 必須。CLIが読む拡張形式の版。`1`と`2`に対応。依存拡張の宣言には`2`を使用 |
+| `dependencies` | schemaVersion 2 で使用。先に組み込む拡張の npm パッケージ名。`package.json` の dependencies または peerDependencies にも宣言する |
 | `runtime` | 必須。対象のHTTP契約。現在は`wasi:http/incoming-handler@0.2.3`との完全一致 |
 | `aliases` | import名からJSファイルへの対応 |
-| `preload` | アプリより前に読むJSファイル。extensions の指定順 |
+| `preload` | アプリより前に読むJSファイル。依存拡張を先に読み、同じ依存は一度だけ実行 |
 | `components` | 配布済みWasm Componentのファイル |
 | `imports` / `wit` | JSから利用するWIT interface名と、その定義を含むディレクトリ。Wasm部品と合わせて指定 |
 | `permissions` | 任意の必要権限宣言。現在は`[]`または`["outbound-network"]` |
@@ -73,6 +74,25 @@ JS用の宣言を含むパッケージは`main`を持つアプリ向けです。
 `schemaVersion`と`runtime`の検査は宣言の互換性確認です。WACが部品間の型を検証し、配備先が最終Wasmとホストimportを検証します。パッケージ内のコードが特定のNodeライブラリと互換かどうかは、配布者が対応範囲を示し、実アプリで確認してください。
 
 **必要権限の宣言は許可を与えません。** `outbound-network`を要求する拡張は、ビルド時に管理者による許可が必要なことを表示し、現在の`dev`では起動前に拒否します。配備先ではバージョンごとの通信許可が別途必要です。宣言に書かれていなくても、実際の通信・ファイル操作にはホストの制限が適用されます。
+
+## 拡張が別の拡張に依存するとき
+
+アプリは使いたい拡張だけを指定します。例えば `"extensions": ["@hibana/node-tls"]` と指定すると、必要な Node TCP アダプター・Buffer・TLS エンジンを依存として解決します。`@hibana/node-tls` の宣言は次のとおりです。
+
+```json
+{
+  "schemaVersion": 2,
+  "runtime": "wasi:http/incoming-handler@0.2.3",
+  "dependencies": ["@hibana/node-net", "@hibana/node-buffer", "@hibana/tls"],
+  "aliases": { "tls": "./src/index.mjs", "node:tls": "./src/index.mjs" }
+}
+```
+
+同じパッケージの `package.json` で各依存のバージョンを指定します。[現在の依存バージョン](../extensions/node-tls/package.json)を参照してください。バージョン解決・インストールは npm の責務です。CLI はインストール済みの依存を、その宣言元を基準に解決します。JS アダプターと Wasm エンジンを別パッケージにし、エンジンのみを利用できる構成です。
+
+依存を先に、参照元を後に合成します。直接指定と間接指定で同じ実体を参照する場合も、一度だけ取り込みます。循環依存、同名拡張の異なるインストール、alias／interface の競合、依存を含む 64 個超の拡張はビルド前に拒否します。複数のインストールが競合した場合は npm の依存バージョンを揃えて重複を解消してください。依存の権限宣言も集約し、外向き通信を要する依存があれば `dev` は従来どおり起動前に拒否します。
+
+旧 CLI は schemaVersion 2 を拒否するので、利用前に CLI を更新してください。既存の schemaVersion 1 のパッケージは変更せず利用できます。
 
 ## 手元で作る拡張も同じ形式にする
 
@@ -121,16 +141,38 @@ CLI 操作は引き続き `hibana build / dev / deploy` です。拡張専用の
 
 Node.js バイナリやネイティブ npm addon をアップロードするだけでは動かない。必要な API の振る舞いを JS／Wasm で実装し、既存 WASI の権限内で完結させる。永続化やアラームは、計算用部品の同梱だけでは実現できない。
 
-`net`・`tls` の外向きクライアントは、任意パッケージ [@hibana/node-net](../extensions/node-net/README.md) として提供します。JS の Duplex と Rust/rustls の Wasm をアプリへ同梱し、標準 WASI sockets のみをホストに要求します。TCP、検証付き TLS、STARTTLS を対象とする限定実装であり、TCP サーバー、`setNoDelay`、Node.js 全体の互換性は提供しません。DB ドライバーなどは必要な API の移植・検証が別途必要です。ホストのファイル操作・子プロセス起動を前提とする依存も、そのままでは動きません。
+`net`・`tls` の外向きクライアントは、別々の任意パッケージ [@hibana/node-net](../extensions/node-net/README.md)・[@hibana/node-tls](../extensions/node-tls/README.md) として提供します。TCP だけなら TLS の Wasm は入りません。JS の Duplex と Rust/rustls の Wasm をアプリへ同梱し、標準 WASI sockets のみをホストに要求します。TCP、検証付き TLS、STARTTLS を対象とする限定実装であり、TCP サーバー、`setNoDelay`、Node.js 全体の互換性は提供しません。DB ドライバーなどは必要な API の移植・検証が別途必要です。ホストのファイル操作・子プロセス起動を前提とする依存も、そのままでは動きません。
 
-実装例は [Hono + ユーザー拡張](../sdk/examples/hono-extensions/README.md)。`Buffer` は npm パッケージ、`createHash('sha256')` の計算は Rust 部品が担当する。例の crypto shim は SHA-256 の限定実装であり、Node.js crypto 全体の互換実装ではない。
+汎用の回帰試験では、一時パッケージに npm の Buffer と Rust 製 SHA-256 部品を組み合わせます。常設のサンプルアプリは不要です。汎用の暗号と NFKC 正規化も[アルゴリズムごとのパッケージ](../extensions/README.md)と [unicode-nfkc](../extensions/unicode-nfkc/README.md) で提供し、通信・Node API を必要としません。
 
 回帰検証は `scripts/test-application-extensions.mjs`。実際の Hono HTTP 応答を Node の SHA-256／Base64 と照合し、合成後の配備検証、部品の未同梱による拒否、合成失敗時の既存成果物の保持を確認する。
 
-TCP/TLS 拡張は `scripts/test-node-net-extension.mjs` で、配布 tarball からの合成、汎用 Wasmtime 上での実通信と証明書エラー、Hibana 実行環境での権限拒否を確認する。本体の Cargo workspace・CLI の標準依存・Worker イメージに互換実装を追加しない。
+TCP/TLS 拡張は `scripts/test-tcp-tls-extension.mjs` で、配布 tarball からの合成、汎用 Wasmtime 上での実通信と証明書エラー、Hibana 実行環境での権限拒否を確認する。本体の Cargo workspace・CLI の標準依存・Worker イメージに互換実装を追加しない。
+
+単機能の非同梱検証は `scripts/test-extension-boundaries.mjs`。基礎部品を1つだけ有効にしたアプリと、Wasm の実際の import／export を検査します。
+
+Node TCP／TLS 0.6.0からは `@hibana/node-stream/duplex` にだけ依存し、通常の Stream の入口を読み込みません。これにより、Socket だけのアプリから `Transform`・`PassThrough`・`pipeline`・`compose`・追加の演算子を除外します。アプリが `node:stream` を import した場合は従来の API が使え、両方の入口は同じ Duplex コンストラクターを共有します。npm パッケージや CLI 設定は増やしていません。配布 tarball を使ったバンドルの依存一覧と、Stream 同士の相互運用も上記の非同梱検証で確認します。
+
+Node Stream 0.6.0では Readable・Writable・Duplex・Transform・PassThrough・pipeline・compose・finished の8つの[機能別入口](../extensions/node-stream/README.md)を提供します。例えば `@hibana/node-stream/passthrough` には必須の Transform と共通の読み書き処理だけが入り、pipeline・compose・追加の演算子は入りません。finished は完了監視だけを提供し、ストリームのクラス実装を読み込みません。各入口は上流の実装を共有し、通常の `node:stream` と併用できます。
+
+0.6.1では、複数の機能別入口を共通ファイルから再 export した場合も、未使用の入口を除去できるよう `sideEffects` を指定しています。バイト列変換と通常の入口の初期化は保持します。検証では解析したモジュール一覧だけでなく、出力コードに残るモジュールも調べます。
+
+0.7.0では Readable／Writable の Duplex 型判定に必要だった循環参照を切り離し、Readable だけのアプリに Writable・Duplex、Writable だけのアプリに Readable・Duplex が入らないようにしています。配布者が固定した上流の型参照を移植し、生成済みの共有実装を配布します。通常の入口も同じ実装を使い、クラスの同一性・継承・読み書き別の設定を維持します。CLI と Hibana 本体への機能追加はありません。
 
 ## DB 接続について
 
-`@hibana/node-net` は通信層です。PostgreSQL のクエリ・認証・リクエスト内 Pool は、別の任意拡張 [@hibana/postgres](../extensions/postgres/README.md) で提供します。`extensions: ["@hibana/node-net", "@hibana/postgres"]` を設定すると、`pg` の import を Rust/Wasm の暗号処理を組み込んだ適応版に解決します。pg 8.23.0 と Drizzle 0.45.2 について、汎用 Wasmtime 上で PostgreSQL への TCP／TLS 接続、クエリ、ORM の CRUD・トランザクションを確認しました。本番 Hibana の DB 接続試験とは区別しています。[検証結果と再現手順](postgres-compatibility.md)を参照してください。
+`@hibana/node-net`・`@hibana/node-tls` は通信層です。PostgreSQL のクエリは [postgres-core](../extensions/postgres-core/README.md) が提供し、通信・認証・Pool は必要な部品を選びます。`database/` に部品を組み合わせるローカル拡張を用意して `extensions: ["./database"]` と指定し、`pg` の import をその構成へ解決します。Client だけを使う構成では Pool を追加しません。
+
+pg 8.23.0 と Drizzle 0.45.2 について、汎用 Wasmtime 上で PostgreSQL への TCP／TLS 接続、クエリ、ORM の CRUD・トランザクションを確認しました。Drizzle には Pool 部品も必要です。検証クラスタから Neon への読み取り専用接続も別途確認しています。[検証結果と再現手順](postgres-compatibility.md)を参照してください。
+
+既存のプリセットとして、Pool と全認証をまとめた `@hibana/postgres` と、TLS・証明書用ハッシュを含まない `@hibana/postgres-tcp` も用意しています。プリセットを使う場合は、ローカル拡張の代わりにそのパッケージ名を `extensions` に指定します。接続設定で機能を使わなくても、プリセットの依存 Wasm は構成から外れません。
 
 Hibana の管理用 PostgreSQL は Wasm ランタイムが配備情報や実行記録を管理するための DB であり、ゲスト用 Binding ではありません。接続情報はアプリに公開しません。現在の egress ポリシーは private / loopback 宛ても拒否するので、Docker 内や同じ Kubernetes 内の DB に自動的に接続できるという意味ではありません。
+
+## PostgreSQL の機能を個別に選ぶ
+
+PostgreSQL 0.6.0 では、`postgres-core` に通信・認証の部品を引数で渡せます。`postgres-auth-md5` と `postgres-auth-scram` は独立し、channel binding の証明書ハッシュも使用する関数だけを登録します。[具体的なローカル拡張の例](../extensions/postgres-core/README.md)を参照してください。
+
+0.7.0では接続プールも `postgres-pool` に分離しました。`postgres-core` は Client を提供し、`createPostgres({ transport, authentication, pool: createPool })` と指定した構成だけに Pool を追加します。Client 専用の構成には `pg-pool` のコードやその補助処理は入りません。既存の `postgres`・`postgres-tcp` プリセットは Pool を選択済みです。Drizzle 0.45.2 の node-postgres アダプターは内部で `pg.Pool` を参照するため、独自構成で Drizzle を使う場合も Pool を選択します。
+
+アプリのローカル拡張が必要な部品を dependencies に列挙し、組み合わせた JS を `pg` alias として提供します。CLI の専用オプションや新しいマニフェスト形式、グローバルな機能登録は不要です。未選択の認証は `ERR_PG_AUTH_UNAVAILABLE`、不足する証明書ハッシュは `ERR_PG_CERTIFICATE_DIGEST_UNAVAILABLE` で拒否します。通常版と TCP 版のプリセットも同じ公開部品で構成します。

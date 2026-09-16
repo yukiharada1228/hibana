@@ -1,6 +1,6 @@
 // Browser contract fixtures only; excluded from the production image and bundle.
 import { createServer } from "node:http";
-let components, versions, tokens, expired, unavailable;
+let components, versions, tokens, expired, unavailable, invocationCount;
 function reset(empty = false) {
   components = empty
     ? []
@@ -9,6 +9,7 @@ function reset(empty = false) {
           component_id: "cmp_api",
           name: "hello-api",
           active_version_id: "ver_2",
+          previous_active_version_id: "ver_1",
           ingress_enabled: true,
           created_at: "2026-09-15T00:00:00Z",
         },
@@ -21,9 +22,15 @@ function reset(empty = false) {
         },
       ];
   versions = {
-    cmp_api: [version("ver_2", "2.0.0"), version("ver_1", "1.0.0")],
+    cmp_api: [
+      version("ver_2", "2.0.0"),
+      version("ver_1", "1.0.0"),
+      version("ver_old", "0.0.0-dev.1789484656916.d26b94ca"),
+      { ...version("ver_busy", "0.8.0"), has_active_executions: true },
+    ],
   };
   tokens = new Map([["cli-fixture-token", ["read", "deploy", "admin"]]]);
+  invocationCount = 12408;
   expired = false;
   unavailable = false;
 }
@@ -36,6 +43,26 @@ function version(id, name) {
     wasm_sha256: "a".repeat(64),
     created_at: "2026-09-15T00:00:00Z",
   };
+}
+function componentView(c) {
+  const active = (versions[c.component_id] || []).find(
+    (v) => v.version_id === c.active_version_id,
+  );
+  return {
+    ...c,
+    active_version: active?.version || null,
+    active_version_created_at: active?.created_at || null,
+    public_url:
+      c.ingress_enabled && active
+        ? `https://${c.name}.team.apps.example.internal:8443/`
+        : null,
+  };
+}
+function deletionBlockedReason(component, v) {
+  if (v.version_id === component.active_version_id) return "active_version";
+  if (v.version_id === component.previous_active_version_id)
+    return "rollback_target";
+  return v.has_active_executions ? "active_executions" : null;
 }
 reset();
 createServer(async (req, res) => {
@@ -56,6 +83,10 @@ createServer(async (req, res) => {
     reset(body.empty);
     return send(200, {});
   }
+  if (url.pathname === "/__test/activity") {
+    invocationCount++;
+    return send(200, {});
+  }
   if (url.pathname === "/__test/expire") {
     expired = true;
     return send(200, {});
@@ -69,7 +100,11 @@ createServer(async (req, res) => {
     const scopes =
       body.email === "reader@example.internal"
         ? ["read"]
-        : ["read", "deploy", "admin"];
+        : body.email === "admin-only@example.internal"
+          ? ["read", "admin"]
+          : body.email === "deployer@example.internal"
+            ? ["read", "deploy"]
+            : ["read", "deploy", "admin"];
     const token = `browser-fixture-token-${tokens.size}`;
     tokens.set(token, scopes);
     return send(201, {
@@ -105,14 +140,14 @@ createServer(async (req, res) => {
       components.push(c);
       return send(201, c);
     }
-    return send(200, components);
+    return send(200, components.map(componentView));
   }
   if (url.pathname === "/usage")
     return send(200, {
       from: url.searchParams.get("from"),
       to: url.searchParams.get("to"),
       totals: {
-        invocation_count: 12408,
+        invocation_count: invocationCount,
         succeeded_count: 12400,
         failed_count: 6,
         timeout_count: 2,
@@ -122,7 +157,7 @@ createServer(async (req, res) => {
       by_component: [
         {
           component_id: "cmp_api",
-          invocation_count: 12408,
+          invocation_count: invocationCount,
           succeeded_count: 12400,
           failed_count: 6,
           timeout_count: 2,
@@ -131,10 +166,23 @@ createServer(async (req, res) => {
         },
       ],
     });
-  const [, , id, action] = url.pathname.split("/");
+  const [, , id, action, versionName] = url.pathname
+    .split("/")
+    .map(decodeURIComponent);
   const component = components.find((c) => c.component_id === id);
   if (!component) return send(404, {});
   if (req.method === "DELETE") {
+    if (!scopes.includes("admin")) return send(403, {});
+    if (action === "versions" && versionName) {
+      const v = (versions[id] || []).find(
+        (item) => item.version === versionName,
+      );
+      if (!v) return send(404, {});
+      if (deletionBlockedReason(component, v)) return send(409, {});
+      versions[id] = versions[id].filter((item) => item !== v);
+      return send(204);
+    }
+    if (action) return send(404, {});
     components = components.filter((c) => c !== component);
     return send(204);
   }
@@ -143,20 +191,63 @@ createServer(async (req, res) => {
       const name = /name="version"\r\n\r\n([^\r]+)/.exec(raw)?.[1];
       const v = version(`ver_${id}_${name}`, name);
       versions[id] = [v, ...(versions[id] || [])];
+      component.previous_active_version_id = component.active_version_id;
       component.active_version_id = v.version_id;
       component.ingress_enabled = true;
-      return send(201, v);
+      return send(201, {
+        ...v,
+        public_url: componentView(component).public_url,
+      });
     }
-    return send(200, versions[id] || []);
+    return send(
+      200,
+      (versions[id] || []).map((v) => ({
+        ...v,
+        deletion_blocked_reason: deletionBlockedReason(component, v),
+      })),
+    );
+  }
+  if (action === "executions") {
+    const offset = url.searchParams.has("before") ? 20 : 0;
+    const items = Array.from({ length: offset ? 1 : 20 }, (_, i) => ({
+      execution_id: `exe_${offset + i}`,
+      version_id: component.active_version_id,
+      status: "timeout",
+      error: {
+        code: "execution_timeout",
+        message: "Execution deadline exceeded",
+      },
+      created_at: "2026-09-15T01:00:00Z",
+      wall_time_ms: 1000,
+    }));
+    return send(200, {
+      items,
+      next_cursor: offset ? null : "2026-09-15T01:00:00Z,exe_19",
+    });
   }
   if (action === "config")
     return send(200, {
+      version_id: component.active_version_id,
       env: { GREETING: "Hello from Hibana", STAGE: "development" },
+      secrets: [
+        { name: "API_KEY", available: true },
+        { name: "OLD_KEY", available: false },
+      ],
+      resource_limits: {
+        max_memory_bytes: 134217728,
+        max_wall_time_ms: 1000,
+        max_execution_time_ms: 5000,
+      },
+      net_allow_outbound: ["db.example.internal:5432"],
     });
   if (action === "rollback") {
-    component.active_version_id = versions[id].find(
-      (v) => v.version === body.version,
-    ).version_id;
+    if (!scopes.includes("deploy")) return send(403, {});
+    const target = versions[id].find((v) => v.version === body.version);
+    if (!target) return send(409, {});
+    if (target.version_id !== component.active_version_id) {
+      component.previous_active_version_id = component.active_version_id;
+      component.active_version_id = target.version_id;
+    }
     return send(200, { active_version_id: component.active_version_id });
   }
   send(404, {});

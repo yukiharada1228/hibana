@@ -14,7 +14,7 @@ data:
   S3_ENDPOINT: "https://objects.example.internal"
   S3_REGION: "us-east-1"
   S3_BUCKET: "hibana-components"
-  INGRESS_BASE_DOMAIN: "apps.example.internal"
+  APP_PUBLIC_ORIGIN: "https://apps.example.internal"
   JOB_SIGNING_KID: "k1"
   SECRETS_MASTER_KID: "k1"
   WORKER_MAX_CONCURRENCY: "8"

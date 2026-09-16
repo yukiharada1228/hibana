@@ -1,8 +1,7 @@
-import { cp, mkdir, readdir, readFile, writeFile } from "node:fs/promises";
+import { cp, mkdir, readdir, writeFile } from "node:fs/promises";
 import { resolve, join, dirname, basename } from "node:path";
 import { fileURLToPath } from "node:url";
 import { run } from "./process.mjs";
-import { cliRelease } from "./package.mjs";
 
 const sdk = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 export const templates = ["hono", "javascript", "rust", "go"];
@@ -42,12 +41,6 @@ export async function init(
   const javascript = template === "hono" || template === "javascript";
   if (javascript) {
     config.main = "src/index.ts";
-    const { version } = JSON.parse(
-      await readFile(join(sdk, "package.json"), "utf8"),
-    );
-    const cliDependency = cliPackage
-      ? `file:${resolve(cliPackage)}`
-      : cliRelease(version);
     await writeFile(
       join(root, "package.json"),
       JSON.stringify(
@@ -61,7 +54,15 @@ export async function init(
             deploy: "hibana deploy",
           },
           ...(template === "hono" ? { dependencies: { hono: "^4.6.0" } } : {}),
-          devDependencies: { "@hibana/cli": cliDependency },
+          // The CLI that created the project is already installed on this PC.
+          // A project-local CLI is an explicit opt-in, never an assumed release URL.
+          ...(cliPackage
+            ? {
+                devDependencies: {
+                  "@hibana/cli": `file:${resolve(cliPackage)}`,
+                },
+              }
+            : {}),
           engines: { node: ">=24" },
         },
         null,

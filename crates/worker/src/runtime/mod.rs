@@ -29,6 +29,7 @@ use wasmtime_wasi_http::{
 const GUEST_STDERR_CAPTURE_BYTES: usize = 64 * 1024;
 const MAX_HOST_RESOURCES: usize = 4096;
 pub(crate) struct Runtime {
+    tcp_policy: crate::network::TcpPolicy,
     pub engine: Engine,
     pub metrics: Arc<metrics::Metrics>,
     _epoch_ticker: EpochTickerGuard,
@@ -146,10 +147,20 @@ impl Runtime {
                 }
             })?;
         Ok(Self {
+            tcp_policy: crate::network::TcpPolicy::default(),
             engine,
             metrics,
             _epoch_ticker: EpochTickerGuard(stop),
         })
+    }
+
+    pub(crate) fn with_tcp_policy(mut self, policy: crate::network::TcpPolicy) -> Self {
+        self.tcp_policy = policy;
+        self
+    }
+
+    pub(crate) fn tcp_destination_allowed(&self, addr: std::net::SocketAddr) -> bool {
+        self.tcp_policy.allows_destination(addr)
     }
 
     pub(crate) async fn run_http(
@@ -190,17 +201,11 @@ impl Runtime {
             wasi_builder.allow_tcp(true);
             wasi_builder.allow_udp(false);
             wasi_builder.allow_ip_name_lookup(true);
+            let tcp_policy = self.tcp_policy.clone();
             wasi_builder.socket_addr_check(move |addr, use_| {
                 let allowed = std::sync::Arc::clone(&allowed);
-                Box::pin(async move {
-                    if !matches!(use_, wasmtime_wasi::SocketAddrUse::TcpConnect) {
-                        return false;
-                    }
-                    if hibana_shared::egress::is_hard_denied(addr.ip()) {
-                        return false;
-                    }
-                    allowed.contains(&addr)
-                })
+                let tcp_policy = tcp_policy.clone();
+                Box::pin(async move { tcp_policy.allows_connect(&allowed, addr, use_) })
             });
         }
 

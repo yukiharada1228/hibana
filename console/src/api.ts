@@ -1,4 +1,11 @@
-import type { Component, Session, Usage, Version } from "./types";
+import type {
+  Component,
+  Session,
+  Usage,
+  Version,
+  Settings,
+  ExecutionsPage,
+} from "./types";
 
 export class ApiError extends Error {
   constructor(
@@ -110,8 +117,15 @@ export class Api {
     );
   }
   config(id: string) {
-    return this.request<{ env: Record<string, string> }>(
+    return this.request<Settings>(
       `/components/${encodeURIComponent(id)}/config`,
+    );
+  }
+  executions(id: string, errorsOnly: boolean, before?: string) {
+    const query = new URLSearchParams({ errors_only: String(errorsOnly) });
+    if (before) query.set("before", before);
+    return this.request<ExecutionsPage>(
+      `/components/${encodeURIComponent(id)}/executions?${query}`,
     );
   }
   rollback(id: string, version: string) {
@@ -124,44 +138,50 @@ export class Api {
   deleteComponent(id: string) {
     return this.request(`/components/${encodeURIComponent(id)}`, "DELETE");
   }
+  deleteVersion(id: string, version: string) {
+    return this.request<void>(
+      `/components/${encodeURIComponent(id)}/versions/${encodeURIComponent(version)}`,
+      "DELETE",
+    );
+  }
   usage(from: string, to: string) {
     return this.request<Usage>(`/usage?${new URLSearchParams({ from, to })}`);
   }
 }
 
-export function appUrl(
-  component: Component,
-  session: Session,
-  origin = import.meta.env.VITE_APP_ORIGIN,
-): string | null {
-  const { ingress_base_domain: domain, tenant_slug: tenant } = session;
-  if (!domain || !component.ingress_enabled || !component.active_version_id)
-    return null;
-  const label = /^[a-z0-9](?:[a-z0-9-]*[a-z0-9])?$/;
+/** Validate navigation; URL construction belongs exclusively to the platform. */
+export function appUrl(component: Component): string | null {
   if (
-    ![component.name, tenant, ...domain.split(".")].every((part) =>
-      label.test(part),
-    )
+    !component.public_url ||
+    !component.ingress_enabled ||
+    !component.active_version_id
   )
     return null;
   try {
-    const url = new URL(origin || `https://${domain}`);
+    const url = new URL(component.public_url);
     if (
-      url.hostname !== domain ||
       url.username ||
       url.password ||
       url.search ||
       url.hash ||
-      url.pathname !== "/" ||
-      (url.protocol !== "https:" &&
-        !(url.protocol === "http:" && domain === "localhost"))
+      url.pathname !== "/"
     )
       return null;
-    url.hostname = `${component.name}.${tenant}.${domain}`;
+    if (
+      url.protocol !== "https:" &&
+      !(url.protocol === "http:" && url.hostname.endsWith(".localhost"))
+    )
+      return null;
     return url.href;
   } catch {
     return null;
   }
+}
+
+export function publication(component: Component): string {
+  if (!component.active_version_id) return "未配備";
+  if (!component.ingress_enabled) return "非公開";
+  return appUrl(component) ? "公開設定済み" : "公開 URL 未設定";
 }
 
 export const errorMessage = (error: unknown) =>

@@ -2,6 +2,7 @@
 use anyhow::Context as _;
 use std::path::PathBuf;
 pub(crate) struct Settings {
+    pub(crate) tcp_policy: crate::network::TcpPolicy,
     pub(crate) database_url: String,
     pub(crate) wasm_cache_dir: PathBuf,
     pub(crate) metrics_bind_addr: String,
@@ -32,6 +33,9 @@ impl Settings {
             .map(|v| v.trim().to_string())
             .unwrap_or_else(|_| DEFAULT_METRICS_BIND_ADDR.to_string());
         Ok(Self {
+            tcp_policy: crate::network::TcpPolicy::parse_private_endpoints(
+                &std::env::var("WORKER_PRIVATE_TCP_ENDPOINTS").unwrap_or_default(),
+            )?,
             database_url,
             wasm_cache_dir,
             metrics_bind_addr,

@@ -1,0 +1,32 @@
+{
+  "name": "@hibana/postgres-core",
+  "version": "0.7.0",
+  "private": true,
+  "type": "module",
+  "license": "MIT",
+  "exports": {
+    ".": "./dist/index.mjs",
+    "./hibana.extension.json": "./hibana.extension.json"
+  },
+  "files": [
+    "hibana.extension.json",
+    "README.md",
+    "LICENSE",
+    "dist/"
+  ],
+  "dependencies": {
+    "@hibana/node-buffer": "0.5.0",
+    "@hibana/node-events": "0.5.0",
+    "@hibana/node-process": "0.5.0"
+  },
+  "devDependencies": {
+    "pg": "8.23.0",
+    "pg-connection-string": "2.14.0",
+    "pg-protocol": "1.16.0",
+    "pg-types": "2.2.0"
+  },
+  "scripts": {
+    "build": "node build.mjs",
+    "prepack": "npm run build"
+  }
+}

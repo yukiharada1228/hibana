@@ -1,9 +1,20 @@
 {
-  "schemaVersion": 1,
+  "schemaVersion": 2,
   "runtime": "wasi:http/incoming-handler@0.2.3",
-  "aliases": { "pg": "./dist/pg.mjs" },
-  "components": ["./dist/crypto.wasm"],
-  "imports": ["hibana:postgres/crypto@0.1.0"],
-  "wit": "./wit",
-  "permissions": ["outbound-network"]
+  "dependencies": [
+    "@hibana/postgres-core",
+    "@hibana/postgres-pool",
+    "@hibana/postgres-transport-tls",
+    "@hibana/postgres-auth-md5",
+    "@hibana/postgres-auth-scram",
+    "@hibana/sha224",
+    "@hibana/sha256",
+    "@hibana/sha384",
+    "@hibana/sha512",
+    "@hibana/sha512-224",
+    "@hibana/sha512-256"
+  ],
+  "aliases": {
+    "pg": "./dist/index.mjs"
+  }
 }

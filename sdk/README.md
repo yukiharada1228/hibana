@@ -6,9 +6,11 @@ Hibanaの実行契約はWebAssembly Componentです。Honoは対応するJavaScr
 
 Node API などの追加機能は、ユーザーが用意した JS モジュールや Rust 製 Wasm 部品を `extensions` でアプリに同梱できます。本体に互換ランタイムを追加せず、合成した `.wasm` を通常の `deploy` でアップロードします。[設定と実装例](../docs/application-extensions.md)を参照してください。
 
-外向き TCP/TLS が必要なアプリには、任意パッケージ [@hibana/node-net](../extensions/node-net/README.md) を追加できます。対応する Node API は限定的で、通信には配備先の管理者による許可が必要です。
+外向き TCP/TLS が必要なアプリには、任意パッケージ [@hibana/node-net](../extensions/node-net/README.md)・[@hibana/node-tls](../extensions/node-tls/README.md) を追加できます。対応する Node API は限定的で、通信には配備先の管理者による許可が必要です。
 
-PostgreSQL には [@hibana/postgres](../extensions/postgres/README.md) を併用できます。`pg` の適応版と Rust/Wasm の認証処理をアプリに同梱し、Drizzle の CRUD・トランザクションを Wasm 上で検証しています。[検証範囲](../docs/postgres-compatibility.md)を確認してください。
+Stream は [機能別の入口](../extensions/node-stream/README.md)から必要な API を import します。例えば PassThrough だけなら `@hibana/node-stream/passthrough` を使います。通常の `node:stream` は複数の API をまとめて使う入口として維持しています。
+
+PostgreSQL は [postgres-core に必要な通信・認証を組み合わせる](../extensions/postgres-core/README.md)構成を基本とします。`database/` にローカル拡張を用意し、`extensions: ["./database"]` を指定します。Pool または Drizzle が必要な場合だけ `postgres-pool` を追加します。複数の通信・認証方式をまとめて使うための [@hibana/postgres](../extensions/postgres/README.md) プリセットもあります。[検証範囲](../docs/postgres-compatibility.md)を確認してください。
 
 配布された拡張パッケージを使う場合は、アプリにnpm依存として導入し、`extensions`配列にパッケージ名、または`./`で始まるローカル拡張のディレクトリを指定します。通常の`build`・`dev`・`deploy`が宣言ファイルを読み、JSの参照解決とWIT・Wasmの合成を行います。パッケージ名・バージョンはアプリのlockfileで管理し、CLIは拡張の自動取得やインストール処理を行いません。
 
@@ -44,7 +46,7 @@ hibana dev
 | `rust` | RustのWASI HTTP handler | Rust、`wasm32-wasip2`ターゲット |
 | `go` | GoのWASI HTTP handler | Go 1.25.9以上、固定したcomponentize-go v0.4.2 |
 
-`init`は空のディレクトリに生成します。JS系にはnpm scriptsとCLIと同じバージョンのGitHub Release URLを指定した`@hibana/cli`依存を追加します。閉域環境のtarballや開発用ディレクトリは`--cli-package PATH`で明示できます。`--no-install`でnpmインストールを省略できます。Rust・Goにはnpm依存を生成しません。CLIの実装自体はどの言語でもNode.jsを使用します。
+`init`は空のディレクトリに生成します。JS系にはnpm scriptsを生成し、PCに導入済みの`hibana`を使用します。通常のHonoプロジェクトのnpm依存は`hono`だけです。プロジェクト専用のCLIを固定したい場合は`--cli-package PATH`でtarballや開発用ディレクトリを指定できます。別のPCでも、先にHibana CLIを導入してください。`--no-install`でnpmインストールを省略できます。Rust・Goにはnpm依存を生成しません。CLIの実装自体はどの言語でもNode.jsを使用します。
 
 Rust・Go・ビルド済みComponentだけを扱う場合、`npm ci --prefix sdk --omit=optional --omit=dev`でJSコンパイラーとHonoをインストールせずにCLIを使えます。JS向けビルドを追加するときは`npm ci --prefix sdk`を実行してください。
 
@@ -161,7 +163,7 @@ Wranglerを参考にするのは、この短い開発・配備の流れです。
 
 ## 候補版の設定整理
 
-拡張は `"extensions": ["@hibana/node-net"]` に統一しました。旧 `extensions.packages` や直接の aliases/WIT 設定からの移行は[アプリ拡張](../docs/application-extensions.md#旧候補版の設定から移行する)を参照してください。
+拡張は `"extensions": ["@hibana/node-tls"]` に統一しました。旧 `extensions.packages` や直接の aliases/WIT 設定からの移行は[アプリ拡張](../docs/application-extensions.md#旧候補版の設定から移行する)を参照してください。
 
 重複していた `delete --name NAME` / `--force` は `delete NAME` / `--yes` に、`platform --local --source PATH` は `platform --source PATH` に統一しました。ログインはユーザー設定領域のプロファイル、CI は `HIBANA_URL` / `HIBANA_TOKEN` を使います。旧 `.hibana/auth.json` は読み書きしないため、使用していた場合は `hibana login` で再ログインしてください。既存の認証ファイル自体は削除しません。
 

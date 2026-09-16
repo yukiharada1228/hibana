@@ -17,7 +17,7 @@ const cli=args=>runCommand(process.execPath,[process.env.HIBANA_CLI_ENTRY || joi
 });
 async function check(code, variable) {
   const response=await new Promise((done,fail)=>{
-    const request=http.get(state.gateway+'/',{headers:{Host:`${name}.smoke.hibana.local`},signal:AbortSignal.timeout(15000)},incoming=>{
+    const request=http.get(state.gateway+'/',{headers:{Host:`${name}.smoke.localhost`},signal:AbortSignal.timeout(15000)},incoming=>{
       let body='';
       incoming.on('data',chunk=>{body+=chunk;if(body.length>4096) request.destroy(new Error('Oversized proof response'));});
       incoming.on('error',fail);

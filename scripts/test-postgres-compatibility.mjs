@@ -2,7 +2,7 @@
 // Only the trusted Wasmtime test fixture inherits network access.
 import assert from "node:assert/strict";
 import { execFile, spawn } from "node:child_process";
-import { randomBytes, randomUUID } from "node:crypto";
+import { createHash, randomBytes, randomUUID } from "node:crypto";
 import {
   copyFile,
   mkdir,
@@ -18,12 +18,19 @@ import { setTimeout as sleep } from "node:timers/promises";
 import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
 import { runCommand } from "./bounded-process.mjs";
+import { packExtensions } from "./pack-extensions.mjs";
+import { authenticationFixture } from "./postgres-auth-fixture.mjs";
+import { writePostgresSelection } from "./postgres-selection.mjs";
+import { resolveExtensions } from "../sdk/src/extensions.mjs";
 
 const execute = promisify(execFile);
 const root = fileURLToPath(new URL("..", import.meta.url));
 const fixture = join(root, "scripts/fixtures/postgres");
 const require = createRequire(join(fixture, "package.json"));
 const pg = require("pg");
+const { build: bundleJavaScript } = createRequire(
+  join(root, "sdk/package.json"),
+)("esbuild");
 const folder = await mkdtemp(join(tmpdir(), "hibana-pg-probe-"));
 const reportDir = resolve(
   process.env.HIBANA_PG_REPORT_DIR ||
@@ -46,7 +53,13 @@ let started = false;
 let runtime,
   runtimeLog = "";
 const application = join(folder, "application");
-const artifact = join(application, ".hibana/build/app.wasm");
+const artifact = join(folder, "postgres.wasm");
+const tcpArtifact = join(folder, "postgres-tcp.wasm");
+const selectedArtifacts = Object.fromEntries(
+  ["scram", "md5", "noCertificateHash", "clientOnly", "clientWithPool"].map(
+    (name) => [name, join(folder, `selected-${name}.wasm`)],
+  ),
+);
 
 async function run(command, args, options = {}) {
   const { stdout } = await execute(command, args, {
@@ -64,6 +77,7 @@ async function buildApplication() {
     "package.json",
     "package-lock.json",
     "app.mjs",
+    "client-only.mjs",
     "schema.mjs",
   ])
     await copyFile(join(fixture, name), join(application, name));
@@ -72,32 +86,13 @@ async function buildApplication() {
     ["ci", "--offline", "--ignore-scripts", "--no-audit", "--no-fund"],
     { cwd: application },
   );
-  const tarballs = [];
-  report.extensions = [];
-  for (const name of ["node-net", "postgres"]) {
-    const [packed] = JSON.parse(
-      await run(
-        "npm",
-        ["pack", "--ignore-scripts", "--json", "--pack-destination", folder],
-        {
-          cwd: join(root, "extensions", name),
-        },
-      ),
-    );
-    assert.ok(packed.files.some((file) => file.path.endsWith(".wasm")));
-    assert.ok(
-      packed.files.every(
-        (file) =>
-          !file.path.startsWith("component/") && file.path !== "build.mjs",
-      ),
-    );
-    report.extensions.push({
-      name,
-      version: packed.version,
-      integrity: packed.integrity,
-    });
-    tarballs.push(join(folder, packed.filename));
-  }
+  const packed = await packExtensions(folder);
+  const tarballs = packed.map((pkg) => pkg.tarball);
+  report.extensions = packed.map(({ name, version, integrity }) => ({
+    name,
+    version,
+    integrity,
+  }));
   await run(
     "npm",
     [
@@ -118,7 +113,7 @@ async function buildApplication() {
       {
         name: "postgres-probe",
         main: "app.mjs",
-        extensions: ["@hibana/node-net", "@hibana/postgres"],
+        extensions: ["@hibana/postgres"],
       },
       null,
       2,
@@ -148,6 +143,94 @@ async function buildApplication() {
       output.replaceAll(folder, "<temporary>"),
     );
   }
+  await copyFile(join(application, ".hibana/build/app.wasm"), artifact);
+  await writeFile(
+    join(application, "hibana.json"),
+    JSON.stringify({
+      name: "postgres-probe",
+      main: "app.mjs",
+      extensions: ["@hibana/postgres-tcp"],
+    }),
+  );
+  await execute(process.execPath, [join(root, "sdk/src/cli.mjs"), "build"], {
+    cwd: application,
+    timeout: 180000,
+    killSignal: "SIGKILL",
+    maxBuffer: 2 * 1024 * 1024,
+  });
+  await copyFile(join(application, ".hibana/build/app.wasm"), tcpArtifact);
+  report.artifactBytes = {
+    full: (await readFile(artifact)).byteLength,
+    tcpOnly: (await readFile(tcpArtifact)).byteLength,
+  };
+  assert.ok(report.artifactBytes.tcpOnly < report.artifactBytes.full);
+  report.selections = {};
+  for (const [name, options] of [
+    ["scram", {}],
+    ["md5", { tls: false, scram: false, md5: true }],
+    ["noCertificateHash", { certificateHashes: [] }],
+    ["clientOnly", { pool: false }],
+    ["clientWithPool", { pool: true }],
+  ]) {
+    const selection = await writePostgresSelection(application, options);
+    const config = {
+      name: "postgres-probe",
+      main: name.startsWith("client") ? "client-only.mjs" : "app.mjs",
+      extensions: [selection],
+    };
+    await writeFile(join(application, "hibana.json"), JSON.stringify(config));
+    const plan = await resolveExtensions({ ...config, root: application });
+    await execute(process.execPath, [join(root, "sdk/src/cli.mjs"), "build"], {
+      cwd: application,
+      timeout: 180000,
+      killSignal: "SIGKILL",
+      maxBuffer: 2 * 1024 * 1024,
+    });
+    const bytes = await readFile(join(application, ".hibana/build/app.wasm"));
+    await writeFile(selectedArtifacts[name], bytes);
+    report.selections[name] = {
+      artifactBytes: bytes.length,
+      imports: plan.imports,
+    };
+    if (name.startsWith("client")) {
+      const bundle = await bundleJavaScript({
+        stdin: {
+          contents: [
+            ...plan.preload.map((path) => `import ${JSON.stringify(path)};`),
+            `export {default} from ${JSON.stringify(join(application, config.main))};`,
+          ].join("\n"),
+          resolveDir: application,
+        },
+        absWorkingDir: application,
+        bundle: true,
+        format: "esm",
+        platform: "browser",
+        target: "es2022",
+        mainFields: ["module", "main"],
+        conditions: ["import", "default"],
+        alias: plan.aliases,
+        external: plan.imports,
+        write: false,
+        metafile: true,
+      });
+      assert.equal(
+        Object.keys(bundle.metafile.inputs).some((path) =>
+          path.endsWith("/postgres-pool/dist/index.mjs"),
+        ),
+        name === "clientWithPool",
+      );
+      report.selections[name].javascriptBytes =
+        bundle.outputFiles[0].contents.length;
+    }
+    assert.ok(bytes.length < report.artifactBytes.full);
+  }
+  // Compare the JS input. The initialized JS engine's Wasm memory snapshot
+  // does not grow monotonically with the amount of application source.
+  assert.ok(
+    report.selections.clientOnly.javascriptBytes <
+      report.selections.clientWithPool.javascriptBytes,
+    "The same Client application must be smaller without Pool",
+  );
   const cp = resolve(
     process.env.HIBANA_TEST_CP_BIN || "target/debug/hibana-control-plane",
   );
@@ -200,7 +283,7 @@ async function launch(command, args, pattern) {
 
 async function checkWasm(config, ca) {
   const wasmtime = process.env.WASMTIME_BIN || "wasmtime";
-  const url = await launch(
+  let url = await launch(
     wasmtime,
     [
       "serve",
@@ -222,18 +305,27 @@ async function checkWasm(config, ca) {
     DB_PASSWORD: config.password,
     DB_CA: ca,
   };
+  report.requests = [];
   async function call(path = "/", overrides = {}, status = 200) {
-    const response = await fetch(url + path, {
-      headers: {
-        "x-hibana-env": Buffer.from(
-          JSON.stringify({ ...env, ...overrides }),
-        ).toString("base64url"),
-      },
-      signal: AbortSignal.timeout(35000),
-    });
-    const text = await response.text();
-    assert.equal(response.status, status, `${path}: ${text}\n${runtimeLog}`);
-    return JSON.parse(text);
+    const started = performance.now();
+    const sample = { path, status: null, durationMs: null };
+    report.requests.push(sample);
+    try {
+      const response = await fetch(url + path, {
+        headers: {
+          "x-hibana-env": Buffer.from(
+            JSON.stringify({ ...env, ...overrides }),
+          ).toString("base64url"),
+        },
+        signal: AbortSignal.timeout(35000),
+      });
+      sample.status = response.status;
+      const text = await response.text();
+      assert.equal(response.status, status, `${path}: ${text}\n${runtimeLog}`);
+      return JSON.parse(text);
+    } finally {
+      sample.durationMs = Math.round(performance.now() - started);
+    }
   }
   for (const tls of ["off", "trusted"]) {
     const result = await call("/", { DB_TLS: tls });
@@ -253,9 +345,68 @@ async function checkWasm(config, ca) {
   assert.deepEqual(await call("/sql-error"), { code: "42P01", answer: 42 });
   assert.deepEqual(await call("/pool"), [0, 1, 2, 3, 4, 5, 6, 7]);
   assert.deepEqual(await call("/password-provider"), { answer: 42 });
+  for (const tls of ["off", "trusted"])
+    for (const api of ["promise", "callback"])
+      assert.deepEqual(
+        await call(`/cancel-connect?api=${api}`, { DB_TLS: tls }),
+        {
+          code: "ERR_PG_CONNECTION_CANCELLED",
+          notifications: 1,
+          closed: true,
+        },
+      );
+  report.connectionCancellation =
+    "passed (Client.end settles pending Promise/callback connect once over TCP/TLS; repeated end and late password completion are safe)";
+  console.log(
+    "PASS Wasm pg: end cancels pending authentication over TCP/TLS for Promise and callback APIs",
+  );
+  for (const tls of ["off", "trusted"])
+    for (const api of ["promise", "callback"])
+      for (const sqlError of [false, true])
+        assert.deepEqual(
+          await call(`/pipeline-end?api=${api}&error=${sqlError}`, {
+            DB_TLS: tls,
+          }),
+          {
+            results: [
+              sqlError ? { code: "22012" } : { value: 1 },
+              { value: 42 },
+            ],
+            notifications: [1, 1],
+            endNotifications: 1,
+            closed: true,
+          },
+        );
+  report.pipelineShutdown =
+    "passed (in-flight parameterized queries and SQL error recovery drain before end over TCP/TLS, Promise/callback APIs, query timeout disabled)";
+  console.log(
+    "PASS Wasm pg: pipeline end drains queries and SQL errors over TCP/TLS without a query timeout",
+  );
+  assert.deepEqual(await call("/invalid-ports"), { client: 21, pool: 21 });
+  for (const owner of ["client", "pool"])
+    for (const api of ["promise", "callback"])
+      for (const method of ["connect", "setNoDelay"])
+        assert.deepEqual(
+          await call(
+            `/connect-error?owner=${owner}&api=${api}&method=${method}`,
+          ),
+          {
+            code: "ERR_FIXTURE_CONNECT",
+            notifications: 1,
+            closed: true,
+            remaining: 0,
+          },
+        );
+  report.connectionStartFailure =
+    "passed (invalid Client/Pool ports rejected before transport creation; synchronous transport errors settle Promise/callback connect and end, with sockets released)";
+  console.log(
+    "PASS Wasm pg: invalid ports rejected; synchronous transport errors close Client/Pool without hanging",
+  );
   assert.deepEqual(await call("/options"), [
     "password",
     "channelBinding",
+    "channelBindingWithoutTls",
+    "channelBindingOption",
     "verification",
     "clientCertificate",
     "filesystem",
@@ -266,6 +417,103 @@ async function checkWasm(config, ca) {
   ]);
   console.log(
     "PASS Wasm pg: callback, rowMode, prepared statements, SQL error recovery and pooled concurrency",
+  );
+  for (const mode of ["require", "prefer", "disable"]) {
+    assert.deepEqual(
+      await call("/channel-binding", {
+        DB_TLS: "trusted",
+        DB_CHANNEL_BINDING: mode,
+      }),
+      {
+        answer: 42,
+        channelBinding: mode !== "disable",
+      },
+    );
+  }
+  assert.deepEqual(await call("/channel-binding-url", { DB_TLS: "trusted" }), {
+    channelBinding: true,
+  });
+  assert.deepEqual(
+    await call("/channel-binding", {
+      DB_TLS: "off",
+      DB_CHANNEL_BINDING: "prefer",
+    }),
+    { answer: 42, channelBinding: false },
+  );
+  assert.match(
+    (
+      await call(
+        "/channel-binding",
+        { DB_TLS: "off", DB_CHANNEL_BINDING: "require" },
+        500,
+      )
+    ).error,
+    /needs TLS/,
+  );
+  const mismatch = await call(
+    "/channel-binding",
+    {
+      DB_TLS: "trusted",
+      DB_CHANNEL_BINDING: "require",
+      DB_TAMPER_CERT: "true",
+    },
+    500,
+  );
+  assert.match(mismatch.error, /channel binding|authentication/i);
+  const authFixture = await authenticationFixture({
+    cert: ca,
+    key: await readFile(join(folder, "server.key")),
+  });
+  try {
+    for (const mode of ["scram", "cleartext", "md5", "trust"]) {
+      authFixture.mode = mode;
+      const rejected = await call(
+        "/channel-binding",
+        {
+          DB_TLS: "trusted",
+          DB_CHANNEL_BINDING: "require",
+          DB_PORT: String(authFixture.port),
+        },
+        500,
+      );
+      assert.equal(rejected.code, "ERR_PG_CHANNEL_BINDING", mode);
+    }
+    for (const mode of [
+      "early-cleartext",
+      "early-md5",
+      "duplicate-md5",
+      "early-scram-continuation",
+      "early-scram-final",
+    ]) {
+      authFixture.mode = mode;
+      const rejected = await call(
+        "/channel-binding",
+        {
+          DB_TLS: "trusted",
+          DB_CHANNEL_BINDING: "prefer",
+          DB_PORT: String(authFixture.port),
+        },
+        500,
+      );
+      assert.equal(rejected.code, "ERR_PG_AUTH_UNAVAILABLE", mode);
+    }
+    assert.equal(
+      authFixture.credentialOrQueryMessages,
+      0,
+      "No password, proof or query may follow a rejected authentication method",
+    );
+  } finally {
+    await authFixture.close();
+  }
+  report.channelBinding =
+    "passed (SCRAM-SHA-256-PLUS, URL policy, required/preferred/disabled, tampered certificate and authentication downgrade refusal)";
+  report.authenticationOrder =
+    "passed (early success, duplicate password challenge, premature SCRAM continuation/final rejected before sending credentials or queries)";
+  console.log(
+    "PASS Wasm authentication rejects out-of-order messages without sending credentials or queries",
+  );
+  console.log(
+    "PASS Wasm channel binding: verified certificate, server proof, URL require policy; plaintext, mismatched binding, unbound SCRAM, password/MD5 and trust downgrade refused",
   );
   for (const tls of ["off", "trusted"])
     assert.deepEqual(await call("/orm", { DB_TLS: tls }), {
@@ -302,6 +550,166 @@ async function checkWasm(config, ca) {
     "PASS Wasm pg: wrong password, invalid certificates, verification bypass and timeout rejected; repeated connections released",
   );
   await stopRuntime();
+  url = await launch(
+    wasmtime,
+    [
+      "serve",
+      "--addr",
+      "127.0.0.1:0",
+      "-S",
+      "cli=y,inherit-network=y,allow-ip-name-lookup=y,tcp=y,udp=n",
+      "-W",
+      "timeout=30s",
+      tcpArtifact,
+    ],
+    /Serving HTTP on (http:\/\/127\.0\.0\.1:\d+)/,
+  );
+  const plain = await call("/", { DB_TLS: "off" });
+  assert.equal(plain.answer, 42);
+  assert.equal(plain.ssl, false);
+  assert.deepEqual(await call("/pool"), [0, 1, 2, 3, 4, 5, 6, 7]);
+  assert.deepEqual(await call("/orm"), {
+    result: { id: 1, label: "更新 🔥" },
+    remaining: [],
+  });
+  assert.equal(
+    (await call("/", { DB_TLS: "trusted" }, 500)).code,
+    "ERR_PG_TLS_UNAVAILABLE",
+  );
+  assert.equal(
+    (await call("/tls-required-url", {}, 500)).code,
+    "ERR_PG_TLS_UNAVAILABLE",
+  );
+  report.tcpOnly =
+    "passed (separate artifact, SCRAM, queries, pool, Drizzle; TLS options and sslmode=require rejected before connecting)";
+  console.log(
+    "PASS PostgreSQL TCP-only artifact: queries/Pool/Drizzle work; TLS options and required-TLS URLs fail closed",
+  );
+  await stopRuntime();
+  for (const [name, selected] of Object.entries(selectedArtifacts)) {
+    url = await launch(
+      wasmtime,
+      [
+        "serve",
+        "--addr",
+        "127.0.0.1:0",
+        "-S",
+        "cli=y,inherit-network=y,allow-ip-name-lookup=y,tcp=y,udp=n",
+        "-W",
+        "timeout=30s",
+        selected,
+      ],
+      /Serving HTTP on (http:\/\/127\.0\.0\.1:\d+)/,
+    );
+    if (name.startsWith("client")) {
+      for (const secure of [false, true])
+        assert.deepEqual(
+          await call("/", { DB_TLS: secure ? "trusted" : "off" }),
+          {
+            answer: 42,
+            greeting: "こんにちは 🔥",
+            hasPool: name === "clientWithPool",
+            channelBinding: secure,
+          },
+        );
+    } else if (name === "scram") {
+      assert.deepEqual(
+        await call("/channel-binding", {
+          DB_TLS: "trusted",
+          DB_CHANNEL_BINDING: "require",
+        }),
+        { answer: 42, channelBinding: true },
+      );
+      assert.deepEqual(
+        await call("/pool", { DB_TLS: "trusted" }),
+        [0, 1, 2, 3, 4, 5, 6, 7],
+      );
+      assert.deepEqual(await call("/orm", { DB_TLS: "trusted" }), {
+        result: { id: 1, label: "更新 🔥" },
+        remaining: [],
+      });
+      const peer = await authenticationFixture({
+        cert: ca,
+        key: await readFile(join(folder, "server.key")),
+      });
+      try {
+        for (const mode of ["cleartext", "md5", "trust"]) {
+          peer.mode = mode;
+          assert.equal(
+            (
+              await call(
+                "/channel-binding",
+                {
+                  DB_TLS: "trusted",
+                  DB_CHANNEL_BINDING: "disable",
+                  DB_PORT: String(peer.port),
+                },
+                500,
+              )
+            ).code,
+            "ERR_PG_AUTH_UNAVAILABLE",
+          );
+        }
+        assert.equal(
+          peer.credentialOrQueryMessages,
+          0,
+          "Unselected authentication must not send credentials or queries",
+        );
+      } finally {
+        await peer.close();
+      }
+    } else if (name === "md5") {
+      assert.equal(
+        (await call("/", { DB_USER: "probe_md5", DB_TLS: "off" })).answer,
+        42,
+      );
+      assert.deepEqual(
+        await call("/pool", { DB_USER: "probe_md5", DB_TLS: "off" }),
+        [0, 1, 2, 3, 4, 5, 6, 7],
+      );
+      assert.equal(
+        (await call("/", { DB_TLS: "off" }, 500)).code,
+        "ERR_PG_AUTH_UNAVAILABLE",
+      );
+      assert.equal(
+        (await call("/", { DB_TLS: "trusted" }, 500)).code,
+        "ERR_PG_TLS_UNAVAILABLE",
+      );
+    } else {
+      assert.equal(
+        (
+          await call(
+            "/channel-binding",
+            { DB_TLS: "trusted", DB_CHANNEL_BINDING: "require" },
+            500,
+          )
+        ).code,
+        "ERR_PG_CERTIFICATE_DIGEST_UNAVAILABLE",
+      );
+      assert.equal(
+        (
+          await call(
+            "/channel-binding",
+            { DB_TLS: "trusted", DB_CHANNEL_BINDING: "prefer" },
+            500,
+          )
+        ).code,
+        "ERR_PG_CERTIFICATE_DIGEST_UNAVAILABLE",
+      );
+      assert.deepEqual(
+        await call("/channel-binding", {
+          DB_TLS: "trusted",
+          DB_CHANNEL_BINDING: "disable",
+        }),
+        { answer: 42, channelBinding: false },
+      );
+    }
+    report.selections[name].verification = "passed";
+    console.log(
+      `PASS selected PostgreSQL ${name}: actual Wasm connection and omitted-feature refusal`,
+    );
+    await stopRuntime();
+  }
   const settings = join(folder, "settings.json");
   await writeFile(
     settings,
@@ -381,8 +789,10 @@ async function checkDatabase() {
       "POSTGRES_DB=probe",
       "POSTGRES_USER=probe",
       `POSTGRES_PASSWORD=${password}`,
-      "POSTGRES_HOST_AUTH_METHOD=scram-sha-256",
-      "POSTGRES_INITDB_ARGS=--auth-host=scram-sha-256",
+      // PostgreSQL still negotiates SCRAM for SCRAM-stored passwords under md5
+      // HBA; the dedicated legacy role below stores an MD5 verifier instead.
+      "POSTGRES_HOST_AUTH_METHOD=md5",
+      "POSTGRES_INITDB_ARGS=--auth-host=md5",
       "",
     ].join("\n"),
     { mode: 0o600 },
@@ -439,6 +849,29 @@ async function checkDatabase() {
       await sleep(500);
     }
   }
+  // initdb's md5 HBA can create the initial owner with an MD5 verifier too.
+  // Explicitly provision SCRAM for the main role; only probe_md5 is legacy.
+  await runCommand(
+    "docker",
+    [
+      "exec",
+      "-i",
+      container,
+      "psql",
+      "-U",
+      "probe",
+      "-d",
+      "probe",
+      "-v",
+      "ON_ERROR_STOP=1",
+    ],
+    {
+      input: Buffer.from(
+        `SET password_encryption='scram-sha-256'; ALTER ROLE probe PASSWORD '${password.replaceAll("'", "''")}';\n`,
+      ),
+      timeoutMs: 30000,
+    },
+  );
   const ca = await readFile(join(folder, "server.crt"), "utf8");
   report.nativeNodeControl = [];
   for (const encrypted of [false, true]) {
@@ -452,10 +885,19 @@ async function checkDatabase() {
     });
     try {
       await client.connect();
-      if (!encrypted)
+      if (!encrypted) {
         await client.query(
           await readFile(join(fixture, "migrations/0001_probe.sql"), "utf8"),
         );
+        const verifier =
+          "md5" +
+          createHash("md5")
+            .update(password + "probe_md5")
+            .digest("hex");
+        await client.query(
+          `CREATE ROLE probe_md5 LOGIN PASSWORD '${verifier}'`,
+        );
+      }
       assert.equal(scram, true, "PostgreSQL must request SCRAM authentication");
       const result = await client.query(
         "SELECT $1::integer AS answer, $2::text AS greeting",
@@ -487,6 +929,22 @@ async function checkDatabase() {
       await client.end();
     }
   }
+  const legacy = new pg.Client({ ...config, user: "probe_md5" });
+  let md5Requested = false;
+  legacy.connection.on("authenticationMD5Password", () => {
+    md5Requested = true;
+  });
+  try {
+    await legacy.connect();
+    assert.equal(md5Requested, true);
+    assert.equal(
+      (await legacy.query("SELECT 42 AS answer")).rows[0].answer,
+      42,
+    );
+    report.nativeMd5Control = "passed";
+  } finally {
+    await legacy.end();
+  }
   const invalid = new pg.Client({
     ...config,
     password: randomBytes(24).toString("hex"),
@@ -507,6 +965,7 @@ try {
   await checkDatabase();
 } catch (error) {
   console.error(runtimeLog);
+  console.error("Failed request:", report.requests?.at(-1));
   throw error;
 } finally {
   try {

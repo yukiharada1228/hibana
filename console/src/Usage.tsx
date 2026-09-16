@@ -41,15 +41,15 @@ export function Usage({
     return () => {
       current = false;
     };
-  }, [api, range]);
+  }, [api, range, components]);
   return (
     <>
       <div className="page-title">
         <div>
-          <p className="eyebrow">USAGE</p>
           <h1>利用状況</h1>
           <p className="muted">
-            テナント全体とアプリごとの実行量を確認します。集計は UTC 日付です。
+            ランタイムの実行量です。HTTP 応答の成否とは異なります。集計は UTC
+            日付です。
           </p>
         </div>
       </div>
@@ -134,9 +134,11 @@ export function Usage({
                     {data.by_component.map((row) => (
                       <TableRow key={row.component_id}>
                         <TableCell>
-                          {components.find(
-                            (c) => c.component_id === row.component_id,
-                          )?.name || row.component_id}
+                          <a href={`#apps/${row.component_id}`}>
+                            {components.find(
+                              (c) => c.component_id === row.component_id,
+                            )?.name || row.component_id}
+                          </a>
                         </TableCell>
                         <TableCell>{number(row.invocation_count)}</TableCell>
                         <TableCell>{number(row.succeeded_count)}</TableCell>

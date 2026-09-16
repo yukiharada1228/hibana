@@ -5,7 +5,7 @@ import { Login } from "./Login";
 import { Applications, Application } from "./Applications";
 import { Usage } from "./Usage";
 import { Deploy } from "./Deploy";
-import { Brand, Icon, Notice } from "./components/common";
+import { Brand, Icon, Notice, date } from "./components/common";
 import { Button } from "./components/ui/button";
 
 type Connection = {
@@ -62,6 +62,7 @@ function Console({
     [error, setError] = useState("");
   const [loading, setLoading] = useState(false),
     [leaving, setLeaving] = useState(false);
+  const [updatedAt, setUpdatedAt] = useState<string>();
   const revision = useRef(0);
   const reload = useCallback(async () => {
     const current = ++revision.current;
@@ -69,7 +70,10 @@ function Console({
     setError("");
     try {
       const result = await api.components();
-      if (current === revision.current) setComponents(result);
+      if (current === revision.current) {
+        setComponents(result);
+        setUpdatedAt(new Date().toISOString());
+      }
     } catch (error) {
       if (current === revision.current) setError(errorMessage(error));
     } finally {
@@ -116,29 +120,33 @@ function Console({
           <Brand />
         </a>
         <div className="header-account">
-          <span className="connection-dot" />
-          <span>{session.tenant_name}</span>
+          <details className="account-menu">
+            <summary>{email}</summary>
+            <div>
+              <strong>{session.tenant_name}</strong>
+              <p>
+                権限：
+                {session.scopes
+                  .filter((s) => ["read", "deploy", "admin"].includes(s))
+                  .map(
+                    (s) => ({ read: "閲覧", deploy: "配備", admin: "管理" })[s],
+                  )
+                  .join("・")}
+              </p>
+            </div>
+          </details>
           <Button variant="text" size="sm" disabled={leaving} onClick={logout}>
             ログアウト
           </Button>
         </div>
       </header>
       <aside className="sidebar">
-        <div className="workspace">
-          <span className="workspace-avatar">
-            {session.tenant_name.slice(0, 1).toUpperCase()}
-          </span>
-          <div>
-            <small>WORKSPACE</small>
-            <strong>{session.tenant_slug}</strong>
-          </div>
-        </div>
         <nav aria-label="メインナビゲーション">
           {(
             [
               { id: "apps", label: "アプリケーション", icon: "apps" },
               { id: "usage", label: "利用状況", icon: "usage" },
-              { id: "deploy", label: "デプロイ", icon: "deploy" },
+              { id: "deploy", label: "CLI の接続", icon: "deploy" },
             ] as const
           ).map((item) => (
             <a
@@ -154,15 +162,17 @@ function Console({
           ))}
         </nav>
         <div className="sidebar-bottom">
-          <span className="connection-dot" />
-          <span>イントラネット接続</span>
+          <span>接続先</span>
           <small>{location.host}</small>
         </div>
       </aside>
       <main id="main" className="main">
         <div className="context-bar">
           <span>
-            {session.tenant_slug} <span className="muted">/ コンソール</span>
+            {session.tenant_slug}
+            {updatedAt && (
+              <span className="muted"> · 一覧取得 {date(updatedAt)}</span>
+            )}
           </span>
           <Button variant="text" size="sm" onClick={reload} disabled={loading}>
             <Icon name="refresh" />
@@ -189,10 +199,10 @@ function Console({
             このアプリは見つかりません。<a href="#apps">一覧へ戻る</a>
           </Notice>
         ) : (
-          <Applications components={components} session={session} />
+          <Applications components={components} />
         )}
         <footer>
-          Hibana · WebAssembly application platform
+          Hibana
           <a href="/licenses/NOTICE">ライセンス</a>
         </footer>
       </main>

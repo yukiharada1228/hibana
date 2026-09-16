@@ -49,7 +49,7 @@ data:
   S3_ENDPOINT: https://CHANGE_ME
   S3_REGION: us-east-1
   S3_BUCKET: CHANGE_ME
-  INGRESS_BASE_DOMAIN: CHANGE_ME
+  APP_PUBLIC_ORIGIN: https://CHANGE_ME
 `,
     "egress.yaml": `# Use the address ranges and ports of your external dependencies.
 apiVersion: networking.k8s.io/v1

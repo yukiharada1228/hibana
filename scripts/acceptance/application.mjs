@@ -22,7 +22,7 @@ const cli=(args,token=state.deployToken,input) => runCommand(process.execPath,[s
   cwd:folder,env:{...process.env,HIBANA_URL:state.url,HIBANA_TOKEN:token},input,timeoutMs:180000,
 });
 const request=(path, token=state.apiToken, extra={}, signal) => new Promise((done,fail)=>{
-  const req=http.request(new URL(path,state.gateway),{signal,headers:{Host:'inventory-api.smoke.hibana.local',...(token ? {Authorization:`Bearer ${token}`} : {}),...extra}},res=>{
+  const req=http.request(new URL(path,state.gateway),{signal,headers:{Host:'inventory-api.smoke.localhost',...(token ? {Authorization:`Bearer ${token}`} : {}),...extra}},res=>{
     let data='';
     res.on('data',b=>{data+=b;if(data.length>32768) req.destroy(new Error('Oversized API response'));});
     res.on('error',fail);
@@ -114,7 +114,7 @@ if (process.argv[2] === '--verify-restored') {
   const user=await api(`/tenants/${state.tenant}/users`,{method:'POST',body:{email:'developer@example.invalid',password:randomBytes(32).toString('hex'),role:'member'}});
   state.deployToken=(await api('/tokens',{method:'POST',body:{user_id:user.user_id,scopes:['read','deploy'],ttl_secs:seconds+3600}})).token;
   // All builds and credentials belong to this run; the checked-in example is untouched.
-  const source=join(root,'sdk/examples/inventory-api/src/index.ts');
+  const source=join(root,'sdk/test/fixtures/inventory-api.ts');
   const vars={UPSTREAM_URL:state.upstream,RELEASE:'v1'};
   const config={name:'inventory-api',main:source,vars,secrets:[],limits:{memory_mb:256,timeout_ms:10000}};
   await savePrivate('hibana.json',config);

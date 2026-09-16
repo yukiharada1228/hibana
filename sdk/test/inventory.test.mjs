@@ -2,9 +2,9 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { build } from 'esbuild';
 
-// Run the real example in-process for boundary cases. Kubernetes acceptance separately
+// Run the shared acceptance fixture in-process for boundary cases. Kubernetes acceptance separately
 // exercises its compiled Wasm through the CLI and a real HTTP upstream.
-const bundled = await build({entryPoints:[new URL('../examples/inventory-api/src/index.ts',import.meta.url).pathname], bundle:true, platform:'node', format:'esm', write:false});
+const bundled = await build({entryPoints:[new URL('./fixtures/inventory-api.ts',import.meta.url).pathname], bundle:true, platform:'node', format:'esm', write:false});
 const {default:app} = await import('data:text/javascript;base64,'+Buffer.from(bundled.outputFiles[0].contents).toString('base64'));
 const env = {API_TOKEN:'example-client-token',UPSTREAM_TOKEN:'example-upstream-token',UPSTREAM_URL:'https://inventory.example.com',RELEASE:'v1'};
 test('inventory API authenticates before fetching, validates input and exposes only its contract', async () => {

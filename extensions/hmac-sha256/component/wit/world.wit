@@ -1,0 +1,5 @@
+package hibana:hmac-sha256@0.5.0;
+interface api {
+  sign: func(key: list<u8>, data: list<u8>) -> result<list<u8>, string>;
+}
+world primitive { export api; }

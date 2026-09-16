@@ -18,10 +18,7 @@ const options = {
   "no-install": boolean(
     "Create project files without installing npm dependencies",
   ),
-  "cli-package": string(
-    "PATH",
-    "Use a local CLI package when creating a project",
-  ),
+  "cli-package": string("PATH", "Pin a local CLI package in the new project"),
   port: string("PORT", "Local HTTP port (default: 8787)"),
   "no-watch": boolean("Run once without watching for file changes"),
   runtime: string("PATH", "Use a specific local runtime executable"),
@@ -29,10 +26,6 @@ const options = {
   url: string("URL", "Hibana management API URL"),
   tenant: string("TEAM", "Tenant name"),
   email: string("EMAIL", "Account email"),
-  "ingress-domain": string(
-    "DOMAIN",
-    "Application domain, for example apps.example.com",
-  ),
   "password-stdin": boolean("Read the login password from standard input"),
   version: string("VERSION", "Version to use"),
   all: boolean("Select all applications in the current tenant"),
@@ -82,7 +75,7 @@ const commands = {
       max: 1,
       examples: ["hibana init my-api", "hibana init my-api --template rust"],
       notes:
-        "Creates a Hono application by default and installs its npm dependencies.\nUse an empty directory; omit the directory to create files in the current one.",
+        "Creates a Hono application by default and installs its npm dependencies.\nProject scripts use the installed hibana CLI.\nUse an empty directory; omit the directory to create files in the current one.",
     },
   ),
   dev: leaf(
@@ -103,7 +96,7 @@ const commands = {
   deploy: leaf(
     "Build and deploy your application",
     "hibana deploy",
-    [...projectRemote, "version", "tenant", "ingress-domain"],
+    [...projectRemote, "version"],
     {
       examples: [
         "hibana deploy",
@@ -150,11 +143,11 @@ const commands = {
   login: leaf(
     "Sign in and save a connection profile",
     "hibana login",
-    [...remote, "tenant", "email", "ingress-domain", "password-stdin"],
+    [...remote, "tenant", "email", "password-stdin"],
     {
       examples: [
-        "hibana login --profile onprem --url https://api.example.com --tenant team --email dev@example.com",
-        "hibana login --profile onprem --url https://api.example.com --tenant team --email dev@example.com --password-stdin < password.txt",
+        "hibana login --url https://api.example.com --tenant team --email dev@example.com",
+        "hibana login --url https://api.example.com --tenant team --email dev@example.com --password-stdin < password.txt",
       ],
       notes:
         "Reuses saved connection details when signing in again.\nPrompts for a hidden password in an interactive terminal.\nFor scripts, use --password-stdin < password.txt or HIBANA_PASSWORD.\nHIBANA_TENANT and HIBANA_EMAIL can also supply account details.",

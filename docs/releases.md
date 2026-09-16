@@ -19,7 +19,7 @@ npm run dev
 # Ctrl+Cで停止
 ```
 
-CLIの導入にリポジトリ、Rust、Docker、kubectlは不要です。`init`が作るプロジェクトも、同じバージョンのGitHub Release URLを参照します。`dev`はランタイムが見つからなければ、CLIと同じバージョンのOS・CPUに合うファイルをHTTPSで取得し、Releaseの`SHA256SUMS`と照合してから保存します。次回以降は保存済みのランタイムを再利用します。`hibana runtime install`で事前に取得することもできます。
+CLIの導入にリポジトリ、Rust、Docker、kubectlは不要です。`init`が作るプロジェクトは、PCに導入済みのCLIを使用します。プロジェクト作成時にCLIのRelease URLを参照しません。`dev`はランタイムが見つからなければ、CLIと同じバージョンのOS・CPUに合うファイルをHTTPSで取得し、Releaseの`SHA256SUMS`と照合してから保存します。次回以降は保存済みのランタイムを再利用します。`hibana runtime install`で事前に取得することもできます。
 
 管理APIへのログインと配備は[リモートCLI手順](remote-cli.md)を参照してください。リモート配備だけを行うPCにはローカルランタイムは不要です。
 

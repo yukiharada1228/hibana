@@ -47,7 +47,7 @@ HTTP受付時にexecutionへバージョンIDを固定し、Workerはその版�
 
 このソースはSeaORMの新しい初期スキーマを使用します。旧SQLマイグレーションを適用したDBへの上書き更新には対応しません。空の検証DBへ初期マイグレーションを適用し、CP・Worker・CLIを同じソースから用意して確認します。既存DBはそのまま保持し、切替は別の保守作業として行います。[基盤DBの手順](database.md)を参照してください。
 
-varsとSecret参照の変更には新しいバージョンを配備します。旧`PUT /config`・`DELETE /config/{key}`・版ごとのenv承認PUTは409を返します。
+varsとSecret参照の変更には新しいバージョンを配備します。設定APIは参照専用です。旧`PUT /config`・`DELETE /config/{key}`・版ごとのenv承認PUTは削除しました。既存クライアントでこれらを呼んでいた場合は、`hibana.json`を更新して`hibana deploy`を実行する方式へ変更してください。
 
 ## 検証
 

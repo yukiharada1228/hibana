@@ -1,0 +1,36 @@
+[workspace]
+resolver = "2"
+members = [
+    "tcp/component",
+    "dns/component",
+    "tls/component",
+    "random/component",
+    "sha224/component",
+    "sha256/component",
+    "sha384/component",
+    "sha512/component",
+    "sha512-224/component",
+    "sha512-256/component",
+    "md5/component",
+    "hmac-sha256/component",
+    "pbkdf2-sha256/component",
+    "unicode-nfkc/component",
+]
+
+[workspace.package]
+version = "0.5.0"
+edition = "2021"
+license = "MIT"
+
+[workspace.dependencies]
+wit-bindgen = "=0.36.0"
+wasi = "=0.13.3"
+sha2 = "=0.10.9"
+hmac = "=0.12.1"
+md-5 = "=0.10.6"
+pbkdf2 = { version = "=0.12.2", default-features = false, features = ["hmac"] }
+
+[profile.release]
+opt-level = "s"
+lto = true
+strip = true

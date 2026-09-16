@@ -41,7 +41,7 @@ fn state(pool: DatabaseConnection, store: Arc<dyn crate::store::Store>) -> AppSt
         Arc::new(cfg.secret_keyring().unwrap()),
         cfg.job_env_exchange_rate_per_min,
         false,
-        None,
+        cfg.public_apps.clone(),
     )
 }
 
@@ -594,7 +594,193 @@ async fn http_mvp_regression() {
         .await
         .unwrap();
     tx.commit().await.unwrap();
+    console_information_regression(&state).await;
     println!("PASS admin deletion: authentication / RLS / active execution guard / suspended tenant inventory / name reuse / retained history");
+}
+
+async fn console_information_regression(state: &AppState) {
+    use crate::handlers::{
+        configuration::get_function_config,
+        executions::{list_executions, ExecutionsQuery},
+    };
+    use axum::extract::{Path, Query};
+    use hibana_database::prelude::*;
+    let principal = |tenant: &str| crate::auth::Principal {
+        tenant_id: tenant.into(),
+        user_id: None,
+        token_id: "test".into(),
+        scopes: vec![hibana_shared::Scope::Read, hibana_shared::Scope::Deploy],
+        role: hibana_shared::Role::Admin,
+    };
+    let tx = state.pool().begin().await.unwrap();
+    db::set_tenant_guc(&tx, "http").await.unwrap();
+    db::create_component(&tx, "http", "console", "console")
+        .await
+        .unwrap();
+    db::insert_version(
+        &tx,
+        "http",
+        "console",
+        "console-v1",
+        "1.0.0",
+        "console.wasm",
+        "abcd",
+        4,
+        &json!({}),
+        &json!(hibana_shared::ResourceLimits::default()),
+        "active",
+    )
+    .await
+    .unwrap();
+    db::switch_active_version(&tx, "http", "console", "console-v1")
+        .await
+        .unwrap();
+    let now = chrono::Utc::now();
+    for i in 0..27 {
+        executions::Entity::insert(executions::ActiveModel {
+            id: Set(format!("console-{i:02}")),
+            tenant_id: Set("http".into()),
+            component_id: Set("console".into()),
+            version_id: Set("console-v1".into()),
+            status: Set(if i == 25 { "succeeded" } else { "failed" }.into()),
+            created_at: Set(if i == 26 {
+                now - chrono::Duration::hours(25)
+            } else {
+                now
+            }),
+            finished_at: Set(Some(now)),
+            error: Set(Some(json!({"code":"fixture_error"}))),
+            input: Set(Some(json!("private-input"))),
+            output: Set(Some(json!("private-output"))),
+            ..Default::default()
+        })
+        .exec(&tx)
+        .await
+        .unwrap();
+    }
+    db::insert_secret_meta(&tx, "http", "console-old", "console", "TOKEN", 1)
+        .await
+        .unwrap();
+    version_secret_bindings::Entity::insert(version_secret_bindings::ActiveModel {
+        tenant_id: Set("http".into()),
+        component_id: Set("console".into()),
+        version_id: Set("console-v1".into()),
+        secret_id: Set("console-old".into()),
+        name: Set("TOKEN".into()),
+    })
+    .exec(&tx)
+    .await
+    .unwrap();
+    function_secrets::Entity::update_many()
+        .col_expr(function_secrets::Column::DeletedAt, Expr::val(now))
+        .filter(function_secrets::Column::Id.eq("console-old"))
+        .exec(&tx)
+        .await
+        .unwrap();
+    db::insert_secret_meta(&tx, "http", "console-new", "console", "TOKEN", 1)
+        .await
+        .unwrap();
+    tx.commit().await.unwrap();
+
+    async fn body(response: impl IntoResponse) -> serde_json::Value {
+        let response = response.into_response();
+        let bytes = axum::body::to_bytes(response.into_body(), 64 * 1024)
+            .await
+            .unwrap();
+        serde_json::from_slice(&bytes).unwrap()
+    }
+    let page = body(
+        list_executions(
+            State(state.clone()),
+            principal("http"),
+            Path("console".into()),
+            Query(ExecutionsQuery {
+                errors_only: true,
+                before: None,
+            }),
+        )
+        .await
+        .unwrap(),
+    )
+    .await;
+    assert_eq!(page["items"].as_array().unwrap().len(), 20);
+    assert!(page["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .all(|e| e["status"] == "failed"
+            && e.get("input").is_none()
+            && e.get("output").is_none()
+            && e.get("input_ref").is_none()));
+    let next = body(
+        list_executions(
+            State(state.clone()),
+            principal("http"),
+            Path("console".into()),
+            Query(ExecutionsQuery {
+                errors_only: true,
+                before: Some(page["next_cursor"].as_str().unwrap().into()),
+            }),
+        )
+        .await
+        .unwrap(),
+    )
+    .await;
+    assert_eq!(next["items"].as_array().unwrap().len(), 5, "ties paginate without duplicate or missing rows, and old/successful executions are excluded");
+    assert_eq!(next["next_cursor"], serde_json::Value::Null);
+    assert!(next["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .all(|e| !page["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|p| p["execution_id"] == e["execution_id"])));
+    let denied = list_executions(
+        State(state.clone()),
+        principal("other"),
+        Path("console".into()),
+        Query(ExecutionsQuery::default()),
+    )
+    .await
+    .err()
+    .unwrap()
+    .into_response();
+    assert_eq!(denied.status(), StatusCode::NOT_FOUND);
+    let malformed = list_executions(
+        State(state.clone()),
+        principal("http"),
+        Path("console".into()),
+        Query(ExecutionsQuery {
+            before: Some("invalid".into()),
+            ..Default::default()
+        }),
+    )
+    .await
+    .err()
+    .unwrap()
+    .into_response();
+    assert_eq!(malformed.status(), StatusCode::BAD_REQUEST);
+    let settings = body(
+        get_function_config(
+            State(state.clone()),
+            principal("http"),
+            Path("console".into()),
+        )
+        .await
+        .unwrap(),
+    )
+    .await;
+    assert_eq!(settings["version_id"], "console-v1");
+    assert_eq!(
+        settings["secrets"],
+        json!([{"name":"TOKEN", "available":false}]),
+        "recreating a Secret name does not restore an old binding"
+    );
+    assert!(settings["resource_limits"]["max_memory_bytes"].is_number());
+    assert_eq!(settings["net_allow_outbound"], json!([]));
+    println!("PASS console execution pagination, 24h window, RLS, body exclusion and immutable Secret references");
 }
 
 async fn secret_resolution_regression(state: &AppState) {

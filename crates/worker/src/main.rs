@@ -10,6 +10,7 @@ mod direct_http;
 mod env;
 mod lifecycle;
 mod metrics;
+mod network;
 mod repository;
 mod runtime;
 mod service;

@@ -5,14 +5,19 @@
 ## 利用できる操作
 
 - テナントのアカウントでログイン・ログアウト。
-- アプリ一覧、名前での絞り込み、配信 URL の確認。
-- バージョン一覧、確認ダイアログを経由した切り戻し。
-- 現在のバージョンの環境変数を参照。変更は CLI で新しいバージョンを配備する。
+- アプリ一覧、名前での絞り込み、現在のバージョン、公開 URL の表示・コピー。
+- 直近24時間の実行履歴・エラーを20件ずつ表示。入力・出力本文は取得しない。
+- バージョン一覧、確認ダイアログを経由した切り戻し・不要なバージョンの削除（削除は管理権限が必要）。
+- 現在のバージョンの環境変数、Secret の参照名・参照先の有無、メモリ・時間上限、承認済み外部通信先を参照。変更は CLI で新しいバージョンを配備する（外部通信の許可は管理者操作）。
 - UTC 日付の期間を指定した利用量集計。
 - 管理権限を持つアカウントによるアプリ削除。
 - 接続中の基盤に合わせた CLI の接続・配備コマンドを表示。
 
-アプリ一覧は画面の「更新」、ブラウザに戻った時、表示中の30秒間隔で再取得します。CLI と画面は同じ API とテナントの状態を使います。コンソールは基盤管理用の kubeconfig、DB・Redis・S3 の資格情報を保持しません。
+アプリ一覧と表示中の利用状況・詳細は画面の「更新」、ブラウザに戻った時、表示中の30秒間隔で再取得します。CLI と画面は同じ API とテナントの状態を使います。コンソールは基盤管理用の kubeconfig、DB・Redis・S3 の資格情報を保持しません。
+
+自動採番されたバージョンは「自動 d26b94ca」のような短い識別子と登録日時で表示します。`--version 1.0.0`などで指定した番号はそのまま表示します。完全な番号は履歴の「バージョンの詳細」と切り戻しの確認画面で確認できます。登録日時はその版を最初に配備した日時で、切り戻しても変わりません。保存するバージョン番号や CLI の指定形式は変わりません。
+
+管理者はバージョン履歴の各行から不要な版を削除できます。確認画面には完全なバージョン番号と、削除後はその版へ切り戻せなくなることを表示します。現在の版、直前の版（切り戻し先）、実行中・実行待ちの処理が参照する版は削除できず、理由を表示します。切り戻した直後の旧版も切り戻し先として保護されます。削除は論理削除で、現在の版の公開と過去の実行履歴は維持されます。一覧取得後に保護状態が変わった場合も API が削除を拒否し、画面を再取得します。
 
 ## Kubernetes への導入
 
@@ -33,7 +38,9 @@ docker build -t registry.example.internal/hibana/console:0.2.0-rc.1 console
 docker push registry.example.internal/hibana/console:0.2.0-rc.1
 ```
 
-アプリ配信 URL は既定で `https://<app>.<tenant>.<INGRESS_BASE_DOMAIN>/` です。標準以外のポートを使う場合、ビルド時の `--build-arg VITE_APP_ORIGIN=https://apps.example.internal:8443` で配信元を指定します。ホスト名は基盤の `INGRESS_BASE_DOMAIN` と一致させます。ローカル検証では `INGRESS_BASE_DOMAIN=localhost` と `--build-arg VITE_APP_ORIGIN=http://localhost:28084` を組み合わせると、コンソールから `http://<app>.<tenant>.localhost:28084/` を開けます。HTTP を許可するのはこの localhost 構成だけです。値は静的ファイルに埋め込まれるため、変更時はイメージを再ビルドします。
+アプリの公開先は基盤の `APP_PUBLIC_ORIGIN` に一度だけ設定します。例は `https://apps.example.internal`、標準以外のポートなら `https://apps.example.internal:8443` です。基盤が `<app>.<tenant>` を付けた完全な公開 URL を返し、CLI とコンソールは同じ値を表示します。開発時は `http://localhost:28084` のように指定できます（HTTP は localhost のみ）。コンソールのイメージは接続先ごとに再ビルドする必要がありません。
+
+既存サイトの `INGRESS_BASE_DOMAIN` は HTTPS・標準ポートとして読み取る互換設定を残しています。新しい設定には `APP_PUBLIC_ORIGIN` を使用してください。両方ある場合は `APP_PUBLIC_ORIGIN` が優先されます。CLI の `--ingress-domain` は廃止し、`--profile` は複数の接続先を保存する場合だけ使用します。
 
 `hibana platform install --image ...` で指定するのは Control Plane・Worker のイメージです。コンソールのイメージはサイトの `console/kustomization.yaml` で別に管理します。リリースワークフローは Linux amd64 / arm64 のコンソールイメージを tar として出力し、既存のリリース用チェックサムに含めます。コンソールを除外したいサイトは `resources` の `console` を省略できます。
 
@@ -46,12 +53,11 @@ CLI 管理 API    https://hibana.example.internal/api
 ```
 
 ```sh
-hibana login --profile intranet \
+hibana login \
   --url https://hibana.example.internal/api \
-  --tenant team --email developer@example.internal \
-  --ingress-domain apps.example.internal
+  --tenant team --email developer@example.internal
 # Password: と表示されたらパスワードを入力して Enter（入力文字は非表示）
-hibana deploy --profile intranet --version 1.0.0
+hibana deploy
 ```
 
 この入力方式には最新の候補版 CLI が必要です。スクリプトや以前の CLI では、ログインコマンドの末尾に `--password-stdin < /secure/login-password.txt` を追加し、パスワードだけを保存したファイルを指定します。`--password-stdin` だけを付けても対話入力にはなりません。
@@ -70,7 +76,7 @@ CLI とブラウザはそれぞれ既存の `/auth/login` でトークンを発�
 
 「ログアウト」は `/auth/logout` で現在のトークンを失効させます。別の PC・CLI のトークンは失効しません。タブを閉じるだけではサーバー側の失効は行わず、そのトークンは期限まで残ります。パスワード・トークンを URL や画面のコマンドに埋め込みません。
 
-ブラウザからの API は同じオリジンへの Bearer 認証です。権限は画面と API の双方で確認し、Read のみのアカウントには切り戻し・環境変数・削除の操作を表示しません。認証失効時は画面上のテナントデータを破棄してログイン画面へ戻ります。イントラネットでも HTTPS が必要です。開発時の loopback HTTP のみ許可します。社内 CA はブラウザの信頼ストアと CLI の `NODE_EXTRA_CA_CERTS` に設定してください。
+ブラウザからの API は同じオリジンへの Bearer 認証です。権限は画面と API の双方で確認し、Read のみのアカウントには切り戻し・設定・削除の操作を表示しません。認証失効時は画面上のテナントデータを破棄してログイン画面へ戻ります。イントラネットでも HTTPS が必要です。開発時の loopback HTTP のみ許可します。社内 CA はブラウザの信頼ストアと CLI の `NODE_EXTRA_CA_CERTS` に設定してください。
 
 ## 検証
 
@@ -92,3 +98,9 @@ HIBANA_TEST_CONSOLE_IMAGE=hibana-console:verification bash scripts/test-http.sh
 ```
 
 この試験は専用の一時 PostgreSQL・Redis・コンソールコンテナと空 DB を使用します。Control Plane と Wasmtime Worker はテストが起動し、S3 API は既存試験と同じテスト用オブジェクトサーバーです。CLI終了後のアプリ応答、ブラウザの切り戻し後の応答変更、CLIによる反映確認、ログアウト後の配信継続まで検証し、`.local/verification/console/` に画面と結果を保存します。物理的な別PC・実際のイントラネット DNS/TLS・Kubernetes への導入確認は、導入先で行います。
+
+## 表示する状態
+
+「公開設定済み」は、配備されたバージョンと HTTP 公開設定が存在し、公開 URL を取得できる状態です。疎通や正常稼働を保証する表示ではありません。公開 URL を構成できない場合は「公開 URL 未設定」と表示します。実行結果は実行履歴で確認します。HTTP 4xx/5xx の集計や console.log の保管・表示は行いません。
+
+バージョンの登録日時は初回の配備日時です。切り戻し時刻ではありません。設定画面では現在のバージョンが参照する Secret の識別子まで照合するため、削除後に同名の Secret が作られても元の参照が復旧したとは表示しません。

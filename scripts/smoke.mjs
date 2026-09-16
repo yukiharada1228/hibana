@@ -1,6 +1,6 @@
 // Run against a disposable tenant. Exercises the actual CLI and deployed Wasmtime runtime.
 import assert from "node:assert/strict";
-import { readFile, writeFile, rm, mkdtemp } from "node:fs/promises";
+import { writeFile, mkdtemp } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { rmSync } from "node:fs";
 import { execFileSync } from "node:child_process";
@@ -8,32 +8,36 @@ import http from "node:http";
 import https from "node:https";
 import { Readable } from "node:stream";
 import { resolve } from "node:path";
-import { apiClient } from "../sdk/src/api.mjs";
+import { apiClient, findComponent } from "../sdk/src/api.mjs";
 const cliHome = await mkdtemp(resolve(tmpdir(), "hibana-smoke-cli-"));
 process.env.HIBANA_CONFIG_HOME = cliHome;
 process.env.HIBANA_PROFILE = "";
 process.once("exit", () => rmSync(cliHome, { recursive: true, force: true }));
 const root = resolve(import.meta.dirname, "..");
-const project = resolve(root, "sdk/examples/hono");
+const project = cliHome;
 const cli = resolve(root, "sdk/src/cli.mjs");
 function hibana(args, input) {
   execFileSync(process.execPath, [cli, ...args], { cwd: project, env: process.env, input, stdio: [input === undefined ? "ignore" : "pipe", "inherit", "inherit"], timeout: 180000 });
 }
+// Keep the fixture configuration and build output inside this disposable project.
+const configFile = resolve(project, "hibana.json");
+const config = {
+  name: "hello-hono",
+  main: resolve(root, "sdk/test/fixtures/hono-http.ts"),
+  vars: { GREETING: "Hello from Hono on Hibana 🔥" },
+  limits: { memory_mb: 256, timeout_ms: 15000 },
+};
+await writeFile(configFile, JSON.stringify({ ...config, secrets: [] }));
 hibana(["login"]);
-// Use temporary config files: first publish has no bindings, the next explicitly selects TEST_SECRET.
-const configFile = resolve(project, `.smoke-${process.pid}.json`);
-const config = JSON.parse(await readFile(resolve(project, "hibana.json"), "utf8"));
-config.main = resolve(project, config.main);
-try {
-  await writeFile(configFile, JSON.stringify({ ...config, secrets: [] }));
-  hibana(["deploy", "-c", configFile]);
-  hibana(["secret", "put", "TEST_SECRET"], "hibana-test-secret");
-  hibana(["secret", "allow-deploy", "TEST_SECRET"]);
-  await writeFile(configFile, JSON.stringify({ ...config, secrets: ["TEST_SECRET"] }));
-  hibana(["deploy", "-c", configFile]);
-} finally { await rm(configFile, { force: true }); }
+hibana(["deploy"]);
+hibana(["secret", "put", "TEST_SECRET"], "hibana-test-secret");
+hibana(["secret", "allow-deploy", "TEST_SECRET"]);
+await writeFile(configFile, JSON.stringify({ ...config, secrets: ["TEST_SECRET"] }));
+hibana(["deploy"]);
 const gateway = process.env.GATEWAY || "http://127.0.0.1:8083";
-const host = `hello-hono.${process.env.HIBANA_TENANT}.${process.env.HIBANA_INGRESS_DOMAIN || "hibana.local"}`;
+const publicUrl = (await findComponent(await apiClient(), "hello-hono")).public_url;
+assert.ok(publicUrl, "platform returns the public application URL");
+const host = new URL(publicUrl).host;
 async function app(path, options = {}) {
   // Node's built-in fetch may replace Host; use an explicit HTTP request for virtual hosting.
   const response = await new Promise((done, fail) => {

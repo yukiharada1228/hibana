@@ -43,27 +43,10 @@ export function Login({
   }
   return (
     <main className="login">
-      <div className="login-intro">
-        <Brand />
-        <div>
-          <p className="eyebrow">YOUR CODE. YOUR INFRASTRUCTURE.</p>
-          <h1>
-            小さなコードから、
-            <br />
-            動き続けるサービスへ。
-          </h1>
-          <p>
-            アプリの配備と運用を、ひとつの場所で。
-            <br />
-            Hibana 基盤に接続して、管理をはじめましょう。
-          </p>
-        </div>
-        <span className="login-foot">WebAssembly application platform</span>
-      </div>
       <div className="login-main">
         <form onSubmit={submit} className="login-form">
-          <p className="eyebrow">HIBANA CONSOLE</p>
-          <h2>コンソールにログイン</h2>
+          <Brand />
+          <h1>コンソールにログイン</h1>
           <p className="muted">
             管理者から受け取ったアカウントを入力してください。
           </p>
@@ -107,7 +90,7 @@ export function Login({
           </p>
         </form>
         <a className="license-link" href="/licenses/NOTICE">
-          デザインについて
+          ライセンス
         </a>
       </div>
     </main>

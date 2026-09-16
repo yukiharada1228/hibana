@@ -26,17 +26,8 @@ pub(crate) fn build_internal_router(state: AppState) -> Router {
         .with_state(state)
 }
 
-/// ルータを組み立てる。
-///
-/// レイヤリング:
-/// - スコープ要件はルート群ごとに `route_layer(require_scope(..))` で被せる
-///   （GET=>Read / POST /invoke=>Invoke / component・version 作成=>Deploy /
-///   全 DELETE・active-version 切替・user/token/tenant 管理=>Admin）。
-/// - `authenticate` は /healthz・/auth/login・POST /admin/tenants を**除く**
-///   全ルートに適用し、`Principal` を確立する。
-///
-/// メソッド単位でスコープが異なる（例 /components の POST=Deploy, GET=Read）ため、
-/// スコープ別の小ルータに分割して各々へ route_layer を被せてから merge する。
+/// Group management routes by scope, then authenticate the merged router.
+/// Public probes/login and bootstrap-token administration are registered separately.
 pub(crate) fn build_router(state: AppState) -> Router {
     // --- Read スコープ（一覧・取得） ---
     let read_routes = Router::new()
@@ -46,8 +37,11 @@ pub(crate) fn build_router(state: AppState) -> Router {
             get(handlers::components::list_versions),
         )
         .route("/executions/{id}", get(handlers::executions::get_execution))
-        // GET /components/{id}/versions/{version}/capabilities: 現在の承認 env 名 / egress 先を返す
-        // （M11-9。値は返さない。CLI が全置換 PUT 前にマージするための読み取り）。
+        .route(
+            "/components/{component_id}/executions",
+            get(handlers::executions::list_executions),
+        )
+        // Return environment names and approved destinations, never values.
         .route(
             "/components/{component_id}/versions/{version}/capabilities",
             get(handlers::capabilities::get_capabilities),
@@ -81,21 +75,10 @@ pub(crate) fn build_router(state: AppState) -> Router {
             "/components/{component_id}/ingress",
             put(handlers::components::set_component_ingress),
         )
-        // --- M7b: per-function 環境変数（平文 config, §15 / §4.4）---
-        // 読み書きとも Deploy。GET を Read に置かないのは、config が平文で secret と同じ env
-        // 名前空間に混ざるため（資格情報を誤って config へ入れた瞬間、最も広く配られる read
-        // スコープが資格情報の読み取り権限になる）。
+        // Plaintext vars require Deploy scope. Changes go through version upload.
         .route(
             "/components/{component_id}/config",
             get(handlers::configuration::get_function_config),
-        )
-        .route(
-            "/components/{component_id}/config",
-            put(handlers::configuration::put_function_config),
-        )
-        .route(
-            "/components/{component_id}/config/{key}",
-            delete(handlers::configuration::delete_function_config),
         )
         .route(
             "/components/{component_id}/rollback",
@@ -129,11 +112,6 @@ pub(crate) fn build_router(state: AppState) -> Router {
         .route(
             "/tokens/{token_id}",
             delete(handlers::identity::revoke_token),
-        )
-        // Legacy env mutation returns 409: bindings belong to immutable versions.
-        .route(
-            "/components/{component_id}/versions/{version}/capabilities",
-            put(handlers::capabilities::approve_capability_env),
         )
         // --- M9c: capability の egress allowlist 承認 (§4.4 / §15 M9) ---
         // PUT /components/{id}/versions/{version}/capabilities/egress:

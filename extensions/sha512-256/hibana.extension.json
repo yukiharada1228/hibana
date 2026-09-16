@@ -1,0 +1,11 @@
+{
+  "schemaVersion": 2,
+  "runtime": "wasi:http/incoming-handler@0.2.3",
+  "imports": [
+    "hibana:sha512t256/api@0.5.0"
+  ],
+  "wit": "./wit",
+  "components": [
+    "./dist/sha512-256.wasm"
+  ]
+}

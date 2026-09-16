@@ -3,16 +3,102 @@ use crate::auth::Principal;
 use crate::db;
 use crate::error::AppError;
 use crate::state::AppState;
-use axum::extract::{Path, State};
+use axum::extract::{Path, Query, State};
 use axum::response::IntoResponse;
 use axum::Json;
+use hibana_database::prelude::*;
 use hibana_shared::FaasError;
-use sea_orm::TransactionTrait as _;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-// ---------------------------------------------------------------------------
-// ---------------------------------------------------------------------------
+#[derive(Debug, Default, Deserialize)]
+pub struct ExecutionsQuery {
+    #[serde(default)]
+    pub errors_only: bool,
+    pub before: Option<String>,
+}
+
+/// A bounded operational view. Request/response bodies and storage references are excluded.
+#[derive(Debug, Serialize, FromQueryResult)]
+pub struct ExecutionSummary {
+    pub execution_id: String,
+    pub version_id: String,
+    pub status: String,
+    pub error: Option<Value>,
+    pub created_at: chrono::DateTime<chrono::Utc>,
+    pub wall_time_ms: Option<i64>,
+}
+
+pub async fn list_executions(
+    State(state): State<AppState>,
+    principal: Principal,
+    Path(component_id): Path<String>,
+    Query(query): Query<ExecutionsQuery>,
+) -> Result<impl IntoResponse, AppError> {
+    let tenant = &principal.tenant_id;
+    let tx = state.pool().begin().await?;
+    db::set_tenant_guc(&tx, tenant).await?;
+    db::find_component_by_id(&tx, tenant, &component_id)
+        .await?
+        .ok_or_else(|| FaasError::NotFound("component".into()))?;
+    let mut select = executions::Entity::find()
+        .select_only()
+        .column_as(executions::Column::Id, "execution_id")
+        .columns([
+            executions::Column::VersionId,
+            executions::Column::Status,
+            executions::Column::Error,
+            executions::Column::CreatedAt,
+            executions::Column::WallTimeMs,
+        ])
+        .filter(executions::Column::TenantId.eq(tenant))
+        .filter(executions::Column::ComponentId.eq(&component_id))
+        .filter(
+            executions::Column::CreatedAt.gte(chrono::Utc::now() - chrono::Duration::hours(24)),
+        );
+    if query.errors_only {
+        select = select.filter(executions::Column::Status.is_in(["failed", "timeout"]));
+    }
+    if let Some(cursor) = query.before {
+        let invalid = || FaasError::InvalidRequest("invalid execution cursor".into());
+        let (created, id) = cursor.split_once(',').ok_or_else(invalid)?;
+        let created = chrono::DateTime::parse_from_rfc3339(created)
+            .map_err(|_| invalid())?
+            .with_timezone(&chrono::Utc);
+        if id.is_empty() || id.len() > 128 {
+            return Err(invalid().into());
+        }
+        select = select.filter(
+            Condition::any()
+                .add(executions::Column::CreatedAt.lt(created))
+                .add(
+                    Condition::all()
+                        .add(executions::Column::CreatedAt.eq(created))
+                        .add(executions::Column::Id.lt(id)),
+                ),
+        );
+    }
+    let mut items = select
+        .order_by_desc(executions::Column::CreatedAt)
+        .order_by_desc(executions::Column::Id)
+        .limit(21)
+        .into_model::<ExecutionSummary>()
+        .all(&tx)
+        .await?;
+    tx.commit().await?;
+    let more = items.len() > 20;
+    items.truncate(20);
+    let next_cursor = if more {
+        items
+            .last()
+            .map(|e| format!("{},{}", e.created_at.to_rfc3339(), e.execution_id))
+    } else {
+        None
+    };
+    Ok(Json(
+        serde_json::json!({"items": items, "next_cursor": next_cursor}),
+    ))
+}
 
 #[derive(Debug, Serialize)]
 pub struct ExecutionResponse {

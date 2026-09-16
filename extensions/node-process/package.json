@@ -1,0 +1,20 @@
+{
+  "name": "@hibana/node-process",
+  "version": "0.5.0",
+  "private": true,
+  "type": "module",
+  "license": "MIT",
+  "exports": {
+    ".": "./src/index.mjs",
+    "./hibana.extension.json": "./hibana.extension.json"
+  },
+  "files": [
+    "hibana.extension.json",
+    "README.md",
+    "LICENSE",
+    "src/"
+  ],
+  "dependencies": {
+    "process": "0.11.10"
+  }
+}

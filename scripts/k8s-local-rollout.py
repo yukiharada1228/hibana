@@ -28,7 +28,7 @@ def workers():
 
 def get(path):
     request = urllib.request.Request(os.environ.get("GATEWAY", "http://127.0.0.1:18084") + path,
-                                     headers={"Host": "hello-hono.smoke.hibana.local"})
+                                     headers={"Host": "hello-hono.smoke.localhost"})
     with urllib.request.urlopen(request, timeout=50) as response:
         return response.read().decode()
 

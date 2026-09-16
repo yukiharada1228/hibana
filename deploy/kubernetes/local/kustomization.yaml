@@ -37,8 +37,8 @@ patches:
         path: /data/S3_ENDPOINT
         value: "http://hibana-minio:9000"
       - op: replace
-        path: /data/INGRESS_BASE_DOMAIN
-        value: "hibana.local"
+        path: /data/APP_PUBLIC_ORIGIN
+        value: "http://localhost:18084"
   - target:
       kind: Namespace
       name: hibana

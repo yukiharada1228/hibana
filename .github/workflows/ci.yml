@@ -230,17 +230,14 @@ jobs:
         working-directory: sdk
         run: npm test
 
-      - name: Test application-owned JS and Rust Wasm extensions
+      - name: Install the Wasm component composition tool
         run: |
           cargo install wac-cli --version 0.11.0 --locked --no-default-features --features wit
-          npm run build --prefix sdk/examples/hono-extensions/extension
-          npm ci --prefix sdk/examples/hono-extensions
-          HIBANA_TEST_CP_BIN=target/release/hibana-control-plane node scripts/test-application-extensions.mjs
 
       - name: Verify distributable CLI outside the checkout
         run: HIBANA_RUNTIME_BIN="$GITHUB_WORKSPACE/target/release/hibana-worker" npm run test:package --prefix sdk
 
-      - name: Test optional application-owned TCP and TLS package
+      - name: Build optional packages and test separate TCP / TLS
         # No Worker/CLI dependencies. Official tool archives are checksum-pinned.
         run: |
           curl --fail --location --retry 3 https://github.com/WebAssembly/wasi-sdk/releases/download/wasi-sdk-34/wasi-sdk-34.0-x86_64-linux.tar.gz -o "$RUNNER_TEMP/wasi-sdk.tar.gz"
@@ -249,21 +246,22 @@ jobs:
           curl --fail --location --retry 3 https://github.com/bytecodealliance/wasmtime/releases/download/v36.0.14/wasmtime-v36.0.14-x86_64-linux.tar.xz -o "$RUNNER_TEMP/wasmtime.tar.xz"
           printf '%s  %s\n' 74cf96775172c1a752a1cdabc7b10c5a83ce5149e47e9065b54f913c62f13a14 "$RUNNER_TEMP/wasmtime.tar.xz" | sha256sum --check
           tar -xJf "$RUNNER_TEMP/wasmtime.tar.xz" -C "$RUNNER_TEMP"
-          npm ci --ignore-scripts --prefix extensions/node-net
-          WASI_SDK_PATH="$RUNNER_TEMP/wasi-sdk-34.0-x86_64-linux" npm run build --prefix extensions/node-net
-          CC_wasm32_wasip2="$RUNNER_TEMP/wasi-sdk-34.0-x86_64-linux/bin/clang" AR_wasm32_wasip2="$RUNNER_TEMP/wasi-sdk-34.0-x86_64-linux/bin/llvm-ar" cargo clippy --locked --release --target wasm32-wasip2 --manifest-path extensions/node-net/component/Cargo.toml -- -D warnings
-          cargo fmt --manifest-path extensions/node-net/component/Cargo.toml -- --check
-          WASMTIME_BIN="$RUNNER_TEMP/wasmtime-v36.0.14-x86_64-linux/wasmtime" HIBANA_TEST_CP_BIN=target/release/hibana-control-plane node scripts/test-node-net-extension.mjs
+          npm ci --ignore-scripts --prefix extensions
+          WASI_SDK_PATH="$RUNNER_TEMP/wasi-sdk-34.0-x86_64-linux" npm run build --prefix extensions
+          CC_wasm32_wasip2="$RUNNER_TEMP/wasi-sdk-34.0-x86_64-linux/bin/clang" AR_wasm32_wasip2="$RUNNER_TEMP/wasi-sdk-34.0-x86_64-linux/bin/llvm-ar" cargo clippy --locked --release --target wasm32-wasip2 --workspace --manifest-path extensions/Cargo.toml -- -D warnings
+          cargo fmt --manifest-path extensions/Cargo.toml --all -- --check
+          cargo test --locked --workspace --lib --manifest-path extensions/Cargo.toml
+          WASMTIME_BIN="$RUNNER_TEMP/wasmtime-v36.0.14-x86_64-linux/wasmtime" node scripts/test-extension-boundaries.mjs
+          WASMTIME_BIN="$RUNNER_TEMP/wasmtime-v36.0.14-x86_64-linux/wasmtime" HIBANA_TEST_CP_BIN=target/release/hibana-control-plane node scripts/test-tcp-tls-extension.mjs
 
       - name: Test optional PostgreSQL adapter and Drizzle on Wasm
         run: |
-          npm ci --ignore-scripts --prefix extensions/postgres
           npm ci --ignore-scripts --prefix scripts/fixtures/postgres
-          npm run build --prefix extensions/postgres
-          cargo test --locked --lib --manifest-path extensions/postgres/component/Cargo.toml
-          cargo clippy --locked --release --target wasm32-wasip2 --manifest-path extensions/postgres/component/Cargo.toml -- -D warnings
-          cargo fmt --manifest-path extensions/postgres/component/Cargo.toml -- --check
+          node --test scripts/test-postgres-selection.mjs
           WASMTIME_BIN="$RUNNER_TEMP/wasmtime-v36.0.14-x86_64-linux/wasmtime" HIBANA_TEST_CP_BIN=target/release/hibana-control-plane node scripts/test-postgres-compatibility.mjs
+
+      - name: Test generic application-owned JS and Rust Wasm extensions
+        run: HIBANA_TEST_CP_BIN=target/release/hibana-control-plane node scripts/test-application-extensions.mjs
 
       - name: Bounded operational commands
         run: node --test scripts/test-bounded-process.test.mjs

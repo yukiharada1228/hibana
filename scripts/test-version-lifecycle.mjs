@@ -108,7 +108,37 @@ export async function testVersionLifecycle({api, sql, pg, token, wasm, upload, a
   }
   const live = await snapshot();
   const previous = (await sql(`SELECT version FROM component_versions WHERE id='${live.previous}'`)).trim();
+  const listedVersions = async () => {
+    const response = await api(`${base}/versions`, {token});
+    assert.equal(response.status, 200);
+    return response.json();
+  };
+  const protectedVersions = await listedVersions();
+  assert.equal(protectedVersions.find(v => v.version_id===live.active).deletion_blocked_reason,'active_version');
+  assert.equal(protectedVersions.find(v => v.version_id===live.previous).deletion_blocked_reason,'rollback_target');
+  assert.ok(protectedVersions.filter(v => ![live.active,live.previous].includes(v.version_id))
+    .every(v => v.deletion_blocked_reason===null));
   assert.equal((await api(`${base}/versions/${previous}`,{token,method:'DELETE'})).status,409,
     'the previous version remains protected as the rollback destination');
+
+  const idle = await upload(id,token,'inflight-list',wasm,0,{activate:false});
+  assert.equal(idle.status,201);
+  const idleId = idle.data.version_id;
+  await sql(`INSERT INTO executions (id,tenant_id,component_id,version_id,status,http_request)
+    SELECT 'version-list-execution',tenant_id,id,'${idleId}','pending',true FROM components WHERE id='${id}'`);
+  for (const status of ['pending','running','succeeded']) {
+    await sql(`UPDATE executions SET status='${status}' WHERE id='version-list-execution'`);
+    const listed = (await listedVersions()).find(v => v.version_id===idleId);
+    assert.equal(listed.deletion_blocked_reason,status==='succeeded' ? null : 'active_executions',
+      `${status}: the console protection matches the DELETE guard`);
+    assert.equal((await api(`${base}/versions/inflight-list`,{token,method:'DELETE'})).status,
+      status==='succeeded' ? 204 : 409);
+  }
+  assert.ok(!(await listedVersions()).some(v => v.version_id===idleId));
+  assert.equal((await sql("SELECT count(*) FROM executions WHERE id='version-list-execution'")).trim(),'1',
+    'deleting a version preserves execution history');
+  assert.deepEqual(await snapshot(),live,'deleting an unused version preserves publication');
+  assert.equal((await app('version-race')).status,200);
+  console.log('PASS version list explains active / rollback / pending / running protection; deletion preserves publication and execution history');
   assert.equal((await api(base,{token,method:'DELETE'})).status,204);
 }

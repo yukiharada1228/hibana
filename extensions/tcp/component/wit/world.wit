@@ -1,0 +1,18 @@
+package hibana:tcp@0.5.0;
+
+interface api {
+  record failure { code: string, message: string }
+  record state { connected: bool, write-closed: bool }
+  resource socket {
+    status: func() -> result<state, failure>;
+    read: func() -> result<option<list<u8>>, failure>;
+    write: func(data: list<u8>) -> result<u32, failure>;
+    end: func() -> result<_, failure>;
+    keep-alive: func(enabled: bool, idle-ms: u32) -> result<_, failure>;
+    close: func();
+  }
+  connect: func(host: string, port: u16) -> result<socket, failure>;
+  ip-version: func(address: string) -> u8;
+}
+
+world transport-component { export api; }

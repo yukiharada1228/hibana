@@ -17,7 +17,7 @@ use serde_json::{json, Value};
 pub struct GetCapabilitiesResponse {
     pub component_id: String,
     pub version: String,
-    /// 注入が承認された env 名（M7b/M9c）。
+    /// vars と許可済み Secret 参照から配備時に確定した環境変数名。
     pub env: Vec<String>,
     /// 承認された egress 先（host:port, M9c）。
     pub net_allow_outbound: Vec<String>,
@@ -25,8 +25,8 @@ pub struct GetCapabilitiesResponse {
 
 /// GET /components/{id}/versions/{version}/capabilities — 現在の承認内容を返す（Read）。
 ///
-/// **値は返さない**（env の名前と egress 先のみ）。CLI が「既存を保ったまま名前を足す」
-/// マージのために読む用途（承認 PUT は全置換なので、GET してマージしてから PUT する）。
+/// 値は返さず、環境変数名と外向き通信の許可先だけを返す。
+/// CLI は現在の許可先を読み、追加・削除後の一覧を egress API へ送る。
 pub async fn get_capabilities(
     State(state): State<AppState>,
     principal: Principal,
@@ -51,11 +51,6 @@ pub async fn get_capabilities(
         env: caps.env.into_iter().collect(),
         net_allow_outbound: caps.net_allow_outbound.into_iter().collect(),
     }))
-}
-
-/// Legacy env grants must not mutate the environment of an existing version.
-pub async fn approve_capability_env() -> Result<(), AppError> {
-    Err(FaasError::Conflict("environment bindings are versioned; authorize Secret deploy-access, then deploy a new version".into()).into())
 }
 
 #[derive(Debug, Deserialize)]

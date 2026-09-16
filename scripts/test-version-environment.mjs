@@ -19,8 +19,10 @@ export async function testVersionEnvironment(h) {
   await deploy(client, config, artifact, 'atomic-one');
   const expected = (message, secret=false, rotated=false) => ({status:200,body:{message,secret,rotated,unselected:false}});
   assert.deepEqual(await app('upload'),expected('one'));
-  assert.equal((await api(`${base}/config`, {token:limited,method:'PUT',body:{env:{GREETING:'mutated'}}})).status,409);
-  assert.equal((await api(`${base}/versions/atomic-one/capabilities`, {token,method:'PUT',body:{env:['RESTORE_TOKEN']}})).status,409);
+  // Only deployment can change vars/bindings; removed write APIs cannot mutate them.
+  assert.equal((await api(`${base}/config`, {token:limited,method:'PUT',body:{env:{GREETING:'mutated'}}})).status,405);
+  assert.equal((await api(`${base}/config/GREETING`, {token:limited,method:'DELETE'})).status,404);
+  assert.equal((await api(`${base}/versions/atomic-one/capabilities`, {token,method:'PUT',body:{env:['RESTORE_TOKEN']}})).status,405);
   assert.equal((await api(`${base}/secrets/RESTORE_TOKEN/deploy-access`, {token:limited,method:'PUT',body:{allowed:true}})).status,403);
   assert.equal((await api(`${base}/secrets/UNSELECTED`, {token,method:'PUT',body:{value:'never-injected'}})).status,201);
   assert.equal((await api(`${base}/secrets/UNSELECTED/deploy-access`, {token,method:'PUT',body:{allowed:true}})).status,200);

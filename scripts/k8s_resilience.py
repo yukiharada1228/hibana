@@ -395,7 +395,7 @@ class Operations:
     def fault(self, target, seconds, probe_host=None):
         from contextlib import ExitStack
         if probe_host is None:
-            raise ValueError('Supply --probe-host for a read-only deployed HTTP fixture (for example hello.smoke.hibana.local).')
+            raise ValueError('Supply --probe-host for a read-only deployed HTTP fixture (for example hello.smoke.localhost).')
         with ExitStack() as stack:
             endpoint = stack.enter_context(self.forward('control-plane', 8083))
             def probe():

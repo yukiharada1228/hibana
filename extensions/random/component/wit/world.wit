@@ -1,0 +1,5 @@
+package hibana:random@0.5.0;
+interface api {
+  bytes: func(length: u32) -> result<list<u8>, string>;
+}
+world primitive { export api; }

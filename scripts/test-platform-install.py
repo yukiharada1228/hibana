@@ -218,7 +218,7 @@ def main():
             content = content.replace("@hibana-postgres." + dependency_namespace + ".svc:", "@" + old_ip + ":")
             (site / filename).write_text(content)
         configmap = yaml.safe_load((site / "site.yaml").read_text())
-        configmap["data"].update(S3_ENDPOINT=f"http://hibana-minio.{dependency_namespace}.svc:9000", S3_BUCKET="hibana-components", INGRESS_BASE_DOMAIN="hibana.local")
+        configmap["data"].update(S3_ENDPOINT=f"http://hibana-minio.{dependency_namespace}.svc:9000", S3_BUCKET="hibana-components", APP_PUBLIC_ORIGIN="http://localhost:18084")
         write_yaml(site / "site.yaml", configmap)
         kustomization = yaml.safe_load((site / "kustomization.yaml").read_text())
         kustomization["resources"].remove("ingress.yaml")  # Exercise dependency verification without an Ingress.

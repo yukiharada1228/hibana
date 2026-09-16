@@ -1,0 +1,11 @@
+{
+  "schemaVersion": 2,
+  "runtime": "wasi:http/incoming-handler@0.2.3",
+  "imports": [
+    "hibana:hmac-sha256/api@0.5.0"
+  ],
+  "wit": "./wit",
+  "components": [
+    "./dist/hmac-sha256.wasm"
+  ]
+}

@@ -11,13 +11,12 @@ import {
 export function Icon({
   name,
 }: {
-  name: "apps" | "usage" | "deploy" | "arrow" | "refresh";
+  name: "apps" | "usage" | "deploy" | "refresh";
 }) {
   const paths = {
     apps: "M3 3h7v7H3z M14 3h7v7h-7z M3 14h7v7H3z M14 14h7v7h-7z",
     usage: "M4 20h16 M7 16V9 M12 16V4 M17 16v-5",
     deploy: "M12 16V3 M7 8l5-5 5 5 M4 15v6h16v-6",
-    arrow: "M7 17L17 7 M7 7h10v10",
     refresh:
       "M20 7v5h-5 M4 17v-5h5 M5 8a8 8 0 0 1 13-3l2 3 M4 16l2 3a8 8 0 0 0 13-3",
   };
@@ -95,6 +94,11 @@ export const date = (value: string) =>
     dateStyle: "medium",
     timeStyle: "short",
   }).format(new Date(value));
+// Keep user-supplied versions intact; shorten only the CLI's automatic format.
+export function versionLabel(version: string) {
+  const automatic = /^0\.0\.0-dev\.\d+\.([a-f0-9]{8})$/.exec(version);
+  return automatic ? `自動 ${automatic[1]}` : version;
+}
 export const number = (value: number) =>
   new Intl.NumberFormat("ja-JP").format(value);
 export const bytes = (value: number) =>
@@ -107,6 +111,7 @@ export function Confirm({
   children,
   busy,
   confirmLabel,
+  confirmDisabled = false,
   onCancel,
   onConfirm,
 }: {
@@ -114,6 +119,7 @@ export function Confirm({
   children: ReactNode;
   busy: boolean;
   confirmLabel: string;
+  confirmDisabled?: boolean;
   onCancel: () => void;
   onConfirm: () => void;
 }) {
@@ -145,7 +151,7 @@ export function Confirm({
           <Button variant="outline" disabled={busy} onClick={onCancel}>
             キャンセル
           </Button>
-          <Button disabled={busy} onClick={onConfirm}>
+          <Button disabled={busy || confirmDisabled} onClick={onConfirm}>
             {busy ? "処理中…" : confirmLabel}
           </Button>
         </DialogActions>

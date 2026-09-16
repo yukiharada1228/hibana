@@ -1,0 +1,5 @@
+package hibana:sha512t256@0.5.0;
+interface api {
+  digest: func(data: list<u8>) -> result<list<u8>, string>;
+}
+world primitive { export api; }

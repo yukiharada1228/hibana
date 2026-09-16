@@ -7,6 +7,7 @@ import { resolve, join } from "node:path";
 import net from "node:net";
 import http from "node:http";
 import https from "node:https";
+import { apiClient, findComponent } from "../sdk/src/api.mjs";
 import { run } from "../sdk/src/process.mjs";
 
 const root = resolve(import.meta.dirname, "..");
@@ -124,7 +125,9 @@ try {
     if (process.env.HIBANA_TEST_DEPLOY === "1") {
       if (!process.env.HIBANA_TOKEN) await hibana(["login"]);
       await hibana(["deploy"]);
-      const host = `${config.name}.${process.env.HIBANA_TENANT}.${process.env.HIBANA_INGRESS_DOMAIN || "hibana.local"}`;
+      const publicUrl = (await findComponent(await apiClient(), config.name)).public_url;
+      assert.ok(publicUrl, "platform returns the public application URL");
+      const host = new URL(publicUrl).host;
       await checkHttp(requester(process.env.GATEWAY || "http://127.0.0.1:8083", host), message);
       console.log(`PASS ${variant}: CLI deployment and distributed Wasmtime HTTP`);
     }

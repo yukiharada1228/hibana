@@ -218,7 +218,7 @@ class LocalCluster(KubernetesTarget):
         write_private(sdk, "".join(f"{key}={shlex.quote(value)}\n" for key, value in {
             "HIBANA_URL": "http://127.0.0.1:18080", "HIBANA_TENANT": "smoke",
             "HIBANA_EMAIL": "admin@example.com", "HIBANA_PASSWORD": login,
-            "HIBANA_INGRESS_DOMAIN": "hibana.local", "BOOTSTRAP_ADMIN_TOKEN": bootstrap,
+            "BOOTSTRAP_ADMIN_TOKEN": bootstrap,
         }.items()))
         return result
 
@@ -346,7 +346,7 @@ class LocalCluster(KubernetesTarget):
             self.kube("-n", "hibana", "rollout", "status", f"deployment/hibana-{component}", "--timeout=300s")
         self.resume_admission()
         wait_http("http://127.0.0.1:18080/readyz", 200)
-        wait_http("http://127.0.0.1:18084/", 404, {"Host": "startup-probe.smoke.hibana.local"})
+        wait_http("http://127.0.0.1:18084/", 404, {"Host": "startup-probe.smoke.localhost"})
         self.bootstrap()
         print(f"Ready. API: http://127.0.0.1:18080 | Apps: http://127.0.0.1:18084\nCredentials: {self.state / 'sdk.env'}\nStop: hibana platform stop --source {shlex.quote(str(ROOT))} --cluster {self.name}")
 

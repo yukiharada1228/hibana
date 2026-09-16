@@ -1,0 +1,21 @@
+{
+  "name": "@hibana/postgres-transport-tls",
+  "version": "0.7.3",
+  "private": true,
+  "type": "module",
+  "license": "MIT",
+  "exports": {
+    ".": "./src/index.mjs",
+    "./hibana.extension.json": "./hibana.extension.json"
+  },
+  "files": [
+    "hibana.extension.json",
+    "README.md",
+    "LICENSE",
+    "src/"
+  ],
+  "dependencies": {
+    "@hibana/postgres-transport-tcp": "0.7.3",
+    "@hibana/node-tls": "0.6.3"
+  }
+}

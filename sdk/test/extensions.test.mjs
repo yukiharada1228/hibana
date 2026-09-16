@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtemp, writeFile, readFile, readdir, mkdir, rm, symlink, access } from 'node:fs/promises';
+import { mkdtemp, writeFile, readFile, readdir, mkdir, rm, symlink, access, realpath } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { build, build as bundle } from 'esbuild';
@@ -62,13 +62,13 @@ test('failed JavaScript compilation removes staging and preserves the published 
 });
 
 async function fixture(t) {
-  const root = await mkdtemp(join(tmpdir(), 'hibana-extension-package-'));
+  const root = await realpath(await mkdtemp(join(tmpdir(), 'hibana-extension-package-')));
   t.after(() => rm(root, { recursive: true, force: true }));
   const config = { root, main: 'index.mjs', extensions: ['@example/compat'] };
-  async function install(extra = {}, name = '@example/compat') {
-    const folder = join(root, 'node_modules', name);
+  async function install(extra = {}, name = '@example/compat', packageFields = {}, parent = root) {
+    const folder = join(parent, 'node_modules', name);
     await mkdir(folder, { recursive: true });
-    await writeFile(join(folder, 'package.json'), JSON.stringify({ name, version: '1.0.0', exports: { '.': './throw.mjs', './hibana.extension.json': './hibana.extension.json' } }));
+    await writeFile(join(folder, 'package.json'), JSON.stringify({ name, version: '1.0.0', exports: { '.': './throw.mjs', './hibana.extension.json': './hibana.extension.json' }, ...packageFields }));
     await writeFile(join(folder, 'throw.mjs'), 'throw new Error("Extension host entry point must never execute");');
     await writeFile(join(folder, 'value.mjs'), 'export const value = "from packaged extension";');
     await writeFile(join(folder, 'hibana.extension.json'), JSON.stringify({ schemaVersion: 1, runtime: HTTP_CONTRACT, aliases: { 'node:example': './value.mjs' }, ...extra }));
@@ -76,6 +76,68 @@ async function fixture(t) {
   }
   return { root, config, install };
 }
+
+test('declared extension dependencies initialize first, deduplicate and propagate requirements without running package code', async t => {
+  const f = await fixture(t);
+  const transport = await f.install({ aliases: { net: './value.mjs' }, preload: ['./value.mjs'], permissions: ['outbound-network'] }, '@example/transport');
+  const database = await f.install({ schemaVersion: 2, dependencies: ['@example/transport'], aliases: { pg: './value.mjs' }, preload: ['./value.mjs'] }, '@example/compat', { dependencies: { '@example/transport': '1.0.0', 'ordinary-js-dependency': '1.0.0' } });
+  const config = { ...f.config, extensions: ['@example/compat', '@example/transport'] };
+  const before = JSON.stringify(config);
+  const plan = await resolveExtensions(config);
+  assert.deepEqual(plan.preload, [join(transport, 'value.mjs'), join(database, 'value.mjs')]);
+  assert.deepEqual(Object.keys(plan.aliases), ['net', 'pg']);
+  assert.deepEqual(plan.permissions, ['outbound-network']);
+  assert.equal(JSON.stringify(config), before);
+  assert.equal(plan.net_allow_outbound, undefined);
+  await assert.rejects(resolveExtensions(f.config, { mode: 'dev' }), /dev does not currently allow/);
+});
+
+test('diamond dependencies are included once in deterministic dependency order', async t => {
+  const f = await fixture(t);
+  const common = await f.install({ aliases: {}, preload: ['./value.mjs'] }, '@example/common');
+  const parents = [];
+  for (const name of ['@example/compat', '@example/other']) {
+    parents.push(await f.install({ schemaVersion: 2, dependencies: ['@example/common'], aliases: {}, preload: ['./value.mjs'] }, name, { dependencies: { '@example/common': '1.0.0' } }));
+  }
+  const plan = await resolveExtensions({ ...f.config, extensions: ['@example/compat', '@example/other'] });
+  assert.deepEqual(plan.preload, [common, ...parents].map(folder => join(folder, 'value.mjs')));
+});
+
+test('dependencies resolve from their owning package; incompatible installations are rejected', async t => {
+  const f = await fixture(t);
+  const parent = await f.install({ schemaVersion: 2, dependencies: ['@example/transport'], aliases: {} }, '@example/compat', { dependencies: { '@example/transport': '1.0.0' } });
+  const nested = await f.install({ aliases: { net: './value.mjs' } }, '@example/transport', {}, parent);
+  await f.install({ aliases: { net: './value.mjs' } }, '@example/transport', { version: '2.0.0' });
+  assert.equal((await resolveExtensions(f.config)).aliases.net, join(nested, 'value.mjs'));
+  await assert.rejects(resolveExtensions({ ...f.config, extensions: ['@example/compat', '@example/transport'] }), /Multiple installations/);
+});
+
+test('extension dependency declarations reject cycles, undeclared packages and non-package references', async t => {
+  const f = await fixture(t);
+  const graph = { schemaVersion: 2, aliases: {}, dependencies: ['@example/other'] };
+  await f.install(graph);
+  await assert.rejects(resolveExtensions(f.config), /Declare @example\/other in package.json/);
+  await f.install(graph, '@example/compat', { dependencies: { '@example/other': '1.0.0' } });
+  await assert.rejects(resolveExtensions(f.config), /Cannot resolve/);
+  await f.install({ ...graph, dependencies: ['@example/compat'] }, '@example/other', { dependencies: { '@example/compat': '1.0.0' } });
+  await assert.rejects(resolveExtensions(f.config), /dependency cycle: @example\/compat -> @example\/other -> @example\/compat/);
+  for (const dependencies of [['./local'], ['https://example.com'], ['x@1.0.0'], ['x', 'x'], [null], 'x']) {
+    await f.install({ ...graph, dependencies });
+    await assert.rejects(resolveExtensions(f.config), /dependencies must list/);
+  }
+  await f.install({ dependencies: [] });
+  await assert.rejects(resolveExtensions(f.config), /require schemaVersion 2/);
+});
+
+test('the extension limit includes indirect dependencies', async t => {
+  const f = await fixture(t);
+  for (let i = 0; i < 65; i++) {
+    const name = i === 0 ? '@example/compat' : `@example/chain-${i}`;
+    const next = `@example/chain-${i + 1}`;
+    await f.install({ schemaVersion: 2, aliases: {}, dependencies: i < 64 ? [next] : [] }, name, { dependencies: { [next]: '1.0.0' } });
+  }
+  await assert.rejects(resolveExtensions(f.config), /At most 64 extensions/);
+});
 
 test('installed packages provide aliases without executing host entry points or mutating config', async t => {
   const f = await fixture(t);
@@ -96,7 +158,7 @@ test('unsupported contracts, permissions and incomplete package inputs fail befo
   await mkdir(destination, { recursive: true });
   await writeFile(join(destination, 'app.wasm'), 'previous artifact');
   for (const [extra, pattern] of [
-    [{ schemaVersion: 2 }, /schemaVersion/],
+    [{ schemaVersion: 3 }, /schemaVersion/],
     [{ runtime: 'wasi:http/incoming-handler@0.3.0' }, /runtime contract/],
     [{ permissions: ['filesystem'] }, /Unsupported permissions/],
     [{ permissions: ['outbound-network', 'outbound-network'] }, /Unsupported permissions/],

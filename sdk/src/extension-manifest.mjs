@@ -1,6 +1,6 @@
 // Public configuration is a list of extensions; author details live in a manifest.
 export const HTTP_CONTRACT = "wasi:http/incoming-handler@0.2.3";
-const API_VERSION = 1;
+const API_VERSIONS = [1, 2];
 const MAX_ITEMS = 64;
 const PACKAGE_NAME = /^(?:@[a-z0-9][a-z0-9._-]*\/)?[a-z0-9][a-z0-9._-]*$/;
 const INTERFACE_NAME =
@@ -14,6 +14,7 @@ const FIELDS = new Set([
   "imports",
   "wit",
   "permissions",
+  "dependencies",
 ]);
 const isObject = (value) =>
   value !== null && typeof value === "object" && !Array.isArray(value);
@@ -29,6 +30,12 @@ export function isLocalExtension(value) {
   return typeof value === "string" && value.startsWith("./");
 }
 
+export function isExtensionPackage(value) {
+  return (
+    typeof value === "string" && value.length <= 214 && PACKAGE_NAME.test(value)
+  );
+}
+
 export function validateExtensionList(value = []) {
   if (!Array.isArray(value)) {
     throw new Error(
@@ -38,7 +45,7 @@ export function validateExtensionList(value = []) {
   const validReference = (name) =>
     isLocalExtension(name)
       ? !name.includes("\\") && !name.split("/").includes("..")
-      : PACKAGE_NAME.test(name) && name.length <= 214;
+      : isExtensionPackage(name);
   if (!isList(value) || !value.every(validReference)) {
     throw new Error(
       "extensions must list unique installed npm package names or project-relative directories starting with ./ (at most 64)",
@@ -51,10 +58,12 @@ export function validateManifest(manifest, { javascript }) {
   for (const key of Object.keys(manifest)) {
     if (!FIELDS.has(key)) throw new Error(`Unsupported manifest field: ${key}`);
   }
-  if (manifest.schemaVersion !== API_VERSION)
+  if (!API_VERSIONS.includes(manifest.schemaVersion))
     throw new Error(
-      `Unsupported schemaVersion; this CLI supports ${API_VERSION}`,
+      `Unsupported schemaVersion; this CLI supports ${API_VERSIONS.join(" and ")}`,
     );
+  if (manifest.dependencies !== undefined && manifest.schemaVersion !== 2)
+    throw new Error("Extension dependencies require schemaVersion 2");
   if (manifest.runtime !== HTTP_CONTRACT)
     throw new Error(
       `Incompatible runtime contract; this CLI supports ${HTTP_CONTRACT}`,
@@ -66,8 +75,13 @@ export function validateManifest(manifest, { javascript }) {
     components = [],
     imports = [],
     permissions = [],
+    dependencies = [],
     wit,
   } = manifest;
+  if (!isList(dependencies) || !dependencies.every(isExtensionPackage))
+    throw new Error(
+      "dependencies must list unique installed npm package names (at most 64)",
+    );
   if (
     !isObject(aliases) ||
     Object.keys(aliases).length > MAX_ITEMS ||
@@ -119,5 +133,13 @@ export function validateManifest(manifest, { javascript }) {
       "WIT extensions require imports, a wit directory and prebuilt components",
     );
   }
-  return { aliases, preload, components, imports, permissions, wit };
+  return {
+    aliases,
+    preload,
+    components,
+    imports,
+    permissions,
+    wit,
+    dependencies,
+  };
 }

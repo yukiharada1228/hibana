@@ -189,7 +189,6 @@ Wasmの隔離と実行制限に加え、ホスト・ネットワーク・資格�
 | ガイド | 内容 |
 |---|---|
 | [CLIガイド](sdk/README.md) | コマンド、言語別セットアップ、`hibana.json`、認証 |
-| [認証付きAPIの例](sdk/examples/inventory-api/README.md) | HonoでSecrets・外向きHTTP・更新・rollbackを試す |
 | [MVPの試用受入](docs/pilot.md) | 開発者へ渡すもの、確認項目、継続負荷と復元試験 |
 | [Kubernetes導入ガイド](deploy/kubernetes/README.md) | ローカルクラスタ、マニフェスト、配備手順 |
 | [アーキテクチャ](docs/architecture.md) | 実行経路、モジュールの責務、依存関係 |

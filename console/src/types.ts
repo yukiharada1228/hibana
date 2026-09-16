@@ -3,9 +3,11 @@ export type Session = {
   tenant_slug: string;
   tenant_name: string;
   scopes: string[];
-  ingress_base_domain: string | null;
 };
 export type Component = {
+  public_url: string | null;
+  active_version: string | null;
+  active_version_created_at: string | null;
   component_id: string;
   name: string;
   active_version_id: string | null;
@@ -19,6 +21,11 @@ export type Version = {
   size_bytes: number;
   wasm_sha256: string;
   created_at: string;
+  deletion_blocked_reason:
+    | "active_version"
+    | "rollback_target"
+    | "active_executions"
+    | null;
 };
 export type Totals = {
   invocation_count: number;
@@ -35,3 +42,24 @@ export type Usage = {
   totals: Totals;
   by_component: (Totals & { component_id: string })[];
 };
+
+export type Settings = {
+  version_id: string | null;
+  env: Record<string, string>;
+  secrets: { name: string; available: boolean }[];
+  resource_limits: {
+    max_memory_bytes: number;
+    max_wall_time_ms: number;
+    max_execution_time_ms: number;
+  } | null;
+  net_allow_outbound: string[];
+};
+export type Execution = {
+  execution_id: string;
+  version_id: string;
+  status: string;
+  error: unknown;
+  created_at: string;
+  wall_time_ms: number | null;
+};
+export type ExecutionsPage = { items: Execution[]; next_cursor: string | null };

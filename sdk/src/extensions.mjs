@@ -68,23 +68,23 @@ async function checkWitDirectory(directory) {
   }
 }
 
-async function manifestPath(config, name) {
-  if (isLocalExtension(name)) return join(config.root, name, MANIFEST);
+async function manifestPath(from, name) {
+  if (isLocalExtension(name)) return join(from, name, MANIFEST);
   try {
-    return createRequire(join(config.root, "package.json")).resolve(
+    return createRequire(join(from, "package.json")).resolve(
       `${name}/${MANIFEST}`,
     );
   } catch (error) {
     throw new Error(
-      `Cannot resolve ${name}/${MANIFEST}. Install the extension in this application; the package must export its manifest.`,
+      `Cannot resolve ${name}/${MANIFEST}. Install the extension and its npm dependencies; the package must export its manifest.`,
       { cause: error },
     );
   }
 }
 
-async function readExtension(config, name) {
+async function readExtension(config, name, from) {
   try {
-    const path = await manifestPath(config, name);
+    const path = await manifestPath(from, name);
     const root = await realpath(dirname(path));
     if ((await stat(path)).size > 65536)
       throw new Error("Manifest exceeds 64 KiB");
@@ -97,12 +97,37 @@ async function readExtension(config, name) {
     const manifest = validateManifest(json, {
       javascript: Boolean(config.main),
     });
+    if (manifest.dependencies.length) {
+      const packageFile = await packagePath(root, "./package.json");
+      let pkg;
+      try {
+        pkg = JSON.parse(await readFile(packageFile, "utf8"));
+      } catch {
+        throw new Error("package.json must be valid JSON");
+      }
+      for (const dependency of manifest.dependencies) {
+        if (
+          ![pkg.dependencies, pkg.peerDependencies].some(
+            (values) =>
+              values &&
+              Object.hasOwn(values, dependency) &&
+              typeof values[dependency] === "string" &&
+              values[dependency].length,
+          )
+        )
+          throw new Error(
+            `Declare ${dependency} in package.json dependencies or peerDependencies`,
+          );
+      }
+    }
     const aliases = [];
     for (const [alias, input] of Object.entries(manifest.aliases)) {
       aliases.push([alias, await packagePath(root, input)]);
     }
     const resolved = {
       name,
+      root,
+      dependencies: manifest.dependencies,
       aliases: Object.fromEntries(aliases),
       preload: [],
       components: [],
@@ -138,8 +163,32 @@ export async function resolveExtensions(config, { mode = "build" } = {}) {
   const aliases = new Map();
   const imports = new Map();
   const permissions = new Set();
-  for (const reference of config.extensions || []) {
-    const extension = await readExtension(config, reference);
+  const visited = new Set();
+  const visiting = new Set();
+  const packages = new Map();
+  async function visit(reference, from, trail = []) {
+    const extension = await readExtension(config, reference, from);
+    const { root } = extension;
+    if (visiting.has(root))
+      throw new Error(
+        `Extension dependency cycle: ${[...trail, reference].join(" -> ")}`,
+      );
+    if (visited.has(root)) return;
+    if (visiting.size + visited.size >= 64)
+      throw new Error(
+        "At most 64 extensions are allowed, including dependencies",
+      );
+    if (!isLocalExtension(reference)) {
+      if (packages.has(reference) && packages.get(reference) !== root)
+        throw new Error(
+          `Multiple installations of extension ${reference}. Align dependency versions and deduplicate the npm installation.`,
+        );
+      packages.set(reference, root);
+    }
+    visiting.add(root);
+    for (const dependency of extension.dependencies)
+      await visit(dependency, root, [...trail, reference]);
+    // Dependencies initialize before the extension that consumes them.
     for (const [name, path] of Object.entries(extension.aliases)) {
       if (aliases.has(name))
         throw new Error(
@@ -158,7 +207,11 @@ export async function resolveExtensions(config, { mode = "build" } = {}) {
     plan.components.push(...extension.components);
     if (extension.wit) plan.witDirectories.push(extension.wit);
     for (const permission of extension.permissions) permissions.add(permission);
+    visiting.delete(root);
+    visited.add(root);
   }
+  for (const reference of config.extensions || [])
+    await visit(reference, config.root);
   plan.aliases = Object.fromEntries(
     [...aliases].map(([name, value]) => [name, value.path]),
   );

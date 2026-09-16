@@ -46,14 +46,14 @@ shasum -a 256 -c SHA256SUMS
 npm install -g ./hibana-cli-0.2.0-rc.1.tgz
 hibana --version
 hibana runtime install --from ./hibana-worker-0.2.0-rc.1-darwin-arm64 --sha256 HASH
-hibana init hello --cli-package "$PWD/hibana-cli-0.2.0-rc.1.tgz"
+hibana init hello
 cd hello
 npm run dev
 # 別ターミナルで curl http://127.0.0.1:8787/
 # Ctrl+Cで開発サーバーを終了
 ```
 
-`--cli-package`により、生成するHonoプロジェクトも取得済み候補を使います。正式公開前はこの指定とランタイムの事前導入が必要です。Hono・JavaScriptコンパイラーの依存はnpmまたは社内ミラーから取得します。
+生成するHonoプロジェクトは、PCに導入したCLIを使います。正式公開前にローカル実行する場合は、上記のランタイムの事前導入が必要です。Hono・JavaScriptコンパイラーの依存はnpmまたは社内ミラーから取得します。
 
 ## オンプレ検証環境へ導入する
 

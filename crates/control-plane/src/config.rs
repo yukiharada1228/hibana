@@ -65,7 +65,7 @@ pub struct Config {
 
     pub metrics_include_tenant_label: bool,
 
-    pub ingress_base_domain: Option<String>,
+    pub public_apps: crate::public_apps::PublicApps,
 }
 
 impl std::fmt::Debug for Config {
@@ -184,9 +184,15 @@ impl Config {
                 "METRICS_INCLUDE_TENANT_LABEL",
                 DEFAULT_METRICS_INCLUDE_TENANT_LABEL,
             ),
-            ingress_base_domain: env_optional("INGRESS_BASE_DOMAIN")
-                .map(|s| s.trim().trim_matches('.').to_ascii_lowercase())
-                .filter(|s| !s.is_empty()),
+            public_apps: crate::public_apps::PublicApps::parse(
+                env_optional("APP_PUBLIC_ORIGIN")
+                    .or_else(|| {
+                        // Compatibility with existing sites; new sites configure one full origin.
+                        env_optional("INGRESS_BASE_DOMAIN")
+                            .map(|domain| format!("https://{}", domain.trim().trim_matches('.')))
+                    })
+                    .as_deref(),
+            )?,
         };
 
         Ok(cfg)

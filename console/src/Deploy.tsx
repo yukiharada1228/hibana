@@ -12,7 +12,7 @@ export function Deploy({
   email: string;
 }) {
   const [copied, setCopied] = useState("");
-  const login = `hibana login --profile intranet \\\n  --url ${quote(`${location.origin}/api`)} \\\n  --tenant ${quote(session.tenant_slug)} \\\n  --email ${quote(email)}${session.ingress_base_domain ? ` \\\n  --ingress-domain ${quote(session.ingress_base_domain)}` : ""}`;
+  const login = `hibana login \\\n  --url ${quote(`${location.origin}/api`)} \\\n  --tenant ${quote(session.tenant_slug)} \\\n  --email ${quote(email)}`;
   const commands = [
     {
       title: "この基盤にログイン",
@@ -29,15 +29,14 @@ export function Deploy({
     {
       title: "デプロイ",
       description: "PC でビルドした Wasm が、この基盤へアップロードされます。",
-      command: "hibana deploy --profile intranet --version 1.0.0",
+      command: "hibana deploy",
     },
   ];
   return (
     <>
       <div className="page-title">
         <div>
-          <p className="eyebrow">DEPLOY</p>
-          <h1>CLI からデプロイ</h1>
+          <h1>CLI の接続</h1>
           <p className="muted">
             手元の PC から、この Hibana 基盤へ接続します。
           </p>
@@ -86,13 +85,6 @@ export function Deploy({
             : copied}
         </Notice>
       )}
-      <div className="info-strip">
-        <div>
-          <strong>デプロイ完了後は、基盤がアプリを実行・配信します。</strong>
-          <p>PC を閉じても、配備したアプリは基盤側で動き続けます。</p>
-        </div>
-        <a href="#apps">アプリ一覧へ →</a>
-      </div>
     </>
   );
 }
