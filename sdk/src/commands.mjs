@@ -21,6 +21,9 @@ const options = {
   "cli-package": string("PATH", "Pin a local CLI package in the new project"),
   port: string("PORT", "Local HTTP port (default: 8787)"),
   "no-watch": boolean("Run once without watching for file changes"),
+  "frozen-lockfile": boolean(
+    "Require hibana-lock.json to match extension sources; never update it",
+  ),
   runtime: string("PATH", "Use a specific local runtime executable"),
   profile: string("NAME", "Use a saved connection profile"),
   url: string("URL", "Hibana management API URL"),
@@ -81,22 +84,27 @@ const commands = {
   dev: leaf(
     "Run your application locally and reload changes",
     "hibana dev",
-    ["config", "port", "no-watch", "runtime"],
+    ["config", "port", "no-watch", "runtime", "frozen-lockfile"],
     {
       examples: ["hibana dev", "hibana dev --port 3000"],
       notes:
         "Open http://127.0.0.1:8787 (or your chosen port). Press Ctrl+C to stop.\nThe matching local runtime is installed automatically when needed and reused.\nFor a supplied executable, use --runtime PATH or HIBANA_RUNTIME_BIN.",
     },
   ),
-  build: leaf("Build a WebAssembly Component", "hibana build", ["config"], {
-    examples: ["hibana build"],
-    notes:
-      "Builds the project without starting a runtime or contacting a Hibana server.\nOptional libraries: install with npm, then list package names or ./local-directories in hibana.json extensions.",
-  }),
+  build: leaf(
+    "Build a WebAssembly Component",
+    "hibana build",
+    ["config", "frozen-lockfile"],
+    {
+      examples: ["hibana build"],
+      notes:
+        "Builds the project without starting a runtime or contacting a Hibana server.\nDeclare extension names and sources in hibana.json. The CLI installs them into .hibana/ and records hibana-lock.json. Commit the lockfile; use --frozen-lockfile in CI.",
+    },
+  ),
   deploy: leaf(
     "Build and deploy your application",
     "hibana deploy",
-    [...projectRemote, "version"],
+    [...projectRemote, "version", "frozen-lockfile"],
     {
       examples: [
         "hibana deploy",
@@ -177,6 +185,39 @@ const commands = {
         "hibana profile remove NAME",
         [],
         { min: 1, max: 1 },
+      ),
+    },
+  },
+  egress: {
+    description: "Manage application outbound destinations",
+    actions: {
+      list: leaf(
+        "List the application egress policy as JSON",
+        "hibana egress list",
+        projectRemote,
+        {
+          notes:
+            "allow_outbound: null means unconfigured (legacy version permissions remain); [] denies all outbound access.\n" +
+            connectionHelp,
+        },
+      ),
+      ...Object.fromEntries(
+        ["allow", "deny"].map((action) => [
+          action,
+          leaf(
+            `${action === "allow" ? "Allow" : "Revoke"} outbound destinations for every version`,
+            `hibana egress ${action} HOST:PORT [HOST:PORT ...]`,
+            projectRemote,
+            {
+              min: 1,
+              max: 64,
+              examples: [`hibana egress ${action} db.example.com:5432`],
+              notes:
+                "Requires administrator credentials. Applies to past, current and future versions.\nThe first change replaces legacy version-specific permissions with this shared policy.\nSpecify destinations without a URL, password or wildcard. IPv6: [address]:port.\n" +
+                connectionHelp,
+            },
+          ),
+        ]),
       ),
     },
   },

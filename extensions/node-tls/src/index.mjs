@@ -67,13 +67,21 @@ function tlsOptions(options, host) {
 export class TLSSocket extends Socket {
   constructor(socket, options = {}) {
     checkOptions(options, allowed);
-    super(
-      Object.fromEntries(
+    if (socket && (!(socket instanceof Socket) || socket.encrypted))
+      throw error(
+        "ERR_TLS_INVALID_STATE",
+        "STARTTLS requires a plain TCP socket",
+      );
+    super({
+      ...Object.fromEntries(
         baseOptions
           .filter((key) => key in options)
           .map((key) => [key, options[key]]),
       ),
-    );
+      // Match Node: an adopted socket retains its half-open policy, including
+      // when TLS options contain a different value.
+      allowHalfOpen: socket ? socket.allowHalfOpen : options.allowHalfOpen,
+    });
     this._secure = false;
     this.encrypted = true;
     this.authorized = false;
@@ -85,11 +93,6 @@ export class TLSSocket extends Socket {
     );
     // Validation precedes ownership transfer so failure leaves the raw socket intact.
     if (socket) {
-      if (!(socket instanceof Socket) || socket.encrypted)
-        throw error(
-          "ERR_TLS_INVALID_STATE",
-          "STARTTLS requires a plain TCP socket",
-        );
       if (options.timeout !== undefined) this.setTimeout(options.timeout);
       socket._transferTo(this);
       this._rawSocket = socket;

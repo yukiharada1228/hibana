@@ -494,6 +494,52 @@ try {
   );
   assert.equal(upgraded.rawClosed, true);
   console.log("PASS STARTTLS ownership transfer and socket cleanup");
+  for (const secure of [false, true]) {
+    const result = await call({
+      test: "connect-options",
+      secure,
+      port: secure ? tlsPort : tcpPort,
+      text: small,
+      ca: cert,
+    });
+    assert.equal(result.received, small);
+    assert.equal(result.rejectedCallbacks, 0);
+    assert.deepEqual(result.rejected, [
+      ...Array(8).fill("ERR_INVALID_ARG_TYPE"),
+      ...Array(8).fill("ERR_SOCKET_BAD_PORT"),
+      ...Array(12).fill("ERR_OUT_OF_RANGE"),
+    ]);
+    if (secure) assert.equal(result.authorized, true);
+  }
+  console.log(
+    "PASS invalid TCP/TLS ports and options preserve an unused socket and callbacks; numeric-string retry exchanges data",
+  );
+  for (const construct of [false, true])
+    for (const halfOpen of [false, true])
+      for (const override of [false, true]) {
+        const result = await call({
+          test: "starttls-half-open",
+          construct,
+          halfOpen,
+          override,
+          port: passivePorts.starttls,
+          ca: cert,
+        });
+        assert.equal(result.allowHalfOpen, halfOpen);
+        assert.equal(result.destroyed, true);
+        assert.equal(result.rawClosed, true);
+        assert.deepEqual(result.events, [
+          "connect",
+          "secureConnect",
+          "end",
+          "finish",
+          "close",
+        ]);
+        if (halfOpen) assert.equal(result.writableAtEnd, true);
+      }
+  console.log(
+    "PASS both STARTTLS entry points preserve the original half-open policy even with conflicting TLS options",
+  );
   for (const upgrade of [false, true]) {
     const result = await call({
       test: "starttls-options",

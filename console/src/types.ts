@@ -27,6 +27,23 @@ export type Version = {
     | "active_executions"
     | null;
 };
+export type Extension = {
+  name: string;
+  version: string | null;
+  dependencies: string[];
+  permissions: string[];
+};
+export type VersionDetails = {
+  version_id: string;
+  wasm_sha256: string;
+  build_metadata: {
+    schema_version: 1;
+    input: "javascript" | "component";
+    roots: string[];
+    extensions: Extension[];
+  } | null;
+  net_allow_outbound: string[];
+};
 export type Totals = {
   invocation_count: number;
   succeeded_count: number;
@@ -63,3 +80,6 @@ export type Execution = {
   wall_time_ms: number | null;
 };
 export type ExecutionsPage = { items: Execution[]; next_cursor: string | null };
+export interface EgressPolicy {
+  allow_outbound: string[] | null;
+}

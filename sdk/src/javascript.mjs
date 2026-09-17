@@ -1,6 +1,7 @@
 // Compile a JavaScript fetch handler into a WASI HTTP Component.
 import { build as esbuild } from "esbuild";
 import { run } from "./process.mjs";
+import { extensionImports } from "./extension-imports.mjs";
 import { writeFile } from "node:fs/promises";
 import { dirname, resolve, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -55,6 +56,7 @@ addEventListener("fetch", event => {
     absWorkingDir: config.root,
     alias: extensions.aliases || {},
     external: extensions.imports || [],
+    plugins: [extensionImports(extensions.packages)],
   });
   const wit = extensions.wit || join(SDK_ROOT, "wit");
   await run(process.execPath, [

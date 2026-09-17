@@ -3,6 +3,8 @@ use sea_orm_migration::prelude::*;
 pub use sea_orm_migration::MigratorTrait;
 mod m20260915_000001_indexes;
 mod m20260915_000001_platform;
+mod m20260916_000002_build_metadata;
+mod m20260916_000003_component_egress;
 
 pub struct Migrator;
 
@@ -54,6 +56,10 @@ async fn assert_empty_schema(manager: &SchemaManager<'_>) -> Result<(), DbErr> {
 #[async_trait::async_trait]
 impl MigratorTrait for Migrator {
     fn migrations() -> Vec<Box<dyn MigrationTrait>> {
-        vec![Box::new(m20260915_000001_platform::Migration)]
+        vec![
+            Box::new(m20260915_000001_platform::Migration),
+            Box::new(m20260916_000002_build_metadata::Migration),
+            Box::new(m20260916_000003_component_egress::Migration),
+        ]
     }
 }

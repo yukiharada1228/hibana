@@ -1,4 +1,4 @@
-// Public configuration is a list of extensions; author details live in a manifest.
+// Applications declare extension sources; author details live in a manifest.
 export const HTTP_CONTRACT = "wasi:http/incoming-handler@0.2.3";
 const API_VERSIONS = [1, 2];
 const MAX_ITEMS = 64;
@@ -36,15 +36,73 @@ export function isExtensionPackage(value) {
   );
 }
 
+export const extensionNames = (value) =>
+  Array.isArray(value) ? value : Object.keys(value || {});
+export const managesExtensions = (value) => isObject(value);
+
+export function isExtensionArchive(source) {
+  return (
+    typeof source === "string" &&
+    source.startsWith("./") &&
+    source.endsWith(".tgz")
+  );
+}
+
+function validSource(source) {
+  if (
+    !isText(source) ||
+    source.length > 2048 ||
+    /[\u0000-\u0020\u007f-\u009f]/u.test(source)
+  )
+    return false;
+  if (isExtensionArchive(source))
+    return !source.includes("\\") && !source.split("/").includes("..");
+  if (
+    /^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)(?:-[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?(?:\+[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?$/.test(
+      source,
+    )
+  )
+    return true;
+  try {
+    const url = new URL(source);
+    return (
+      url.protocol === "https:" &&
+      !url.username &&
+      !url.password &&
+      !url.search &&
+      !url.hash &&
+      url.pathname.endsWith(".tgz")
+    );
+  } catch {
+    return false;
+  }
+}
+
 export function validateExtensionList(value = []) {
+  if (managesExtensions(value)) {
+    const entries = Object.entries(value);
+    if (
+      entries.length > MAX_ITEMS ||
+      entries.some(
+        ([name, source]) => !isExtensionPackage(name) || !validSource(source),
+      )
+    )
+      throw new Error(
+        'extensions must map package names to an exact version, HTTPS .tgz URL or project-relative .tgz path, for example {"@hibana/postgres-scram":"./vendor/hibana-postgres-scram-0.7.5-bundle.tgz"}',
+      );
+    return;
+  }
   if (!Array.isArray(value)) {
     throw new Error(
-      'extensions must be an array, for example ["@hibana/node-net"]. Move aliases/WIT/components into hibana.extension.json; replace extensions.packages with this array.',
+      "extensions must map extension names to sources. Local directories and legacy installed packages may use an array.",
     );
   }
   const validReference = (name) =>
     isLocalExtension(name)
-      ? !name.includes("\\") && !name.split("/").includes("..")
+      ? Buffer.byteLength(name) <= 512 &&
+        !/[\u0000-\u001f\u007f-\u009f]/u.test(name) &&
+        !name.includes("\\") &&
+        !name.split("/").includes("..")
       : isExtensionPackage(name);
   if (!isList(value) || !value.every(validReference)) {
     throw new Error(

@@ -143,12 +143,6 @@ export function ApplicationSettings({
               ? `${data.resource_limits.max_execution_time_ms} ms`
               : "—"}
           </dd>
-          <dt>許可された外部通信先</dt>
-          <dd>
-            {data.net_allow_outbound.length
-              ? data.net_allow_outbound.join(", ")
-              : "なし（外部通信は拒否）"}
-          </dd>
         </dl>
       </section>
     </div>

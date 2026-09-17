@@ -76,13 +76,28 @@
   max-width: 20em;
   margin-top: 8px;
 }
+.inline-help {
+  color: #646b78;
+  font-size: 12px;
+}
+.inline-help summary {
+  cursor: pointer;
+  color: #0017c1;
+}
+.inline-help p {
+  margin-top: 8px;
+}
+.inline-help summary:focus-visible {
+  outline: 3px solid #0017c1;
+  outline-offset: 4px;
+}
 .version-table th:first-child,
 .version-table td:first-child {
   min-width: 180px;
 }
 .version-table th:last-child,
 .version-table td:last-child {
-  min-width: 260px;
+  min-width: 210px;
 }
 .nowrap {
   white-space: nowrap;
@@ -107,6 +122,7 @@
   font-weight: 600;
 }
 .header {
+  position: relative;
   background: white;
   height: 80px;
   border-bottom: 1px solid #e0e3ea;
@@ -125,6 +141,7 @@
   align-items: center;
   gap: 12px;
   font-size: 13px;
+  min-width: 0;
 }
 .shell {
   display: grid;
@@ -190,6 +207,14 @@
   gap: 16px;
   font-size: 12px;
 }
+.context-bar > span {
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+.context-bar > button {
+  flex-shrink: 0;
+  white-space: nowrap;
+}
 .page-title {
   display: flex;
   align-items: center;
@@ -201,6 +226,41 @@
   font-size: 14px;
   margin-top: 8px;
   overflow-wrap: anywhere;
+}
+.title-with-count,
+.application-heading {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px 16px;
+}
+.application-header {
+  margin: 12px 0 8px;
+  min-width: 0;
+}
+.application-heading h1 {
+  overflow-wrap: anywhere;
+  min-width: 0;
+}
+.application-summary {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 4px 20px;
+  margin-top: 6px;
+}
+.application-summary > * {
+  min-width: 0;
+  max-width: 100%;
+}
+.application-summary strong {
+  overflow-wrap: anywhere;
+}
+.applications-title {
+  flex-wrap: wrap;
+}
+.applications-title .search {
+  width: auto;
 }
 .stats {
   display: grid;
@@ -259,7 +319,6 @@
   background: #edf0f5;
   border-radius: 5px;
   padding: 2px 7px;
-  margin-left: 8px;
   font-size: 11px;
   color: #596273;
 }
@@ -292,6 +351,7 @@
   color: #626c7e;
   background: #f8f9fc;
   text-align: left;
+  white-space: nowrap;
   border-top: 1px solid #e6e9ef;
   border-bottom: 1px solid #e6e9ef;
   padding: 12px 24px;
@@ -632,6 +692,9 @@ footer {
     gap: 16px;
     margin-top: 16px;
   }
+  .tabs {
+    gap: 16px;
+  }
   h1 {
     font-size: 26px;
   }
@@ -662,6 +725,20 @@ footer {
   }
   .search input {
     width: 100%;
+  }
+  .applications-title .search,
+  .application-summary .public-url {
+    width: 100%;
+  }
+  .application-summary .public-url a {
+    flex: 1;
+    min-width: 0;
+  }
+  .application-summary .public-url button {
+    flex-shrink: 0;
+  }
+  .application-summary .public-url [role="status"] {
+    flex-basis: 100%;
   }
 
   .table-scroll th,
@@ -718,6 +795,7 @@ footer {
 }
 .account-menu {
   position: relative;
+  min-width: 0;
 }
 .account-menu summary {
   cursor: pointer;
@@ -760,11 +838,6 @@ footer {
   font-size: 12px;
   color: #646b78;
 }
-.version-date {
-  display: inline-block;
-  margin-inline-start: 1rem;
-  font-size: 0.875rem;
-}
 .artifact-details .hash {
   white-space: normal;
   overflow-wrap: anywhere;
@@ -799,11 +872,120 @@ footer {
   .sidebar-bottom {
     display: none;
   }
+  .account-menu {
+    position: static;
+  }
   .account-menu summary {
     max-width: 110px;
+  }
+  .account-menu > div {
+    top: 100%;
+    right: 18px;
+    width: min(280px, calc(100% - 36px));
+    min-width: 0;
+    overflow-wrap: anywhere;
   }
 }
 
 .table-scroll .badge {
   white-space: nowrap;
+}
+
+.extension-content {
+  padding: 24px;
+  min-width: 0;
+}
+.extension-content label {
+  display: block;
+  margin-bottom: 8px;
+}
+.extension-content select {
+  width: 100%;
+  max-width: 640px;
+  margin-bottom: 24px;
+}
+.extension-content h3 {
+  font-size: 1rem;
+  margin: 24px 0 12px;
+}
+.extension-list {
+  padding: 0;
+  margin: 0;
+  list-style: none;
+}
+.extension-list li {
+  padding: 14px 0;
+  border-bottom: 1px solid #dfe3eb;
+  overflow-wrap: anywhere;
+}
+.extension-name {
+  display: flex;
+  align-items: baseline;
+  flex-wrap: wrap;
+  gap: 8px 16px;
+}
+.extension-list p {
+  margin: 8px 0 0;
+}
+.extension-dependencies {
+  margin-top: 20px;
+}
+.extension-dependencies summary {
+  cursor: pointer;
+  color: #0017c1;
+}
+.extension-destinations {
+  padding-left: 20px;
+  overflow-wrap: anywhere;
+}
+.extension-egress {
+  margin-top: 24px;
+  padding-top: 16px;
+  border-top: 1px solid #dfe3eb;
+}
+.extension-egress h3 {
+  margin-top: 0;
+}
+.extension-egress > button,
+.extension-destination-details {
+  margin-top: 12px;
+}
+.extension-destination-details .extension-destinations {
+  margin-top: 8px;
+  font-size: 13px;
+}
+
+.egress-settings {
+  margin-bottom: 1.5rem;
+}
+.egress-content {
+  padding: 0 1.5rem 1.5rem;
+}
+.egress-destinations {
+  list-style: none;
+  padding: 0;
+}
+.egress-destinations li {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 1rem;
+  flex-wrap: wrap;
+  margin-bottom: 1rem;
+}
+.egress-destinations code {
+  overflow-wrap: anywhere;
+}
+.egress-form {
+  margin-top: 1.5rem;
+}
+.egress-form > div {
+  display: flex;
+  gap: 0.75rem;
+  flex-wrap: wrap;
+  margin-top: 0.75rem;
+}
+.egress-form input {
+  flex: 1;
+  min-width: min(100%, 20rem);
 }

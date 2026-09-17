@@ -6,4 +6,4 @@ TLS セッションの状態・暗号化・復号・証明書検証だけを行�
 
 受信元が切断したら `receiveEof()` を呼びます。ハンドシェイク完了前の切断は `ECONNRESET` で失敗し、そのセッションでは処理を続行できません。成功・失敗にかかわらず `close()` で解放してください。
 
-0.5.1 の任意拡張です。WIT のインターフェースは0.5.0を維持します。`hibana.json` で `extensions: ["@hibana/tls"]` を指定します。[配布・導入・ビルド手順](../README.md)。
+0.5.1 の任意拡張です。WIT のインターフェースは0.5.0を維持します。`hibana.json` で `"extensions": { "@hibana/tls": "./vendor/hibana-tls-0.5.1.tgz" }` を指定します。[配布・導入・ビルド手順](../README.md)。

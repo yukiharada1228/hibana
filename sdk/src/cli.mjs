@@ -77,7 +77,11 @@ async function main() {
   }
   const config = await loadConfig(values.config);
   if (command === "build") {
-    console.log(await build(config));
+    console.log(
+      await build(config, {
+        frozenLockfile: Boolean(values["frozen-lockfile"]),
+      }),
+    );
     return;
   }
   if (command === "dev") {
@@ -86,10 +90,21 @@ async function main() {
     return;
   }
   const api = await apiClient(values);
+  if (command === "egress") {
+    const { egress } = await import("./egress.mjs");
+    return egress(api, config, args);
+  }
   if (command === "deploy") {
     const version =
       values.version || `0.0.0-dev.${Date.now()}.${randomUUID().slice(0, 8)}`;
-    const result = await deploy(api, config, await build(config), version);
+    const result = await deploy(
+      api,
+      config,
+      await build(config, {
+        frozenLockfile: Boolean(values["frozen-lockfile"]),
+      }),
+      version,
+    );
     console.log(
       `Deployed ${config.name} (${result.component_id}) version ${result.version}`,
     );

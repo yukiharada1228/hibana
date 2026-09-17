@@ -20,8 +20,8 @@ SQLiteへの集約は、既存の複数CP/Worker構成に別の共有・調停�
 | `users` | テナント内ユーザーと認証用ハッシュ |
 | `api_tokens` | トークンハッシュ、スコープ、有効期限 |
 | `audit_logs` | 追記専用の監査記録 |
-| `components` | アプリ、公開設定、active・previous版の参照 |
-| `component_versions` | 成果物、ハッシュ、実行制限、許可設定 |
+| `components` | アプリ、公開設定、active・previous版の参照、管理者承認済み外部通信先 |
+| `component_versions` | 成果物、ハッシュ、実行制限、許可設定、ビルド時の拡張構成 |
 | `executions` | 受付時に固定した版、実行状態、結果・利用量のメタデータ |
 | `usage_rollups` | テナント・日付・アプリごとの利用量 |
 | `function_secrets` | SecretのID、名前、現行世代、配備への利用許可 |
@@ -48,6 +48,10 @@ SQLiteへの集約は、既存の複数CP/Worker構成に別の共有・調停�
 
 初期版は`m20260915_000001_platform`です。以後は新しい番号のRustファイルを追加し、`Migrator::migrations()`へ登録してモデルも更新します。適用済みのマイグレーションと同梱ファイルは編集しません。SeaORMの履歴は適用済みバージョンの記録であり、ファイルのチェックサム照合ではないため、この規則はコードレビューでも確認します。
 
+`m20260916_000002_build_metadata` は `component_versions.build_metadata` に NULL 許容の JSONB 列を追加します。初期版を適用済みの DB へ追加適用し、既存の版・成果物・公開先を保持します。既存行の NULL は「未記録」を表し、拡張がないビルドの空の構成とは区別します。構成を後から推測して補完したり、別の版へ付け替えたりしません。新版の Control Plane / Worker より先にマイグレーションを実行してください。旧バイナリは追加列を使わず引き続き動作します。
+
+`m20260916_000003_component_egress` は `components.egress_policy` に NULL 許容の JSONB 列を追加します。NULL は旧版別の許可を維持し、空配列はアプリ全体の deny-all を表します。管理者の明示操作で共通設定を保存し、既存の未削除版の通信許可だけを同じトランザクションで更新します。配備と許可変更はアプリ行のロックで直列化します。移行だけで既存権限を将来の版へ引き継ぐことはありません。旧 Control Plane は新規配備に共通設定を引き継がないため、移行後は Control Plane を更新し、完了後に共通設定を運用してください。Worker の通信検証方式は変更しません。
+
 ## 空DBでの検証
 
 以下の自動試験は新しいPostgreSQL・Redisコンテナをランダムなloopbackポートで作成し、終了時に削除します。既存の`.env`・DB・Kubernetesには接続しません。DockerとRust、Node.jsが必要です。
@@ -65,7 +69,7 @@ MIGRATION_DATABASE_URL='postgres://OWNER:PASSWORD@HOST:PORT/hibana_verify' \
 
 所有者にはDDLとRLSを迂回するDB関数の管理権限が必要です。`faas_app`を事前作成していなければロール作成権限も必要です。ローカル検証用の既定パスワードは`faas_app`です。共有・本番環境では管理者が専用の認証情報でロールを用意してください。既存ロールのパスワードはマイグレーションでは変更しません。
 
-検証CP・Workerだけに、新DBの非特権ロールの`DATABASE_URL`を渡します。自動マイグレーションを無効にして起動する場合も、初期版の適用を読み取り専用で検査します。ランタイムは所有者やSUPERUSER/BYPASSRLSで起動できません。
+検証CP・Workerだけに、新DBの非特権ロールの`DATABASE_URL`を渡します。自動マイグレーションを無効にして起動する場合も、そのバイナリが必要とする最新版まで適用済みか読み取り専用で検査します。ランタイムは所有者やSUPERUSER/BYPASSRLSで起動できません。
 
 初期マイグレーションは空の`public`スキーマ専用です。旧`_sqlx_migrations`があるDBや別のテーブルがあるDBは、変更する前に拒否します。同時適用はPostgreSQLのトランザクションアドバイザリロックで直列化し、失敗時はスキーマと履歴をまとめてロールバックします。再実行しても適用済み版は実行しません。
 

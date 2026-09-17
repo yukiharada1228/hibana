@@ -2,7 +2,14 @@
 import assert from "node:assert/strict";
 import { spawn, execFile } from "node:child_process";
 import { promisify } from "node:util";
-import { mkdtemp, mkdir, readFile, writeFile, rm } from "node:fs/promises";
+import {
+  mkdtemp,
+  mkdir,
+  readFile,
+  writeFile,
+  rm,
+  realpath,
+} from "node:fs/promises";
 import { join, resolve } from "node:path";
 import { tmpdir } from "node:os";
 import { fileURLToPath, pathToFileURL } from "node:url";
@@ -673,6 +680,42 @@ try {
     extensions: ["@hibana/postgres"],
   });
   assert.ok(fullPg.imports.includes("hibana:tls/api@0.5.0"));
+  const scramPg = await resolveExtensions({
+    root: application,
+    main: "app.mjs",
+    extensions: ["@hibana/postgres-scram"],
+  });
+  assert.deepEqual(scramPg.metadata.roots, ["@hibana/postgres-scram"]);
+  assert.equal(scramPg.metadata.extensions.length, 20);
+  assert.equal(
+    scramPg.aliases.pg,
+    await realpath(
+      join(application, "node_modules/@hibana/postgres-scram/dist/index.mjs"),
+    ),
+  );
+  assert.ok(
+    !scramPg.metadata.extensions.some(({ name }) =>
+      /(?:md5|sha224|sha384|sha512|postgres-tcp)$/.test(name),
+    ),
+    "The SCRAM preset must not include unused authentication or certificate digests",
+  );
+  const presetMetadata = JSON.parse(
+    await readFile(
+      join(
+        application,
+        "node_modules/@hibana/postgres-scram/dist/upstream.json",
+      ),
+    ),
+  );
+  assert.deepEqual(presetMetadata.bundledPackages, []);
+  await assert.rejects(
+    resolveExtensions({
+      root: application,
+      main: "app.mjs",
+      extensions: ["@hibana/postgres-scram", "@hibana/postgres"],
+    }),
+    /Extension alias conflict for pg/,
+  );
   const corePg = await resolveExtensions({
     root: application,
     main: "app.mjs",
@@ -747,7 +790,26 @@ try {
         .sort(),
       expected.sort(),
     );
+    if (Object.keys(options).length === 0) {
+      for (const key of ["components", "imports", "permissions", "preload"])
+        assert.deepEqual(
+          [...scramPg[key]].sort(),
+          [...plan[key]].sort(),
+          `The SCRAM preset must match the individually selected configuration: ${key}`,
+        );
+      assert.deepEqual(
+        scramPg.metadata.extensions
+          .filter(({ name }) => name !== "@hibana/postgres-scram")
+          .sort((a, b) => a.name.localeCompare(b.name)),
+        plan.metadata.extensions
+          .filter(({ name }) => name !== selection)
+          .sort((a, b) => a.name.localeCompare(b.name)),
+      );
+    }
   }
+  console.log(
+    "PASS the packaged pg SCRAM preset replaces local wiring with the same 8 Wasm components and no duplicated driver implementation",
+  );
   console.log(
     "PASS PostgreSQL core, SCRAM-only, MD5-only, trust-only and explicit certificate hash selections include only their declared Wasm",
   );

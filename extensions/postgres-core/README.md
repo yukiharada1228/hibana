@@ -8,15 +8,15 @@ PostgreSQL のクエリ・型変換・Client を提供する、0.7.0 の JS 部�
 
 部品を変更するときは、次の3つを揃えます。
 
-1. `pg.mjs` の import と `createPostgres` に渡す部品。
-2. `hibana.extension.json` の `dependencies`。
-3. `package.json` の依存と lockfile。
+1. アプリの `src/db.ts` の import と `createPostgres` に渡す部品。
+2. `hibana.json` の `extensions`。
+3. ビルドが生成する `hibana-lock.json` と配布 tarball。
 
-JS の import だけを削除しても、マニフェストの依存に残した Wasm 部品は合成されます。使用しなくなった部品は依存宣言からも外してください。以下は SCRAM＋TLS＋SHA-256 証明書の Client 専用構成です。
+JS の import だけを削除しても、`extensions` やその依存に残した Wasm 部品は合成されます。使用しなくなった部品は拡張の指定からも外してください。以下は SCRAM＋TLS＋SHA-256 証明書の Client 専用構成です。
 
 ## SCRAM と SHA-256 の証明書だけを使う
 
-アプリ内の `database/pg.mjs` で必要な部品を import します。
+アプリ内の `src/db.ts` で必要な部品を import し、使う `Client` だけを公開します。
 
 ```js
 import { createPostgres } from '@hibana/postgres-core';
@@ -24,61 +24,56 @@ import { tcpTls } from '@hibana/postgres-transport-tls';
 import { scramSha256 } from '@hibana/postgres-auth-scram';
 import { digest } from '@hibana/sha256';
 
-const pg = createPostgres({
+export const { Client } = createPostgres({
   transport: tcpTls,
   authentication: {
     scram: scramSha256({ certificateDigests: { 'SHA-256': digest } }),
   },
 });
-export const { Client, types } = pg;
-export default pg;
 ```
 
-同じ `database/` に、通常のローカル拡張マニフェストを置きます。アプリの `import ... from 'pg'` をこの構成へ解決します。Drizzle を使う場合は後述の Pool も追加してください。
+同じ `src/` のアプリから `import { Client } from './db'` で使います。利用する API は上記4部品です。未公開の個別 tarball を使う場合、依存部品の取得元も `hibana.json` に指定します。ローカル拡張用のディレクトリやマニフェストは不要です。
 
-`database/hibana.extension.json`:
+`hibana.json`:
 
 ```json
 {
-  "schemaVersion": 2,
-  "runtime": "wasi:http/incoming-handler@0.2.3",
-  "dependencies": [
-    "@hibana/postgres-core",
-    "@hibana/postgres-transport-tls",
-    "@hibana/postgres-auth-scram",
-    "@hibana/sha256"
-  ],
-  "aliases": { "pg": "./pg.mjs" }
-}
-```
-
-`database/package.json`:
-
-```json
-{
-  "private": true,
-  "type": "module",
-  "dependencies": {
-    "@hibana/postgres-core": "0.7.0",
-    "@hibana/postgres-transport-tls": "0.7.3",
-    "@hibana/postgres-auth-scram": "0.6.0",
-    "@hibana/sha256": "0.5.0"
+  "name": "my-api",
+  "main": "src/index.ts",
+  "extensions": {
+    "@hibana/node-buffer": "./vendor/hibana-node-buffer-0.5.0.tgz",
+    "@hibana/node-events": "./vendor/hibana-node-events-0.5.0.tgz",
+    "@hibana/node-process": "./vendor/hibana-node-process-0.5.0.tgz",
+    "@hibana/postgres-core": "./vendor/hibana-postgres-core-0.7.0.tgz",
+    "@hibana/node-stream": "./vendor/hibana-node-stream-0.7.0.tgz",
+    "@hibana/tcp": "./vendor/hibana-tcp-0.5.0.tgz",
+    "@hibana/dns": "./vendor/hibana-dns-0.5.0.tgz",
+    "@hibana/node-net": "./vendor/hibana-node-net-0.6.4.tgz",
+    "@hibana/postgres-transport-tcp": "./vendor/hibana-postgres-transport-tcp-0.7.4.tgz",
+    "@hibana/tls": "./vendor/hibana-tls-0.5.1.tgz",
+    "@hibana/node-tls": "./vendor/hibana-node-tls-0.6.4.tgz",
+    "@hibana/postgres-transport-tls": "./vendor/hibana-postgres-transport-tls-0.7.4.tgz",
+    "@hibana/random": "./vendor/hibana-random-0.5.0.tgz",
+    "@hibana/sha256": "./vendor/hibana-sha256-0.5.0.tgz",
+    "@hibana/hmac-sha256": "./vendor/hibana-hmac-sha256-0.5.0.tgz",
+    "@hibana/pbkdf2-sha256": "./vendor/hibana-pbkdf2-sha256-0.5.0.tgz",
+    "@hibana/unicode-nfkc": "./vendor/hibana-unicode-nfkc-0.5.0.tgz",
+    "@hibana/postgres-auth-scram": "./vendor/hibana-postgres-auth-scram-0.6.0.tgz"
   }
 }
 ```
 
-アプリの `hibana.json` では `"extensions": ["./database"]` を指定します。上記とその依存の tarball をアプリの `vendor/` に揃え、ルートで `npm install --save-exact --ignore-scripts ./vendor/hibana-*.tgz` を実行します。CLI は `database/` から上位の `node_modules` にあるパッケージを解決できます。npm registry には未公開です。
+上記の tarball を `vendor/` に揃えて `hibana build` を実行します。拡張18個が `.hibana/` に取得され、`hibana-lock.json` で固定されます。アプリの `package.json` への追加は不要です。この指定では18個を直接選択した構成としてコンソールに表示します。配布者が必要な依存を同梱すれば、その拡張だけの指定にできます。取得と固定の詳細は[アプリ拡張](../../docs/application-extensions.md)を参照してください。
 
 この構成の Wasm 部品は TCP・DNS・TLS・乱数・SHA-256・HMAC-SHA-256・PBKDF2-SHA-256・NFKC の8個です。MD5・SHA-224・SHA-384・SHA-512 系は含みません。インストール済みの別パッケージがあっても、依存に列挙しなければ合成しません。
 
 ## Pool が必要な場合
 
-0.7.0 から Pool は別の [@hibana/postgres-pool](../postgres-pool/README.md) です。上記の構成は Client 専用で、返される `pg` オブジェクトに `Pool` はありません。Pool を使う場合は以下を追加します。
+0.7.0 から Pool は別の [@hibana/postgres-pool](../postgres-pool/README.md) です。上記の構成は Client 専用で、`createPostgres` が返すオブジェクトに `Pool` はありません。Pool を使う場合は以下を追加します。
 
 - `import { createPool } from '@hibana/postgres-pool'` と、`createPostgres` の引数 `pool: createPool`。
-- ローカル拡張マニフェストの `dependencies` に `@hibana/postgres-pool`。
-- `package.json` の依存に `"@hibana/postgres-pool": "0.7.0"` と、その tarball。
-- 必要に応じて `export const { Client, Pool, types } = pg`。
+- `hibana.json` の `extensions` に `"@hibana/postgres-pool": "./vendor/hibana-postgres-pool-0.7.0.tgz"` と、その tarball。
+- 必要な公開 API に合わせて `export const { Client, Pool } = createPostgres(...)`。
 
 これで同じ通信・認証設定を持つ Pool を利用できます。設定の検証と失敗時の処理は Client と共通です。Drizzle 0.45.2 の node-postgres アダプターは内部で `pg.Pool` を参照するため、Drizzle では Pool も選択してください。既存の `postgres`・`postgres-tcp` プリセットは Pool を含み、従来の API を維持します。
 
@@ -116,6 +111,10 @@ Client／Pool の `channel_binding: 'require'` または接続 URL の `channel_
 
 ## 既存構成との関係
 
-`@hibana/postgres` と `@hibana/postgres-tcp` は、これらの公開部品を組み合わせるプリセットとして維持します。旧来の import と設定で動きます。認証と証明書ハッシュを限定する場合は上記のローカル拡張を使い、プリセットを `extensions` から外します。同じ `pg` alias を二重に有効化すると CLI が拒否します。
+`@hibana/postgres` と `@hibana/postgres-tcp` は、これらの公開部品を組み合わせるプリセットとして維持します。旧来の import と設定で動きます。認証と証明書ハッシュを限定する場合は上記の直接指定へ切り替え、プリセットを `extensions` から外します。
+
+既存ライブラリが `import ... from 'pg'` を要求し、SCRAM＋TLS＋SHA-256 証明書の構成で足りる場合は、[@hibana/postgres-scram](../postgres-scram/README.md) を使えます。`hibana.json` に 拡張名と同梱 tarball の取得元を指定すると Client・Pool・default export を提供し、アプリ側の接続用 JS は不要です。
+
+プリセットにない組み合わせが必要な場合だけ、[ローカル拡張](../../docs/application-extensions.md#手元で作る拡張も同じ形式にする)で `pg` alias を用意します。宣言の `dependencies` に必要な部品、`aliases` に `{ "pg": "./index.mjs" }` を指定し、`index.mjs` で `createPostgres` を呼びます。同じ `pg` alias を持つプリセットとの併用は CLI が拒否します。
 
 作者用 `extensions/build-postgres.mjs` は固定した pg 8.23.0 を、依存を引数で受け取る関数へ移植します。認証の順序と終了処理は `src/authentication.mjs` に集約し、使わなくなった上流 Client の認証ハンドラーと pgpass の処理は配布物から除去します。SCRAM 自体の計算・証明検証は認証部品に委譲します。暗号・通信のグローバルな登録や実行時のソース書き換えは行いません。上流の想定したコードが変わるとビルドを停止します。利用者には生成済み JS と上流ライセンスだけを配布します。

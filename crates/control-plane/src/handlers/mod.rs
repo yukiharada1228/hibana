@@ -5,12 +5,14 @@ pub(crate) mod capabilities;
 pub(crate) mod components;
 pub(crate) mod configuration;
 mod deployment;
+pub(crate) mod egress;
 pub(crate) mod executions;
 pub(crate) mod health;
 pub(crate) mod identity;
 pub(crate) mod signing_keys;
 pub(crate) mod tenants;
 pub(crate) mod usage;
+pub(crate) mod version_details;
 
 fn map_unique_violation(e: sea_orm::DbErr, msg: &str) -> AppError {
     if is_unique_violation(&e) {

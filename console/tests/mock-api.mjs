@@ -1,6 +1,6 @@
 // Browser contract fixtures only; excluded from the production image and bundle.
 import { createServer } from "node:http";
-let components, versions, tokens, expired, unavailable, invocationCount;
+let components, versions, egress, tokens, expired, unavailable, invocationCount;
 function reset(empty = false) {
   components = empty
     ? []
@@ -29,6 +29,7 @@ function reset(empty = false) {
       { ...version("ver_busy", "0.8.0"), has_active_executions: true },
     ],
   };
+  egress = {};
   tokens = new Map([["cli-fixture-token", ["read", "deploy", "admin"]]]);
   invocationCount = 12408;
   expired = false;
@@ -171,6 +172,16 @@ createServer(async (req, res) => {
     .map(decodeURIComponent);
   const component = components.find((c) => c.component_id === id);
   if (!component) return send(404, {});
+  if (action === "egress") {
+    if (req.method === "PATCH") {
+      if (!scopes.includes("admin")) return send(403, {});
+      const approved = new Set(egress[id] || []);
+      for (const value of body.allow || []) approved.add(value);
+      for (const value of body.deny || []) approved.delete(value);
+      egress[id] = [...approved].sort();
+    }
+    return send(200, { allow_outbound: egress[id] ?? null });
+  }
   if (req.method === "DELETE") {
     if (!scopes.includes("admin")) return send(403, {});
     if (action === "versions" && versionName) {
@@ -187,6 +198,54 @@ createServer(async (req, res) => {
     return send(204);
   }
   if (action === "versions") {
+    if (req.method === "GET" && versionName) {
+      const v = (versions[id] || []).find(
+        (item) => item.version === versionName,
+      );
+      if (!v) return send(404, {});
+      return send(200, {
+        version_id: v.version_id,
+        wasm_sha256: v.wasm_sha256,
+        build_metadata:
+          v.version === "2.0.0"
+            ? {
+                schema_version: 1,
+                input: "javascript",
+                roots: ["./database"],
+                extensions: [
+                  {
+                    name: "./database",
+                    version: null,
+                    dependencies: ["@example/tls"],
+                    permissions: [],
+                  },
+                  {
+                    name: "@example/tls",
+                    version: "1.2.3",
+                    dependencies: ["@example/tcp"],
+                    permissions: ["outbound-network"],
+                  },
+                  {
+                    name: "@example/tcp",
+                    version: "0.5.0",
+                    dependencies: [],
+                    permissions: ["outbound-network"],
+                  },
+                ],
+              }
+            : v.version === "1.0.0"
+              ? {
+                  schema_version: 1,
+                  input: "javascript",
+                  roots: [],
+                  extensions: [],
+                }
+              : null,
+        net_allow_outbound:
+          egress[id] ??
+          (v.version === "2.0.0" ? ["db.example.internal:5432"] : []),
+      });
+    }
     if (req.method === "POST") {
       const name = /name="version"\r\n\r\n([^\r]+)/.exec(raw)?.[1];
       const v = version(`ver_${id}_${name}`, name);
@@ -238,7 +297,7 @@ createServer(async (req, res) => {
         max_wall_time_ms: 1000,
         max_execution_time_ms: 5000,
       },
-      net_allow_outbound: ["db.example.internal:5432"],
+      net_allow_outbound: egress[id] ?? ["db.example.internal:5432"],
     });
   if (action === "rollback") {
     if (!scopes.includes("deploy")) return send(403, {});

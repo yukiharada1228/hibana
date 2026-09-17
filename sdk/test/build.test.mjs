@@ -5,6 +5,7 @@ import { execFileSync } from "node:child_process";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { build } from "../src/build.mjs";
+import { readBuildMetadata, withBuildMetadata } from "../src/build-metadata.mjs";
 import { init } from "../src/init.mjs";
 import { loadConfig } from "../src/config.mjs";
 import { shouldRebuild } from "../src/dev.mjs";
@@ -20,11 +21,12 @@ test("native build commands run in order with literal argv; failed builds preser
   await writeFile(join(root, "compile.mjs"), `import { writeFileSync } from 'node:fs'; writeFileSync('argv.txt', process.argv[2]); writeFileSync('source.wasm', Buffer.from(${JSON.stringify([...component])}));`);
   const config = { root, component: "source.wasm", build: { commands: [[process.execPath, "compile.mjs", literal], [process.execPath, "-e", "require('node:fs').accessSync('source.wasm')"]] } };
   const artifact = await build(config);
+  const built = await readFile(artifact);
   assert.equal(await readFile(join(root, "argv.txt"), "utf8"), literal);
   await assert.rejects(access(join(root, "injected")));
   config.build.commands = [[process.execPath, "-e", "require('node:fs').writeFileSync('source.wasm', 'broken'); process.exit(7)"]];
   await assert.rejects(build(config), /failed \(7\)/);
-  assert.deepEqual(await readFile(artifact), component);
+  assert.deepEqual(await readFile(artifact), built);
 }));
 
 test("prebuilt Components bypass compilation; core Wasm is rejected before deployment", () => fixture(async root => {
@@ -32,10 +34,12 @@ test("prebuilt Components bypass compilation; core Wasm is rejected before deplo
   const config = { root, component: input };
   await writeFile(input, component);
   const artifact = await build(config);
-  assert.deepEqual(await readFile(artifact), component);
+  const built = await readFile(artifact);
+  assert.deepEqual(built.subarray(0, 8), component);
+  assert.deepEqual(readBuildMetadata(built), {schema_version:1,input:"component",roots:[],extensions:[]});
   await writeFile(input, Buffer.from([0, 97, 115, 109, 1, 0, 0, 0]));
   await assert.rejects(build(config), /WebAssembly Component/);
-  assert.deepEqual(await readFile(artifact), component);
+  assert.deepEqual(await readFile(artifact), built);
 }));
 
 test("native CLI builds without any installed JavaScript compiler packages", () => fixture(async root => {
@@ -43,7 +47,16 @@ test("native CLI builds without any installed JavaScript compiler packages", () 
   await writeFile(join(root, "app.wasm"), component);
   await writeFile(join(root, "hibana.json"), JSON.stringify({ name: "native", component: "app.wasm" }));
   execFileSync(process.execPath, [join(root, "src/cli.mjs"), "build"], { cwd: root, stdio: "pipe" });
-  assert.deepEqual(await readFile(join(root, ".hibana/build/app.wasm")), component);
+  assert.deepEqual(readBuildMetadata(await readFile(join(root, ".hibana/build/app.wasm"))), {schema_version:1,input:"component",roots:[],extensions:[]});
+}));
+
+test("deploying an existing artifact without extra extensions preserves its original build declaration", () => fixture(async root => {
+  const original = withBuildMetadata(component, { schema_version: 1, input: "javascript", roots: ["./compat"], extensions: [
+    { name: "./compat", version: null, dependencies: [], permissions: [] },
+  ] });
+  await writeFile(join(root, "source.wasm"), original);
+  const output = await build({ root, component: "source.wasm" });
+  assert.deepEqual(await readFile(output), original);
 }));
 
 test("native config validates commands and watch paths", () => fixture(async root => {

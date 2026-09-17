@@ -29,6 +29,7 @@
     "postgres-transport-tls",
     "postgres-auth-md5",
     "postgres-auth-scram",
+    "postgres-scram",
     "postgres",
     "postgres-tcp"
   ],
@@ -37,6 +38,7 @@
   },
   "scripts": {
     "build": "npm run build --workspaces --if-present",
-    "pack": "npm pack --workspaces"
+    "pack": "npm pack --workspaces",
+    "pack:bundle": "node ../scripts/pack-extension-bundle.mjs"
   }
 }

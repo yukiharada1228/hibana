@@ -48,8 +48,8 @@ function failure(socket) {
     socket.once("error", (e) => resolve({ code: e.code, message: e.message }));
   });
 }
-async function startTlsSocket(port) {
-  const raw = net.connect(port, "127.0.0.1");
+async function startTlsSocket(port, options = {}) {
+  const raw = net.connect({ port, host: "127.0.0.1", ...options });
   await new Promise((resolve, reject) => {
     raw.once("error", reject);
     raw.once("connect", () => raw.write("STARTTLS\n"));
@@ -95,6 +95,61 @@ async function echoConnected(socket, text) {
     socket.once("error", reject);
     socket.write(text);
   });
+}
+async function connectAfterInvalidOptions(port, text, secure, ca) {
+  const socket = secure
+    ? new tls.TLSSocket(undefined, { servername: "localhost", ca })
+    : new net.Socket();
+  const rejected = [];
+  let rejectedCallbacks = 0;
+  try {
+    for (const [options, expected] of [
+      ...[true, false, [port], {}, null, undefined, 5432n, Symbol("port")].map(
+        (port) => [{ port }, "ERR_INVALID_ARG_TYPE"],
+      ),
+      ...[0, -1, 65536, 1.5, NaN, Infinity, "", "bad"].map((port) => [
+        { port },
+        "ERR_SOCKET_BAD_PORT",
+      ]),
+      ...[-1, NaN, Infinity, "10", null].map((timeout) => [
+        { timeout },
+        "ERR_OUT_OF_RANGE",
+      ]),
+      ...[-1, 1.5, 0x100000000, NaN, Infinity, "10"].map(
+        (keepAliveInitialDelay) => [
+          { keepAlive: true, keepAliveInitialDelay, timeout: 1000 },
+          "ERR_OUT_OF_RANGE",
+        ],
+      ),
+      [
+        { keepAlive: true, keepAliveInitialDelay: 1000, timeout: -1 },
+        "ERR_OUT_OF_RANGE",
+      ],
+    ]) {
+      let code;
+      try {
+        socket.connect(
+          { host: "127.0.0.1", port, ...options },
+          () => rejectedCallbacks++,
+        );
+      } catch (error) {
+        code = error.code;
+      }
+      if (
+        code !== expected ||
+        socket.connecting ||
+        socket.destroyed ||
+        socket.listenerCount("connect")
+      )
+        throw new Error(`Invalid options changed the unused socket: ${code}`);
+      rejected.push(code);
+    }
+    const completed = exchange(socket, text, secure);
+    socket.connect({ host: "127.0.0.1", port: String(port), timeout: 5000 });
+    return { ...(await completed), rejected, rejectedCallbacks };
+  } finally {
+    socket.destroy();
+  }
 }
 function handshakeEof(socket) {
   return new Promise((resolve, reject) => {
@@ -202,6 +257,29 @@ app.post("/", async (c) => {
         true,
       );
       result.rawClosed = raw.destroyed;
+    } else if (p.test === "connect-options") {
+      result = await connectAfterInvalidOptions(p.port, p.text, p.secure, p.ca);
+    } else if (p.test === "starttls-half-open") {
+      const raw = await startTlsSocket(p.port, { allowHalfOpen: p.halfOpen });
+      let socket;
+      try {
+        const options = {
+          servername: "localhost",
+          ca: p.ca,
+          ...(p.override ? { allowHalfOpen: !p.halfOpen } : {}),
+        };
+        socket = p.construct
+          ? new tls.TLSSocket(raw, options)
+          : tls.connect({ socket: raw, ...options });
+        result = {
+          ...(await passiveClose(socket)),
+          allowHalfOpen: socket.allowHalfOpen,
+          rawClosed: raw.destroyed,
+        };
+      } finally {
+        socket?.destroy();
+        raw.destroy();
+      }
     } else if (p.test === "starttls-options") {
       const raw = p.upgrade
         ? await startTlsSocket(p.port)
@@ -249,7 +327,11 @@ app.post("/", async (c) => {
       result = [];
       for (let n = 0; n < (p.test === "passive-eof" ? 40 : 1); n++) {
         const raw =
-          p.transport === "starttls" ? await startTlsSocket(p.port) : undefined;
+          p.transport === "starttls"
+            ? await startTlsSocket(p.port, {
+                allowHalfOpen: Boolean(p.halfOpen),
+              })
+            : undefined;
         const options = {
           allowHalfOpen: Boolean(p.halfOpen),
           readableHighWaterMark: 1024,

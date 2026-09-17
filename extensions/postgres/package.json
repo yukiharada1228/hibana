@@ -1,6 +1,6 @@
 {
   "name": "@hibana/postgres",
-  "version": "0.7.4",
+  "version": "0.7.5",
   "private": true,
   "type": "module",
   "license": "MIT",
@@ -16,7 +16,7 @@
   ],
   "dependencies": {
     "@hibana/postgres-core": "0.7.0",
-    "@hibana/postgres-transport-tls": "0.7.3",
+    "@hibana/postgres-transport-tls": "0.7.4",
     "@hibana/postgres-auth-md5": "0.6.0",
     "@hibana/postgres-auth-scram": "0.6.0",
     "@hibana/sha224": "0.5.0",

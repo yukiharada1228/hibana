@@ -83,7 +83,7 @@ pub async fn assert_runtime_role(db: &impl ConnectionTrait) -> Result<(), DbErr>
     Ok(())
 }
 
-/// Serving against a pre-ORM database requires an explicit database switch.
+/// Require the schema used by this version, including additive ORM migrations.
 /// This check is read-only, including when automatic migrations are disabled.
 pub async fn assert_runtime_schema(db: &impl ConnectionTrait) -> Result<(), DbErr> {
     let version = db
@@ -91,13 +91,13 @@ pub async fn assert_runtime_schema(db: &impl ConnectionTrait) -> Result<(), DbEr
             &Query::select()
                 .column("version")
                 .from(("public", "seaql_migrations"))
-                .and_where(Expr::col("version").eq("m20260915_000001_platform"))
+                .and_where(Expr::col("version").eq("m20260916_000003_component_egress"))
                 .to_owned(),
         )
         .await;
     match version {
         Ok(Some(_)) => Ok(()),
-        _ => Err(DbErr::Custom("Hibana requires the ORM database baseline; migrate an empty database and switch DATABASE_URL explicitly.".into())),
+        _ => Err(DbErr::Custom("Hibana database migrations are required before starting this version. Legacy databases need a separate switch to the ORM baseline.".into())),
     }
 }
 

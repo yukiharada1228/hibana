@@ -5,6 +5,8 @@ import type {
   Version,
   Settings,
   ExecutionsPage,
+  VersionDetails,
+  EgressPolicy,
 } from "./types";
 
 export class ApiError extends Error {
@@ -116,9 +118,26 @@ export class Api {
       `/components/${encodeURIComponent(id)}/versions`,
     );
   }
+  versionDetails(id: string, version: string) {
+    return this.request<VersionDetails>(
+      `/components/${encodeURIComponent(id)}/versions/${encodeURIComponent(version)}`,
+    );
+  }
   config(id: string) {
     return this.request<Settings>(
       `/components/${encodeURIComponent(id)}/config`,
+    );
+  }
+  egress(id: string) {
+    return this.request<EgressPolicy>(
+      `/components/${encodeURIComponent(id)}/egress`,
+    );
+  }
+  changeEgress(id: string, action: "allow" | "deny", destination: string) {
+    return this.request<EgressPolicy>(
+      `/components/${encodeURIComponent(id)}/egress`,
+      "PATCH",
+      { [action]: [destination] },
     );
   }
   executions(id: string, errorsOnly: boolean, before?: string) {

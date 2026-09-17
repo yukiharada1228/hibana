@@ -14,7 +14,7 @@ test('extension configuration rejects malformed interfaces and platform compatib
   const root = await mkdtemp(join(tmpdir(), 'hibana-extensions-'));
   const path = join(root, 'hibana.json');
   try {
-    for (const extensions of [null, {}, { packages: ['example'] }, ['a', 'a'], [null], ['../bad'], ['https://example.com'], ['a@1.0.0']]) {
+    for (const extensions of [null, { packages: ['example'] }, ['a', 'a'], [null], ['../bad'], ['https://example.com'], ['a@1.0.0']]) {
       await writeFile(path, JSON.stringify({ name: 'app', main: 'index.mjs', extensions }));
       await assert.rejects(loadConfig(path), undefined, JSON.stringify(extensions));
     }
@@ -87,6 +87,11 @@ test('declared extension dependencies initialize first, deduplicate and propagat
   assert.deepEqual(plan.preload, [join(transport, 'value.mjs'), join(database, 'value.mjs')]);
   assert.deepEqual(Object.keys(plan.aliases), ['net', 'pg']);
   assert.deepEqual(plan.permissions, ['outbound-network']);
+  assert.deepEqual(plan.metadata, {schema_version:1,input:'javascript',roots:['@example/compat','@example/transport'],extensions:[
+    {name:'@example/transport',version:'1.0.0',dependencies:[],permissions:['outbound-network']},
+    {name:'@example/compat',version:'1.0.0',dependencies:['@example/transport'],permissions:[]},
+  ]});
+  assert.ok(!JSON.stringify(plan.metadata).includes(f.root));
   assert.equal(JSON.stringify(config), before);
   assert.equal(plan.net_allow_outbound, undefined);
   await assert.rejects(resolveExtensions(f.config, { mode: 'dev' }), /dev does not currently allow/);
@@ -101,6 +106,21 @@ test('diamond dependencies are included once in deterministic dependency order',
   }
   const plan = await resolveExtensions({ ...f.config, extensions: ['@example/compat', '@example/other'] });
   assert.deepEqual(plan.preload, [common, ...parents].map(folder => join(folder, 'value.mjs')));
+});
+
+test('local metadata keeps relative names, missing versions and canonical references to shared packages', async t => {
+  const f = await fixture(t);
+  const shared = await f.install({ aliases: {} }, '@example/shared', { version: '2.3.4-rc.1' });
+  await symlink(shared, join(f.root, 'linked'));
+  await mkdir(join(f.root, 'local'));
+  await writeFile(join(f.root, 'local/hibana.extension.json'), JSON.stringify({ schemaVersion: 1, runtime: HTTP_CONTRACT }));
+  await f.install({ schemaVersion: 2, aliases: {}, dependencies: ['@example/shared'] }, '@example/compat', { dependencies: { '@example/shared': '^2.0.0' } });
+  const plan = await resolveExtensions({ ...f.config, extensions: ['./linked', '@example/compat', '@example/shared', './local'] });
+  assert.deepEqual(plan.metadata, { schema_version: 1, input: 'javascript', roots: ['./linked', '@example/compat', './local'], extensions: [
+    { name: './linked', version: '2.3.4-rc.1', dependencies: [], permissions: [] },
+    { name: '@example/compat', version: '1.0.0', dependencies: ['./linked'], permissions: [] },
+    { name: './local', version: null, dependencies: [], permissions: [] },
+  ] });
 });
 
 test('dependencies resolve from their owning package; incompatible installations are rejected', async t => {

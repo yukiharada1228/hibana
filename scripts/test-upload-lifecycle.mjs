@@ -13,6 +13,8 @@ import {runCommand} from './bounded-process.mjs';
 import {testVersionEnvironment} from './test-version-environment.mjs';
 import {testVersionLifecycle} from './test-version-lifecycle.mjs';
 import {testConsole} from './test-console.mjs';
+import {testBuildMetadata} from './test-build-metadata.mjs';
+import {testApplicationEgress} from './test-application-egress.mjs';
 
 const pg = process.env.HTTP_TEST_PG_CONTAINER;
 assert.match(pg || '', /^hibana-http-pg-[0-9]+$/);
@@ -117,8 +119,10 @@ try {
   // Test fixture exposes only boolean Secret checks, never the values.
   const source = join(folder, 'app/src/lib.rs');
   await writeFile(source, (await readFile(source, 'utf8')).replace('{ "message": message }', '{ "message": message, "secret": std::env::var("RESTORE_TOKEN").ok().as_deref() == Some("restore-test-value"), "rotated": std::env::var("RESTORE_TOKEN").ok().as_deref() == Some("rotated-value"), "unselected": std::env::var("UNSELECTED").is_ok() }'));
-  const artifact = await build(await loadConfig(join(folder, 'app/hibana.json')));
+  const buildConfig = await loadConfig(join(folder, 'app/hibana.json'));
+  const artifact = await build(buildConfig);
   const wasm = await readFile(artifact);
+  const unrecordedWasm = await readFile(resolve(buildConfig.root, buildConfig.component));
   // bootstrap::run treats presence of APP_BIND_ADDR as enabled; remove it entirely.
   delete process.env.APP_BIND_ADDR;
   await start();
@@ -271,6 +275,8 @@ try {
   });
   await testVersionEnvironment({api, sql, token, id, wasm, upload, app, holdStorage, releaseStorage:() => releasePut(), url, root:join(folder, 'app'), artifact});
   await testVersionLifecycle({api, sql, pg, token, wasm, upload, app});
+  await testBuildMetadata({api, token, wasm, unrecordedWasm, upload});
+  await testApplicationEgress({api, sql, token, wasm, upload, holdStorage, releaseStorage:() => releasePut()});
   await testConsole({api, token, url, app, wasm, folder});
 
   const acceptedObjects = objects.size;

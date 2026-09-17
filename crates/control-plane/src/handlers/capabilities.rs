@@ -26,7 +26,6 @@ pub struct GetCapabilitiesResponse {
 /// GET /components/{id}/versions/{version}/capabilities — 現在の承認内容を返す（Read）。
 ///
 /// 値は返さず、環境変数名と外向き通信の許可先だけを返す。
-/// CLI は現在の許可先を読み、追加・削除後の一覧を egress API へ送る。
 pub async fn get_capabilities(
     State(state): State<AppState>,
     principal: Principal,
@@ -54,6 +53,7 @@ pub async fn get_capabilities(
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ApproveCapabilityEgressRequest {
     /// 許可する outbound 先（`host:port`）の**全置換**リスト（空配列 = egress deny-all へ戻す）。
     pub allow_outbound: Vec<String>,
@@ -74,7 +74,8 @@ pub struct ApproveCapabilityEgressResponse {
 /// 非空のときだけ worker の `socket_addr_check` が通す。ここで承認された `host:port` を
 /// `capabilities.net_allow_outbound` へ**全置換**で書く。空配列は egress を deny-all に戻す。
 ///
-/// **deploy スコープの upload 経路ではこの値を書けない**（upload は常に空で保存する）。
+/// Legacy endpoint: only available until an application-wide egress policy is configured.
+/// Uploads inherit only the administrator-approved application policy.
 /// egress は admin 専用の管理操作である（deploy トークンが自分で外部到達を承認できてはならない）。
 pub async fn approve_capability_egress(
     State(state): State<AppState>,
@@ -85,22 +86,23 @@ pub async fn approve_capability_egress(
     require_admin_role(principal.role)?;
     let tenant = &principal.tenant_id;
 
-    // 各エントリを host:port として検証し、正規化する（重複は BTreeSet が畳む）。
-    // 1 つでも不正なら 400 で全体を拒否する（部分承認しない）。
-    let mut approved = std::collections::BTreeSet::new();
-    for raw in &req.allow_outbound {
-        let ep = hibana_shared::egress::parse_egress_endpoint(raw).map_err(|e| {
-            FaasError::InvalidRequest(format!("invalid egress endpoint '{raw}': {e}"))
-        })?;
-        approved.insert(format!("{}:{}", ep.host, ep.port));
-    }
+    let approved = super::egress::normalize(&req.allow_outbound)?;
 
     let tx = state.pool().begin().await?;
     db::set_tenant_guc(&tx, tenant).await?;
 
-    db::find_component_by_id(&tx, tenant, &component_id)
+    if !db::lock_component(&tx, tenant, &component_id).await? {
+        return Err(FaasError::NotFound("component".into()).into());
+    }
+    let component = db::find_component_by_id(&tx, tenant, &component_id)
         .await?
-        .ok_or_else(|| FaasError::NotFound(format!("component '{component_id}'")))?;
+        .ok_or_else(|| FaasError::NotFound("component".into()))?;
+    if component.egress_policy.is_some() {
+        return Err(FaasError::Conflict(
+            "Egress is managed for this application; use /components/{id}/egress".into(),
+        )
+        .into());
+    }
 
     let version_id = db::find_version_id(&tx, tenant, &component_id, &version)
         .await?

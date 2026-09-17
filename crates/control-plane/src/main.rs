@@ -3,6 +3,7 @@ mod artifact_reservations;
 mod auth;
 mod authz;
 mod backup;
+mod build_metadata;
 mod completion;
 mod config;
 mod crypto;

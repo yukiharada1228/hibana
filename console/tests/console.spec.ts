@@ -20,6 +20,229 @@ test.beforeEach(async ({ request }) => {
   await request.post("/api/__test/reset", { data: {} });
 });
 
+test("administrator manages shared egress with persistence, revocation and visible errors", async ({
+  page,
+}, info) => {
+  await login(page, "admin-only@example.internal");
+  await page.getByRole("link", { name: "hello-api", exact: true }).click();
+  await page.getByRole("tab", { name: "設定", exact: true }).click();
+  await expect(page.getByText(/共通設定は未設定/)).toBeVisible();
+  await page
+    .getByLabel("通信先（ホスト名:ポート）")
+    .fill("db.example.com:5432");
+  await page.getByRole("button", { name: "通信先を許可", exact: true }).click();
+  await expect(
+    page.getByText("外部通信の許可を更新しました。", { exact: true }),
+  ).toBeVisible();
+  await expect(
+    page.getByText("db.example.com:5432", { exact: true }),
+  ).toBeVisible();
+  await page.setViewportSize({ width: 390, height: 844 });
+  expect(
+    await page.evaluate(
+      () => document.documentElement.scrollWidth <= innerWidth,
+    ),
+  ).toBe(true);
+  await page.screenshot({
+    path: info.outputPath("egress-mobile.png"),
+    fullPage: true,
+  });
+
+  await page.getByRole("tab", { name: "拡張", exact: true }).click();
+  await page.getByLabel("確認するバージョン").selectOption("1.0.0");
+  await expect(page.getByText(/アプリ共通の設定を適用中/)).toBeVisible();
+  await expect(
+    page.getByText("db.example.com:5432", { exact: true }),
+  ).not.toBeVisible();
+  await page.getByText("許可された通信先（1件）", { exact: true }).click();
+  await expect(
+    page.getByText("db.example.com:5432", { exact: true }),
+  ).toBeVisible();
+  await page
+    .getByRole("button", { name: "通信先の設定を開く", exact: true })
+    .click();
+  await expect(
+    page.getByRole("tab", { name: "設定", exact: true }),
+  ).toBeFocused();
+  await page.route("**/components/cmp_api/egress", async (route) => {
+    if (route.request().method() === "PATCH")
+      await route.fulfill({ status: 400, json: {} });
+    else await route.continue();
+  });
+  await page
+    .getByLabel("通信先（ホスト名:ポート）")
+    .fill("https://wrong.example");
+  await page.getByRole("button", { name: "通信先を許可", exact: true }).click();
+  await expect(
+    page.getByText(/URL・認証情報・ワイルドカードは使用できません/),
+  ).toBeVisible();
+  await expect(
+    page.getByText("外部通信の許可を更新しました。", { exact: true }),
+  ).not.toBeVisible();
+  await expect(
+    page.getByText("db.example.com:5432", { exact: true }),
+  ).toBeVisible();
+  await page.unroute("**/components/cmp_api/egress");
+  await page
+    .getByRole("button", {
+      name: "db.example.com:5432 の許可を取り消す",
+      exact: true,
+    })
+    .click();
+  await expect(
+    page.getByText("なし（外部通信は拒否）", { exact: true }),
+  ).toBeVisible();
+  await page.getByRole("tab", { name: "拡張", exact: true }).click();
+  await expect(
+    page.getByText("db.example.com:5432", { exact: true }),
+  ).not.toBeVisible();
+  await expect(
+    page.getByText("なし（外部通信は拒否）", { exact: true }),
+  ).toBeVisible();
+});
+
+test("deployer can inspect egress but cannot change it", async ({ page }) => {
+  await login(page, "deployer@example.internal");
+  await page.getByRole("link", { name: "hello-api", exact: true }).click();
+  await page.getByRole("tab", { name: "設定", exact: true }).click();
+  await expect(
+    page.getByRole("heading", { name: "許可された外部通信先", exact: true }),
+  ).toBeVisible();
+  await expect(
+    page.getByText("通信先の変更には管理者権限が必要です。", { exact: true }),
+  ).toBeVisible();
+  await expect(page.getByLabel("通信先（ホスト名:ポート）")).toHaveCount(0);
+  await expect(
+    page.getByRole("button", { name: "通信先を許可", exact: true }),
+  ).toHaveCount(0);
+});
+
+test("extension composition distinguishes recorded, empty and unrecorded versions for Read users", async ({
+  page,
+}, info) => {
+  const details: string[] = [];
+  page.on("request", (request) => {
+    if (/\/versions\/[^/]+$/.test(new URL(request.url()).pathname))
+      details.push(request.url());
+  });
+  await login(page, "reader@example.internal");
+  await page.getByRole("link", { name: "hello-api", exact: true }).click();
+  expect(details).toEqual([]);
+  await page.getByRole("tab", { name: "拡張", exact: true }).click();
+  await expect(page.getByText("./database", { exact: true })).toBeVisible();
+  await expect(page.getByText(/このバージョンの旧設定を適用中/)).toBeVisible();
+  await expect(
+    page.getByText("db.example.internal:5432", { exact: true }),
+  ).toBeVisible();
+  await expect(
+    page.getByText("@example/tcp", { exact: true }),
+  ).not.toBeVisible();
+  await page.getByText("依存する拡張（2）", { exact: true }).click();
+  await expect(page.getByText("@example/tls", { exact: true })).toBeVisible();
+  await expect(page.getByText("1.2.3", { exact: true })).toBeVisible();
+  await expect(
+    page.getByText("依存：@example/tcp", { exact: true }),
+  ).toBeVisible();
+  await expect(page.getByText("要求権限：外部通信")).toHaveCount(2);
+  await page.setViewportSize({ width: 390, height: 844 });
+  expect(
+    await page.evaluate(
+      () => document.documentElement.scrollWidth <= innerWidth,
+    ),
+  ).toBe(true);
+  await page.screenshot({
+    path: info.outputPath("extensions-mobile.png"),
+    fullPage: true,
+  });
+  await page.getByLabel("確認するバージョン").selectOption("1.0.0");
+  await expect(
+    page.getByText("指定された拡張はありません。", { exact: true }),
+  ).toBeVisible();
+  await expect(
+    page.getByText("なし（外部通信は拒否）", { exact: true }),
+  ).toBeVisible();
+  await page
+    .getByLabel("確認するバージョン")
+    .selectOption("0.0.0-dev.1789484656916.d26b94ca");
+  await expect(page.getByText(/構成情報が未記録です/)).toBeVisible();
+  await expect(
+    page.getByText("指定された拡張はありません。", { exact: true }),
+  ).toHaveCount(0);
+  await page.getByRole("tab", { name: "バージョン", exact: true }).click();
+  const old = page.getByRole("row").filter({ hasText: "1.0.0" });
+  await old.getByText("バージョンの詳細", { exact: true }).click();
+  await old.getByRole("button", { name: "拡張の構成を見る" }).click();
+  await expect(page.getByLabel("確認するバージョン")).toHaveValue("1.0.0");
+  await expect(
+    page.getByText("指定された拡張はありません。", { exact: true }),
+  ).toBeVisible();
+});
+
+test("extension details fail visibly and do not display another version's metadata", async ({
+  page,
+}) => {
+  await login(page);
+  await page.getByRole("link", { name: "hello-api", exact: true }).click();
+  await page.route("**/components/cmp_api/versions/2.0.0", (route) =>
+    route.fulfill({ status: 503, json: {} }),
+  );
+  await page.getByRole("tab", { name: "拡張", exact: true }).click();
+  await expect(page.getByRole("alert")).toContainText(
+    "基盤が処理を受け付けられません",
+  );
+  await expect(
+    page.getByText("指定された拡張はありません。", { exact: true }),
+  ).toHaveCount(0);
+  await page.unroute("**/components/cmp_api/versions/2.0.0");
+  await page.route("**/components/cmp_api/versions/2.0.0", async (route) => {
+    const response = await route.fetch();
+    await route.fulfill({
+      json: { ...(await response.json()), version_id: "wrong-version" },
+    });
+  });
+  await page.getByRole("button", { name: "更新", exact: true }).click();
+  await expect(page.getByRole("alert")).toContainText(
+    "バージョンの情報が一致しません",
+  );
+});
+
+test("Read users can inspect shared egress and failed policy reads do not imply legacy permissions", async ({
+  page,
+  request,
+}) => {
+  await request.patch("/api/components/cmp_api/egress", {
+    headers: { Authorization: "Bearer cli-fixture-token" },
+    data: { allow: ["shared.example.internal:443"] },
+  });
+  await login(page, "reader@example.internal");
+  await page.getByRole("link", { name: "hello-api", exact: true }).click();
+  await page.route("**/components/cmp_api/egress", (route) =>
+    route.fulfill({ status: 503, json: {} }),
+  );
+  await page.getByRole("tab", { name: "拡張", exact: true }).click();
+  await expect(page.getByText("./database", { exact: true })).toBeVisible();
+  await expect(page.getByRole("alert")).toContainText(
+    "通信先の適用元を取得できませんでした",
+  );
+  await expect(page.getByText(/このバージョンの旧設定を適用中/)).toHaveCount(0);
+  await expect(
+    page.getByText("なし（外部通信は拒否）", { exact: true }),
+  ).toHaveCount(0);
+  await page.unroute("**/components/cmp_api/egress");
+  await page.getByRole("button", { name: "更新", exact: true }).click();
+  await expect(page.getByText(/アプリ共通の設定を適用中/)).toBeVisible();
+  await page.getByText("許可された通信先（1件）", { exact: true }).click();
+  await expect(
+    page.getByText("shared.example.internal:443", { exact: true }),
+  ).toBeVisible();
+  await expect(page.getByRole("tab", { name: "設定", exact: true })).toHaveCount(
+    0,
+  );
+  await expect(
+    page.getByRole("button", { name: "通信先の設定を開く", exact: true }),
+  ).toHaveCount(0);
+});
+
 test("CLI versions have concise labels while console rollback preserves the full identifier", async ({
   page,
 }, info) => {
@@ -170,6 +393,85 @@ test("read-only account, usage filters, API errors and session expiration", asyn
   ).toBeVisible();
 });
 
+test("account details stay inside the viewport when opened on narrow screens", async ({
+  page,
+}, info) => {
+  await login(page);
+  const summary = page.locator(".account-menu summary");
+  const details = page.locator(".account-menu > div");
+  for (const width of [320, 390, 1440]) {
+    await page.setViewportSize({ width, height: 844 });
+    await summary.focus();
+    await page.keyboard.press("Enter");
+    await expect(details).toBeVisible();
+    await expect(details).toContainText("Development");
+    await expect(details).toContainText("閲覧・配備・管理");
+    const bounds = await details.boundingBox();
+    const viewportWidth = await page.evaluate(
+      () => document.documentElement.clientWidth,
+    );
+    expect(bounds).not.toBeNull();
+    expect(bounds!.x).toBeGreaterThanOrEqual(0);
+    expect(bounds!.x + bounds!.width).toBeLessThanOrEqual(viewportWidth);
+    await page.screenshot({
+      path: info.outputPath(`account-menu-${width}.png`),
+    });
+    await page.keyboard.press("Enter");
+    await expect(details).not.toBeVisible();
+  }
+});
+
+test("CLI guide is available while the initial application list is pending or failed", async ({
+  page,
+}, info) => {
+  let releaseList!: () => void;
+  const pendingList = new Promise<void>((resolve) => {
+    releaseList = resolve;
+  });
+  await page.route("**/api/components", async (route) => {
+    await pendingList;
+    await route.fulfill({ status: 503, json: {} });
+  });
+  try {
+    await page.goto("/#deploy");
+    await page.getByLabel("テナント", { exact: true }).fill("team");
+    await page.getByLabel("メールアドレス").fill("developer@example.internal");
+    await page.getByLabel("パスワード", { exact: true }).fill("fixture-password");
+    await page.getByRole("button", { name: "ログイン", exact: true }).click();
+    const guide = page.getByRole("heading", { name: "CLI の接続", exact: true });
+    await expect(guide).toBeVisible();
+    await expect(page.locator("pre").first()).toContainText("--tenant 'team'");
+    await expect(page.locator("pre").last()).toHaveText("hibana deploy");
+
+    releaseList();
+    await expect(page.getByRole("alert")).toContainText(
+      "基盤が処理を受け付けられません",
+    );
+    await expect(guide).toBeVisible();
+    await expect(
+      page.getByRole("button", { name: "コマンドをコピー", exact: true }),
+    ).toHaveCount(3);
+    await expect(
+      page.getByRole("button", { name: "更新", exact: true }),
+    ).toHaveCount(0);
+    await page.screenshot({
+      path: info.outputPath("cli-guide-list-error.png"),
+      fullPage: true,
+    });
+
+    await page.unroute("**/api/components");
+    await page.getByRole("link", { name: "アプリケーション", exact: true }).click();
+    await page.getByRole("button", { name: "更新", exact: true }).click();
+    await expect(
+      page.getByRole("link", { name: "hello-api", exact: true }),
+    ).toBeVisible();
+    await expect(page.getByRole("alert")).toHaveCount(0);
+  } finally {
+    releaseList();
+    await page.unroute("**/api/components");
+  }
+});
+
 test("mobile layout, empty state, command guide and failed login", async ({
   page,
   request,
@@ -224,6 +526,10 @@ test("mobile layout, empty state, command guide and failed login", async ({
     "--ingress-domain",
   );
   await expect(page.locator("pre").last()).toHaveText("hibana deploy");
+  await expect(
+    page.getByRole("button", { name: "更新", exact: true }),
+  ).toHaveCount(0);
+  await expect(page.getByText(/一覧取得/)).toHaveCount(0);
   expect(
     await page.evaluate(
       () => document.documentElement.scrollWidth <= innerWidth,
@@ -295,9 +601,7 @@ test("operational details, pagination and usage refresh reflect the platform", a
   await expect(
     page.getByRole("row").filter({ hasText: "OLD_KEY" }),
   ).toContainText("参照先が削除されています");
-  await expect(
-    page.getByText("db.example.internal:5432", { exact: true }),
-  ).toBeVisible();
+  await expect(page.getByText(/共通設定は未設定/)).toBeVisible();
   await page.screenshot({
     path: info.outputPath("settings.png"),
     fullPage: true,
@@ -340,6 +644,14 @@ test("version deletion protects live versions, confirms the full identifier and 
       row.getByRole("button", { name: "削除", exact: true }),
     ).toBeDisabled();
   await expect(current).toContainText("現在のバージョンのため削除できません");
+  const currentReason = current.getByText(
+    "現在のバージョンのため削除できません。",
+    { exact: true },
+  );
+  await expect(currentReason).not.toBeVisible();
+  await current.getByText("削除できない理由", { exact: true }).click();
+  await expect(currentReason).toBeVisible();
+  await current.getByText("削除できない理由", { exact: true }).click();
   await expect(previous).toContainText("切り戻し先として保護されています");
   await expect(executing).toContainText("実行中・実行待ちの処理");
   await expect(page.getByRole("button", { name: "切り戻す" })).toHaveCount(0);

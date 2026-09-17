@@ -41,7 +41,7 @@ import { Readable } from "./streams.mjs";
 
 全入口は同じ生成済みモジュールとコンストラクターを使うため、別の入口で作った Stream も `pipe`・`pipeline`・`compose` で接続できます。バッファ・イベント・終了処理など、各機能に必要な共通処理は引き続き含みます。
 
-`hibana.json` に `extensions: ["@hibana/node-stream"]` を指定します。Node TCP／TLS・PostgreSQL の依存として既に有効な場合は、追加の設定は不要です。未公開のため、必要な依存 tarball も一緒にインストールしてください。[配布・インストール・ビルド手順](../README.md)。
+`hibana.json` に `"extensions": { "@hibana/node-stream": "./vendor/hibana-node-stream-0.7.0.tgz" }` を指定します。Node TCP／TLS・PostgreSQL の依存として既に有効な場合は、追加の設定は不要です。未公開の依存部品がある場合は、その tarball の取得元も `hibana.json` に指定します。アプリの `package.json` への拡張追加は不要です。[配布・インストール・ビルド手順](../README.md)。
 
 ## 通常の Stream API をまとめて使う
 

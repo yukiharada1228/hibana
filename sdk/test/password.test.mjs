@@ -20,7 +20,14 @@ function terminal() {
   return { input, output, text: () => written };
 }
 
-test("password prompt supports editing and Unicode without echoing the password", async () => {
+test("password prompt supports editing and Unicode without echoing the password", async (t) => {
+  // The fixture models an interactive terminal, even when npm runs with TERM=dumb.
+  const term = process.env.TERM;
+  process.env.TERM = "xterm";
+  t.after(() => {
+    if (term === undefined) delete process.env.TERM;
+    else process.env.TERM = term;
+  });
   const tty = terminal();
   const answer = promptPassword(tty);
   assert.equal(tty.input.isRaw, true);

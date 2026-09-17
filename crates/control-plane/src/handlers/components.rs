@@ -246,13 +246,6 @@ pub async fn upload_version(
     // §4.4 MUST: クライアント宣言値ではなく、承認集合と照合して解決した import を保存する。
     //
     // Plain vars and selected, separately authorized Secrets form the environment.
-    // Egress stays deny-all until an administrator approves it.
-    let capabilities_json = hibana_shared::capabilities::CapabilitySet {
-        imports: validated.approved_imports.clone(),
-        env: allowed_env,
-        net_allow_outbound: std::collections::BTreeSet::new(),
-    }
-    .to_json();
 
     // (5) 検証通過 → MinIO 保存 → INSERT(active) → active 化。
     let version_id = new_version_id();
@@ -349,7 +342,18 @@ pub async fn upload_version(
         }
     }
 
+    // Read after the parent lock: deployments cannot race an administrator's
+    // approval/revocation or grant permissions supplied by the uploaded artifact.
+    let current = db::find_component_by_id(&tx, tenant, &component_id).await?
+        .ok_or_else(|| FaasError::NotFound("component".into()))?;
+    let capabilities_json = hibana_shared::capabilities::CapabilitySet {
+        imports: validated.approved_imports.clone(),
+        env: allowed_env,
+        net_allow_outbound: super::egress::policy(&current)?.unwrap_or_default(),
+    }.to_json();
+
     let limits_json = serde_json::to_value(resource_limits)?;
+    let build_metadata = validated.build_metadata.as_ref().map(serde_json::to_value).transpose()?;
 
     db::insert_version(
         &tx,
@@ -363,6 +367,7 @@ pub async fn upload_version(
         &capabilities_json,
         &limits_json,
         "active",
+        build_metadata.as_ref(),
     )
     .await
     // 同一 (component_id, version) 上書きは禁止 (§6.7 MUST NOT) → 409/422。

@@ -170,22 +170,24 @@ function Console({
         <div className="context-bar">
           <span>
             {session.tenant_slug}
-            {updatedAt && (
+            {route === "apps" && updatedAt && (
               <span className="muted"> · 一覧取得 {date(updatedAt)}</span>
             )}
           </span>
-          <Button variant="text" size="sm" onClick={reload} disabled={loading}>
-            <Icon name="refresh" />
-            {loading ? "更新中…" : "更新"}
-          </Button>
+          {route !== "deploy" && (
+            <Button variant="text" size="sm" onClick={reload} disabled={loading}>
+              <Icon name="refresh" />
+              {loading ? "更新中…" : "更新"}
+            </Button>
+          )}
         </div>
         {error && <Notice error>{error}</Notice>}
-        {!components ? (
+        {route === "deploy" ? (
+          <Deploy session={session} email={email} />
+        ) : !components ? (
           !error && <Notice>アプリケーションを読み込み中…</Notice>
         ) : route === "usage" ? (
           <Usage api={api} components={components} />
-        ) : route === "deploy" ? (
-          <Deploy session={session} email={email} />
         ) : selected ? (
           <Application
             key={selected.component_id}

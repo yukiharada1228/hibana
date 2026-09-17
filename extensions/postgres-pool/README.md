@@ -20,7 +20,7 @@ export const { Client, Pool, types } = pg;
 export default pg;
 ```
 
-[ローカル拡張のマニフェスト](../postgres-core/README.md)の `dependencies` に `@hibana/postgres-pool` を追加し、`package.json` に `"@hibana/postgres-pool": "0.7.0"` を宣言します。必要な tarball をインストールしてください。Hibana 本体や CLI の専用設定は不要です。
+[個別の部品構成](../postgres-core/README.md)では、`hibana.json` の `extensions` に `"@hibana/postgres-pool": "./vendor/hibana-postgres-pool-0.7.0.tgz"` を追加します。`hibana build` が取得・固定するため、アプリの `package.json` への追加は不要です。拡張作者が別の拡張から利用する場合は、その配布パッケージの `dependencies` に宣言します。
 
 `createPostgres` が `createPool(Client, configuration)` を呼び出し、その factory の Client と接続設定の検証関数を渡します。Pool はその組み合わせを保持し、他の factory の認証・通信設定を使用しません。Pool の生成時にも設定を検証しますが、その時点ではソケットを作りません。
 

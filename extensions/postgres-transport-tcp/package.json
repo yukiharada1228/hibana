@@ -1,6 +1,6 @@
 {
   "name": "@hibana/postgres-transport-tcp",
-  "version": "0.7.3",
+  "version": "0.7.4",
   "private": true,
   "type": "module",
   "license": "MIT",
@@ -15,6 +15,6 @@
     "src/"
   ],
   "dependencies": {
-    "@hibana/node-net": "0.6.3"
+    "@hibana/node-net": "0.6.4"
   }
 }

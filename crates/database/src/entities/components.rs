@@ -12,6 +12,7 @@ pub struct Model {
     pub deleted_at: Option<DateTimeUtc>,
     pub previous_active_version_id: Option<String>,
     pub ingress_enabled: bool,
+    pub egress_policy: Option<Json>,
 }
 
 #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]

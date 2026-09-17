@@ -1,6 +1,6 @@
 {
   "name": "@hibana/node-tls",
-  "version": "0.6.3",
+  "version": "0.6.4",
   "private": true,
   "type": "module",
   "license": "MIT",
@@ -15,7 +15,7 @@
     "src/"
   ],
   "dependencies": {
-    "@hibana/node-net": "0.6.3",
+    "@hibana/node-net": "0.6.4",
     "@hibana/node-buffer": "0.5.0",
     "@hibana/tls": "0.5.1"
   }

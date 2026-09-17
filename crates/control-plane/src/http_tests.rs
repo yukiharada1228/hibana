@@ -104,6 +104,7 @@ async fn http_mvp_regression() {
         UPDATE components SET active_version_id=id||'-v1';
     "#, vec![]).await.unwrap();
     assert_compound_identities(&owner).await;
+    assert_build_metadata_upgrade(&owner).await;
     let pool = hibana_database::postgres::connect(&std::env::var("DATABASE_URL").unwrap(), 10, 0)
         .await
         .unwrap();
@@ -629,6 +630,7 @@ async fn console_information_regression(state: &AppState) {
         &json!({}),
         &json!(hibana_shared::ResourceLimits::default()),
         "active",
+        None,
     )
     .await
     .unwrap();
@@ -946,11 +948,56 @@ async fn assert_fresh_schema(owner: &DatabaseConnection) {
     assert_eq!(scalar(owner,"SELECT count(*) FROM information_schema.tables WHERE table_schema='public' AND table_type='BASE TABLE'").await,16);
     assert_eq!(
         scalar(owner, "SELECT count(*) FROM seaql_migrations").await,
-        1
+        3
     );
     assert_eq!(scalar(owner,"SELECT count(*) FROM pg_class c JOIN pg_namespace n ON c.relnamespace=n.oid WHERE n.nspname='public' AND c.relkind='r' AND c.relrowsecurity AND c.relforcerowsecurity").await,13);
     assert_eq!(scalar(owner,"SELECT count(*) FROM information_schema.columns WHERE table_schema='public' AND column_name IN ('canary_weight','canary_version_id','chain_depth','routing_reason','idempotency_key')").await,0);
     println!("PASS fresh ORM schema: 15 platform tables, RLS, no removed feature tables, idempotent migration");
+}
+
+async fn assert_build_metadata_upgrade(owner: &DatabaseConnection) {
+    use hibana_migration::MigratorTrait as _;
+    // Exercise an existing baseline with real versions; never recreate the DB.
+    hibana_migration::Migrator::down(owner, Some(2))
+        .await
+        .unwrap();
+    assert!(hibana_database::postgres::assert_runtime_schema(owner)
+        .await
+        .is_err());
+    crate::migrations::run_migrations(owner).await.unwrap();
+    assert_eq!(
+        scalar(
+            owner,
+            "SELECT count(*) FROM component_versions WHERE build_metadata IS NULL"
+        )
+        .await,
+        3
+    );
+    assert_eq!(
+        scalar(
+            owner,
+            "SELECT count(*) FROM components WHERE active_version_id=id||'-v1'"
+        )
+        .await,
+        2
+    );
+    assert_eq!(
+        scalar(
+            owner,
+            "SELECT count(*) FROM component_versions WHERE id='source-v1' AND wasm_sha256='abcd'"
+        )
+        .await,
+        1
+    );
+    assert_eq!(
+        scalar(
+            owner,
+            "SELECT count(*) FROM components WHERE egress_policy IS NOT NULL"
+        )
+        .await,
+        0
+    );
+    println!("PASS additive build metadata and egress migrations preserves versions, hashes and publication; old versions remain unrecorded");
 }
 
 async fn assert_legacy_database_rejected(owner: &DatabaseConnection) {

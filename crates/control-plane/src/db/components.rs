@@ -12,6 +12,7 @@ pub struct ComponentRow {
     pub name: String,
     pub active_version_id: Option<String>,
     pub previous_active_version_id: Option<String>,
+    pub egress_policy: Option<Value>,
 }
 
 /// Component メタデータのみを作成する (§6.2 M2)。
@@ -48,6 +49,7 @@ pub async fn find_component_by_id(
             components::Column::Name,
             components::Column::ActiveVersionId,
             components::Column::PreviousActiveVersionId,
+            components::Column::EgressPolicy,
         ])
         .filter(components::Column::TenantId.eq(tenant_id))
         .filter(components::Column::Id.eq(component_id))
@@ -77,6 +79,51 @@ pub async fn lock_component(
         .is_some())
 }
 
+/// Caller holds the parent lock. Keep the Worker's per-version capability
+/// document authoritative, including for rollback targets, in this transaction.
+pub async fn set_component_egress(
+    tx: &DatabaseTransaction,
+    tenant_id: &str,
+    component_id: &str,
+    approved: &[String],
+) -> Result<(), DbErr> {
+    use sea_orm::sea_query::{extension::postgres::PgExpr, CaseStatement};
+
+    components::Entity::update_many()
+        .col_expr(
+            components::Column::EgressPolicy,
+            Expr::val(serde_json::json!(approved)),
+        )
+        .filter(components::Column::TenantId.eq(tenant_id))
+        .filter(components::Column::Id.eq(component_id))
+        .filter(components::Column::DeletedAt.is_null())
+        .exec(tx)
+        .await?;
+
+    let column = component_versions::Column::Capabilities;
+    let kind = || Func::cust("jsonb_typeof").arg(Expr::col(column));
+    let document = CaseStatement::new()
+        .case(Expr::expr(kind()).eq("object"), Expr::col(column))
+        .case(
+            Expr::expr(kind()).eq("array"),
+            Func::cust("jsonb_build_object").args([Expr::val("imports"), Expr::col(column)]),
+        )
+        .finally(Expr::val(serde_json::json!({})));
+    component_versions::Entity::update_many()
+        .col_expr(
+            column,
+            Expr::expr(document).concat(Expr::val(
+                serde_json::json!({"net_allow_outbound": approved}),
+            )),
+        )
+        .filter(component_versions::Column::TenantId.eq(tenant_id))
+        .filter(component_versions::Column::ComponentId.eq(component_id))
+        .filter(component_versions::Column::DeletedAt.is_null())
+        .exec(tx)
+        .await?;
+    Ok(())
+}
+
 /// 検証通過した version を登録する (§6.2)。
 ///
 /// 同一 (component_id, version) の重複は UNIQUE 違反（呼び出し側で 409/422 へ）。
@@ -98,6 +145,7 @@ pub async fn insert_version(
     capabilities: &Value,
     resource_limits: &Value,
     status: &str,
+    build_metadata: Option<&Value>,
 ) -> Result<(), DbErr> {
     component_versions::Entity::insert(component_versions::ActiveModel {
         id: Set(version_id.into()),
@@ -110,6 +158,7 @@ pub async fn insert_version(
         capabilities: Set(capabilities.clone()),
         resource_limits: Set(resource_limits.clone()),
         status: Set(status.into()),
+        build_metadata: Set(build_metadata.cloned()),
         ..Default::default()
     })
     .exec(executor)
@@ -323,6 +372,37 @@ pub async fn list_versions(
         .order_by_desc(component_versions::Column::CreatedAt)
         .into_model::<VersionListItem>()
         .all(executor)
+        .await
+}
+
+#[derive(Debug, FromQueryResult)]
+pub struct VersionDetails {
+    pub version_id: String,
+    pub wasm_sha256: String,
+    pub build_metadata: Option<Value>,
+    pub capabilities: Value,
+}
+
+pub async fn version_details(
+    executor: &impl ConnectionTrait,
+    tenant_id: &str,
+    component_id: &str,
+    version: &str,
+) -> Result<Option<VersionDetails>, DbErr> {
+    component_versions::Entity::find()
+        .select_only()
+        .column_as(component_versions::Column::Id, "version_id")
+        .columns([
+            component_versions::Column::WasmSha256,
+            component_versions::Column::BuildMetadata,
+            component_versions::Column::Capabilities,
+        ])
+        .filter(component_versions::Column::TenantId.eq(tenant_id))
+        .filter(component_versions::Column::ComponentId.eq(component_id))
+        .filter(component_versions::Column::Version.eq(version))
+        .filter(component_versions::Column::DeletedAt.is_null())
+        .into_model::<VersionDetails>()
+        .one(executor)
         .await
 }
 

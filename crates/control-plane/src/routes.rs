@@ -4,7 +4,7 @@ use crate::{
     auth, auth::require_scope, direct_http, handlers, handlers_secrets, login, state::AppState,
 };
 use axum::{
-    routing::{delete, get, post, put},
+    routing::{delete, get, patch, post, put},
     Router,
 };
 use hibana_shared::Scope;
@@ -31,10 +31,18 @@ pub(crate) fn build_internal_router(state: AppState) -> Router {
 pub(crate) fn build_router(state: AppState) -> Router {
     // --- Read スコープ（一覧・取得） ---
     let read_routes = Router::new()
+        .route(
+            "/components/{component_id}/egress",
+            get(handlers::egress::get),
+        )
         .route("/components", get(handlers::components::list_components))
         .route(
             "/components/{component_id}/versions",
             get(handlers::components::list_versions),
+        )
+        .route(
+            "/components/{component_id}/versions/{version}",
+            get(handlers::version_details::get),
         )
         .route("/executions/{id}", get(handlers::executions::get_execution))
         .route(
@@ -88,6 +96,10 @@ pub(crate) fn build_router(state: AppState) -> Router {
 
     // --- Admin スコープ（全 DELETE・active-version 切替・user/token 管理） ---
     let admin_routes = Router::new()
+        .route(
+            "/components/{component_id}/egress",
+            patch(handlers::egress::update),
+        )
         .route(
             "/components/{component_id}/secrets/{name}/deploy-access",
             put(handlers_secrets::set_secret_deploy_access),

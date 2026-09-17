@@ -53,6 +53,7 @@ async function fixture(t) {
   const calls = [];
   async function server(token, { tls, redirect } = {}) {
     let components = [];
+    let egress = null;
     const handler = async (req, res) => {
       const chunks = [];
       for await (const chunk of req) chunks.push(chunk);
@@ -89,6 +90,15 @@ async function fixture(t) {
           components = [{ name: JSON.parse(body).name, component_id: "cmp" }];
           res.end(JSON.stringify(components[0]));
         } else res.end(JSON.stringify(components));
+      } else if (req.url.endsWith("/egress")) {
+        if (req.method === "PATCH") {
+          const change = JSON.parse(body),
+            next = new Set(egress || []);
+          for (const value of change.allow || []) next.add(value);
+          for (const value of change.deny || []) next.delete(value);
+          egress = [...next].sort();
+        }
+        res.end(JSON.stringify({ allow_outbound: egress }));
       } else if (req.url.endsWith("/versions"))
         res.end(
           JSON.stringify({
@@ -173,6 +183,35 @@ test("remote login, deploy, rollback, secrets and deletion work across directori
     const r = await f.invoke(args, { input: "secret-value\n" });
     assert.equal(r.code, 0, r.output);
   }
+  assert.deepEqual(JSON.parse((await f.invoke(["egress", "list"])).output), {
+    allow_outbound: null,
+  });
+  const approved = await f.invoke([
+    "egress",
+    "allow",
+    "db.example.com:5432",
+    "api.example.com:443",
+  ]);
+  assert.equal(approved.code, 0, approved.output);
+  assert.match(approved.output, /existing and future versions/);
+  assert.equal(f.calls.at(-1).method, "PATCH");
+  assert.deepEqual(JSON.parse(f.calls.at(-1).body), {
+    allow: ["db.example.com:5432", "api.example.com:443"],
+  });
+  assert.equal(
+    (await f.invoke(["egress", "deny", "api.example.com:443"])).code,
+    0,
+  );
+  assert.deepEqual(JSON.parse((await f.invoke(["egress", "list"])).output), {
+    allow_outbound: ["db.example.com:5432"],
+  });
+  const beforeInvalidEgress = f.calls.length;
+  assert.notEqual((await f.invoke(["egress", "allow"])).code, 0);
+  assert.notEqual(
+    (await f.invoke(["egress", "allow", "db:443", "--unknown"])).code,
+    0,
+  );
+  assert.equal(f.calls.length, beforeInvalidEgress);
   const listed = await f.invoke(["list"], { cwd: f.root });
   assert.equal(listed.code, 0, listed.output);
   assert.match(listed.output, /hello/);

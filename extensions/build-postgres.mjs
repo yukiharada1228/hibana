@@ -41,6 +41,7 @@ export async function buildPostgres(name) {
       "postgres-core",
       "postgres-pool",
       "postgres-auth-scram",
+      "postgres-scram",
       "postgres",
       "postgres-tcp",
     ].includes(name)

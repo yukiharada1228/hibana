@@ -61,6 +61,7 @@ pub struct Validated {
     pub sha256: String,
     /// 本体サイズ（bytes）。
     pub size_bytes: u64,
+    pub build_metadata: Option<crate::build_metadata::BuildMetadata>,
 }
 
 /// 検証子プロセスの wall-clock timeout（秒）。超過で SIGKILL する。
@@ -289,6 +290,7 @@ fn validate_blocking(bytes: &[u8]) -> Result<Validated, FaasError> {
         approved_imports,
         sha256,
         size_bytes: bytes.len() as u64,
+        build_metadata: crate::build_metadata::extract(bytes)?,
     })
 }
 

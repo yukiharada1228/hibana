@@ -6,14 +6,27 @@ import { dirname, resolve, relative, join, delimiter } from "node:path";
 import { loadConfig } from "./config.mjs";
 import { installedRuntime, installRuntime } from "./runtime.mjs";
 import { resolveExtensions } from "./extensions.mjs";
-import { isLocalExtension } from "./extension-manifest.mjs";
+import {
+  isLocalExtension,
+  extensionNames,
+  managesExtensions,
+  isExtensionArchive,
+} from "./extension-manifest.mjs";
 
 export function shouldRebuild(config, file) {
   const path = resolve(config.root, file);
   if (path === config.path || path === join(config.root, ".dev.vars"))
     return true;
+  if (path === join(config.root, "hibana-lock.json")) return true;
   if (
-    config.extensions?.length &&
+    managesExtensions(config.extensions) &&
+    Object.values(config.extensions)
+      .filter(isExtensionArchive)
+      .some((source) => path === resolve(config.root, source))
+  )
+    return true;
+  if (
+    extensionNames(config.extensions).length &&
     [
       "package.json",
       "package-lock.json",
@@ -34,15 +47,17 @@ export function shouldRebuild(config, file) {
   // Local extension sources and their dist/ outputs participate in reload even
   // when a native app restricts build.watch. Generated target/ stays ignored.
   if (
-    config.extensions?.filter(isLocalExtension).some((input) => {
-      const within = relative(resolve(config.root, input), path);
-      return (
-        within === "" ||
-        (within !== ".." &&
-          !within.startsWith("../") &&
-          !within.startsWith("..\\"))
-      );
-    })
+    extensionNames(config.extensions)
+      .filter(isLocalExtension)
+      .some((input) => {
+        const within = relative(resolve(config.root, input), path);
+        return (
+          within === "" ||
+          (within !== ".." &&
+            !within.startsWith("../") &&
+            !within.startsWith("..\\"))
+        );
+      })
   )
     return true;
   if (config.component && path === resolve(config.root, config.component))
@@ -63,7 +78,11 @@ export async function dev(config, options, build) {
   const port = Number(options.port || 8787);
   if (!Number.isInteger(port) || port < 1 || port > 65535)
     throw new Error("port must be 1..65535");
-  await resolveExtensions(config, { mode: "dev" });
+  const extensionOptions = {
+    mode: "dev",
+    frozenLockfile: Boolean(options["frozen-lockfile"]),
+  };
+  await resolveExtensions(config, extensionOptions);
   let runtime = options.runtime || process.env.HIBANA_RUNTIME_BIN;
   if (!runtime) runtime = await installedRuntime();
   if (!runtime) {
@@ -115,7 +134,7 @@ export async function dev(config, options, build) {
     return childStopping;
   }
   async function start() {
-    const artifact = await build(config, { mode: "dev" });
+    const artifact = await build(config, extensionOptions);
     let local = {};
     try {
       local = parseEnv(await readFile(join(config.root, ".dev.vars"), "utf8"));

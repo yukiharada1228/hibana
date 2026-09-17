@@ -251,6 +251,7 @@ jobs:
           CC_wasm32_wasip2="$RUNNER_TEMP/wasi-sdk-34.0-x86_64-linux/bin/clang" AR_wasm32_wasip2="$RUNNER_TEMP/wasi-sdk-34.0-x86_64-linux/bin/llvm-ar" cargo clippy --locked --release --target wasm32-wasip2 --workspace --manifest-path extensions/Cargo.toml -- -D warnings
           cargo fmt --manifest-path extensions/Cargo.toml --all -- --check
           cargo test --locked --workspace --lib --manifest-path extensions/Cargo.toml
+          node scripts/test-extension-bundles.mjs
           WASMTIME_BIN="$RUNNER_TEMP/wasmtime-v36.0.14-x86_64-linux/wasmtime" node scripts/test-extension-boundaries.mjs
           WASMTIME_BIN="$RUNNER_TEMP/wasmtime-v36.0.14-x86_64-linux/wasmtime" HIBANA_TEST_CP_BIN=target/release/hibana-control-plane node scripts/test-tcp-tls-extension.mjs
 

@@ -13,10 +13,13 @@ import { createRequire } from "node:module";
 import { dirname, isAbsolute, join, relative, resolve } from "node:path";
 import {
   HTTP_CONTRACT,
+  extensionNames,
+  managesExtensions,
   isLocalExtension,
   validateExtensionList,
   validateManifest,
 } from "./extension-manifest.mjs";
+import { installExtensionPackages } from "./extension-packages.mjs";
 
 const MANIFEST = "hibana.extension.json";
 
@@ -97,14 +100,42 @@ async function readExtension(config, name, from) {
     const manifest = validateManifest(json, {
       javascript: Boolean(config.main),
     });
-    if (manifest.dependencies.length) {
+    let pkg;
+    try {
       const packageFile = await packagePath(root, "./package.json");
-      let pkg;
       try {
         pkg = JSON.parse(await readFile(packageFile, "utf8"));
       } catch {
         throw new Error("package.json must be valid JSON");
       }
+    } catch (error) {
+      if (
+        error.code !== "ENOENT" ||
+        !isLocalExtension(name) ||
+        manifest.dependencies.length
+      )
+        throw error;
+    }
+    const version = pkg?.version ?? null;
+    if (
+      version !== null &&
+      (typeof version !== "string" ||
+        version.length > 128 ||
+        !/^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)(?:-[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?(?:\+[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?$/.test(
+          version,
+        ) ||
+        version
+          .split("+")[0]
+          .split("-")
+          .slice(1)
+          .join("-")
+          .split(".")
+          .some((part) => /^0\d+$/.test(part)))
+    )
+      throw new Error(
+        "package.json version must be a concrete semantic version",
+      );
+    if (manifest.dependencies.length) {
       for (const dependency of manifest.dependencies) {
         if (
           ![pkg.dependencies, pkg.peerDependencies].some(
@@ -126,6 +157,7 @@ async function readExtension(config, name, from) {
     }
     const resolved = {
       name,
+      version,
       root,
       dependencies: manifest.dependencies,
       aliases: Object.fromEntries(aliases),
@@ -150,8 +182,14 @@ async function readExtension(config, name, from) {
 
 // The build plan is separate from user configuration. Resolved absolute paths
 // and generated WIT never overwrite the user's extension references.
-export async function resolveExtensions(config, { mode = "build" } = {}) {
+export async function resolveExtensions(config, options = {}) {
+  const { mode = "build" } = options;
   validateExtensionList(config.extensions);
+  const installation =
+    managesExtensions(config.extensions) ||
+    !extensionNames(config.extensions).length
+      ? await installExtensionPackages(config, options)
+      : { root: config.root, managed: false };
   const plan = {
     aliases: {},
     preload: [],
@@ -159,6 +197,13 @@ export async function resolveExtensions(config, { mode = "build" } = {}) {
     imports: [],
     permissions: [],
     witDirectories: [],
+    packages: {},
+    metadata: {
+      schema_version: 1,
+      input: config.main ? "javascript" : "component",
+      roots: [],
+      extensions: [],
+    },
   };
   const aliases = new Map();
   const imports = new Map();
@@ -166,14 +211,19 @@ export async function resolveExtensions(config, { mode = "build" } = {}) {
   const visited = new Set();
   const visiting = new Set();
   const packages = new Map();
+  const names = new Map();
   async function visit(reference, from, trail = []) {
     const extension = await readExtension(config, reference, from);
     const { root } = extension;
+    if (installation.managed && !isInside(installation.root, root))
+      throw new Error(
+        `Extension ${reference} must resolve inside the managed installation`,
+      );
     if (visiting.has(root))
       throw new Error(
         `Extension dependency cycle: ${[...trail, reference].join(" -> ")}`,
       );
-    if (visited.has(root)) return;
+    if (visited.has(root)) return names.get(root);
     if (visiting.size + visited.size >= 64)
       throw new Error(
         "At most 64 extensions are allowed, including dependencies",
@@ -186,8 +236,11 @@ export async function resolveExtensions(config, { mode = "build" } = {}) {
       packages.set(reference, root);
     }
     visiting.add(root);
+    names.set(root, reference);
+    if (installation.managed) plan.packages[reference] = root;
+    const dependencies = [];
     for (const dependency of extension.dependencies)
-      await visit(dependency, root, [...trail, reference]);
+      dependencies.push(await visit(dependency, root, [...trail, reference]));
     // Dependencies initialize before the extension that consumes them.
     for (const [name, path] of Object.entries(extension.aliases)) {
       if (aliases.has(name))
@@ -209,9 +262,17 @@ export async function resolveExtensions(config, { mode = "build" } = {}) {
     for (const permission of extension.permissions) permissions.add(permission);
     visiting.delete(root);
     visited.add(root);
+    plan.metadata.extensions.push({
+      name: reference,
+      version: extension.version,
+      dependencies: [...new Set(dependencies)],
+      permissions: extension.permissions,
+    });
+    return reference;
   }
-  for (const reference of config.extensions || [])
-    await visit(reference, config.root);
+  for (const reference of extensionNames(config.extensions))
+    plan.metadata.roots.push(await visit(reference, installation.root));
+  plan.metadata.roots = [...new Set(plan.metadata.roots)];
   plan.aliases = Object.fromEntries(
     [...aliases].map(([name, value]) => [name, value.path]),
   );
@@ -222,6 +283,8 @@ export async function resolveExtensions(config, { mode = "build" } = {}) {
       "This extension requires outbound-network, which hibana dev does not currently allow. Use a deployment with administrator-approved destinations.",
     );
   }
+  // Do not replace a working lock with an invalid or conflicting extension graph.
+  await installation.commitLock?.();
   return plan;
 }
 

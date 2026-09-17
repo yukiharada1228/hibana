@@ -100,6 +100,11 @@ export function normalizeConnect(args) {
   return { options, callback };
 }
 export function destination(options) {
+  if (typeof options.port !== "number" && typeof options.port !== "string")
+    throw error(
+      "ERR_INVALID_ARG_TYPE",
+      "Port must be a number or numeric string",
+    );
   const port = Number(options.port);
   if (!Number.isInteger(port) || port < 1 || port > 65535)
     throw error("ERR_SOCKET_BAD_PORT", "Port must be 1..65535");
@@ -107,6 +112,19 @@ export function destination(options) {
   if (typeof host !== "string" || !host.length)
     throw error("ERR_INVALID_ARG_TYPE", "Host must be a nonempty string");
   return { host, port };
+}
+
+function validateTimeout(ms) {
+  if (!Number.isFinite(ms) || ms < 0)
+    throw error("ERR_OUT_OF_RANGE", "Timeout must be a nonnegative number");
+}
+function validateKeepAliveDelay(initialDelay) {
+  if (
+    !Number.isInteger(initialDelay) ||
+    initialDelay < 0 ||
+    initialDelay > 0xffffffff
+  )
+    throw error("ERR_OUT_OF_RANGE", "Invalid keepalive delay");
 }
 
 export class Socket extends Duplex {
@@ -143,6 +161,14 @@ export class Socket extends Duplex {
         "Create a new Socket for each connection",
       );
     const { host, port } = destination(options);
+    // Reject invalid options before changing state or registering callbacks, so
+    // callers can correct their arguments and retry on this unused socket.
+    if (options.timeout !== undefined) validateTimeout(options.timeout);
+    if (
+      options.keepAlive !== undefined ||
+      options.keepAliveInitialDelay !== undefined
+    )
+      validateKeepAliveDelay(options.keepAliveInitialDelay ?? 0);
     if (callback) this.once("connect", callback);
     this._started = true;
     this.connecting = true;
@@ -353,20 +379,14 @@ export class Socket extends Duplex {
   }
 
   setTimeout(ms, callback) {
-    if (!Number.isFinite(ms) || ms < 0)
-      throw error("ERR_OUT_OF_RANGE", "Timeout must be a nonnegative number");
+    validateTimeout(ms);
     this._timeout = ms;
     this._activity();
     if (callback) this.once("timeout", callback);
     return this;
   }
   setKeepAlive(enable = false, initialDelay = 0) {
-    if (
-      !Number.isInteger(initialDelay) ||
-      initialDelay < 0 ||
-      initialDelay > 0xffffffff
-    )
-      throw error("ERR_OUT_OF_RANGE", "Invalid keepalive delay");
+    validateKeepAliveDelay(initialDelay);
     this._keepAlive = [Boolean(enable), initialDelay];
     if (this._connected && this._handle) {
       try {

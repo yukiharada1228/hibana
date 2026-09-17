@@ -1,7 +1,18 @@
-import { copyFile, mkdir, mkdtemp, open, rename, rm } from "node:fs/promises";
+import {
+  copyFile,
+  mkdir,
+  mkdtemp,
+  open,
+  readFile,
+  rename,
+  rm,
+  writeFile,
+} from "node:fs/promises";
 import { join, resolve } from "node:path";
 import { run } from "./process.mjs";
 import { resolveExtensions, prepareExtensionWit } from "./extensions.mjs";
+import { withBuildMetadata } from "./build-metadata.mjs";
+import { extensionNames } from "./extension-manifest.mjs";
 
 const COMPONENT_HEADER = Buffer.from([0, 97, 115, 109, 13, 0, 1, 0]);
 
@@ -25,7 +36,7 @@ export async function build(config, options = {}) {
   const extensions = await resolveExtensions(config, options);
   if (extensions.permissions.includes("outbound-network"))
     console.error(
-      "Extension requires outbound-network. Deployment does not grant network access; an administrator must approve destinations for the deployed version.",
+      "Extension requires outbound-network. An administrator must approve application destinations with hibana egress allow HOST:PORT; deployments inherit that policy.",
     );
   const directory = join(config.root, ".hibana/build");
   await mkdir(directory, { recursive: true });
@@ -81,6 +92,13 @@ export async function build(config, options = {}) {
       await checkComponent(composed);
       output = composed;
     }
+    await writeFile(
+      output,
+      withBuildMetadata(await readFile(output), extensions.metadata, {
+        preserveExisting:
+          !config.main && !extensionNames(config.extensions).length,
+      }),
+    );
     await rename(output, artifact);
     return artifact;
   } finally {

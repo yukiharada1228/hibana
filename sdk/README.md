@@ -10,9 +10,17 @@ Node API などの追加機能は、ユーザーが用意した JS モジュー�
 
 Stream は [機能別の入口](../extensions/node-stream/README.md)から必要な API を import します。例えば PassThrough だけなら `@hibana/node-stream/passthrough` を使います。通常の `node:stream` は複数の API をまとめて使う入口として維持しています。
 
-PostgreSQL は [postgres-core に必要な通信・認証を組み合わせる](../extensions/postgres-core/README.md)構成を基本とします。`database/` にローカル拡張を用意し、`extensions: ["./database"]` を指定します。Pool または Drizzle が必要な場合だけ `postgres-pool` を追加します。複数の通信・認証方式をまとめて使うための [@hibana/postgres](../extensions/postgres/README.md) プリセットもあります。[検証範囲](../docs/postgres-compatibility.md)を確認してください。
+PostgreSQL は [postgres-core に必要な通信・認証を組み合わせる](../extensions/postgres-core/README.md)構成を基本とします。Pool または Drizzle が必要な場合だけ `postgres-pool` を追加します。既存ライブラリの `pg` import には、接続先に合わせた [プリセット](../extensions/README.md#複数の機能をまとめて使うプリセット)も使えます。[検証範囲](../docs/postgres-compatibility.md)を確認してください。
 
-配布された拡張パッケージを使う場合は、アプリにnpm依存として導入し、`extensions`配列にパッケージ名、または`./`で始まるローカル拡張のディレクトリを指定します。通常の`build`・`dev`・`deploy`が宣言ファイルを読み、JSの参照解決とWIT・Wasmの合成を行います。パッケージ名・バージョンはアプリのlockfileで管理し、CLIは拡張の自動取得やインストール処理を行いません。
+拡張の名前と取得元は `hibana.json` だけに書きます。`build`・`dev`・`deploy` が `.hibana/` に取得し、`hibana-lock.json` で依存を固定します。アプリの `package.json` と `node_modules` は通常の JS 依存だけに使います。例えば次の設定で、依存同梱版の PostgreSQL 拡張を利用できます。
+
+```json
+"extensions": {
+  "@hibana/postgres-scram": "./vendor/hibana-postgres-scram-0.7.5-bundle.tgz"
+}
+```
+
+`hibana-lock.json` は Git に保存し、CI では `hibana build --frozen-lockfile` を使います。取得元には HTTPS の `.tgz` URL や公開済みパッケージの完全なバージョンも指定できます。ローカル拡張の配列形式は開発・互換用に維持します。[詳細と移行手順](../docs/application-extensions.md)。
 
 ```ts
 import { Hono } from 'hono'
@@ -139,6 +147,8 @@ CLIはComponentのヘッダーを確認します。WITの一致や全体の検�
 
 ローカル専用の秘密値は`.dev.vars`にdotenv形式で書きます。値は`vars`より優先します。`.hibana/`と`.dev.vars`をバージョン管理に含めないでください。サーバーのSecretsは管理者が`hibana secret put NAME`の標準入力から登録し、`hibana secret allow-deploy NAME`でそのアプリへの利用を許可します。`hibana.json`に`"secrets": ["NAME"]`を指定し、通常の開発者が`deploy`します。省略時は空配列で、Secretを自動列挙・注入しません。`secret deny-deploy NAME`は今後の配備だけを拒否します。既存バージョンでの利用も止める場合は`secret delete NAME`を使います。
 
+外部 DB などへの通信は、管理者が初回配備後に `hibana egress allow db.example.com:5432` で許可します。`hibana egress list` で確認し、`hibana egress deny db.example.com:5432` で取り消します。アプリの全バージョンに共通で適用し、以後の `deploy` にも引き継ぎます。拡張や hibana.json は権限を自動付与しません。[コンソールでも同じ設定を操作](../docs/console.md#外部通信先の管理)できます。
+
 `hibana login --profile onprem --url https://api.example.internal --tenant team --email dev@example.internal`を実行し、`Password:` にパスワードを入力します（文字は非表示）。スクリプトでは末尾に `--password-stdin < password.txt` を付けます。`HIBANA_URL`・`HIBANA_TENANT`・`HIBANA_EMAIL`・`HIBANA_PASSWORD`でも設定できます。接続先と認証はPC共通のプロファイルに保存し、`--profile onprem`で選択できます。CIでは`HIBANA_TOKEN`を設定できます。配備先を変えた場合、保存済みの別サーバーのトークンは再利用しません。`deploy --version 1.0.0`で版を指定できます。省略時は一意な開発版を採番します。
 
 実行用Workerが設定された配備先では、`deploy`はWorkerでの事前コンパイルを待ってから公開します。初回HTTPへのコンパイル待ちを避けるため、その時間はデプロイ所要時間に含まれます。準備に失敗すると配備はエラーになり、旧版の公開設定を維持します。`rollback`も切替先を準備してから公開します。
@@ -163,7 +173,7 @@ Wranglerを参考にするのは、この短い開発・配備の流れです。
 
 ## 候補版の設定整理
 
-拡張は `"extensions": ["@hibana/node-tls"]` に統一しました。旧 `extensions.packages` や直接の aliases/WIT 設定からの移行は[アプリ拡張](../docs/application-extensions.md#旧候補版の設定から移行する)を参照してください。
+配布拡張は `extensions` に名前と取得元を指定します。アプリの npm 依存や旧 `extensions.packages`、直接の aliases/WIT 設定からの移行は[アプリ拡張](../docs/application-extensions.md#旧候補版の設定から移行する)を参照してください。
 
 重複していた `delete --name NAME` / `--force` は `delete NAME` / `--yes` に、`platform --local --source PATH` は `platform --source PATH` に統一しました。ログインはユーザー設定領域のプロファイル、CI は `HIBANA_URL` / `HIBANA_TOKEN` を使います。旧 `.hibana/auth.json` は読み書きしないため、使用していた場合は `hibana login` で再ログインしてください。既存の認証ファイル自体は削除しません。
 

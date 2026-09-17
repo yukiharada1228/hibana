@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { Api, ApiError, appUrl, publication, errorMessage } from "./api";
 import type { Component, Session, Version } from "./types";
 import { Button } from "./components/ui/button";
@@ -21,7 +21,9 @@ import {
   versionLabel,
 } from "./components/common";
 import { ApplicationSettings } from "./ApplicationSettings";
+import { EgressSettings } from "./EgressSettings";
 import { Executions } from "./Executions";
+import { Extensions } from "./Extensions";
 
 function deletionReason(version: Version, component: Component): string | null {
   const reason = version.deletion_blocked_reason;
@@ -88,24 +90,26 @@ export function Applications({ components }: { components: Component[] }) {
   );
   return (
     <>
-      <div className="page-title">
-        <h1>アプリケーション</h1>
+      <div className="page-title applications-title">
+        <div className="title-with-count">
+          <h1>アプリケーション</h1>
+          <span className="count" role="status">
+            {query
+              ? `${filtered.length} / ${components.length} 件`
+              : `${components.length} 件`}
+          </span>
+        </div>
+        <div className="search">
+          <label htmlFor="app-search">名前で絞り込み</label>
+          <Input
+            id="app-search"
+            blockSize="sm"
+            value={query}
+            onChange={(e) => setQuery(e.target.value)}
+          />
+        </div>
       </div>
       <section className="panel">
-        <div className="panel-toolbar">
-          <h2>
-            すべてのアプリ <span className="count">{components.length}</span>
-          </h2>
-          <div className="search">
-            <label htmlFor="app-search">名前で絞り込み</label>
-            <Input
-              id="app-search"
-              blockSize="sm"
-              value={query}
-              onChange={(e) => setQuery(e.target.value)}
-            />
-          </div>
-        </div>
         {!components.length ? (
           <Empty title="最初のアプリをデプロイしましょう">
             <a href="#deploy">CLI の接続・デプロイ手順を見る</a>
@@ -142,11 +146,6 @@ export function Applications({ components }: { components: Component[] }) {
                           ? versionLabel(component.active_version)
                           : "—"}
                       </strong>
-                      {component.active_version_created_at && (
-                        <div className="muted small nowrap">
-                          登録 {date(component.active_version_created_at)}
-                        </div>
-                      )}
                     </TableCell>
                     <TableCell>
                       <Badge>{publication(component)}</Badge>
@@ -184,6 +183,8 @@ export function Application({
   const [loading, setLoading] = useState(true),
     [busy, setBusy] = useState(false);
   const [confirm, setConfirm] = useState<Confirmation | null>(null);
+  const [extensionVersion, setExtensionVersion] = useState<string | null>(null);
+  const settingsTab = useRef<HTMLButtonElement>(null);
   const canDeploy = session.scopes.includes("deploy"),
     canAdmin = session.scopes.includes("admin");
   const deleteTarget =
@@ -266,26 +267,23 @@ export function Application({
       <a className="back" href="#apps">
         ← アプリケーション
       </a>
-      <div className="page-title">
-        <div>
+      <div className="application-header">
+        <div className="application-heading">
           <h1>{component.name}</h1>
-          <PublicUrl component={component} />
+          <Badge>{publication(component)}</Badge>
         </div>
-        <Badge>{publication(component)}</Badge>
+        <div className="application-summary">
+          <p className="muted small">
+            現在のバージョン：
+            <strong title={component.active_version || undefined}>
+              {component.active_version
+                ? versionLabel(component.active_version)
+                : "未配備"}
+            </strong>
+          </p>
+          {appUrl(component) && <PublicUrl component={component} />}
+        </div>
       </div>
-      <p className="muted">
-        現在のバージョン：
-        <strong title={component.active_version || undefined}>
-          {component.active_version
-            ? versionLabel(component.active_version)
-            : "未配備"}
-        </strong>
-        {component.active_version_created_at && (
-          <span className="version-date">
-            登録 {date(component.active_version_created_at)}
-          </span>
-        )}
-      </p>
       <div className="tabs" role="tablist" aria-label="アプリの詳細">
         <button
           role="tab"
@@ -296,6 +294,16 @@ export function Application({
         </button>
         <button
           role="tab"
+          aria-selected={tab === "extensions"}
+          onClick={() => {
+            setExtensionVersion(null);
+            setTab("extensions");
+          }}
+        >
+          拡張
+        </button>
+        <button
+          role="tab"
           aria-selected={tab === "executions"}
           onClick={() => setTab("executions")}
         >
@@ -303,6 +311,7 @@ export function Application({
         </button>
         {(canDeploy || canAdmin) && (
           <button
+            ref={settingsTab}
             role="tab"
             aria-selected={tab === "settings"}
             onClick={() => setTab("settings")}
@@ -313,10 +322,39 @@ export function Application({
       </div>
       {error && !confirm && <Notice error>{error}</Notice>}
       {message && <Notice>{message}</Notice>}
-      {tab === "executions" ? (
+      {tab === "extensions" ? (
+        loadError ? (
+          <Notice error>{loadError}</Notice>
+        ) : loading ? (
+          <Notice>読み込み中…</Notice>
+        ) : (
+          <Extensions
+            api={api}
+            component={component}
+            versions={versions}
+            selected={extensionVersion || component.active_version}
+            onSelect={setExtensionVersion}
+            onOpenSettings={
+              canDeploy || canAdmin
+                ? () => {
+                    setTab("settings");
+                    settingsTab.current?.focus();
+                  }
+                : undefined
+            }
+          />
+        )
+      ) : tab === "executions" ? (
         <Executions api={api} component={component} versions={versions} />
       ) : tab === "settings" ? (
         <>
+          <EgressSettings
+            key={component.component_id}
+            api={api}
+            component={component}
+            canManage={canAdmin}
+            onChange={onChange}
+          />
           {canDeploy && <ApplicationSettings api={api} component={component} />}
           {canAdmin && (
             <div className="danger-zone">
@@ -343,12 +381,13 @@ export function Application({
       ) : (
         <section className="panel">
           <div className="panel-toolbar">
-            <div>
-              <h2>バージョン履歴</h2>
+            <h2>バージョン履歴</h2>
+            <details className="inline-help">
+              <summary>登録日時について</summary>
               <p className="muted small">
                 登録日時はバージョンを初めて配備した日時です。切り戻しても変わりません。
               </p>
-            </div>
+            </details>
           </div>
           {!versions.length ? (
             <Empty title="バージョンはまだありません">
@@ -379,6 +418,16 @@ export function Application({
                           </p>
                           <p>{bytes(version.size_bytes)}</p>
                           <p className="hash">SHA-256 {version.wasm_sha256}</p>
+                          <Button
+                            size="sm"
+                            variant="text"
+                            onClick={() => {
+                              setExtensionVersion(version.version);
+                              setTab("extensions");
+                            }}
+                          >
+                            拡張の構成を見る
+                          </Button>
                         </details>
                       </TableCell>
                       <TableCell>
@@ -447,12 +496,12 @@ export function Application({
                           )}
                         </div>
                         {canAdmin && deletionReason(version, component) && (
-                          <p
-                            className="version-delete-reason muted small"
-                            id={`delete-reason-${version.version_id}`}
-                          >
-                            {deletionReason(version, component)}
-                          </p>
+                          <details className="version-delete-reason inline-help">
+                            <summary>削除できない理由</summary>
+                            <p id={`delete-reason-${version.version_id}`}>
+                              {deletionReason(version, component)}
+                            </p>
+                          </details>
                         )}
                       </TableCell>
                     </TableRow>

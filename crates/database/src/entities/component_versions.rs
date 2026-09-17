@@ -15,6 +15,7 @@ pub struct Model {
     pub created_at: DateTimeUtc,
     pub size_bytes: i64,
     pub capabilities: Json,
+    pub build_metadata: Option<Json>,
     pub deleted_at: Option<DateTimeUtc>,
 }
 
