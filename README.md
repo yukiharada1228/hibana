@@ -58,6 +58,8 @@ export default app
 
 ファイルを編集すると変更が反映されます。ローカル開発にはKubernetes、PostgreSQL、Redis、オブジェクトストレージの起動は不要です。`Ctrl-C`で終了します。
 
+アプリからNeonなど外部DBへ接続する場合は、`hibana.json`の`dev.allow_outbound`に`HOST:PORT`を指定し、接続文字列を`.dev.vars`へ保存します。[ローカルDB接続の設定](sdk/README.md#ローカルで外部dbへ接続する)を参照してください。
+
 ## 対応言語
 
 | テンプレート | アプリの書き方 | ビルドに使うもの |

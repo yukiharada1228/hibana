@@ -94,7 +94,9 @@ test('declared extension dependencies initialize first, deduplicate and propagat
   assert.ok(!JSON.stringify(plan.metadata).includes(f.root));
   assert.equal(JSON.stringify(config), before);
   assert.equal(plan.net_allow_outbound, undefined);
-  await assert.rejects(resolveExtensions(f.config, { mode: 'dev' }), /dev does not currently allow/);
+  await assert.rejects(resolveExtensions(f.config, { mode: 'dev' }), /dev.allow_outbound/);
+  const local = { ...f.config, dev: { allow_outbound: ['db.example.com:5432'] } };
+  assert.deepEqual((await resolveExtensions(local, { mode: 'dev' })).permissions, ['outbound-network']);
 });
 
 test('diamond dependencies are included once in deterministic dependency order', async t => {
@@ -215,7 +217,7 @@ test('permission declarations never grant access, and dev rejects network requir
   assert.deepEqual(config.permissions, ['outbound-network']);
   assert.equal(config.net_allow_outbound, undefined);
   let built = false;
-  await assert.rejects(dev(f.config, {}, async () => { built = true; }), /dev does not currently allow/);
+  await assert.rejects(dev(f.config, {}, async () => { built = true; }), /dev.allow_outbound/);
   assert.equal(built, false);
   await assert.rejects(access(join(f.root, '.hibana')), { code: 'ENOENT' });
 });

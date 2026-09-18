@@ -43,7 +43,7 @@ impl ApprovedEgress {
         }
     }
 
-    pub(super) fn resolve(&self, name: &str) -> impl Iterator<Item = SocketAddr> + '_ {
+    pub(crate) fn resolve(&self, name: &str) -> impl Iterator<Item = SocketAddr> + '_ {
         let key = host_key(name);
         // Literal IPs are safe to return without DNS. Socket policy still checks port.
         let literal = key.parse::<IpAddr>().ok();

@@ -107,6 +107,30 @@ Rust・GoのプロジェクトにはWIT定義と依存ロックもコピーさ�
 
 以降の `hibana ...` は、CLIを導入済みのHono・JavaScriptプロジェクト内では `npm exec -- hibana ...` として実行できます。グローバル導入済みなら直接 `hibana ...` を使えます。プロジェクト作成前やRust・Goでは `npx --yes @yukiharada1228/hibana@0.2.0-rc.1 ...` も使えます。
 
+## ローカルで外部DBへ接続する
+
+PostgreSQLなど外向き通信を使う拡張は、ローカル開発用の接続先を`hibana.json`に指定します。
+
+```json
+"dev": {
+  "allow_outbound": ["db.example.com:5432"]
+}
+```
+
+指定できるのは最大64件の`HOST:PORT`または`[IPv6]:PORT`です。URL・パスワード・ワイルドカードは指定できません。設定したホストの公開IPとポートだけを許可し、リクエストごとにDNSを解決して接続先を固定します。ループバック・プライベートIP・リンクローカルなどの内部IPへの接続は引き続き拒否します。ローカル設定は配備先の`hibana egress allow`と独立しており、配備時には送信しません。
+
+接続文字列はプロジェクトの`.dev.vars`へ保存します。このファイルはGitに含めません。配備先のSecretは自動取得しません。
+
+```dotenv
+DATABASE_URL="postgresql://USER:PASSWORD@db.example.com:5432/DB?sslmode=require&channel_binding=require"
+```
+
+```bash
+npm run dev
+```
+
+`hibana.json`や`.dev.vars`を変更すると開発サーバーが再起動します。この機能には対応するCLIとPC用ランタイムの両方が必要です。ソースから検証するときは`cargo build --locked -p hibana-worker`でランタイムを作り、`hibana dev --runtime /path/to/hibana/target/debug/hibana-worker`で指定できます。
+
 ## アプリと基盤の操作
 
 `hibana --help`で基本の流れとコマンド一覧、`hibana dev --help`でその操作のオプションと実行例を確認できます。`hibana help deploy`の形式も使えます。`runtime`や`platform`などのサブコマンドも同じ形式でヘルプを表示します。
@@ -201,7 +225,7 @@ HTTPの契約は`wasi:http/incoming-handler@0.2.3`です。Hono・JS系はesbuil
 
 コンパイル済みコードはWorkerごとに再利用し、Store・Wasmインスタンスはリクエストごとに新しく作ります。追加・交換されたWorkerはバックグラウンドで準備され、その間の呼び出しは準備済みWorkerへ送ります。全候補が未準備の場合は準備完了まで503を返します。KubernetesのReadyだけで全アプリの準備完了を保証するものではありません。
 
-本番Workerとdevは同じRust実行モジュールを使います。ただしdevは認証なしのloopback HTTPサーバーで、DB・配布・課金・分散処理はありません。外向き通信はdevでは拒否、本番では管理者の承認が必要です。JSのPOSTなどの入力は変換層でバッファします。レスポンスはストリーム可能ですが、WebSocket・完全なNode.js互換・Workers Bindingは提供しません。Preview 1単体や任意のWIT worldも未対応です。
+本番Workerとdevは同じRust実行モジュールを使います。ただしdevは認証なしのloopback HTTPサーバーで、基盤DB・配布・課金・分散処理はありません。外向き通信はdevでは`dev.allow_outbound`の指定、本番では管理者の承認が必要です。JSのPOSTなどの入力は変換層でバッファします。レスポンスはストリーム可能ですが、WebSocket・完全なNode.js互換・Workers Bindingは提供しません。Preview 1単体や任意のWIT worldも未対応です。
 
 バージョンの公開は単一DBトランザクションで行います。コード・vars・選択したSecretsの参照・active版・公開設定が揃って反映され、失敗した配備は稼働中の設定を変えません。初回のアプリ作成は別操作で、失敗時に未公開の空アプリが残る場合があります。詳細と旧環境の移行手順は[デプロイ仕様](../docs/deployment.md)を参照してください。
 

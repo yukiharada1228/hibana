@@ -90,7 +90,7 @@ const commands = {
     {
       examples: ["hibana dev", "hibana dev --port 3000"],
       notes:
-        "Open http://127.0.0.1:8787 (or your chosen port). Press Ctrl+C to stop.\nThe matching local runtime is installed automatically when needed and reused.\nFor a supplied executable, use --runtime PATH or HIBANA_RUNTIME_BIN.",
+        "Open http://127.0.0.1:8787 (or your chosen port). Press Ctrl+C to stop.\nThe matching local runtime is installed automatically when needed and reused.\nFor a supplied executable, use --runtime PATH or HIBANA_RUNTIME_BIN.\nAllow local outbound connections with dev.allow_outbound in hibana.json (HOST:PORT).\nLocal Secrets belong in .dev.vars; deployment permissions and Secrets are separate.",
     },
   ),
   build: leaf(

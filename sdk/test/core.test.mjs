@@ -73,7 +73,7 @@ test("deploy publishes code, vars and selected Secrets with one request and no a
       if (path === "/components") return [{ name: "hello", component_id: "cmp" }];
       return {};
     } };
-    const config = { name: "hello", vars: { GREETING: "hello" }, secrets: ["SELECTED"], resources: {} };
+    const config = { name: "hello", vars: { GREETING: "hello" }, secrets: ["SELECTED"], resources: {}, dev: { allow_outbound: ["local-only.example:5432"] } };
     await deploy(api, config, artifact, "1.0.0");
     assert.deepEqual(calls.map(c => c.path), ["/components", "/components/cmp/versions"]);
     const form = calls[1].body;
@@ -81,6 +81,9 @@ test("deploy publishes code, vars and selected Secrets with one request and no a
     assert.equal(form.get("ingress"), "true");
     assert.deepEqual(JSON.parse(form.get("vars")), config.vars);
     assert.deepEqual(JSON.parse(form.get("secrets")), ["SELECTED"]);
+    assert.equal(form.has("dev"), false);
+    assert.equal(form.has("net_allow_outbound"), false);
+    assert.equal(form.has("capabilities"), false);
     const failed = [];
     await assert.rejects(deploy({ async request(path, options) { failed.push(path); if (path.endsWith("/versions")) throw Error("denied"); return api.request(path, options); } }, config, artifact, "1.0.1"), /denied/);
     assert.deepEqual(failed, ["/components", "/components/cmp/versions"]);
