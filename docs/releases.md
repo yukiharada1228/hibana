@@ -1,6 +1,6 @@
 # Hibanaの配布と導入
 
-CLI は npm の `@yukiharada1228/hibana` と [GitHub Releases](https://github.com/yukiharada1228/hibana/releases) の tarball で配布します。PC用Wasmtimeランタイム、オンプレ用コンテナイメージとKubernetesマニフェストはGitHub Releasesで別々に配布します。通常のCLI操作はバージョンを指定した`npx`を使用し、グローバルインストールは任意です。
+CLI は npm の `@yukiharada1228/hibana` と [GitHub Releases](https://github.com/yukiharada1228/hibana/releases) の tarball で配布します。PC用Wasmtimeランタイム、オンプレ用コンテナイメージとKubernetesマニフェストはGitHub Releasesで別々に配布します。初回作成はバージョンを指定した`npx`、作成後のHono・JavaScriptプロジェクトはローカルCLIをnpm scriptsから使用します。グローバルインストールは任意です。
 
 MVPではCLI・ローカルランタイム・Control Plane・Workerを同じバージョンに揃えます。異なる版の混在は検証対象外です。
 
@@ -18,7 +18,11 @@ npm run dev
 # Ctrl+Cで停止
 ```
 
-CLIの導入にリポジトリ、Rust、Docker、kubectlは不要です。`init`が作るプロジェクトは、作成時のバージョンを固定した`npx`でCLIを実行します。CLIはnpmキャッシュから再利用され、アプリのnpm依存には追加しません。以降の`hibana ...`は`npx --yes @yukiharada1228/hibana@VERSION ...`として実行できます。`dev`はランタイムが見つからなければ、CLIと同じバージョンのOS・CPUに合うファイルをHTTPSで取得し、Releaseの`SHA256SUMS`と照合してから保存します。次回以降は保存済みのランタイムを再利用します。`hibana runtime install`で事前に取得することもできます。
+CLIの導入にリポジトリ、Rust、Docker、kubectlは不要です。`init`が作るHono・JavaScriptプロジェクトは、作成時のCLIバージョンを`devDependencies`に固定します。npm scriptsは`hibana dev`・`hibana build`・`hibana deploy`としてローカルCLIを実行します。`package.json`と`package-lock.json`をGitに保存し、別のPCやCIでは`npm ci`で開発依存も導入します。
+
+以降の`hibana ...`は、CLIを導入済みのプロジェクト内では`npm exec -- hibana ...`として実行できます。グローバル導入済みなら直接実行でき、プロジェクト作成前やRust・Goでは`npx --yes @yukiharada1228/hibana@VERSION ...`も使えます。[グローバル導入と既存プロジェクトの移行](../sdk/README.md#cliの導入とテンプレート)も参照してください。
+
+`dev`はランタイムが見つからなければ、CLIと同じバージョンのOS・CPUに合うファイルをHTTPSで取得し、Releaseの`SHA256SUMS`と照合してから保存します。次回以降は保存済みのランタイムを再利用します。`hibana runtime install`で事前に取得することもできます。
 
 管理APIへのログインと配備は[リモートCLI手順](remote-cli.md)を参照してください。リモート配備だけを行うPCにはローカルランタイムは不要です。
 

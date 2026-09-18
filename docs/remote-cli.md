@@ -65,7 +65,7 @@ CLIは`--url https://hibana.example.internal/api`のようにパス付きの管�
 
 ## CLIの配布
 
-Node.js 24以上が必要です。CLI は `npx --yes @yukiharada1228/hibana@VERSION` で実行します。グローバルインストールやHibanaリポジトリは不要です。未公開の候補はtarballを `npx --package=/path/to/hibana-cli-VERSION.tgz hibana ...` で実行できます。
+Node.js 24以上が必要です。初回作成には `npx --yes @yukiharada1228/hibana@VERSION` を使えます。Hono・JavaScriptプロジェクトにはCLIが`devDependencies`として固定され、以降は`npm run dev`・`npm run build`・`npm run deploy`で実行します。グローバルインストールやHibanaリポジトリは不要です。直接`hibana`を使うための[グローバル導入](../sdk/README.md#cliの導入とテンプレート)も可能です。未公開の候補はtarballを `npx --package=/path/to/hibana-cli-VERSION.tgz hibana ...` で実行し、`init`時には`--cli-package`で同じtarballを指定します。
 
 ```bash
 # 配布担当者がリポジトリ内で実行
@@ -84,7 +84,7 @@ JS/TSのビルドには同梱のoptionalDependenciesを使います。ビルド�
 
 ## 開発者の操作
 
-以下の `hibana ...` は `npx --yes @yukiharada1228/hibana@0.2.0-rc.1 ...` として実行します。コンソールの「CLI の接続」から、自分の接続先とバージョンを含むコマンドをコピーできます。
+以下の `hibana ...` は、グローバル導入済みならそのまま実行できます。CLIを導入済みのプロジェクト内では `npm exec -- hibana ...`、作成前は `npx --yes @yukiharada1228/hibana@0.2.0-rc.1 ...` として実行します。コンソールの「CLI の接続」から、自分の接続先とバージョンを含む初回コマンドと、作成後の`npm run deploy`をコピーできます。
 
 管理者から管理API URL・テナント名・アカウントを受け取ります。公開 URL は基盤から自動取得します。通常のログインでは `Password:` に続けてパスワードを入力します。文字は表示されません。スクリプトでは `--password-stdin < /secure/login-password.txt` または `HIBANA_PASSWORD` を使えます。
 
@@ -95,7 +95,7 @@ hibana login \
 
 hibana init hello
 cd hello
-hibana deploy
+npm run deploy
 curl https://hello.team.apps.example.internal/
 hibana list
 hibana rollback
@@ -106,7 +106,7 @@ hibana logout
 
 複数の接続先を使う場合だけ `hibana login --profile NAME ...` で名前を付け、`hibana profile use NAME` で切り替えます。`--version` も任意で、省略すると自動生成されます。
 
-`init`のnpm scriptsは作成時のCLIバージョンを指定して`npx`から実行します。別のPCでもグローバルCLIは不要です。未公開の候補版では`--cli-package PATH`を使用してください。`--cli-package PATH`を指定した場合だけ、tarballや開発用ディレクトリをプロジェクトのCLI依存として追加します。通常のHonoをWasm Componentへ変換してアップロードし、実行・配置・準備済みコードの管理はオンプレのWorker群が担当します。
+`init`は作成時のCLIバージョンを`devDependencies`に固定し、npm scriptsからプロジェクト内のCLIを実行します。別のPCでは`npm ci`で開発依存も導入すれば、グローバルCLIなしで同じ版を使えます。未公開の候補版では`--cli-package PATH`でtarballや開発用ディレクトリをCLIの取得元に指定してください。通常のHonoをWasm Componentへ変換してアップロードし、実行・配置・準備済みコードの管理はオンプレのWorker群が担当します。
 
 通常の配備はRead・Deploy、アプリ削除はRead・Adminのスコープが必要です。`onprem-admin`には同じテナントの管理者でログインしてください。
 

@@ -80,7 +80,7 @@ const commands = {
       max: 1,
       examples: ["hibana init my-api", "hibana init my-api --template rust"],
       notes:
-        "Creates a Hono application by default and installs its npm dependencies.\nProject scripts use npx with this CLI version; no global installation is needed.\nUse --cli-package PATH for an unpublished or offline CLI package.\nUse an empty directory; omit the directory to create files in the current one.",
+        "Creates a Hono application by default and installs its npm dependencies.\nHono and JavaScript projects pin this CLI version in devDependencies.\nProject scripts use the local CLI; no global installation is needed.\nUse --cli-package PATH for an unpublished or offline CLI package.\nUse an empty directory; omit the directory to create files in the current one.",
     },
   ),
   dev: leaf(

@@ -85,14 +85,19 @@ try {
   assert.equal((await run("npx", [...npx, "--version"])).trim(), `hibana ${metadata.version}`);
   await run("npx", [...npx, "init", project, "--template", "hono", "--no-install"]);
   const projectPackage = JSON.parse(await readFile(join(project, "package.json"), "utf8"));
-  assert.equal(projectPackage.devDependencies?.["@yukiharada1228/hibana"], undefined);
+  assert.deepEqual(projectPackage.devDependencies, { [metadata.name]: metadata.version });
+  assert.deepEqual(projectPackage.scripts, { dev: "hibana dev", build: "hibana build", deploy: "hibana deploy" });
   assert.deepEqual(Object.keys(projectPackage.dependencies), ["hono"]);
   await run("npm", ["install", ...npmFlags], project);
-  await run("npm", ["install", "--include=optional", ...npmFlags], installation);
-  await run("npm", ["run", "build"], project);
+  const projectCli = join(project, "node_modules", metadata.name, "src/cli.mjs");
+  assert.equal((await run(process.execPath, [projectCli, "--version"])).trim(), `hibana ${metadata.version}`);
+  const lock = JSON.parse(await readFile(join(project, "package-lock.json"), "utf8"));
+  assert.equal(lock.packages[`node_modules/${metadata.name}`].version, metadata.version);
+  await writeFile(join(guard, "npx"), '#!/bin/sh\necho "Unexpected npx dependency in project scripts" >&2\nexit 99\n', {mode: 0o755});
+  await run("npm", ["run", "build"], project, { npm_config_offline: "true" });
   const wasm = await readFile(join(project, ".hibana/build/app.wasm"));
   assert.deepEqual(wasm.subarray(0, 8), Buffer.from([0, 97, 115, 109, 13, 0, 1, 0]));
-  console.log(`npx init and npm run build succeeded without global CLI installation: ${wasm.length}-byte Wasm Component (SHA-256 ${createHash("sha256").update(wasm).digest("hex")}).`);
+  console.log(`npx init installed a pinned project-local CLI; npm run build succeeded without npx or a global CLI: ${wasm.length}-byte Wasm Component (SHA-256 ${createHash("sha256").update(wasm).digest("hex")}).`);
 
   if (process.env.HIBANA_RUNTIME_BIN || github) {
     const listener = createServer();
@@ -106,7 +111,7 @@ try {
       await run(process.execPath, [cli, "runtime", "install", "--from", runtime, "--sha256", checksum]);
     }
     const managedRuntime = join(env.HIBANA_RUNTIME_HOME, packed.version, `${process.platform}-${process.arch}`, "hibana-worker");
-    const child = spawn(process.execPath, [cli, "dev", "--no-watch", "--port", String(port)], { cwd: project, env, stdio: ["ignore", "pipe", "pipe"] });
+    const child = spawn(process.execPath, [projectCli, "dev", "--no-watch", "--port", String(port)], { cwd: project, env, stdio: ["ignore", "pipe", "pipe"] });
     let output = ""; child.stdout.on("data", b => output += b); child.stderr.on("data", b => output += b);
     const exited = new Promise(resolve => child.once("exit", (code, signal) => resolve({ code, signal })));
     child.once("error", error => { output += error.message; });

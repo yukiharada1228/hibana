@@ -31,7 +31,7 @@ export function Deploy({
     {
       title: "デプロイ",
       description: "PC でビルドした Wasm が、この基盤へアップロードされます。",
-      command: `${cli} deploy`,
+      command: "npm run deploy",
     },
   ];
   return (

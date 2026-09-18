@@ -44,7 +44,6 @@ export async function init(
   };
   const javascript = template === "hono" || template === "javascript";
   const { name: cliName, version } = await packageInfo();
-  const cli = cliPackage ? "hibana" : `npx --yes ${cliName}@${version}`;
   if (javascript) {
     config.main = "src/index.ts";
     await writeFile(
@@ -55,19 +54,14 @@ export async function init(
           private: true,
           type: "module",
           scripts: {
-            dev: `${cli} dev`,
-            build: `${cli} build`,
-            deploy: `${cli} deploy`,
+            dev: "hibana dev",
+            build: "hibana build",
+            deploy: "hibana deploy",
           },
           ...(template === "hono" ? { dependencies: { hono: "^4.6.0" } } : {}),
-          // Unpublished/offline builds can explicitly use a project-local CLI.
-          ...(cliPackage
-            ? {
-                devDependencies: {
-                  [cliName]: `file:${resolve(cliPackage)}`,
-                },
-              }
-            : {}),
+          devDependencies: {
+            [cliName]: cliPackage ? `file:${resolve(cliPackage)}` : version,
+          },
           engines: { node: ">=24" },
         },
         null,

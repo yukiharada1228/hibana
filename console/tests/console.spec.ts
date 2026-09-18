@@ -975,7 +975,7 @@ test("CLI guide is available while the initial application list is pending or fa
     );
     await expect(page.locator("pre").first()).toContainText("--tenant 'team'");
     await expect(page.locator("pre").last()).toHaveText(
-      /^npx --yes @yukiharada1228\/hibana@\S+ deploy$/,
+      "npm run deploy",
     );
 
     releaseList();
@@ -1063,7 +1063,7 @@ test("mobile layout, empty state, command guide and failed login", async ({
     "--ingress-domain",
   );
   await expect(page.locator("pre").last()).toHaveText(
-    /^npx --yes @yukiharada1228\/hibana@\S+ deploy$/,
+    "npm run deploy",
   );
   await expect(
     page.getByRole("button", { name: "更新", exact: true }),

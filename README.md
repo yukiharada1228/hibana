@@ -33,7 +33,9 @@ cd my-api
 npm run dev
 ```
 
-生成した npm scripts は同じ CLI バージョンを `npx` で使用します。初回の`dev`で同じバージョンのPC用ランタイムをGitHub Releasesから自動取得します。次回以降は保存済みのランタイムを再利用します。ソースからビルドする手順と閉域環境への搬入は[配布ガイド](docs/releases.md)を参照してください。
+`init`は実行したCLIと同じバージョンをプロジェクトの`devDependencies`に固定してインストールします。生成した npm scripts は `hibana dev`・`hibana build`・`hibana deploy` としてプロジェクト内のCLIを使います。`package.json`と`package-lock.json`をGitに保存し、別のPCやCIでは`npm ci`で揃えます。グローバル導入や既存プロジェクトの移行は[CLIガイド](sdk/README.md#cliの導入とテンプレート)を参照してください。
+
+初回の`dev`で同じバージョンのPC用ランタイムをGitHub Releasesから自動取得します。次回以降は保存済みのランタイムを再利用します。ソースからビルドする手順と閉域環境への搬入は[配布ガイド](docs/releases.md)を参照してください。
 
 `http://127.0.0.1:8787`でAPIが起動します。別のターミナルから呼び出せます。
 
@@ -92,7 +94,7 @@ npm run deploy
 
 アプリのホスト名は`<アプリ名>.<テナントのスラッグ>.<アプリ用ドメイン>`です。たとえば`my-api.my-team.apps.example.com`のようになります。DNS・TLS・アプリ用ドメインは基盤管理者が設定します。
 
-トークンの代わりに`npx --yes @yukiharada1228/hibana@0.2.0-rc.1 login`でログインする方法もあります。認証方法とバージョンの指定は[CLIガイド](sdk/README.md)に記載しています。
+トークンの代わりに、プロジェクト内で`npm exec -- hibana login`を実行してログインする方法もあります。認証方法とバージョンの指定は[CLIガイド](sdk/README.md)に記載しています。
 
 ## 設定・Secrets・rollback
 
@@ -116,11 +118,11 @@ npm run deploy
 
 ```bash
 # テナント管理者が登録し、このアプリへの利用を許可
-npx --yes @yukiharada1228/hibana@0.2.0-rc.1 secret put API_KEY < /path/to/secret.txt
-npx --yes @yukiharada1228/hibana@0.2.0-rc.1 secret allow-deploy API_KEY
+npm exec -- hibana secret put API_KEY < /path/to/secret.txt
+npm exec -- hibana secret allow-deploy API_KEY
 # hibana.jsonに "secrets": ["API_KEY"] を追加してから配備
 npm run deploy
-npx --yes @yukiharada1228/hibana@0.2.0-rc.1 secret list
+npm exec -- hibana secret list
 ```
 
 `hibana.json`の`secrets`には使用する名前だけを列挙します。管理者が許可したSecretのうち、列挙したものだけを配備先へ渡します。通常の`deploy`・`rollback`はRead・Deployスコープで実行でき、Adminは不要です。`secret deny-deploy API_KEY`は今後の配備への許可を止めます。既存バージョンからも利用を止める場合は`secret delete API_KEY`を使います。ローカル専用の秘密値は`.dev.vars`にdotenv形式で記述できます。`.dev.vars`と、ビルド成果物を格納する`.hibana/`はGitに含めません。
@@ -128,9 +130,9 @@ npx --yes @yukiharada1228/hibana@0.2.0-rc.1 secret list
 コードを以前の状態に戻すときは次のコマンドを使います。
 
 ```bash
-npx --yes @yukiharada1228/hibana@0.2.0-rc.1 rollback
+npm exec -- hibana rollback
 # 配備済みの版を指定する場合
-npx --yes @yukiharada1228/hibana@0.2.0-rc.1 rollback --version 1.0.0
+npm exec -- hibana rollback --version 1.0.0
 ```
 
 rollbackはコード・環境変数・選択したSecretsの参照を一緒に戻します。Secretsの値と外部データは巻き戻しません。旧環境から更新する場合は[デプロイと移行の仕様](docs/deployment.md)を確認してください。

@@ -51,7 +51,7 @@ export async function soak({urls, slug, project, command, database, replicas}) {
   for (const language of ['hono', 'typescript', 'javascript', 'go', 'rust']) {
     const directory = resolve(project, '..', `soak-${language}`);
     try { await access(resolve(directory, 'hibana.json')); }
-    catch { await init(directory, {template: ['typescript', 'javascript'].includes(language) ? 'javascript' : language}); }
+    catch { await init(directory, {template: ['typescript', 'javascript'].includes(language) ? 'javascript' : language, cliPackage: resolve(import.meta.dirname, '../sdk')}); }
     if (language === 'javascript') {
       await writeFile(resolve(directory, 'src/index.js'), 'export default { fetch: async (request) => request.method === "POST" ? new Response(await request.arrayBuffer()) : Response.json({message: "Hello Hibana"}) };\n');
       const path = resolve(directory, 'hibana.json');

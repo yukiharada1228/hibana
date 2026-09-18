@@ -123,6 +123,9 @@ for (const template of ["javascript", "rust", "go"]) {
     if (template === "javascript") {
       const pkg = JSON.parse(await readFile(join(root, "package.json"), "utf8"));
       assert.equal(pkg.dependencies, undefined);
+      const metadata = JSON.parse(await readFile(new URL("../package.json", import.meta.url), "utf8"));
+      assert.deepEqual(pkg.devDependencies, { [metadata.name]: metadata.version });
+      assert.deepEqual(pkg.scripts, { dev: "hibana dev", build: "hibana build", deploy: "hibana deploy" });
       assert.match(await readFile(join(root, config.main), "utf8"), /fetch\(/);
     } else {
       assert.ok(config.build.commands.length);
