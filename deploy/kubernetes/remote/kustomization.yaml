@@ -5,3 +5,11 @@ resources:
   - ../base
   - ../console
   - ingress.yaml
+patches:
+  - target:
+      kind: ConfigMap
+      name: hibana-config
+    patch: |-
+      - op: replace
+        path: /data/TRUSTED_PROXY_CIDRS
+        value: CHANGE_ME_TRUSTED_PROXY_CIDRS

@@ -47,8 +47,9 @@ async fn run(args: Vec<String>) -> anyhow::Result<()> {
     let worker = Arc::new(Worker::connect(&settings, metrics.clone()).await?);
     let shutdown = Shutdown::new();
     spawn_shutdown_listener(shutdown.clone(), settings.drain_timeout_secs);
-    spawn_metrics_server(metrics, settings.metrics_bind_addr, shutdown.clone());
-    let server = direct_http::start(worker, shutdown.clone(), &settings.http_bind_addr).await?;
+    let server =
+        direct_http::start(worker.clone(), shutdown.clone(), &settings.http_bind_addr).await?;
+    spawn_metrics_server(worker, settings.metrics_bind_addr, shutdown.clone());
     info!("HTTP worker started");
     tokio::select! {
         result = server => result??,

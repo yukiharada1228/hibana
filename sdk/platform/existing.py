@@ -10,7 +10,7 @@ import urllib.request
 import uuid
 from pathlib import Path
 
-from common import KubernetesTarget, MIGRATION_JOB, stamp_runtime_settings
+from common import KubernetesTarget, MIGRATION_JOB, management_api_prefixes, stamp_runtime_settings
 from maintenance import Maintenance, NoControlPlane
 from network import NetworkTransition, PREFIX as NETWORK_PREFIX
 from operation import OperationLock, NAME as OPERATION_LOCK, exclusive
@@ -255,8 +255,8 @@ class ExistingCluster(KubernetesTarget):
             namespace_owner = (namespace or {}).get("metadata", {}).get("annotations", {}).get(RESUME_OWNER)
             paused = record.get("paused", {})
             owner = paused.get("owner") or namespace_owner
+            phase("application readiness")
             if owner:
-                phase("application readiness")
                 maintenance = Maintenance(self)
                 maintenance.close(owner)
                 maintenance.prepare(owner)
@@ -266,7 +266,9 @@ class ExistingCluster(KubernetesTarget):
                     self.apply(restore_hpas)
                 maintenance.open(owner)
                 record.pop("paused", None)
-                record["install"]["completed"].append("application readiness")
+            else:
+                self.verify_applications()
+            record["install"]["completed"].append("application readiness")
             if namespace_owner:
                 self.kube("annotate", "namespace", "hibana", RESUME_OWNER + "-")
             phase("management API check")
@@ -283,6 +285,9 @@ class ExistingCluster(KubernetesTarget):
                     pass
             raise
         print("Hibana installation complete.")
+
+    def verify_applications(self):
+        Maintenance(self).prepare()
 
     def preview(self, action):
         if action == "install":
@@ -317,7 +322,7 @@ class ExistingCluster(KubernetesTarget):
         print("Dry run complete. No resources were changed.")
 
     def connection_guidance(self, docs, verify=False):
-        hosts = set()
+        urls = set()
         for doc in docs:
             if doc["kind"] != "Ingress":
                 continue
@@ -325,14 +330,15 @@ class ExistingCluster(KubernetesTarget):
             tls_hosts = {host for tls in spec.get("tls", []) for host in tls.get("hosts", [])}
             for rule in spec.get("rules", []):
                 host = rule.get("host", "")
-                if host and "*" not in host and any(p.get("backend", {}).get("service", {}).get("name") == "hibana-api" for p in rule.get("http", {}).get("paths", [])):
-                    hosts.add(("https://" if host in tls_hosts else "http://") + host)
-        if not hosts:
+                if host and "*" not in host:
+                    origin = ("https://" if host in tls_hosts else "http://") + host
+                    urls.update(origin + prefix for prefix in management_api_prefixes(rule))
+        if not urls:
             print("No management Ingress is configured. To connect locally:")
             print("  " + shlex.join([*self.kubectl, "-n", "hibana", "port-forward", "service/hibana-api", "18080:8080"]))
             print("  hibana login --url http://127.0.0.1:18080 --tenant TEAM --email EMAIL --password-stdin < password.txt")
             return
-        for url in sorted(hosts):
+        for url in sorted(urls):
             print(f"Management API: {url}")
             if verify:
                 deadline = time.monotonic() + 30

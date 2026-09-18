@@ -38,6 +38,35 @@ pub fn verify_password(password: &str, phc: &str) -> bool {
     }
 }
 
+/// Keep expensive password work off the async executor. The blocking task owns
+/// the reservation: disconnecting a client cannot free still-running work.
+pub(crate) async fn hash_password_async(
+    permit: tokio::sync::OwnedSemaphorePermit,
+    password: String,
+) -> Result<String, FaasError> {
+    password_work(permit, move || hash_password(&password)).await?
+}
+
+pub(crate) async fn verify_password_async(
+    permit: tokio::sync::OwnedSemaphorePermit,
+    password: String,
+    phc: String,
+) -> Result<bool, FaasError> {
+    password_work(permit, move || verify_password(&password, &phc)).await
+}
+
+async fn password_work<T: Send + 'static>(
+    permit: tokio::sync::OwnedSemaphorePermit,
+    work: impl FnOnce() -> T + Send + 'static,
+) -> Result<T, FaasError> {
+    tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        work()
+    })
+    .await
+    .map_err(|_| FaasError::Internal("password processing task failed".into()))
+}
+
 /// 不透明トークン secret を生成する（高エントロピー・URL-safe hex）。
 ///
 /// 返り値は平文。呼び出し側は一度だけクライアントへ返し、DB には
@@ -67,6 +96,60 @@ pub fn dummy_password_hash() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn password_work_yields_and_holds_capacity_after_cancellation() {
+        use std::{sync::Arc, time::Duration};
+        use tokio::sync::{oneshot, Semaphore};
+        let slots = Arc::new(Semaphore::new(1));
+        let permit = slots.clone().try_acquire_owned().unwrap();
+        let (started_tx, started_rx) = oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let task = tokio::spawn(password_work(permit, move || {
+            started_tx.send(()).unwrap();
+            release_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        }));
+        // This single-thread async executor must still be able to run while
+        // password work is blocked. A synchronous implementation deadlocks.
+        tokio::time::timeout(Duration::from_secs(2), started_rx)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(slots.clone().try_acquire_owned().is_err());
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
+        assert!(
+            slots.clone().try_acquire_owned().is_err(),
+            "a disconnected request must not free running password work"
+        );
+        release_tx.send(()).unwrap();
+        let permit = tokio::time::timeout(Duration::from_secs(2), slots.acquire())
+            .await
+            .unwrap()
+            .unwrap();
+        drop(permit);
+        assert_eq!(slots.available_permits(), 1);
+    }
+
+    #[tokio::test]
+    async fn async_password_work_preserves_results_and_releases_capacity() {
+        let slots = std::sync::Arc::new(tokio::sync::Semaphore::new(1));
+        let permit = slots.clone().try_acquire_owned().unwrap();
+        let hash = hash_password_async(permit, "fixture-password".into())
+            .await
+            .unwrap();
+        assert_eq!(slots.available_permits(), 1);
+        for (password, expected) in [("fixture-password", true), ("wrong", false)] {
+            let permit = slots.clone().try_acquire_owned().unwrap();
+            assert_eq!(
+                verify_password_async(permit, password.into(), hash.clone())
+                    .await
+                    .unwrap(),
+                expected
+            );
+            assert_eq!(slots.available_permits(), 1);
+        }
+    }
 
     #[test]
     fn hash_then_verify_roundtrip() {

@@ -20,7 +20,9 @@ pub(crate) async fn run(args: &[String]) -> anyhow::Result<()> {
             (
                 reqwest::Method::POST,
                 "/internal/maintenance/prepare",
-                Some(serde_json::json!({"owner":owner,"workers":workers})),
+                Some(
+                    serde_json::json!({"owner":(!owner.is_empty()).then_some(owner),"workers":workers}),
+                ),
             )
         }
         _ => anyhow::bail!(

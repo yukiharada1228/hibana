@@ -43,7 +43,8 @@ function deletionReason(version: Version, component: Component): string | null {
 
 type Confirmation =
   | { action: "delete-component" }
-  | { action: "rollback" | "delete-version"; version: string };
+  | { action: "rollback"; version: string }
+  | { action: "delete-version"; version: string; versionId: string };
 
 function PublicUrl({ component }: { component: Component }) {
   const url = appUrl(component);
@@ -189,7 +190,7 @@ export function Application({
     canAdmin = session.scopes.includes("admin");
   const deleteTarget =
     confirm?.action === "delete-version"
-      ? versions.find((version) => version.version === confirm.version)
+      ? versions.find((version) => version.version_id === confirm.versionId)
       : undefined;
   const deleteBlocked =
     confirm?.action === "delete-version"
@@ -232,9 +233,9 @@ export function Application({
         await api.deleteComponent(component.component_id);
         location.hash = "apps";
       } else if (confirm.action === "delete-version") {
-        await api.deleteVersion(component.component_id, confirm.version);
+        await api.deleteVersion(component.component_id, confirm.versionId);
         setVersions((items) =>
-          items.filter((item) => item.version !== confirm.version),
+          items.filter((item) => item.version_id !== confirm.versionId),
         );
         setMessage(
           `バージョン ${versionLabel(confirm.version)} を削除しました。`,
@@ -488,6 +489,7 @@ export function Application({
                                 setConfirm({
                                   action: "delete-version",
                                   version: version.version,
+                                  versionId: version.version_id,
                                 });
                               }}
                             >

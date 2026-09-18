@@ -117,19 +117,3 @@ pub async fn set_tenant_quotas(
         .rows_affected
         > 0)
 }
-
-/// reaper 用: 現存する全テナント id を列挙する (M3d, §8)。
-///
-/// `tenants` には RLS が無い（初期スキーマ: tenant_id 列を持たないため対象外）。faas_app は
-/// SELECT 権限を持つため GUC 無しで列挙できる。reaper はこの一覧を回し、テナントごとに
-/// GUC を設定してから `count_inflight_executions` で DB COUNT（真実）を引き、共有カウンタを
-/// 再同期する。`status = 'active'` で停止テナントを除外する（slug 解決と同じ条件）。
-pub async fn list_active_tenant_ids(executor: &impl ConnectionTrait) -> Result<Vec<String>, DbErr> {
-    tenants::Entity::find()
-        .select_only()
-        .column(tenants::Column::Id)
-        .filter(tenants::Column::Status.eq("active"))
-        .into_tuple()
-        .all(executor)
-        .await
-}

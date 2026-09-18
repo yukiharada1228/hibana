@@ -13,11 +13,13 @@ use axum::{
     Router,
 };
 use std::sync::Arc;
+use tokio_util::task::TaskTracker;
 
 #[derive(Clone)]
 struct HttpState {
     worker: Arc<Worker>,
     shutdown: Arc<Shutdown>,
+    executions: TaskTracker,
 }
 
 async fn invoke(State(state): State<HttpState>, headers: HeaderMap) -> Response {
@@ -74,26 +76,23 @@ async fn invoke(State(state): State<HttpState>, headers: HeaderMap) -> Response 
         stage = "worker_admission", redeem_us = redeemed.duration_since(started).as_micros() as u64,
         resolve_us = resolved_at.duration_since(redeemed).as_micros() as u64,
         cache_us = resolved_at.elapsed().as_micros() as u64, "HTTP phase timing");
-    let (stream, response) = crate::runtime::response_channel();
-    let body_tx = stream.body.clone();
-    tokio::spawn(async move {
+    let (stream, response, completed) = crate::runtime::response_channel();
+    let is_head = job.input.get("method").and_then(serde_json::Value::as_str) == Some("HEAD");
+    state.executions.clone().spawn(async move {
         let _slot = slot;
         let _memory = memory;
         let _inflight = InflightGuard::new(&state.worker.metrics);
-        if !state
+        if state
             .worker
             .handle_http(job, resolved, component, stream)
             .await
         {
-            let _ = body_tx
-                .send(Err(std::io::Error::other(
-                    "Invocation result could not be persisted",
-                )))
-                .await;
+            let _ = completed.send(());
         }
-        // EOF only after execution and durable result publication.
+        // Failure (including cancellation/panic) drops the completion sender.
+        // Never wait on the client's body consumption to release Worker capacity.
     });
-    match response.receive().await {
+    match response.receive(is_head).await {
         Ok((mut parts, body)) => {
             // A guest 503 must never be mistaken for a safe-to-retry refusal.
             parts
@@ -185,9 +184,11 @@ pub async fn start(
             tracing::warn!(%error, "cannot enable TCP_NODELAY for HTTP connection");
         }
     });
+    let executions = TaskTracker::new();
     let state = HttpState {
         worker,
         shutdown: shutdown.clone(),
+        executions: executions.clone(),
     };
     let app = Router::new()
         .route("/invoke", post(invoke))
@@ -200,6 +201,11 @@ pub async fn start(
                 shutdown.wait().await;
             })
             .await?;
+        // All handlers have returned, so no new execution can be registered.
+        // A disconnected client or an early 502 can leave result persistence
+        // running after HTTP drains. Keep it inside main's same drain deadline.
+        executions.close();
+        executions.wait().await;
         Ok(())
     }))
 }

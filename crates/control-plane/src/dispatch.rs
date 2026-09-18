@@ -38,7 +38,13 @@ pub(crate) async fn discover(endpoint: &str, operation: &str) -> anyhow::Result<
     if url.scheme() == "http" {
         let host = url
             .host_str()
-            .ok_or_else(|| anyhow::anyhow!("Worker host missing"))?;
+            .ok_or_else(|| anyhow::anyhow!("Worker host missing"))?
+            .trim_matches(['[', ']']);
+        // URL hosts retain IPv6 brackets. Literal IPs already identify one
+        // Worker and must not be sent to the OS hostname resolver.
+        if host.parse::<std::net::IpAddr>().is_ok() {
+            return Ok(targets);
+        }
         let port = url
             .port_or_known_default()
             .ok_or_else(|| anyhow::anyhow!("Worker port missing"))?;
@@ -114,6 +120,71 @@ pub(crate) fn retryable_refusal(response: &reqwest::Response) -> bool {
 mod tests {
     use super::*;
     use axum::{routing::post, Router};
+
+    #[tokio::test]
+    async fn discovery_preserves_ip_literals_ports_paths_and_https_hostnames() {
+        for endpoint in [
+            "http://127.0.0.1:8084",
+            "http://[::1]:8084",
+            "http://[2001:db8::1]:8084/base/",
+            "https://worker.invalid:8443/base",
+        ] {
+            for operation in ["invoke", "prepare"] {
+                let expected = format!("{}/{operation}", endpoint.trim_end_matches('/'));
+                assert_eq!(
+                    discover(endpoint, operation).await.unwrap(),
+                    vec![expected.parse::<reqwest::Url>().unwrap()]
+                );
+            }
+        }
+        let targets = discover("http://localhost:8084/base", "prepare")
+            .await
+            .unwrap();
+        assert!(!targets.is_empty());
+        for target in targets {
+            assert!(target
+                .host_str()
+                .unwrap()
+                .trim_matches(['[', ']'])
+                .parse::<std::net::IpAddr>()
+                .unwrap()
+                .is_loopback());
+            assert_eq!(target.port(), Some(8084));
+            assert_eq!(target.path(), "/base/prepare");
+        }
+    }
+
+    #[tokio::test]
+    async fn ipv6_worker_supports_preparation_and_invocation() {
+        use axum::http::StatusCode;
+        let listener = tokio::net::TcpListener::bind("[::1]:0").await.unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let app = Router::new()
+            .route("/prepare", post(|| async { StatusCode::NO_CONTENT }))
+            .route("/invoke", post(|| async { "IPv6 worker" }));
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let client = reqwest::Client::builder()
+            .no_proxy()
+            .timeout(Duration::from_secs(2))
+            .build()
+            .unwrap();
+        let targets = discover(&endpoint, "prepare").await.unwrap();
+        assert_eq!(
+            client
+                .post(targets[0].clone())
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::NO_CONTENT
+        );
+        let response = send(&client, &endpoint, "fixture").await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.text().await.unwrap(), "IPv6 worker");
+        server.abort();
+    }
     async fn server(
         status: axum::http::StatusCode,
         marker: &'static str,

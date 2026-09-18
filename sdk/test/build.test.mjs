@@ -9,6 +9,7 @@ import { readBuildMetadata, withBuildMetadata } from "../src/build-metadata.mjs"
 import { init } from "../src/init.mjs";
 import { loadConfig } from "../src/config.mjs";
 import { shouldRebuild } from "../src/dev.mjs";
+import { deploy } from "../src/api.mjs";
 
 const component = Buffer.from([0, 97, 115, 109, 13, 0, 1, 0]);
 async function fixture(fn) {
@@ -40,6 +41,43 @@ test("prebuilt Components bypass compilation; core Wasm is rejected before deplo
   await writeFile(input, Buffer.from([0, 97, 115, 109, 1, 0, 0, 0]));
   await assert.rejects(build(config), /WebAssembly Component/);
   assert.deepEqual(await readFile(artifact), built);
+}));
+
+test("deploy keeps its build snapshot while another build replaces the latest artifact", () => fixture(async root => {
+  const tagged = tag => Buffer.concat([component, Buffer.from([0, 3, 1, 120, tag])]);
+  await writeFile(join(root, "first.wasm"), tagged(65));
+  await writeFile(join(root, "second.wasm"), tagged(66));
+  const config = { root, name: "app", component: "first.wasm", vars: {}, secrets: [], resources: {} };
+  const first = await build(config);
+  const expected = await readFile(first);
+  const held = Promise.withResolvers(), started = Promise.withResolvers();
+  let uploaded;
+  const api = { request: async (path, options) => {
+    if (path === "/components") {
+      started.resolve();
+      await held.promise;
+      return [{ name: "app", component_id: "fixture" }];
+    }
+    uploaded = Buffer.from(await options.body.get("wasm").arrayBuffer());
+    return {};
+  } };
+  const pending = deploy(api, config, first, "first");
+  try {
+    await started.promise;
+    const second = await build({ ...config, component: "second.wasm" });
+    assert.notEqual(first, second);
+    assert.deepEqual(await readFile(first), expected);
+    assert.notDeepEqual(await readFile(second), expected);
+    assert.deepEqual(await readFile(join(root, ".hibana/build/app.wasm")), await readFile(second));
+    // Rebuilding the same bytes reuses a snapshot without mutating it.
+    assert.equal(await build(config), first);
+    await writeFile(join(root, ".hibana/build/app.wasm"), "external edit");
+    assert.deepEqual(await readFile(first), expected);
+  } finally {
+    held.resolve();
+    await pending;
+  }
+  assert.deepEqual(uploaded, expected);
 }));
 
 test("native CLI builds without any installed JavaScript compiler packages", () => fixture(async root => {

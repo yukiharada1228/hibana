@@ -56,7 +56,9 @@ DB接続数もPod数に比例します。CPは1 Pod最大10、Workerは既定8�
 - `hibana_worker_active_compilations`、キャッシュhit/miss：cold startとコンパイル集中。
 - CPの受付拒否、HTTP 429/503/502、p95/p99、DB pool待ち・接続数、Pod OOM/再起動、一時ストレージ消費。
 
-readyは過負荷の指標にしません。全Podがbusyでもreadyな接続先を保持し、明示的な503を返します。readyのドレイン判定、Deploymentの段階更新、PDBの役割を混同しないでください。
+Workerは起動時に、有効なテナントのactive版がローカルで実行できることを確認してからreadyになります。準備用のHeadless Service `hibana-worker-preparation`は未Ready Podも返し、`WORKER_PREPARATION_URL`で指定します。実行用の`hibana-worker-discovery`はReady Podだけを返します。これにより新PodのWasm準備中は、`maxUnavailable: 0`の段階更新が旧Podを保持します。準備が失敗した場合は新Podを未Readyのまま残し、rolloutを完了させません。
+
+readyは過負荷の指標にしません。起動時の準備確認後は全Podがbusyでもreadyな接続先を保持し、明示的な503を返します。ドレインを開始すると未Readyになります。起動時の準備確認、Deploymentの段階更新、PDBの役割を混同しないでください。
 
 ## 検証の再現
 

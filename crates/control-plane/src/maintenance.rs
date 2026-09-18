@@ -147,7 +147,7 @@ pub(crate) async fn set(
 
 #[derive(serde::Deserialize)]
 pub(crate) struct PreparationRequest {
-    pub owner: String,
+    pub owner: Option<String>,
     pub workers: std::collections::BTreeSet<std::net::IpAddr>,
 }
 
@@ -162,7 +162,9 @@ pub(crate) async fn prepare(
         .await?
         .ok_or_else(|| DbErr::Custom("maintenance state missing".into()))?
         .owner;
-    if owner.as_deref() != Some(request.owner.as_str()) {
+    // An open platform can be checked without closing admission. During a stop
+    // or recovery only the matching owner may prepare the fleet for reopening.
+    if owner != request.owner {
         return Ok((StatusCode::CONFLICT, "maintenance owner mismatch").into_response());
     }
     if request.workers.is_empty() || request.workers.len() > 1024 {

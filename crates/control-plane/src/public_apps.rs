@@ -39,7 +39,8 @@ impl PublicApps {
     }
 }
 
-fn valid_label(value: &str) -> bool {
+/// App names and tenant slugs become labels in the public hostname.
+pub(crate) fn valid_label(value: &str) -> bool {
     !value.is_empty()
         && value.len() <= 63
         && value
@@ -52,6 +53,27 @@ fn valid_label(value: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn names_are_single_lowercase_dns_labels() {
+        for label in ["a", "0", "app-42", &"a".repeat(63)] {
+            assert!(valid_label(label), "{label}");
+        }
+        for label in [
+            "",
+            "TeamA",
+            "under_score",
+            "two.labels",
+            "-app",
+            "app-",
+            " app",
+            "app ",
+            "日本語",
+            &"a".repeat(64),
+        ] {
+            assert!(!valid_label(label), "{label}");
+        }
+    }
 
     #[test]
     fn public_urls_include_the_platform_scheme_and_port() {

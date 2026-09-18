@@ -23,6 +23,11 @@ for overlay, image in [
     assert all(isinstance(v, str) for v in config.values())
     assert config["WORKER_HTTP_URL"] == "http://hibana-worker-discovery:8084"
     assert named(docs, "Service", "hibana-worker-discovery")["spec"]["clusterIP"] == "None"
+    assert not named(docs, "Service", "hibana-worker-discovery")["spec"].get("publishNotReadyAddresses", False)
+    assert config["WORKER_PREPARATION_URL"] == "http://hibana-worker-preparation:8084"
+    preparation = named(docs, "Service", "hibana-worker-preparation")["spec"]
+    assert preparation["clusterIP"] == "None" and preparation["publishNotReadyAddresses"] is True
+    assert preparation["selector"] == named(docs, "Service", "hibana-worker-discovery")["spec"]["selector"]
     assert int(config["WORKER_MAX_COMPILATIONS"]) == 1
     assert int(config["WORKER_DB_MAX_CONNECTIONS"]) == 8
     for component in ["control-plane", "worker"]:

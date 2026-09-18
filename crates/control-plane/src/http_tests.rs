@@ -105,6 +105,8 @@ async fn http_mvp_regression() {
     "#, vec![]).await.unwrap();
     assert_compound_identities(&owner).await;
     assert_build_metadata_upgrade(&owner).await;
+    assert_execution_input_upgrade(&owner).await;
+    assert_secret_key_retention_upgrade(&owner).await;
     let pool = hibana_database::postgres::connect(&std::env::var("DATABASE_URL").unwrap(), 10, 0)
         .await
         .unwrap();
@@ -118,12 +120,100 @@ async fn http_mvp_regression() {
     let store = Arc::new(crate::store::InProcStore::new());
     let state = state(pool.clone(), store.clone());
 
+    // Capacity is shared across router clones and rejects before identity/store work.
+    let first_check = state.reserve_password_work().unwrap();
+    let second_check = state.clone().reserve_password_work().unwrap();
+    let overloaded = crate::login::login(
+        State(state.clone()),
+        axum::extract::ConnectInfo("127.0.0.1:12345".parse().unwrap()),
+        HeaderMap::new(),
+        crate::extract::JsonBody(crate::login::LoginRequest {
+            tenant_slug: "absent".into(),
+            email: "none@example.invalid".into(),
+            password: "fixture-password".into(),
+            scopes: vec![],
+        }),
+    )
+    .await
+    .unwrap()
+    .into_response();
+    assert_eq!(overloaded.status(), StatusCode::TOO_MANY_REQUESTS);
+    assert_eq!(overloaded.headers()["retry-after"], "1");
+    let user = crate::handlers::identity::create_user(
+        State(state.clone()),
+        crate::auth::Principal {
+            tenant_id: "http".into(),
+            user_id: None,
+            token_id: "test".into(),
+            scopes: vec![hibana_shared::Scope::Admin],
+            role: hibana_shared::Role::Admin,
+        },
+        axum::extract::Path("http".into()),
+        crate::extract::JsonBody(crate::handlers::identity::CreateUserRequest {
+            email: "capacity@example.invalid".into(),
+            password: "fixture-password".into(),
+            role: hibana_shared::Role::Member,
+        }),
+    )
+    .await
+    .unwrap()
+    .into_response();
+    let mut admin_headers = HeaderMap::new();
+    admin_headers.insert("authorization", "Bearer test-only".parse().unwrap());
+    let tenant = crate::handlers::tenants::create_tenant(
+        State(state.clone()),
+        admin_headers,
+        crate::extract::JsonBody(crate::handlers::tenants::CreateTenantRequest {
+            slug: "capacity-blocked".into(),
+            name: "Capacity".into(),
+            admin_email: "capacity@example.invalid".into(),
+            admin_password: "fixture-password".into(),
+        }),
+    )
+    .await
+    .unwrap()
+    .into_response();
+    for response in [user, tenant] {
+        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(response.headers()["retry-after"], "1");
+        let bytes = axum::body::to_bytes(response.into_body(), 4096)
+            .await
+            .unwrap();
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&bytes).unwrap()["error"]["code"],
+            "password_capacity"
+        );
+    }
+    assert_eq!(
+        scalar(
+            &owner,
+            "SELECT count(*) FROM users WHERE email='capacity@example.invalid'"
+        )
+        .await,
+        0
+    );
+    assert_eq!(
+        scalar(
+            &owner,
+            "SELECT count(*) FROM tenants WHERE slug='capacity-blocked'"
+        )
+        .await,
+        0
+    );
+    drop((first_check, second_check));
+    assert!(state.reserve_password_work().is_some());
+
     let unavailable = self::state(pool.clone(), Arc::new(crate::store::FailingStore));
     assert_eq!(
-        direct_http::accept(&unavailable, "http", "source", json!({}))
-            .await
-            .unwrap()
-            .status(),
+        direct_http::accept(
+            &unavailable,
+            "http",
+            "source",
+            std::future::ready(Ok(json!({})))
+        )
+        .await
+        .unwrap()
+        .status(),
         StatusCode::SERVICE_UNAVAILABLE
     );
     let params = unavailable
@@ -148,9 +238,11 @@ async fn http_mvp_regression() {
     )
     .await
     .unwrap();
-    assert!(direct_http::accept(&state, "http", "source", json!({}))
-        .await
-        .is_err());
+    assert!(
+        direct_http::accept(&state, "http", "source", std::future::ready(Ok(json!({}))))
+            .await
+            .is_err()
+    );
     assert_eq!(store.peek_inflight("http"), 0);
     assert_eq!(scalar(&owner, "SELECT count(*) FROM executions").await, 0);
     fixture_execute(
@@ -163,10 +255,14 @@ async fn http_mvp_regression() {
     println!("PASS failed acceptance rolls back the row and releases the reservation");
 
     // An unreachable Worker must yield an error, never queue or replay the HTTP request.
-    let response =
-        direct_http::accept(&state, "http", "source", json!({"method":"GET","path":"/"}))
-            .await
-            .unwrap();
+    let response = direct_http::accept(
+        &state,
+        "http",
+        "source",
+        std::future::ready(Ok(json!({"method":"GET","path":"/"}))),
+    )
+    .await
+    .unwrap();
     assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
     assert_eq!(
         scalar(
@@ -182,6 +278,14 @@ async fn http_mvp_regression() {
     );
     assert_eq!(store.peek_inflight("http"), 0);
     assert_eq!(scalar(&owner, "SELECT count(*) FROM executions WHERE status='failed' AND error->>'code'='dispatch_not_started'").await, 1);
+    assert_eq!(
+        scalar(
+            &owner,
+            "SELECT count(*) FROM executions WHERE input IS NOT NULL OR input_ref IS NOT NULL"
+        )
+        .await,
+        0
+    );
     let rejected: String = fixture_scalar(&owner, "SELECT id FROM executions", vec![])
         .await
         .unwrap();
@@ -208,7 +312,7 @@ async fn http_mvp_regression() {
     );
     fixture_execute(
         &owner,
-        "UPDATE executions SET status='pending',finished_at=NULL,error=NULL WHERE id=$1",
+        "UPDATE executions SET status='pending',finished_at=NULL,error=NULL,input='{\"method\":\"GET\",\"path\":\"/\"}' WHERE id=$1",
         vec![rejected.clone().into()],
     )
     .await
@@ -217,7 +321,7 @@ async fn http_mvp_regression() {
     store.resync_inflight("http", 1, 3600).await.unwrap();
     println!("PASS unavailable Worker releases reservation once without invocation usage; late claim fails");
     assert_eq!(
-        direct_http::accept(&state, "http", "source", json!({}))
+        direct_http::accept(&state, "http", "source", std::future::ready(Ok(json!({}))))
             .await
             .unwrap()
             .status(),
@@ -226,8 +330,8 @@ async fn http_mvp_regression() {
     // A stale Redis reconciliation must never admit more than the DB limit.
     store.resync_inflight("http", 0, 3600).await.unwrap();
     let (a, b) = tokio::join!(
-        direct_http::accept(&state, "http", "source", json!({})),
-        direct_http::accept(&state, "http", "source", json!({}))
+        direct_http::accept(&state, "http", "source", std::future::ready(Ok(json!({})))),
+        direct_http::accept(&state, "http", "source", std::future::ready(Ok(json!({}))))
     );
     assert_eq!(a.unwrap().status(), StatusCode::TOO_MANY_REQUESTS);
     assert_eq!(b.unwrap().status(), StatusCode::TOO_MANY_REQUESTS);
@@ -309,7 +413,7 @@ async fn http_mvp_regression() {
         .await
         .unwrap());
     assert_eq!(store.peek_inflight("http"), 1);
-    let result = ResultMessage {
+    let mut result = ResultMessage {
         execution_id: id.clone(),
         tenant_id: "http".into(),
         status: ExecutionStatus::Succeeded,
@@ -340,18 +444,75 @@ async fn http_mvp_regression() {
         .is_err(),
         "runtime role cannot reopen admission"
     );
+    // Suspending admission must still allow the in-flight result to settle,
+    // even if a transport delay has taken it beyond its admission token expiry.
+    fixture_execute(
+        &owner,
+        "UPDATE tenants SET status='suspended' WHERE id='http'",
+        vec![],
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        direct_http::redeem(State(state.clone()), headers(&job.job_token))
+            .await
+            .unwrap_err()
+            .into_response()
+            .status(),
+        StatusCode::FORBIDDEN
+    );
+    let mut expired = state.verifier().verify(&job.job_token).unwrap();
+    expired.exp = chrono::Utc::now().timestamp() - 1;
+    result.job_token = state.signer().sign(&expired);
+    assert_eq!(
+        direct_http::redeem(State(state.clone()), headers(&result.job_token))
+            .await
+            .unwrap_err()
+            .into_response()
+            .status(),
+        StatusCode::UNAUTHORIZED
+    );
+    for bad_token in [
+        "invalid".to_owned(),
+        token(&state, &id, "http", "source-v2"),
+    ] {
+        let mut forged = result.clone();
+        forged.job_token = bad_token.clone();
+        assert_eq!(
+            direct_http::complete(State(state.clone()), headers(&bad_token), Json(forged))
+                .await
+                .unwrap_err()
+                .into_response()
+                .status(),
+            StatusCode::UNAUTHORIZED
+        );
+    }
+    assert_eq!(
+        direct_http::complete(
+            State(state.clone()),
+            headers(&job.job_token),
+            Json(result.clone())
+        )
+        .await
+        .unwrap_err()
+        .into_response()
+        .status(),
+        StatusCode::UNAUTHORIZED
+    );
     let mut forged = result.clone();
     forged.tenant_id = "other".into();
-    assert!(
-        direct_http::complete(State(state.clone()), headers(&job.job_token), Json(forged))
-            .await
-            .is_err()
-    );
+    assert!(direct_http::complete(
+        State(state.clone()),
+        headers(&result.job_token),
+        Json(forged)
+    )
+    .await
+    .is_err());
     let mut nonterminal = result.clone();
     nonterminal.status = ExecutionStatus::Running;
     assert!(direct_http::complete(
         State(state.clone()),
-        headers(&job.job_token),
+        headers(&result.job_token),
         Json(nonterminal)
     )
     .await
@@ -360,7 +521,7 @@ async fn http_mvp_regression() {
         assert_eq!(
             direct_http::complete(
                 State(state.clone()),
-                headers(&job.job_token),
+                headers(&result.job_token),
                 Json(result.clone())
             )
             .await
@@ -369,6 +530,14 @@ async fn http_mvp_regression() {
         );
     }
     assert_eq!(store.peek_inflight("http"), 0);
+    assert_eq!(
+        scalar(
+            &owner,
+            "SELECT count(*) FROM executions WHERE http_request AND input IS NOT NULL"
+        )
+        .await,
+        0
+    );
     assert_eq!(
         scalar(
             &owner,
@@ -397,6 +566,14 @@ async fn http_mvp_regression() {
     .await
     .unwrap();
     println!("PASS durable completion remains available with admission closed; runtime role cannot change the gate");
+    fixture_execute(
+        &owner,
+        "UPDATE tenants SET status='active' WHERE id='http'",
+        vec![],
+    )
+    .await
+    .unwrap();
+    println!("PASS suspended/expired completion persists once; expired or suspended admission and forged results remain denied");
 
     for attempt in 0..16 {
         let raced = format!("dispatch-race-{attempt}");
@@ -501,9 +678,11 @@ async fn http_mvp_regression() {
             .status(),
         StatusCode::FORBIDDEN
     );
-    assert!(direct_http::accept(&state, "http", "source", json!({}))
-        .await
-        .is_err());
+    assert!(
+        direct_http::accept(&state, "http", "source", std::future::ready(Ok(json!({}))))
+            .await
+            .is_err()
+    );
     println!("PASS suspended tenant cannot accept or redeem HTTP requests");
 
     use crate::handlers::components::{admin_delete_component, admin_list_components};
@@ -602,7 +781,7 @@ async fn http_mvp_regression() {
 async fn console_information_regression(state: &AppState) {
     use crate::handlers::{
         configuration::get_function_config,
-        executions::{list_executions, ExecutionsQuery},
+        executions::{get_execution, list_executions, ExecutionsQuery},
     };
     use axum::extract::{Path, Query};
     use hibana_database::prelude::*;
@@ -706,6 +885,35 @@ async fn console_information_regression(state: &AppState) {
     )
     .await;
     assert_eq!(page["items"].as_array().unwrap().len(), 20);
+    let detail = body(
+        get_execution(
+            State(state.clone()),
+            principal("http"),
+            Path("console-00".into()),
+        )
+        .await
+        .unwrap(),
+    )
+    .await;
+    for key in ["input", "output", "input_ref", "output_ref"] {
+        assert!(
+            detail.get(key).is_none(),
+            "execution details must not expose {key}"
+        );
+    }
+    assert_eq!(
+        get_execution(
+            State(state.clone()),
+            principal("other"),
+            Path("console-00".into())
+        )
+        .await
+        .err()
+        .unwrap()
+        .into_response()
+        .status(),
+        StatusCode::NOT_FOUND
+    );
     assert!(page["items"]
         .as_array()
         .unwrap()
@@ -948,7 +1156,7 @@ async fn assert_fresh_schema(owner: &DatabaseConnection) {
     assert_eq!(scalar(owner,"SELECT count(*) FROM information_schema.tables WHERE table_schema='public' AND table_type='BASE TABLE'").await,16);
     assert_eq!(
         scalar(owner, "SELECT count(*) FROM seaql_migrations").await,
-        3
+        6
     );
     assert_eq!(scalar(owner,"SELECT count(*) FROM pg_class c JOIN pg_namespace n ON c.relnamespace=n.oid WHERE n.nspname='public' AND c.relkind='r' AND c.relrowsecurity AND c.relforcerowsecurity").await,13);
     assert_eq!(scalar(owner,"SELECT count(*) FROM information_schema.columns WHERE table_schema='public' AND column_name IN ('canary_weight','canary_version_id','chain_depth','routing_reason','idempotency_key')").await,0);
@@ -958,7 +1166,7 @@ async fn assert_fresh_schema(owner: &DatabaseConnection) {
 async fn assert_build_metadata_upgrade(owner: &DatabaseConnection) {
     use hibana_migration::MigratorTrait as _;
     // Exercise an existing baseline with real versions; never recreate the DB.
-    hibana_migration::Migrator::down(owner, Some(2))
+    hibana_migration::Migrator::down(owner, Some(5))
         .await
         .unwrap();
     assert!(hibana_database::postgres::assert_runtime_schema(owner)
@@ -998,6 +1206,216 @@ async fn assert_build_metadata_upgrade(owner: &DatabaseConnection) {
         0
     );
     println!("PASS additive build metadata and egress migrations preserves versions, hashes and publication; old versions remain unrecorded");
+}
+
+async fn assert_execution_input_upgrade(owner: &DatabaseConnection) {
+    use hibana_migration::MigratorTrait as _;
+    hibana_migration::Migrator::down(owner, Some(3))
+        .await
+        .unwrap();
+    fixture_execute(owner, r#"
+        INSERT INTO components(id,tenant_id,name) VALUES ('retention-other','other','retention');
+        INSERT INTO component_versions(id,tenant_id,component_id,version,storage_uri,wasm_sha256,status)
+            VALUES ('retention-other-v1','other','retention-other','1','unused','abcd','active');
+        UPDATE tenants SET status='suspended' WHERE id='other';
+        INSERT INTO executions(id,tenant_id,component_id,version_id,status,http_request,input,input_ref)
+            SELECT 'retention-upgrade-'||c.tenant_id||'-'||s.status,c.tenant_id,c.id,v.id,s.status,true,
+                '{"headers":{"authorization":"dummy-token"},"body":"dummy-password"}'::jsonb,'dummy-ref'
+            FROM components c JOIN component_versions v ON v.component_id=c.id
+            CROSS JOIN (VALUES ('pending'),('running'),('succeeded'),('failed'),('timeout')) AS s(status)
+            WHERE v.id IN ('source-v1','retention-other-v1');
+    "#, vec![]).await.unwrap();
+    crate::migrations::run_migrations(owner).await.unwrap();
+    assert_eq!(scalar(owner, "SELECT count(*) FROM executions WHERE id LIKE 'retention-upgrade-%' AND status IN ('pending','running') AND input IS NOT NULL AND input_ref IS NOT NULL").await, 4);
+    assert_eq!(scalar(owner, "SELECT count(*) FROM executions WHERE id LIKE 'retention-upgrade-%' AND status NOT IN ('pending','running') AND input IS NULL AND input_ref IS NULL").await, 6);
+
+    let tx = owner.begin().await.unwrap();
+    db::set_tenant_guc(&tx, "http").await.unwrap();
+    for status in [
+        ExecutionStatus::Succeeded,
+        ExecutionStatus::Failed,
+        ExecutionStatus::Timeout,
+    ] {
+        fixture_execute(&tx, "UPDATE executions SET status='running',input='{}',input_ref='dummy-ref' WHERE id='retention-upgrade-http-running'", vec![]).await.unwrap();
+        assert!(db::finalize_execution(
+            &tx,
+            "http",
+            "retention-upgrade-http-running",
+            status,
+            None,
+            None,
+            None
+        )
+        .await
+        .unwrap()
+        .is_some());
+        assert!(fixture_scalar::<bool>(&tx, "SELECT input IS NULL AND input_ref IS NULL FROM executions WHERE id='retention-upgrade-http-running'", vec![]).await.unwrap());
+    }
+    fixture_execute(&tx, "UPDATE executions SET created_at=now()-interval '1 day' WHERE id='retention-upgrade-http-pending'", vec![]).await.unwrap();
+    assert_eq!(
+        db::finalize_stuck_executions(&tx, "http", 60)
+            .await
+            .unwrap()
+            .len(),
+        1
+    );
+    assert!(fixture_scalar::<bool>(&tx, "SELECT input IS NULL AND input_ref IS NULL FROM executions WHERE id='retention-upgrade-http-pending'", vec![]).await.unwrap());
+    tx.commit().await.unwrap();
+    // Simulate an older Pod finishing after migration, including a suspended tenant.
+    fixture_execute(owner, "UPDATE executions SET status='succeeded',input='{\"headers\":{\"authorization\":\"legacy-fixture\"}}',input_ref='legacy-ref' WHERE id IN ('retention-upgrade-http-running','retention-upgrade-other-running')", vec![]).await.unwrap();
+    crate::migrations::run_migrations(owner).await.unwrap();
+    assert_eq!(scalar(owner, "SELECT count(*) FROM executions WHERE id LIKE 'retention-upgrade-%' AND status='succeeded' AND input IS NOT NULL").await, 2);
+    let runtime = hibana_database::postgres::connect(&std::env::var("DATABASE_URL").unwrap(), 2, 0)
+        .await
+        .unwrap();
+    let state = state(runtime.clone(), Arc::new(crate::store::InProcStore::new()));
+    // The production reaper must clean even with stuck-job recovery disabled.
+    crate::reaper::reconcile_once(&state, 60, 0).await.unwrap();
+    assert_eq!(scalar(owner, "SELECT count(*) FROM executions WHERE id LIKE 'retention-upgrade-%' AND status='succeeded' AND (input IS NOT NULL OR input_ref IS NOT NULL)").await, 0);
+    assert_eq!(scalar(owner, "SELECT count(*) FROM executions WHERE id='retention-upgrade-other-pending' AND input IS NOT NULL AND input_ref IS NOT NULL").await, 1);
+    // More than one batch must progress without touching live or foreign inputs.
+    fixture_execute(owner, r#"
+        INSERT INTO executions(id,tenant_id,component_id,version_id,status,http_request,input_ref)
+        SELECT 'retention-upgrade-batch-'||n,'http','source','source-v1','succeeded',true,'legacy-ref'
+        FROM generate_series(1,501) AS n;
+        UPDATE executions SET input_ref='foreign-ref' WHERE id='retention-upgrade-other-running';
+        INSERT INTO executions(id,tenant_id,component_id,version_id,status,http_request,input_ref)
+        VALUES ('retention-upgrade-live-running','http','source','source-v1','running',true,'live-ref'),
+            ('retention-upgrade-non-http','http','source','source-v1','succeeded',false,'non-http-ref');
+    "#, vec![]).await.unwrap();
+    let tx = runtime.begin().await.unwrap();
+    db::set_tenant_guc(&tx, "http").await.unwrap();
+    assert_eq!(
+        db::purge_terminal_execution_inputs(&tx, "other")
+            .await
+            .unwrap(),
+        0
+    );
+    assert_eq!(
+        db::purge_terminal_execution_inputs(&tx, "http")
+            .await
+            .unwrap(),
+        500
+    );
+    assert_eq!(
+        db::purge_terminal_execution_inputs(&tx, "http")
+            .await
+            .unwrap(),
+        1
+    );
+    assert_eq!(
+        db::purge_terminal_execution_inputs(&tx, "http")
+            .await
+            .unwrap(),
+        0
+    );
+    tx.commit().await.unwrap();
+    assert_eq!(scalar(owner, "SELECT count(*) FROM executions WHERE id IN ('retention-upgrade-other-running','retention-upgrade-live-running','retention-upgrade-non-http') AND input_ref IS NOT NULL").await, 3);
+    runtime.close().await.unwrap();
+    fixture_execute(owner, "DELETE FROM executions WHERE id LIKE 'retention-upgrade-%'; DELETE FROM component_versions WHERE id='retention-other-v1'; DELETE FROM components WHERE id='retention-other'; UPDATE tenants SET status='active' WHERE id='other'", vec![]).await.unwrap();
+    println!("PASS request retention migration preserves live jobs, scrubs completed/suspended-tenant history; completion and sweeper discard input atomically");
+}
+
+async fn assert_secret_key_retention_upgrade(owner: &DatabaseConnection) {
+    use hibana_migration::MigratorTrait as _;
+    hibana_migration::Migrator::down(owner, Some(1))
+        .await
+        .unwrap();
+    assert!(hibana_database::postgres::assert_runtime_schema(owner)
+        .await
+        .is_err());
+    fixture_execute(owner, r#"
+        INSERT INTO components(id,tenant_id,name)
+            SELECT 'key-'||id,id,'key-retention' FROM tenants WHERE id IN ('http','other');
+        INSERT INTO component_versions(id,tenant_id,component_id,version,storage_uri,wasm_sha256,status)
+            SELECT c.id||'-v'||n,c.tenant_id,c.id,n::text,'unused','abcd','active'
+            FROM components c CROSS JOIN generate_series(1,2) AS n WHERE c.id IN ('key-http','key-other');
+        UPDATE components SET active_version_id=id||'-v2' WHERE id IN ('key-http','key-other');
+        INSERT INTO function_secrets(id,tenant_id,component_id,name,current_version)
+            SELECT c.id||'-'||s.name,c.tenant_id,c.id,s.name,3 FROM components c
+            CROSS JOIN (VALUES ('BOUND'),('UNUSED')) AS s(name) WHERE c.id IN ('key-http','key-other');
+        INSERT INTO function_secret_versions(tenant_id,secret_id,version,kek_kid,wrapped_dek,dek_nonce,nonce,ciphertext,value_len,reason,created_at)
+            SELECT s.tenant_id,s.id,n,
+                CASE WHEN n=3 THEN 'key-current' WHEN n=1 THEN 'key-obsolete'
+                    WHEN s.name='BOUND' THEN 'key-required' ELSE 'key-unbound' END,
+                '\x00'::bytea,'\x00'::bytea,'\x00'::bytea,'\x00'::bytea,1,'rotate',
+                '2026-01-01'::timestamptz+(n-1)*interval '1 day'
+            FROM function_secrets s CROSS JOIN generate_series(1,3) AS n WHERE s.id LIKE 'key-%';
+        INSERT INTO version_secret_bindings(tenant_id,component_id,version_id,name,secret_id)
+            SELECT tenant_id,component_id,component_id||CASE WHEN name='BOUND' THEN '-v1' ELSE '-v2' END,name,id
+            FROM function_secrets WHERE id LIKE 'key-%';
+        INSERT INTO executions(id,tenant_id,component_id,version_id,status,http_request,created_at)
+            SELECT c.id||'-'||s.status,c.tenant_id,c.id,c.id||'-v1',s.status,true,'2026-01-02 12:00:00+00'
+            FROM components c CROSS JOIN (VALUES ('pending'),('running')) AS s(status)
+            WHERE c.id IN ('key-http','key-other');
+        INSERT INTO executions(id,tenant_id,component_id,version_id,status,http_request,created_at)
+            SELECT c.id||'-current',c.tenant_id,c.id,c.id||'-v1','running',true,'2026-01-04'
+            FROM components c WHERE c.id IN ('key-http','key-other');
+        UPDATE tenants SET status='suspended' WHERE id='other';
+    "#, vec![]).await.unwrap();
+    // Prove the old function misses generations required by accepted jobs.
+    assert_eq!(scalar(owner, "SELECT COALESCE(sum(n),0)::bigint FROM secrets_kek_kid_counts_all() WHERE kek_kid='key-required'").await, 0);
+    crate::migrations::run_migrations(owner).await.unwrap();
+    hibana_database::postgres::assert_runtime_schema(owner)
+        .await
+        .unwrap();
+    let runtime = hibana_database::postgres::connect(&std::env::var("DATABASE_URL").unwrap(), 1, 0)
+        .await
+        .unwrap();
+    // No tenant GUC: the restricted aggregate must include suspended tenants too.
+    let counts: std::collections::BTreeMap<_, _> = db::secrets_kek_kid_counts_all(&runtime)
+        .await
+        .unwrap()
+        .into_iter()
+        .collect();
+    assert_eq!(
+        counts,
+        std::collections::BTreeMap::from([
+            ("key-current".to_owned(), 4),
+            ("key-required".to_owned(), 2),
+        ]),
+        "count each required generation once, using each execution's immutable version bindings"
+    );
+    assert_eq!(scalar(owner, "SELECT count(*) FROM pg_proc p, LATERAL aclexplode(p.proacl) a WHERE p.oid='public.secrets_kek_kid_counts_all()'::regprocedure AND a.grantee=0 AND a.privilege_type='EXECUTE'").await, 0);
+    fixture_execute(owner, "UPDATE executions SET status='succeeded' WHERE id IN ('key-http-pending','key-other-pending')", vec![]).await.unwrap();
+    assert_eq!(
+        scalar(
+            owner,
+            "SELECT n FROM secrets_kek_kid_counts_all() WHERE kek_kid='key-required'"
+        )
+        .await,
+        2,
+        "remaining running jobs still need the same old generations"
+    );
+    fixture_execute(owner, "UPDATE executions SET status=CASE WHEN tenant_id='http' THEN 'failed' ELSE 'timeout' END WHERE id IN ('key-http-running','key-other-running')", vec![]).await.unwrap();
+    assert_eq!(scalar(owner, "SELECT COALESCE(sum(n),0)::bigint FROM secrets_kek_kid_counts_all() WHERE kek_kid='key-required'").await, 0);
+    assert_eq!(
+        scalar(
+            owner,
+            "SELECT count(*) FROM function_secret_versions WHERE secret_id LIKE 'key-%'"
+        )
+        .await,
+        12,
+        "migration and counting leave the encrypted generation history intact"
+    );
+    runtime.close().await.unwrap();
+    fixture_execute(
+        owner,
+        r#"
+        DELETE FROM executions WHERE id LIKE 'key-%';
+        DELETE FROM version_secret_bindings WHERE component_id IN ('key-http','key-other');
+        DELETE FROM function_secret_versions WHERE secret_id LIKE 'key-%';
+        DELETE FROM function_secrets WHERE id LIKE 'key-%';
+        UPDATE components SET active_version_id=NULL WHERE id IN ('key-http','key-other');
+        DELETE FROM component_versions WHERE component_id IN ('key-http','key-other');
+        DELETE FROM components WHERE id IN ('key-http','key-other');
+        UPDATE tenants SET status='active' WHERE id='other';
+    "#,
+        vec![],
+    )
+    .await
+    .unwrap();
+    println!("PASS key retention migration counts current and in-flight generations once, across tenants and immutable version bindings, until jobs finish");
 }
 
 async fn assert_legacy_database_rejected(owner: &DatabaseConnection) {

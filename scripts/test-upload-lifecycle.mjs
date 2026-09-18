@@ -11,10 +11,28 @@ import {build} from '../sdk/src/build.mjs';
 import {loadConfig} from '../sdk/src/config.mjs';
 import {runCommand} from './bounded-process.mjs';
 import {testVersionEnvironment} from './test-version-environment.mjs';
+import {testEnvironmentLimits} from './test-environment-limits.mjs';
+import {testDeletionAudit} from './test-deletion-audit.mjs';
+import {testManagementAudit} from './test-management-audit.mjs';
+import {testSecretRekey} from './test-secret-rekey.mjs';
+import {testSecretSnapshot} from './test-secret-snapshot.mjs';
+import {testSecretKeyRetention} from './test-secret-key-retention.mjs';
+import {testFirstDeploy} from './test-first-deploy.mjs';
+import {testStreamAccounting} from './test-stream-accounting.mjs';
 import {testVersionLifecycle} from './test-version-lifecycle.mjs';
+import {testHttpPublication} from './test-http-publication.mjs';
+import {testVersionAddressing} from './test-version-addressing.mjs';
+import {testSignatureAudit} from './test-signature-audit.mjs';
 import {testConsole} from './test-console.mjs';
 import {testBuildMetadata} from './test-build-metadata.mjs';
 import {testApplicationEgress} from './test-application-egress.mjs';
+import {testHttpBoundaries, testHttpMetrics, testPublicNames} from './test-http-boundaries.mjs';
+import {testIdentityCapacity, testLoginCapacity, testProxyLogin} from './test-login-capacity.mjs';
+import {testRuntimeBoundaries} from './test-runtime-boundaries.mjs';
+import {testRequestCapacity} from './test-request-capacity.mjs';
+import {testUploadCapacity} from './test-upload-capacity.mjs';
+import {testExecutionShutdown} from './test-execution-shutdown.mjs';
+import {testIngressReadiness} from './test-ingress-readiness.mjs';
 
 const pg = process.env.HTTP_TEST_PG_CONTAINER;
 assert.match(pg || '', /^hibana-http-pg-[0-9]+$/);
@@ -27,7 +45,7 @@ delete process.env.CARGO_TARGET_DIR;
 const log = await open(join(folder, 'cp.log'), 'w');
 const objects = new Map();
 const deniedDeletes = new Set();
-let heldPut, onPut, releasePut, cp, worker, failDelete = false;
+let heldPut, onPut, releasePut, heldGet, releaseGet, cp, worker, failDelete = false;
 const s3 = createServer(async (req, res) => {
   const key = new URL(req.url, 'http://s3.invalid').pathname;
   if (req.method === 'DELETE') {
@@ -36,6 +54,7 @@ const s3 = createServer(async (req, res) => {
     objects.delete(key); res.writeHead(204).end(); return;
   }
   if (req.method === 'GET') {
+    if (heldGet) await heldGet;
     const bytes = objects.get(key);
     res.writeHead(bytes ? 200 : 404, {'Content-Type': 'application/wasm'}).end(bytes);
     return;
@@ -59,12 +78,12 @@ async function stop(process = cp) {
   const timer = setTimeout(() => process.kill('SIGKILL'), 3000);
   await new Promise(done => process.once('exit', done)); clearTimeout(timer);
 }
-async function start() {
+async function start(extraEnv = {}) {
   cp = spawn(join(nativeTarget, 'hibana-control-plane'), [], {
     stdio: ['ignore', log.fd, log.fd], env: {...process.env, BIND_ADDR: `127.0.0.1:${port}`,
       INTERNAL_BIND_ADDR: `127.0.0.1:${internalPort}`, S3_ENDPOINT: `http://127.0.0.1:${s3Port}`,
-      RUN_MIGRATIONS: 'false', LOG_FORMAT: 'json', SECRETS_MASTER_KID: 'rotated-test',
-      WORKER_HTTP_URL: `http://127.0.0.1:${workerPort}`, APP_PUBLIC_ORIGIN: 'https://hibana.test'},
+      RUN_MIGRATIONS: 'false', LOG_FORMAT: 'json', TRUSTED_PROXY_CIDRS: '127.0.0.1/32', TRUST_PROXY_HEADERS: 'false', TOKIO_WORKER_THREADS: '1', SECRETS_MASTER_KID: 'rotated-test',
+      WORKER_HTTP_URL: `http://127.0.0.1:${workerPort}`, APP_PUBLIC_ORIGIN: 'https://hibana.test', ...extraEnv},
   });
   // An absent APP_BIND_ADDR selects the combined management/app listener.
   for (let attempt = 0; attempt < 100; attempt++) {
@@ -74,17 +93,18 @@ async function start() {
   }
   throw new Error('Test Control Plane startup deadline');
 }
-async function startWorker() {
+async function startWorker(controlPlaneUrl = internal, extraEnv = {}) {
   worker = spawn(join(nativeTarget, 'hibana-worker'), [], {
     stdio: ['ignore', log.fd, log.fd], env: {...process.env,
       WORKER_HTTP_BIND_ADDR: `127.0.0.1:${workerPort}`, METRICS_BIND_ADDR: `127.0.0.1:${metricsPort}`,
-      CONTROL_PLANE_INTERNAL_URL: internal, WASM_CACHE_DIR: join(folder, 'cache'), LOG_FORMAT: 'json'},
+      CONTROL_PLANE_INTERNAL_URL: controlPlaneUrl, WASM_CACHE_DIR: join(folder, 'cache'), LOG_FORMAT: 'json', ...extraEnv},
   });
   for (let attempt = 0; ; attempt++) {
     if (worker.exitCode !== null || attempt === 100) throw new Error('Test Worker failed to start');
     try { await fetch(`http://127.0.0.1:${workerPort}/healthz`, {signal:AbortSignal.timeout(300)}); break; } catch {}
     await sleep(100);
   }
+  return worker;
 }
 const api = async (path, {token, method='GET', body} = {}) => fetch(url + path, {
   method, signal: AbortSignal.timeout(30000), headers: {...(token ? {Authorization: `Bearer ${token}`} : {}), ...(body ? {'Content-Type':'application/json'} : {})},
@@ -93,6 +113,10 @@ const api = async (path, {token, method='GET', body} = {}) => fetch(url + path, 
 function holdStorage() {
   heldPut = new Promise(done => { releasePut = () => { heldPut = undefined; done(); }; });
   return new Promise(done => { onPut = done; });
+}
+function holdDownloads() {
+  heldGet = new Promise(done => { releaseGet = () => { heldGet = undefined; done(); }; });
+  return () => releaseGet();
 }
 function upload(id, token, version, wasm, slowMs=0, fields={}) {
   const boundary = 'hibana-regression';
@@ -119,6 +143,55 @@ try {
   // Test fixture exposes only boolean Secret checks, never the values.
   const source = join(folder, 'app/src/lib.rs');
   await writeFile(source, (await readFile(source, 'utf8')).replace('{ "message": message }', '{ "message": message, "secret": std::env::var("RESTORE_TOKEN").ok().as_deref() == Some("restore-test-value"), "rotated": std::env::var("RESTORE_TOKEN").ok().as_deref() == Some("rotated-value"), "unselected": std::env::var("UNSELECTED").is_ok() }'));
+  await writeFile(source, (await readFile(source, 'utf8')).replace('if path == "/echo"', `if path == "/request" {
+    (200, "application/json", serde_json::to_vec(&serde_json::json!({
+      "scheme": format!("{:?}", request.scheme()), "authority": request.authority(), "path": request.path_with_query(),
+      "host": request.headers().get(&"host".into()), "authorization": request.headers().get(&"authorization".into()),
+      "cookie": request.headers().get(&"cookie".into()), "accept": request.headers().get(&"accept".into()), "tags": request.headers().get(&"x-tag".into()), "body": String::from_utf8(read_body(&request).unwrap()).unwrap()
+    })).unwrap())
+  } else if path == "/env-size" {
+    (200, "application/json", serde_json::to_vec(&serde_json::json!({
+      "secret_bytes": std::env::var("Z_TOKEN").ok().map(|v| v.len()),
+      "var_bytes": std::env::var("A0").ok().map(|v| v.len())
+    })).unwrap())
+  } else if path == "/dns-approved" || path == "/dns-blocked" {
+    use std::net::ToSocketAddrs;
+    // A trailing dot forces the guest through WASI DNS even for the approved IP.
+    let name = if path == "/dns-approved" { "1.1.1.1." } else { "localhost" };
+    let result = match (name, 443).to_socket_addrs() {
+      Ok(addrs) => serde_json::json!({"ok":true,"addresses":addrs.map(|a| a.to_string()).collect::<Vec<_>>()}),
+      Err(_) => serde_json::json!({"ok":false}),
+    };
+    (200, "application/json", serde_json::to_vec(&result).unwrap())
+  } else if path == "/busy" {
+    loop { std::hint::black_box(1); }
+  } else if path == "/header-limit" {
+    let fields = Fields::new();
+    fields.append(&"x-large".into(), &vec![b'x'; 512 * 1024]).unwrap();
+    (200, "text/plain", b"unexpected".to_vec())
+  } else if path == "/header-resources" {
+    let mut fields = Vec::new();
+    for _ in 0..256 { fields.push(Fields::new()); }
+    (200, "text/plain", b"unexpected".to_vec())
+  } else if path == "/trap" {
+    panic!("runtime regression fixture");
+  } else if path == "/stream-accounting" {
+    let response = OutgoingResponse::new(Fields::new());
+    response.set_status_code(200).unwrap();
+    let body = response.body().unwrap();
+    ResponseOutparam::set(response_out, Ok(response));
+    {
+      let stream = body.write().unwrap();
+      let bytes = vec![b'x'; 4096];
+      for _ in 0..4096 { stream.blocking_write_and_flush(&bytes).unwrap(); }
+    }
+    OutgoingBody::finish(body, None).unwrap();
+    return;
+  } else if path == "/large" {
+    (200, "application/octet-stream", vec![b'x'; 48 * 1024 * 1024])
+  } else if path == "/empty" || path == "/unchanged" {
+    (if path == "/empty" {204} else {304}, "text/plain", Vec::new())
+  } else if path == "/echo"`));
   const buildConfig = await loadConfig(join(folder, 'app/hibana.json'));
   const artifact = await build(buildConfig);
   const wasm = await readFile(artifact);
@@ -126,11 +199,14 @@ try {
   // bootstrap::run treats presence of APP_BIND_ADDR as enabled; remove it entirely.
   delete process.env.APP_BIND_ADDR;
   await start();
+  await testHttpMetrics({api});
   await startWorker();
-  const created = await api('/admin/tenants', {method:'POST', token:'test-only', body:{slug:'upload',name:'Upload regression',admin_email:'test@example.invalid',admin_password:'test-password'}});
+  const created = await api('/admin/tenants', {method:'POST', token:'test-only', body:{slug:' upload ',name:'Upload regression',admin_email:'test@example.invalid',admin_password:'test-password'}});
   assert.equal(created.status,201);
+  assert.equal((await created.json()).slug, 'upload');
   const login = await api('/auth/login', {method:'POST', body:{tenant_slug:'upload',email:'test@example.invalid',password:'test-password'}});
   const {token} = await login.json(); assert.ok(token);
+  await testPublicNames({api, token, sql});
   const component = await (await api('/components', {method:'POST',token,body:{name:'upload'}})).json();
   const id = component.component_id;
   assert.match(id, /^cmp_[a-f0-9]{32}$/);
@@ -255,6 +331,7 @@ try {
   });
   assert.equal((await prepareMaintenance('regression',undefined,'invalid')).status,401);
   assert.equal((await prepareMaintenance('wrong-owner')).status,409);
+  assert.equal((await prepareMaintenance(null)).status,409, 'normal update cannot bypass a maintenance owner');
   assert.equal((await prepareMaintenance('regression',[])).status,400);
   assert.equal((await prepareMaintenance('regression',['127.0.0.2'])).status,503, 'partial/wrong fleet must not be considered prepared');
   const executionsBeforePreparation = await sql('SELECT count(*) FROM executions');
@@ -263,7 +340,10 @@ try {
   assert.equal((await api('/components',{token})).status,503, 'preparation itself cannot reopen the gate');
   await operator('prepare','regression','127.0.0.1');
   await operator('open','regression');
-  assert.equal((await prepareMaintenance('regression')).status,409, 'preparation requires closed admission');
+  assert.equal((await prepareMaintenance('regression')).status,409, 'stale maintenance owner must be rejected');
+  assert.equal((await prepareMaintenance(null)).status,204, 'normal update can prepare without closing admission');
+  await operator('prepare','','127.0.0.1');
+  assert.equal((await api('/components',{token})).status,200, 'ordinary preparation leaves admission open');
   console.log('PASS native maintenance adapter enforces ownership; SIGTERM preserves internal APIs until publication completes; durable gate survives CP restart');
 
   const app = name => new Promise((done, reject) => {
@@ -273,8 +353,22 @@ try {
     req.setTimeout(30000, () => req.destroy(new Error('HTTP guest deadline')));
     req.on('error', reject); req.end();
   });
+  await testIngressReadiness({api, sql, token, wasm, upload, url, operator, holdDownloads,
+    startWorker, stopWorker:() => stop(worker), metricsUrl:`http://127.0.0.1:${metricsPort}`,
+    cacheDir:join(folder,'readiness-cache'), restart:async env => { await stop(); await start(env); }, workerPort});
   await testVersionEnvironment({api, sql, token, id, wasm, upload, app, holdStorage, releaseStorage:() => releasePut(), url, root:join(folder, 'app'), artifact});
+  await testEnvironmentLimits({api, sql, token, wasm, upload, url});
+  await testDeletionAudit({api, sql, token, wasm, upload});
+  await testManagementAudit({api, sql, wasm, upload});
+  await testStreamAccounting({api, sql, token, wasm, upload, url});
+  await testHttpBoundaries({api, sql, token, wasm, upload, url});
   await testVersionLifecycle({api, sql, pg, token, wasm, upload, app});
+  await testHttpPublication({api, sql, pg, token, wasm, upload, app});
+  await testSecretSnapshot({api, sql, pg, token, wasm, upload, app, internal, startWorker, stopWorker:() => stop(worker)});
+  await testSecretKeyRetention({api, sql, wasm, upload, url, internal, restart:async env => { await stop(); await start(env); }, startWorker, stopWorker:() => stop(worker)});
+  await testFirstDeploy({api, token, url, folder, artifact, app});
+  await testVersionAddressing({api, sql, token, wasm, upload});
+  await testSignatureAudit({api, sql, token, wasm, upload, url, objects});
   await testBuildMetadata({api, token, wasm, unrecordedWasm, upload});
   await testApplicationEgress({api, sql, token, wasm, upload, holdStorage, releaseStorage:() => releasePut()});
   await testConsole({api, token, url, app, wasm, folder});
@@ -360,7 +454,15 @@ try {
   assert.deepEqual(objects.get(original[0]),original[1]);
   for (let i=1; i<=25; i++) assert.ok(!objects.has(`/test-components/denied-${i}.wasm`));
   console.log('PASS per-object 403 failures preserve retry journals without starving another tenant or rows beyond the batch, and recovery reclaims every orphan');
+  await testRequestCapacity({api, token, sql, wasm, upload, url});
+  await testUploadCapacity({api, token, wasm, upload, url, holdStorage, releaseStorage:() => releasePut()});
+  await testSecretRekey({api, sql, pg, restart:async env => { await stop(); await start(env); }});
+  await testIdentityCapacity({api, token});
+  await testProxyLogin({url});
+  await testLoginCapacity({api});
+  await testExecutionShutdown({api, token, wasm, upload, url, internal, metricsUrl:`http://127.0.0.1:${metricsPort}`, startWorker, stopWorker:() => stop(worker)});
+  await testRuntimeBoundaries({api, token, wasm, upload, url, internal, metricsUrl:`http://127.0.0.1:${metricsPort}`, startWorker, stopWorker:() => stop(worker)});
 } finally {
-  releasePut?.(); await stop(worker); await stop(); s3.closeAllConnections(); await new Promise(done => s3.close(done)); await log.close();
+  releaseGet?.(); releasePut?.(); await stop(worker); await stop(); s3.closeAllConnections(); await new Promise(done => s3.close(done)); await log.close();
   await rm(folder,{recursive:true,force:true});
 }

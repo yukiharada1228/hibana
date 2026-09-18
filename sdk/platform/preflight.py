@@ -2,12 +2,13 @@
 import base64
 from copy import deepcopy
 import json
+import ipaddress
 import re
 import shutil
 import subprocess
 from urllib.parse import urlsplit
 
-from common import MIGRATION_JOB, environment_values, secret_values
+from common import MIGRATION_JOB, environment_values, management_api_prefixes, secret_values
 
 
 RESOURCES = {
@@ -140,8 +141,7 @@ class Preflight:
                     require("IngressClass", spec["ingressClassName"])
                 tls_hosts = {host for tls in spec.get("tls", []) for host in tls.get("hosts", [])}
                 for rule in spec.get("rules", []):
-                    management = any(p.get("backend", {}).get("service", {}).get("name") == "hibana-api" for p in rule.get("http", {}).get("paths", []))
-                    if management and rule.get("host") not in tls_hosts:
+                    if management_api_prefixes(rule) and rule.get("host") not in tls_hosts:
                         errors.append(f"Ingress/{doc['metadata']['name']}: configure TLS for the management hostname")
                 for tls in doc.get("spec", {}).get("tls", []):
                     if tls.get("secretName"):
@@ -153,6 +153,10 @@ class Preflight:
         required = {"hibana-runtime": ["DATABASE_URL"], "hibana-control-plane": [
             "REDIS_URL", "S3_ACCESS_KEY", "S3_SECRET_KEY", "BOOTSTRAP_ADMIN_TOKEN", "JOB_SIGNING_KEY", "SECRETS_MASTER_KEY"],
             "hibana-migration": ["MIGRATION_DATABASE_URL"]}
+        behind_proxy = any(resource_id(doc) == ("Deployment", "hibana-console") or (
+            doc["kind"] == "Ingress" and any(
+                management_api_prefixes(rule)
+                for rule in doc.get("spec", {}).get("rules", []))) for doc in docs)
         # Check the effective env rather than prescribing a Secret layout.
         for doc in docs:
             for container in pod_spec(doc).get("containers", []):
@@ -167,6 +171,17 @@ class Preflight:
                     keys += required["hibana-control-plane"] + ["S3_ENDPOINT", "S3_BUCKET"]
                     if not env.get("INGRESS_BASE_DOMAIN"):
                         keys.append("APP_PUBLIC_ORIGIN")
+                    if behind_proxy:
+                        keys.append("TRUSTED_PROXY_CIDRS")
+                    if str(env.get("TRUST_PROXY_HEADERS", "")).lower().strip() in ("1", "true", "yes", "on"):
+                        errors.append("Replace TRUST_PROXY_HEADERS with explicit TRUSTED_PROXY_CIDRS")
+                    if str(env.get("TRUSTED_PROXY_CIDRS", "")).strip():
+                        try:
+                            for entry in env["TRUSTED_PROXY_CIDRS"].split(","):
+                                if "/" not in entry or ipaddress.ip_network(entry.strip(), strict=False).prefixlen == 0:
+                                    raise ValueError("unsafe proxy range")
+                        except ValueError:
+                            errors.append("TRUSTED_PROXY_CIDRS must contain explicit comma-separated IP CIDRs; /0 is not allowed")
                 for key in keys:
                     if not str(env.get(key, "")).strip():
                         errors.append(f"{doc['kind']}/{doc['metadata']['name']}: missing environment setting {key}")
@@ -178,6 +193,8 @@ class Preflight:
                     try:
                         url = urlsplit(env[key])
                         valid = url.scheme in allowed and bool(url.hostname) and (url.port is None or 0 < url.port <= 65535)
+                        if key == "REDIS_URL" and url.fragment:
+                            valid = False  # Redis TLS certificate verification cannot be disabled.
                     except ValueError:
                         valid = False
                     if not valid:

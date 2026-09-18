@@ -36,7 +36,7 @@ export function Executions({
     [error, setError] = useState("");
   useEffect(() => {
     setCursor(undefined);
-  }, [component]);
+  }, [component.component_id]);
   useEffect(() => {
     let current = true;
     setData(null);

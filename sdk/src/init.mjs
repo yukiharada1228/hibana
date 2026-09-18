@@ -1,3 +1,4 @@
+import { isApplicationName } from "./application-name.mjs";
 import { cp, mkdir, readdir, writeFile } from "node:fs/promises";
 import { resolve, join, dirname, basename } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -24,8 +25,10 @@ export async function init(
     .replace(/^-+|-+$/g, "")
     .slice(0, 63)
     .replace(/-+$/, "");
-  if (!/^[a-z]/.test(name))
-    throw new Error("Choose a project directory starting with a letter");
+  if (!isApplicationName(name))
+    throw new Error(
+      "Choose a project directory containing ASCII letters or digits",
+    );
   await mkdir(root, { recursive: true });
   if ((await readdir(root)).some((name) => name !== ".git"))
     throw new Error(

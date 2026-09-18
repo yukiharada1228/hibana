@@ -9,7 +9,40 @@ use hibana_shared::ExecutionStatus;
 use hibana_shared::UsageMetrics;
 use serde_json::Value;
 
-/// `executions` の 1 行 (GET /executions/{id} 応答)。
+/// Old Control Planes can still finish requests after the retention migration.
+/// Sweep those inputs repeatedly, including after rolling upgrades. Bound each
+/// transaction and use the retained-input index instead of scanning all history.
+pub async fn purge_terminal_execution_inputs(
+    tx: &DatabaseTransaction,
+    tenant_id: &str,
+) -> Result<u64, DbErr> {
+    let terminal = Condition::all()
+        .add(executions::Column::TenantId.eq(tenant_id))
+        .add(executions::Column::HttpRequest.eq(true))
+        .add(executions::Column::Status.is_not_in(["pending", "running"]))
+        .add(
+            Condition::any()
+                .add(executions::Column::Input.is_not_null())
+                .add(executions::Column::InputRef.is_not_null()),
+        );
+    let batch = executions::Entity::find()
+        .select_only()
+        .column(executions::Column::Id)
+        .filter(terminal.clone())
+        .order_by_asc(executions::Column::Id)
+        .limit(500)
+        .into_query();
+    Ok(executions::Entity::update_many()
+        .col_expr(executions::Column::Input, Expr::val(None::<Value>))
+        .col_expr(executions::Column::InputRef, Expr::val(None::<String>))
+        .filter(terminal)
+        .filter(executions::Column::Id.in_subquery(batch))
+        .exec(tx)
+        .await?
+        .rows_affected)
+}
+
+/// Execution history projection. Never fetch request/response payloads or their references.
 #[derive(Debug, Clone, FromQueryResult)]
 pub struct ExecutionRow {
     pub id: String,
@@ -17,13 +50,7 @@ pub struct ExecutionRow {
     pub component_id: String,
     pub version_id: String,
     pub status: String,
-    pub input: Option<Value>,
-    pub output: Option<Value>,
     pub error: Option<Value>,
-    /// M3d (§3.4 / §6.4): 大入力の退避オブジェクトキー（NULL=インライン）。
-    pub input_ref: Option<String>,
-    /// M3d (§3.4 / §6.4): 大出力の退避オブジェクトキー（NULL=インライン）。
-    pub output_ref: Option<String>,
     pub created_at: DateTime<Utc>,
     pub started_at: Option<DateTime<Utc>>,
     pub finished_at: Option<DateTime<Utc>>,
@@ -62,11 +89,7 @@ pub async fn get_execution(
             executions::Column::ComponentId,
             executions::Column::VersionId,
             executions::Column::Status,
-            executions::Column::Input,
-            executions::Column::Output,
             executions::Column::Error,
-            executions::Column::InputRef,
-            executions::Column::OutputRef,
             executions::Column::CreatedAt,
             executions::Column::StartedAt,
             executions::Column::FinishedAt,
@@ -191,6 +214,8 @@ pub async fn finalize_stuck_executions(
     let cutoff = now().sub(Expr::cust("interval '1 second'").mul(deadline_secs));
     let mut query = executions::Entity::update_many()
         .col_expr(executions::Column::Status, Expr::val("failed"))
+        .col_expr(executions::Column::Input, Expr::val(None::<Value>))
+        .col_expr(executions::Column::InputRef, Expr::val(None::<String>))
         .col_expr(executions::Column::Error, Expr::val(error))
         .col_expr(executions::Column::FinishedAt, now())
         .filter(executions::Column::TenantId.eq(tenant_id))
@@ -247,6 +272,8 @@ pub async fn finalize_execution(
     debug_assert!(status.is_terminal());
     let mut query = executions::Entity::update_many()
         .col_expr(executions::Column::Status, Expr::val(status.as_str()))
+        .col_expr(executions::Column::Input, Expr::val(None::<Value>))
+        .col_expr(executions::Column::InputRef, Expr::val(None::<String>))
         .col_expr(executions::Column::Output, Expr::val(output.cloned()))
         .col_expr(executions::Column::Error, Expr::val(error.cloned()))
         .col_expr(executions::Column::FinishedAt, now())

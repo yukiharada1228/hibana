@@ -100,11 +100,10 @@ enum ValidationOutcome {
 /// - 子が timeout / OOM kill / クラッシュ / 不正な出力 → **wasm が原因**なので `InvalidRequest`。
 /// - 子の spawn 自体が失敗（fork 上限等） → 基盤側の一時障害なので `Internal`（503 相当・retryable）。
 ///
-pub async fn validate_wasm(bytes: Vec<u8>) -> Result<Validated, FaasError> {
+pub async fn validate_wasm(bytes: &[u8]) -> Result<Validated, FaasError> {
     let permit = validation_semaphore()
-        .acquire()
-        .await
-        .map_err(|e| FaasError::Internal(format!("validation semaphore closed: {e}")))?;
+        .try_acquire()
+        .map_err(|_| FaasError::Unavailable)?;
 
     let result = spawn_validation_child(bytes).await;
 
@@ -113,7 +112,7 @@ pub async fn validate_wasm(bytes: Vec<u8>) -> Result<Validated, FaasError> {
 }
 
 /// 検証子プロセスを起動し、結果を回収する。
-async fn spawn_validation_child(bytes: Vec<u8>) -> Result<Validated, FaasError> {
+async fn spawn_validation_child(bytes: &[u8]) -> Result<Validated, FaasError> {
     use tokio::io::AsyncWriteExt as _;
     use tokio::process::Command;
 
@@ -137,7 +136,7 @@ async fn spawn_validation_child(bytes: Vec<u8>) -> Result<Validated, FaasError> 
     // stdin へ wasm を書き込む。子が先に死ぬと write が EPIPE になるが、その場合は
     // 下の wait 側で timeout/kill として観測されるので、ここでの write エラーは無視してよい。
     if let Some(mut stdin) = child.stdin.take() {
-        let _ = stdin.write_all(&bytes).await;
+        let _ = stdin.write_all(bytes).await;
         let _ = stdin.shutdown().await;
     }
 
@@ -461,6 +460,18 @@ mod tests {
     }
 
     use super::*;
+
+    #[tokio::test]
+    async fn full_validation_capacity_rejects_without_a_payload_wait_queue() {
+        let permits = validation_semaphore().try_acquire_many(4).unwrap();
+        assert!(matches!(
+            validate_wasm(b"fixture").await,
+            Err(FaasError::Unavailable)
+        ));
+        drop(permits);
+        assert_eq!(validation_semaphore().available_permits(), 4);
+    }
+
     use hibana_shared::capabilities::{parse_capabilities, CapabilitySet};
 
     /// §4.4: baseline 承認集合は標準 WASI と標準 handler world 契約を承認する。

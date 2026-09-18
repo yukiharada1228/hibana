@@ -112,6 +112,7 @@ const commands = {
       ],
       notes:
         "Builds and activates a new version. A version is generated when --version is omitted.\n" +
+        "Version names use 1..128 ASCII characters: start with a letter or digit, then letters, digits, '.', '_', '+', '-'.\n" +
         connectionHelp,
     },
   ),

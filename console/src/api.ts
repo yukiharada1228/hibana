@@ -118,9 +118,9 @@ export class Api {
       `/components/${encodeURIComponent(id)}/versions`,
     );
   }
-  versionDetails(id: string, version: string) {
+  versionDetails(id: string, versionId: string) {
     return this.request<VersionDetails>(
-      `/components/${encodeURIComponent(id)}/versions/${encodeURIComponent(version)}`,
+      `/components/${encodeURIComponent(id)}/versions/by-id/${encodeURIComponent(versionId)}`,
     );
   }
   config(id: string) {
@@ -157,9 +157,9 @@ export class Api {
   deleteComponent(id: string) {
     return this.request(`/components/${encodeURIComponent(id)}`, "DELETE");
   }
-  deleteVersion(id: string, version: string) {
+  deleteVersion(id: string, versionId: string) {
     return this.request<void>(
-      `/components/${encodeURIComponent(id)}/versions/${encodeURIComponent(version)}`,
+      `/components/${encodeURIComponent(id)}/versions/by-id/${encodeURIComponent(versionId)}`,
       "DELETE",
     );
   }

@@ -264,16 +264,18 @@ mod tests {
 
     #[tokio::test]
     async fn secret_connection_failure_has_a_distinct_category() {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let endpoint = format!("http://{}", listener.local_addr().unwrap());
-        drop(listener);
+        // No TCP listener can own port zero: bind(0) chooses a nonzero port.
+        // A released ephemeral port could be reused by a parallel fixture.
+        let endpoint = "http://127.0.0.1:0".to_owned();
         let client = ControlPlaneClient::new(
             reqwest::Client::builder().no_proxy().build().unwrap(),
             endpoint,
             Duration::from_secs(2),
             crate::metrics::Metrics::init(),
         );
-        assert!(matches!(client.fetch_job_env("token").await,
-            Err(ExecError::Failed(reason)) if reason.ends_with("connect")));
+        match client.fetch_job_env("token").await {
+            Err(ExecError::Failed(reason)) => assert!(reason.ends_with("connect"), "{reason}"),
+            _ => panic!("expected a classified connection failure"),
+        }
     }
 }

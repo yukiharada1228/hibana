@@ -50,6 +50,7 @@ data:
   S3_REGION: us-east-1
   S3_BUCKET: CHANGE_ME
   APP_PUBLIC_ORIGIN: https://CHANGE_ME
+  TRUSTED_PROXY_CIDRS: CHANGE_ME_TRUSTED_PROXY_CIDRS
 `,
     "egress.yaml": `# Use the address ranges and ports of your external dependencies.
 apiVersion: networking.k8s.io/v1
@@ -86,7 +87,7 @@ SECRETS_MASTER_KEY=${randomBytes(32).toString("hex")}
     "README.md": `# Hibana site configuration
 
 1. Fill in runtime.env, control-plane.env and migration.env with your PostgreSQL, Redis and S3 credentials. Keep the generated signing, master and bootstrap keys; back them up securely.
-2. Update site.yaml with your S3 endpoint, bucket and application domain.
+2. Update site.yaml with your S3 endpoint, bucket and application domain. Set TRUSTED_PROXY_CIDRS to the comma-separated source IP CIDRs of your console and Ingress proxies (single IPs use /32 or /128). Include each trusted hop; do not include ordinary clients or untrusted workloads. The outside Ingress must overwrite X-Forwarded-For with the actual client address, or securely append its peer and trust only known upstream proxies.
 3. Update ingress.yaml with your management hostname, per-tenant app hostname, IngressClass and TLS Secret names. Provision the TLS Secrets in namespace hibana or include them as resources in this overlay. Label the Ingress controller namespace as described in ingress.yaml.
    Update console/ingress.yaml with the intranet console hostname and TLS Secret. Set a released console image (prefer a digest) in console/kustomization.yaml. Browser users open https://CONSOLE_HOST/; the CLI can use https://CONSOLE_HOST/api. The platform --image option only selects the Control Plane/Worker image.
 4. Set your dependency address ranges and ports in egress.yaml. Provision the external databases and bucket before installation.

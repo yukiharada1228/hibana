@@ -14,6 +14,7 @@ use hibana_database::prelude::*;
 #[derive(Debug, Clone, FromQueryResult)]
 pub struct SecretMetaRow {
     pub id: String,
+    pub component_id: String,
     pub name: String,
     pub current_version: i32,
     pub updated_at: chrono::DateTime<chrono::Utc>,
@@ -55,6 +56,7 @@ pub async fn find_live_secret_by_name(
         .select_only()
         .columns([
             function_secrets::Column::Id,
+            function_secrets::Column::ComponentId,
             function_secrets::Column::Name,
             function_secrets::Column::CurrentVersion,
             function_secrets::Column::UpdatedAt,
@@ -78,6 +80,7 @@ pub async fn list_secrets_meta(
         .select_only()
         .columns([
             function_secrets::Column::Id,
+            function_secrets::Column::ComponentId,
             function_secrets::Column::Name,
             function_secrets::Column::CurrentVersion,
             function_secrets::Column::UpdatedAt,
@@ -92,6 +95,7 @@ pub async fn list_secrets_meta(
 }
 
 /// 版台帳へ 1 行 INSERT する（追記専用）。`reason` は `'create' | 'rotate' | 'rekey'`。
+/// 呼び出し側は component の排他ロックを取得済みであること。
 pub async fn insert_secret_version(
     executor: &impl ConnectionTrait,
     tenant_id: &str,
@@ -101,6 +105,18 @@ pub async fn insert_secret_version(
     reason: &str,
     created_by: Option<&str>,
 ) -> Result<(), DbErr> {
+    // now() is the transaction start, possibly before an earlier HTTP admission
+    // released the parent lock. Stamp the generation after acquiring that lock
+    // so delayed Worker lookups cannot select a value published after admission.
+    let created_at: chrono::DateTime<chrono::Utc> = executor
+        .query_one(
+            &Query::select()
+                .expr_as(Func::cust("clock_timestamp"), "created_at")
+                .to_owned(),
+        )
+        .await?
+        .ok_or_else(|| DbErr::Custom("database clock unavailable".into()))?
+        .try_get("", "created_at")?;
     function_secret_versions::Entity::insert(function_secret_versions::ActiveModel {
         tenant_id: Set(tenant_id.into()),
         secret_id: Set(secret_id.into()),
@@ -113,7 +129,7 @@ pub async fn insert_secret_version(
         value_len: Set(env.value_len),
         reason: Set(reason.into()),
         created_by: Set(created_by.map(str::to_owned)),
-        ..Default::default()
+        created_at: Set(created_at),
     })
     .exec(executor)
     .await?;
@@ -206,7 +222,7 @@ pub async fn secrets_stale_kek(
     .collect()
 }
 
-/// kid 別の current 世代件数（M7c-4: Prometheus gauge の内部更新専用）。
+/// kid 別の必要な世代数。現在世代と未完了の実行が参照する世代を重複なく集計する。
 ///
 /// **HTTP 応答に載せてはならない** (MUST NOT)。全テナント横断の集計であり、テナント管理者へ
 /// 返すと他テナントの secret 総数が漏れる。
@@ -230,6 +246,7 @@ pub async fn find_secret_meta_by_id(
         .select_only()
         .columns([
             function_secrets::Column::Id,
+            function_secrets::Column::ComponentId,
             function_secrets::Column::Name,
             function_secrets::Column::CurrentVersion,
             function_secrets::Column::UpdatedAt,

@@ -6,6 +6,27 @@ import { join } from "node:path";
 import { execFileSync } from "node:child_process";
 import { loadConfig } from "../src/config.mjs";
 import { deploy } from "../src/api.mjs";
+import { validateVersionName } from "../src/version-name.mjs";
+
+test("deploy validates version names before building or contacting the API", async () => {
+  for (const version of ["1", "v1.2.3-rc.1+build_7", "a".repeat(128)])
+    assert.equal(validateVersionName(version), version);
+  const api = { async request() { assert.fail("invalid names must not contact the API"); } };
+  for (const version of [undefined, null, 1, {}, "", ".", "..", "../v1", "a/b", "a\\b", "%2e", "a?b", "a#b", "a b", " a", "a\n", "a\r", "版1", "a".repeat(129)])
+    await assert.rejects(deploy(api, {}, "missing.wasm", version), /Version must be/);
+  const dir = await mkdtemp(join(tmpdir(), "hibana-version-"));
+  try {
+    // A build would fail because the configured component is absent.
+    await writeFile(join(dir,"hibana.json"), JSON.stringify({name:"version-test",component:"missing.wasm"}));
+    const cli = new URL("../src/cli.mjs", import.meta.url);
+    for (const version of ["..", "", "a\n"]) {
+      assert.throws(() => execFileSync(process.execPath,[cli.pathname,"deploy","--url","http://localhost:1","--version",version], {cwd:dir,stdio:"pipe"}), error => {
+        assert.match(error.stderr.toString(), version === "" ? /requires a non-empty VERSION/ : /Version must be/);
+        return true;
+      });
+    }
+  } finally { await rm(dir, {recursive:true,force:true}); }
+});
 
 test("config rejects ambiguous workloads and limits rejected by the server", async () => {
   const dir = await mkdtemp(join(tmpdir(), "hibana-config-"));
@@ -71,4 +92,37 @@ test("init can explicitly pin a project-local CLI without changing the default",
     const pkg = JSON.parse(await readFile(join(project, "package.json"), "utf8"));
     assert.equal(pkg.devDependencies["@hibana/cli"], `file:${supplied}`);
   } finally { await rm(dir, { recursive: true, force: true }); }
+});
+
+// These labels are accepted by the API; every local entry point must agree.
+test("numeric DNS labels work through init, config, deploy and deletion", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "hibana-names-"));
+  const cli = new URL("../src/cli.mjs", import.meta.url);
+  try {
+    for (const name of ["0", "2026-api", "9".repeat(63)]) {
+      const root = join(dir, name);
+      execFileSync(process.execPath, [cli.pathname, "init", root, "--no-install"]);
+      const config = await loadConfig(join(root, "hibana.json"));
+      assert.equal(config.name, name);
+      assert.match(execFileSync(process.execPath, [cli.pathname, "delete", name, "--dry-run"], {cwd:dir, encoding:"utf8"}), /Would delete application/);
+      assert.match(execFileSync(process.execPath, [cli.pathname, "delete", "--dry-run"], {cwd:root, encoding:"utf8"}), /Would delete application/);
+      const artifact = join(root, "fixture.wasm");
+      await writeFile(artifact, "fixture");
+      const calls = [];
+      await deploy({async request(path, options = {}) {
+        calls.push({path, ...options});
+        if (path === "/components" && !options.method) return [];
+        if (path === "/components") return {component_id:"fixture"};
+        return {};
+      }}, config, artifact, "1");
+      assert.equal(calls[1].body.name, name);
+      assert.equal(calls[2].path, "/components/fixture/versions");
+    }
+    for (const name of [42, null, {}, "name\n", "name\r", " name", "name ", "a.b", "A", "-a", "a-", "a".repeat(64)]) {
+      const path = join(dir, "hibana.json");
+      await writeFile(path, JSON.stringify({name, main:"index.ts"}));
+      await assert.rejects(loadConfig(path), /DNS label/);
+      assert.throws(() => execFileSync(process.execPath, [cli.pathname, "delete", "--dry-run"], {cwd:dir, stdio:"pipe"}));
+    }
+  } finally { await rm(dir, {recursive:true, force:true}); }
 });

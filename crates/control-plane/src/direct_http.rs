@@ -19,7 +19,9 @@ pub async fn complete(
     headers: HeaderMap,
     Json(result): Json<hibana_shared::ResultMessage>,
 ) -> Result<StatusCode, AppError> {
-    let claims = crate::job_auth::claims_from_token(&state, &headers).await?;
+    // Suspension and token expiry stop new work, but must not strand an
+    // admitted execution or reject a retry of its already-persisted result.
+    let claims = crate::job_auth::verified_claims(&state, &headers)?;
     if claims.tenant_id != result.tenant_id
         || claims.execution_id != result.execution_id
         || headers
@@ -229,7 +231,7 @@ pub async fn accept(
     state: &AppState,
     tenant: &str,
     component: &str,
-    input: Value,
+    input: impl std::future::Future<Output = Result<Value, Response>>,
 ) -> Result<Response, AppError> {
     let started = std::time::Instant::now();
     use crate::admission::{self, Decision};
@@ -261,16 +263,49 @@ pub async fn accept(
             .inc();
         return Ok(r.into_response());
     }
+    let Some(_tenant_request) = state
+        .request_capacity()
+        .reserve_tenant(tenant, resolved.inflight.max as usize)
+    else {
+        return Ok(admission::RateLimited::concurrency().into_response());
+    };
+    let input = match input.await {
+        Ok(input) => input,
+        Err(response) => return Ok(response),
+    };
+    // Receiving can take seconds. Honor suspension/quota changes before creating
+    // an execution, without charging the request's rate limit twice.
+    let (status, quotas) = db::load_tenant_status_and_quotas(state.pool(), tenant)
+        .await?
+        .ok_or(FaasError::Unauthorized)?;
+    if status != "active" {
+        return Err(FaasError::Unauthorized.into());
+    }
+    let resolved = state.admission().resolve_for_tenant(tenant, &quotas);
     let tx = state.pool().begin().await?;
     db::set_tenant_guc(&tx, tenant).await?;
-    let (component_id, version_id) = hibana_database::queries::active_versions(tenant)
-        .filter(components::Column::Name.eq(component))
-        .filter(components::Column::IngressEnabled.eq(true))
+    // Lock only the parent first. A join started before a publisher commits can
+    // lose its old active-version match while waiting and incorrectly return 404.
+    let component_id = components::Entity::find()
         .select_only()
-        .column(component_versions::Column::ComponentId)
-        .column(component_versions::Column::Id)
+        .column(components::Column::Id)
+        .filter(components::Column::TenantId.eq(tenant))
+        .filter(components::Column::Name.eq(component))
+        .filter(components::Column::DeletedAt.is_null())
+        .filter(components::Column::IngressEnabled.eq(true))
         .lock_shared()
-        .into_tuple::<(String, String)>()
+        .into_tuple::<String>()
+        .one(&tx)
+        .await?
+        .ok_or_else(|| FaasError::NotFound("HTTP application".into()))?;
+    // This new statement sees the publisher's commit. Use the database clock
+    // after the wait, rather than transaction-start now(), for Secret selection.
+    let (version_id, accepted_at) = hibana_database::queries::active_versions(tenant)
+        .filter(component_versions::Column::ComponentId.eq(&component_id))
+        .select_only()
+        .column(component_versions::Column::Id)
+        .expr(Func::cust("clock_timestamp"))
+        .into_tuple::<(String, chrono::DateTime<chrono::Utc>)>()
         .one(&tx)
         .await?
         .ok_or_else(|| FaasError::NotFound("HTTP application".into()))?;
@@ -310,6 +345,7 @@ pub async fn accept(
             input: Set(Some(input.clone())),
             job_token_kid: Set(Some(state.signer().kid().into())),
             http_request: Set(true),
+            created_at: Set(accepted_at),
             ..Default::default()
         })
         .exec(&tx)
@@ -351,11 +387,25 @@ pub(crate) async fn cancel_pending(
 ) -> Result<bool, AppError> {
     let tx = state.pool().begin().await?;
     db::set_tenant_guc(&tx, tenant).await?;
-    let changed = executions::Entity::update_many().col_expr(executions::Column::Status,Expr::val("failed"))
-        .col_expr(executions::Column::FinishedAt,now()).col_expr(executions::Column::Error,Expr::val(serde_json::json!({"code":"dispatch_not_started","message":"No Worker claimed the request"})))
-        .filter(executions::Column::TenantId.eq(tenant)).filter(executions::Column::Id.eq(id))
-        .filter(executions::Column::HttpRequest.eq(true)).filter(executions::Column::Status.eq("pending"))
-        .exec(&tx).await?.rows_affected == 1;
+    let changed = executions::Entity::update_many()
+        .col_expr(executions::Column::Status, Expr::val("failed"))
+        .col_expr(executions::Column::Input, Expr::val(None::<Value>))
+        .col_expr(executions::Column::InputRef, Expr::val(None::<String>))
+        .col_expr(executions::Column::FinishedAt, now())
+        .col_expr(
+            executions::Column::Error,
+            Expr::val(serde_json::json!({
+                "code": "dispatch_not_started", "message": "No Worker claimed the request"
+            })),
+        )
+        .filter(executions::Column::TenantId.eq(tenant))
+        .filter(executions::Column::Id.eq(id))
+        .filter(executions::Column::HttpRequest.eq(true))
+        .filter(executions::Column::Status.eq("pending"))
+        .exec(&tx)
+        .await?
+        .rows_affected
+        == 1;
     tx.commit().await?;
     if changed {
         state

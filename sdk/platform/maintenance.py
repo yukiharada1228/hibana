@@ -74,7 +74,7 @@ class Maintenance:
              json.dumps(c.get("state", {}), sort_keys=True))
             for c in p.get("status", {}).get("containerStatuses", []))) for uid, p in pods.items()}
 
-    def prepare(self, owner, timeout=300):
+    def prepare(self, owner=None, timeout=300):
         deadline = time.monotonic() + timeout
         while time.monotonic() < deadline:
             before = self.pods("worker")
@@ -84,7 +84,7 @@ class Maintenance:
                 time.sleep(0.5)
                 continue
             try:
-                self.call(self.control_plane(), "prepare", owner,
+                self.call(self.control_plane(), "prepare", owner or "",
                           ",".join(sorted(p["status"]["podIP"] for p in before.values())),
                           timeout=min(250, max(1, deadline - time.monotonic())))
                 if self.identity(before) == self.identity(self.pods("worker")):
@@ -93,4 +93,6 @@ class Maintenance:
                 # Preparation is idempotent; allow stale Service DNS to converge.
                 pass
             time.sleep(0.5)
-        raise ValueError("Active applications could not be prepared; admission remains closed. Retry start.")
+        if owner:
+            raise ValueError("Active applications could not be prepared; admission remains closed. Retry start.")
+        raise ValueError("Active applications could not be prepared; installation is incomplete. Fix preparation and retry install.")

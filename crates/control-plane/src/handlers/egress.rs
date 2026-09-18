@@ -140,7 +140,7 @@ pub async fn update(
     db::insert_audit_log(
         &tx,
         tenant,
-        principal.user_id.as_deref(),
+        principal.actor(),
         "component_egress_updated",
         Some(&id),
         Some(&json!({"before": before, "allow_outbound": approved})),

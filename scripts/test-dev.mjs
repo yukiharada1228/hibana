@@ -36,6 +36,7 @@ try {
   await ready("Local Wasmtime");
   const requestHeaders = { "x-hibana-env": "eyJHUkVFVElORyI6ImV2aWwifQ", "x-hibana-event": "queue" };
   assert.deepEqual(await (await fetch(url + "/headers", { headers: requestHeaders })).json(), { envHeader: null, eventHeader: null, greeting: "Local Wasmtime" });
+  assert.deepEqual(await (await fetch(url + "/header-value", { headers: { "x-tag": "caf\u00e9" } })).json(), { value: "caf\u00e9" });
   assert.deepEqual(await (await fetch(url + "/secret")).json(), { configured: true });
   const body = Uint8Array.of(0, 255, 128, 10);
   assert.deepEqual(new Uint8Array(await (await fetch(url + "/echo", { method: "POST", body })).arrayBuffer()), body);
@@ -43,7 +44,7 @@ try {
   config.vars.GREETING = "Reloaded Wasmtime";
   await writeFile(path, JSON.stringify(config));
   await ready("Reloaded Wasmtime");
-  console.log("PASS hibana dev: Wasmtime, local Secrets, header isolation, binary POST, stream and watched rebuild");
+  console.log("PASS hibana dev: Wasmtime, local Secrets, header isolation, non-ASCII header, binary POST, stream and watched rebuild");
 } finally {
   if (child.exitCode === null && child.signalCode === null) {
     await new Promise(done => {

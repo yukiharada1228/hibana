@@ -461,7 +461,7 @@ pub const MAX_EXECUTION_TIME_MS_LIMIT: u64 = 60_000;
 // per-function 環境変数 / secret の上限 (M7b/M7c, §15 / §4.4)
 // ============================================================================
 //
-// **CP の受付バリデーションと worker の防御的 clamp の両方でこの定数を使う**（二重防御）。
+// **CP の受付バリデーションと Worker の実行前検証で同じ定数を使う**（二重防御）。
 // CP 側だけで守ると、DB を直接書き換えられた場合や将来の別経路で worker が無制限の env を
 // 組み立ててしまう。
 
@@ -499,8 +499,8 @@ pub fn is_valid_env_key(key: &str) -> bool {
 /// `max_wall_time_ms` を epoch interruption に適用する。
 ///
 /// M4b (§4.3) で以下を追加:
-/// - `max_execution_time_ms`: tokio タイムアウト（ホスト関数込み総経過時間。epoch は
-///   ゲスト内ループは中断できるがホスト関数中のブロッキングは止められないため両者を併用）。
+/// - `max_execution_time_ms`: 環境取得・DNS解決・ホスト関数を含む実行の総経過時間。epoch は
+///   ゲスト内ループは中断できるがホスト関数中の待ちは止められないためtokioタイムアウトと併用。
 ///   既定 5000ms、上限 60000ms。
 /// - `max_fuel`: 任意・決定性用の fuel 単位。`None` のとき epoch のみを適用（既定挙動）。
 ///   `Some(n)` のとき worker は `Store::set_fuel(n)` を呼び、`OutOfFuel` trap は `failed` 分類。

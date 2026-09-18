@@ -81,6 +81,21 @@ impl Worker {
             .resolve_execution(&job.tenant_id, &job.execution_id, &job.wasm_sha256)
             .await
     }
+
+    /// Startup barrier only: downloading/compiling stays on the authenticated
+    /// preparation path. Disk cache validation must not block HTTP I/O threads.
+    pub(crate) async fn applications_prepared(self: &Arc<Self>) -> anyhow::Result<bool> {
+        let hashes = self.repository.active_artifact_hashes().await?;
+        let worker = self.clone();
+        tokio::task::spawn_blocking(move || {
+            hashes
+                .iter()
+                .all(|sha| matches!(worker.artifacts.cached_component(sha, false), Ok(Some(_))))
+        })
+        .await
+        .context("application readiness task failed")
+    }
+    /// True only when both guest execution and result persistence succeeded.
     pub(crate) async fn handle_http(
         &self,
         job: JobMessage,
@@ -108,7 +123,7 @@ impl Worker {
             Ok(true) => {}
             Ok(false) => {
                 info!(%execution_id, "execution already terminal or absent; acknowledging duplicate");
-                return true;
+                return false;
             }
             Err(e) => {
                 warn!(%execution_id, error = %e, "cannot check execution state; refusing to run without DB");
@@ -117,14 +132,19 @@ impl Worker {
         }
 
         let claimed = std::time::Instant::now();
-        let finish = stream.body.clone();
-        let outcome = self.execute(&job, resolved, component, stream)
-            .instrument(tracing::debug_span!(target: "hibana_latency", "invocation", execution_id = %execution_id)).await;
-        if outcome.is_err() {
-            let _ = finish
-                .send(Err(std::io::Error::other("Worker execution failed")))
-                .await;
-        }
+        let deadline =
+            tokio::time::Instant::from_std(claimed) + resolved.limits.max_execution_time();
+        // One budget covers environment retrieval, every approved DNS lookup and
+        // the runtime. A slow resolver must not retain execution capacity before
+        // the runtime's own timeout starts. Persist the timeout outside this scope.
+        let outcome = tokio::time::timeout_at(
+            deadline,
+            self.execute(&job, resolved, component, stream, deadline)
+                .instrument(tracing::debug_span!(target: "hibana_latency", "invocation", execution_id = %execution_id)),
+        )
+        .await
+        .unwrap_or(Err(ExecError::Timeout));
+        let execution_succeeded = outcome.is_ok();
         let exec_elapsed = exec_started.elapsed();
         // wall_time_ms covers the DB claim, environment and runtime; it excludes
         // admission/configuration lookup, artifact preparation and result persistence.
@@ -212,7 +232,7 @@ impl Worker {
             claim_us = claimed.duration_since(exec_started).as_micros() as u64,
             execute_us = exec_elapsed.saturating_sub(claimed.duration_since(exec_started)).as_micros() as u64,
             persist_us = persistence_started.elapsed().as_micros() as u64, "HTTP phase timing");
-        true
+        execution_succeeded
     }
 
     /// Component を解決して handle を呼び出す。Timeout / Failed / 出力を返す。
@@ -222,6 +242,7 @@ impl Worker {
         resolved: repository::ResolvedVersion,
         component: Arc<crate::runtime::PreparedComponent>,
         stream: crate::runtime::ResponseSender,
+        deadline: tokio::time::Instant,
     ) -> std::result::Result<(crate::runtime::HttpResponseReceipt, UsageMetrics), ExecError> {
         let limits = resolved.limits;
 
@@ -233,7 +254,8 @@ impl Worker {
         // M7b (§4.4): 許可リストで畳んで注入する env を組み立てる。許可リストに無いキーは
         // 値が DB に存在しても注入しない（admin 承認が権威。CP 側の引き換えでも同じ許可リストで
         // 絞っており、この二重防御で片側の実装ミスが即漏洩にならないようにする）。
-        let built_env = env::build_env(&resolved.config, &secrets, &resolved.allowed_env);
+        let built_env = env::build_env(&resolved.config, &secrets, &resolved.allowed_env)
+            .map_err(|message| ExecError::Failed(message.into()))?;
         if built_env.dropped_unapproved > 0 {
             // 「設定したのに入っていない」の切り分けを可能にする（キー名は出さない）。
             tracing::debug!(
@@ -245,7 +267,7 @@ impl Worker {
         let request = serde_json::from_value(job.input.clone())
             .map_err(|_| ExecError::Failed("Invalid HTTP request envelope".into()))?;
 
-        let allowed_addrs = self
+        let approved_egress = self
             .resolve_egress_allowlist(&resolved.allow_outbound)
             .await;
 
@@ -256,7 +278,8 @@ impl Worker {
                     request,
                     limits,
                     built_env,
-                    allowed_addrs,
+                    approved_egress,
+                    deadline,
                 },
                 stream,
             )
@@ -266,9 +289,8 @@ impl Worker {
     async fn resolve_egress_allowlist(
         &self,
         endpoints: &[hibana_shared::egress::EgressEndpoint],
-    ) -> std::collections::HashSet<std::net::SocketAddr> {
-        use std::collections::HashSet;
-        let mut out: HashSet<std::net::SocketAddr> = HashSet::new();
+    ) -> crate::runtime::ApprovedEgress {
+        let mut out = crate::runtime::ApprovedEgress::default();
         for ep in endpoints {
             match tokio::net::lookup_host((ep.host.as_str(), ep.port)).await {
                 Ok(addrs) => {
@@ -280,7 +302,7 @@ impl Worker {
                             );
                             continue;
                         }
-                        out.insert(addr);
+                        out.insert(&ep.host, addr);
                     }
                 }
                 Err(e) => {

@@ -5,6 +5,8 @@ use async_trait::async_trait;
 #[cfg(test)]
 mod test_support;
 #[cfg(test)]
+mod transport_tests;
+#[cfg(test)]
 pub use test_support::{FailingStore, InProcStore};
 
 /// ストア操作のエラー。
@@ -163,6 +165,14 @@ pub fn now_unix_millis() -> u64 {
 
 pub use redis_impl::RedisStore;
 
+pub(crate) fn redis_client(url: &str) -> redis::RedisResult<redis::Client> {
+    // Other HTTP clients can enable another Rustls provider. Redis uses the
+    // process default, so feature-based automatic selection is ambiguous.
+    // install_default is thread-safe; an already installed provider is retained.
+    let _ = rustls::crypto::ring::default_provider().install_default();
+    redis::Client::open(url)
+}
+
 mod redis_impl {
     use super::*;
     use redis::aio::{ConnectionManager, ConnectionManagerConfig};
@@ -200,11 +210,11 @@ mod redis_impl {
     }
 
     impl RedisStore {
-        /// Redis URL（例: `redis://127.0.0.1:6379`）へ接続して `Store` を構築する。
+        /// `redis://` または証明書を検証する `rediss://` で `Store` を構築する。
         ///
         /// 接続失敗は [`StoreError::Unavailable`]。Lua スクリプトはここでコンパイル（ロードは遅延）。
         pub async fn connect(url: &str) -> Result<Self, StoreError> {
-            let client = redis::Client::open(url)
+            let client = redis_client(url)
                 .map_err(|e| StoreError::Unavailable(format!("invalid REDIS_URL: {e}")))?;
             // Bounded fail-closed admission during an unreachable primary. The
             // connection manager reconnects; application writes are never replayed.

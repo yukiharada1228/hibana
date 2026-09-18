@@ -231,11 +231,24 @@ class LifecycleTests(unittest.TestCase):
 
     def test_local_start_waits_for_live_api_before_ready_checks(self):
         cluster = k8s.LocalCluster("hibana-check")
-        with patch.object(cluster, "owned_nodes", return_value=[{"Id": "owned", "Name": "/hibana-check-control-plane", "State": {"Running": False}}]), patch("kubernetes.run") as command, patch.object(cluster, "kube") as kube, patch.object(cluster, "wait_workloads"):
+        with patch.object(cluster, "owned_nodes", return_value=[{"Id": "owned", "Name": "/hibana-check-control-plane", "State": {"Running": False}}]), patch("kubernetes.run") as command, patch.object(cluster, "kube") as kube, patch.object(cluster, "wait_workloads"), patch("kubernetes.Maintenance") as maintenance:
             cluster.start()
+        maintenance.return_value.prepare.assert_called_once_with()
+        maintenance.return_value.close.assert_not_called()
+        maintenance.return_value.open.assert_not_called()
         command.assert_called_once_with("docker", "start", "owned")
         self.assertIn("/readyz", kube.call_args_list[0].args)
         self.assertEqual(sum("rollout" in call.args for call in kube.call_args_list), 2)
+
+    def test_local_unprepared_applications_cannot_complete_startup(self):
+        with tempfile.TemporaryDirectory() as directory:
+            cluster = k8s.LocalCluster("hibana-check")
+            cluster.state = Path(directory)
+            with patch("kubernetes.Maintenance") as maintenance:
+                maintenance.return_value.prepare.side_effect = ValueError("not prepared")
+                with self.assertRaisesRegex(ValueError, "not prepared"):
+                    cluster.resume_admission()
+                maintenance.return_value.open.assert_not_called()
 
     def test_persisted_ready_state_cannot_complete_restart(self):
         from datetime import datetime, timezone

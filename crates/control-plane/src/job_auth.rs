@@ -3,7 +3,9 @@ use crate::{error::AppError, state::AppState};
 use axum::http::HeaderMap;
 use hibana_shared::FaasError;
 const JOB_TOKEN_HEADER: &str = "x-hibana-job-token";
-pub(crate) async fn claims_from_token(
+/// Verify the signature only. Callers must check admission requirements or
+/// execution/version provenance before using these claims.
+pub(crate) fn verified_claims(
     state: &AppState,
     headers: &HeaderMap,
 ) -> Result<hibana_shared::JobClaims, AppError> {
@@ -16,6 +18,14 @@ pub(crate) async fn claims_from_token(
         .verifier()
         .verify(token)
         .map_err(|_| FaasError::Unauthorized)?;
+    Ok(claims)
+}
+
+pub(crate) async fn claims_from_token(
+    state: &AppState,
+    headers: &HeaderMap,
+) -> Result<hibana_shared::JobClaims, AppError> {
+    let claims = verified_claims(state, headers)?;
     let now = chrono::Utc::now().timestamp();
     if claims.exp <= now {
         return Err(FaasError::Unauthorized.into());

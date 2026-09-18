@@ -7,6 +7,7 @@ data:
   BIND_ADDR: "0.0.0.0:8080"
   APP_BIND_ADDR: "0.0.0.0:8083"
   WORKER_HTTP_URL: "http://hibana-worker-discovery:8084"
+  WORKER_PREPARATION_URL: "http://hibana-worker-preparation:8084"
   WORKER_HTTP_BIND_ADDR: "0.0.0.0:8084"
   INTERNAL_BIND_ADDR: "0.0.0.0:8081"
   METRICS_BIND_ADDR: "0.0.0.0:9090"
@@ -29,4 +30,5 @@ data:
   TMPDIR: "/tmp"
   LOG_FORMAT: "json"
   RUST_LOG: "info"
-  TRUST_PROXY_HEADERS: "false"
+  # Set only the source networks of the console and Ingress proxies.
+  TRUSTED_PROXY_CIDRS: ""

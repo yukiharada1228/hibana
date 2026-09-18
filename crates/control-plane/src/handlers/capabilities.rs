@@ -127,7 +127,7 @@ pub async fn approve_capability_egress(
     db::insert_audit_log(
         &tx,
         tenant,
-        principal.user_id.as_deref(),
+        principal.actor(),
         "capability_egress_approved",
         Some(&version_id),
         Some(&json!({

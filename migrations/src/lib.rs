@@ -5,6 +5,9 @@ mod m20260915_000001_indexes;
 mod m20260915_000001_platform;
 mod m20260916_000002_build_metadata;
 mod m20260916_000003_component_egress;
+mod m20260917_000004_execution_input_retention;
+mod m20260917_000005_execution_input_cleanup;
+mod m20260918_000006_secret_key_retention;
 
 pub struct Migrator;
 
@@ -60,6 +63,9 @@ impl MigratorTrait for Migrator {
             Box::new(m20260915_000001_platform::Migration),
             Box::new(m20260916_000002_build_metadata::Migration),
             Box::new(m20260916_000003_component_egress::Migration),
+            Box::new(m20260917_000004_execution_input_retention::Migration),
+            Box::new(m20260917_000005_execution_input_cleanup::Migration),
+            Box::new(m20260918_000006_secret_key_retention::Migration),
         ]
     }
 }

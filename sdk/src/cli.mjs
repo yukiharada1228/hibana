@@ -6,6 +6,7 @@ import { init } from "./init.mjs";
 import { readStdin } from "./process.mjs";
 import { promptPassword } from "./password.mjs";
 import { parseCommand } from "./commands.mjs";
+import { validateVersionName } from "./version-name.mjs";
 import {
   apiClient,
   inventoryClient,
@@ -95,8 +96,9 @@ async function main() {
     return egress(api, config, args);
   }
   if (command === "deploy") {
-    const version =
-      values.version || `0.0.0-dev.${Date.now()}.${randomUUID().slice(0, 8)}`;
+    const version = validateVersionName(
+      values.version ?? `0.0.0-dev.${Date.now()}.${randomUUID().slice(0, 8)}`,
+    );
     const result = await deploy(
       api,
       config,

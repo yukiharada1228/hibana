@@ -1,3 +1,4 @@
+import { isApplicationName } from "./application-name.mjs";
 import { resolve } from "node:path";
 import { inventoryClient, findComponent } from "./api.mjs";
 import { confirm } from "./confirm.mjs";
@@ -10,7 +11,7 @@ export async function deleteApplication(args, options) {
     throw new Error("--all-tenants requires --all");
   const path = resolve(options.config || "hibana.json");
   if (!name && !options.all) name = (await readConfigFile(path)).name;
-  if (!options.all && !/^[a-z](?:[a-z0-9-]{0,61}[a-z0-9])?$/.test(name || ""))
+  if (!options.all && !isApplicationName(name))
     throw new Error("Application name must be a lowercase DNS label");
   // Deletion never builds or reads application sources. Dry-run also requires no credentials.
   if (options["dry-run"] && !options.all) {

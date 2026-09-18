@@ -4,6 +4,7 @@ const app = new Hono<{ Bindings: { GREETING: string; TEST_SECRET?: string } }>()
 app.get("/", c => c.json({ message: c.env.GREETING }));
 app.post("/echo", async c => c.body(await c.req.arrayBuffer()));
 app.get("/headers", c => c.json({ envHeader: c.req.header("x-hibana-env") ?? null, eventHeader: c.req.header("x-hibana-event") ?? null, greeting: c.env.GREETING }));
+app.get("/header-value", c => c.json({ value: c.req.header("x-tag") ?? null }));
 app.get("/secret", c => c.json({ configured: c.env.TEST_SECRET === "hibana-test-secret" }));
 app.get("/stream", c => {
   c.executionCtx.waitUntil(new Promise(resolve => setTimeout(resolve, 100)));

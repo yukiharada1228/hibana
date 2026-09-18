@@ -10,6 +10,7 @@
 //! 外向き通信の制御は Worker の runtime が担当する。ここではテナントを解決し、
 //! admission / 受付記録 / 署名付き直接HTTP転送を行う。
 use sea_orm::TransactionTrait as _;
+pub(crate) mod body;
 
 use axum::{
     extract::State,
@@ -17,7 +18,7 @@ use axum::{
     response::{IntoResponse, Response},
 };
 
-use hibana_shared::http::{HttpRequest, MAX_REQUEST_BYTES};
+use hibana_shared::http::HttpRequest;
 
 use crate::state::AppState;
 
@@ -60,31 +61,60 @@ pub async fn ingress_fallback(
         return not_found();
     };
 
+    // Bound DB lookup, body buffering and dispatch together. A slow sender must
+    // acquire capacity before allocating a body or queuing identity queries.
+    let Some(_request_slot) = state.request_capacity().reserve() else {
+        return crate::admission::RateLimited::request_capacity().into_response();
+    };
+
     // 1) tenant_slug -> tenant_id（GUC 不要の SECURITY DEFINER 経路。login と同じ）。
     let tenant_id = match db_find_tenant(&state, tenant_slug).await {
-        Some(t) => t,
-        None => return not_found(),
+        Ok(Some(t)) => t,
+        Ok(None) => return not_found(),
+        Err(error) => return lookup_unavailable(error),
     };
 
     // 2) component 解決 + deny-by-default gate（GUC 下）。
     let comp = match db_find_component(&state, &tenant_id, app).await {
-        Some(c) => c,
-        None => return not_found(),
+        Ok(Some(c)) => c,
+        Ok(None) => return not_found(),
+        Err(error) => return lookup_unavailable(error),
     };
     if !comp.ingress_enabled || comp.active_version_id.is_none() {
         // 未 opt-in / active 版なしは「存在しない」と同じ扱い（情報を晒さない）。
         return not_found();
     }
 
-    // 3) 実リクエスト -> HTTP エンベロープ JSON。
-    let body_bytes = match axum::body::to_bytes(body, MAX_REQUEST_BYTES).await {
-        Ok(b) => b,
-        Err(_) => return (StatusCode::PAYLOAD_TOO_LARGE, "request body too large").into_response(),
+    // The platform origin is authoritative behind TLS termination. Never trust
+    // client-supplied Forwarded/X-Forwarded-* headers or an arbitrary Host port.
+    let Some(origin) = state
+        .app_url(app, tenant_slug)
+        .and_then(|url| url.parse::<axum::http::Uri>().ok())
+    else {
+        return not_found();
     };
-    let envelope = serde_json::to_value(HttpRequest::from_parts(&parts, &body_bytes))
-        .expect("HTTP request serialization");
+    // The future is polled only after tenant status, rate and receive capacity
+    // checks. Keep the global permit until the envelope has left this process.
+    let input = async move {
+        let body_bytes = body::read(body).await.map_err(|response| *response)?;
+        let mut request = HttpRequest::from_parts(&parts, &body_bytes);
+        request.scheme = origin
+            .scheme_str()
+            .expect("configured public scheme")
+            .into();
+        request.authority = origin
+            .authority()
+            .expect("configured public authority")
+            .to_string();
+        request
+            .headers
+            .insert("host".into(), request.authority.clone());
+        request.additional_headers.remove("host");
+        request.encoded_headers.remove("host");
+        Ok(serde_json::to_value(request).expect("HTTP request serialization"))
+    };
 
-    match crate::direct_http::accept(&state, &tenant_id, app, envelope).await {
+    match crate::direct_http::accept(&state, &tenant_id, app, input).await {
         Ok(response) => response,
         Err(error) => error.into_response(),
     }
@@ -92,28 +122,25 @@ pub async fn ingress_fallback(
 
 // --- DB ラッパ（GUC 境界をここに閉じる） ------------------------------------
 
-async fn db_find_tenant(state: &AppState, slug: &str) -> Option<String> {
-    crate::db::find_tenant_id_by_slug(state.pool(), slug)
-        .await
-        .ok()
-        .flatten()
+fn lookup_unavailable(error: sea_orm::DbErr) -> Response {
+    tracing::error!(error = %error, "ingress application lookup failed");
+    crate::error::AppError(hibana_shared::FaasError::Unavailable).into_response()
+}
+
+async fn db_find_tenant(state: &AppState, slug: &str) -> Result<Option<String>, sea_orm::DbErr> {
+    crate::db::find_tenant_id_by_slug(state.pool(), slug).await
 }
 
 async fn db_find_component(
     state: &AppState,
     tenant_id: &str,
     name: &str,
-) -> Option<crate::db::IngressComponentRow> {
-    let tx = state.pool().begin().await.ok()?;
-    if crate::db::set_tenant_guc(&tx, tenant_id).await.is_err() {
-        return None;
-    }
-    let row = crate::db::find_ingress_component(&tx, tenant_id, name)
-        .await
-        .ok()
-        .flatten();
-    let _ = tx.commit().await;
-    row
+) -> Result<Option<crate::db::IngressComponentRow>, sea_orm::DbErr> {
+    let tx = state.pool().begin().await?;
+    crate::db::set_tenant_guc(&tx, tenant_id).await?;
+    let row = crate::db::find_ingress_component(&tx, tenant_id, name).await?;
+    tx.commit().await?;
+    Ok(row)
 }
 
 #[cfg(test)]

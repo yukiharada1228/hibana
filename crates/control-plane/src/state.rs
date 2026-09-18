@@ -13,7 +13,7 @@ pub const QUOTA_MAX_CONCURRENT_EXECUTIONS: u64 = 200;
 ///
 /// M4d (§8): per-tenant 上書きは [`AdmissionConfig::resolve_for_tenant`] で解決する。
 /// グローバル既定 → テナント上書きの優先順位でフィールドごとにマージする（仕様 §8 表）。
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub struct AdmissionConfig {
     /// invoke レート制限の token-bucket パラメータ（refill = invoke_rate, capacity = burst）。
     pub rate: RateLimitParams,
@@ -21,8 +21,8 @@ pub struct AdmissionConfig {
     pub inflight: InflightParams,
     /// login 失敗ロックアウトの閾値 + 減衰窓（両キーに同値適用）。
     pub lockout: LockoutParams,
-    /// X-Forwarded-For を信頼してクライアント IP を取り出すか（§6.0; 既定 false）。
-    pub trust_proxy_headers: bool,
+    /// Explicitly trusted reverse proxy networks; empty means direct clients only.
+    pub trusted_proxies: crate::client_ip::TrustedProxies,
 }
 
 impl AdmissionConfig {
@@ -101,6 +101,8 @@ pub struct AppState {
     inner: Arc<Inner>,
 }
 struct Inner {
+    request_capacity: crate::request_capacity::RequestCapacity,
+    upload_capacity: crate::request_capacity::RequestCapacity,
     public_requests: Arc<crate::maintenance::Requests>,
     worker_http: reqwest::Client,
     pool: DatabaseConnection,
@@ -109,6 +111,7 @@ struct Inner {
     presign_ttl: Duration,
     bootstrap_admin_token: String,
     dummy_password_hash: String,
+    password_work_slots: Arc<tokio::sync::Semaphore>,
     signer: Arc<Signer>,
     token_exp_offset_secs: Box<dyn Fn(u64) -> i64 + Send + Sync>,
     store: Arc<dyn Store>,
@@ -140,6 +143,8 @@ impl AppState {
     ) -> Self {
         Self {
             inner: Arc::new(Inner {
+                request_capacity: crate::request_capacity::RequestCapacity::new(8),
+                upload_capacity: crate::request_capacity::RequestCapacity::new(4),
                 public_requests: Arc::default(),
                 worker_http: reqwest::Client::builder()
                     .no_proxy()
@@ -154,6 +159,9 @@ impl AppState {
                 presign_ttl: Duration::from_secs(presign_ttl_secs),
                 bootstrap_admin_token,
                 dummy_password_hash,
+                // Argon2 hashing and verification share one CPU/memory budget.
+                // Reject excess work immediately rather than growing a wait queue.
+                password_work_slots: Arc::new(tokio::sync::Semaphore::new(2)),
                 signer,
                 token_exp_offset_secs,
                 store,
@@ -168,6 +176,22 @@ impl AppState {
     }
     pub fn pool(&self) -> &DatabaseConnection {
         &self.inner.pool
+    }
+
+    pub(crate) fn upload_capacity(&self) -> &crate::request_capacity::RequestCapacity {
+        &self.inner.upload_capacity
+    }
+
+    pub(crate) fn request_capacity(&self) -> &crate::request_capacity::RequestCapacity {
+        &self.inner.request_capacity
+    }
+
+    pub(crate) fn reserve_password_work(&self) -> Option<tokio::sync::OwnedSemaphorePermit> {
+        self.inner
+            .password_work_slots
+            .clone()
+            .try_acquire_owned()
+            .ok()
     }
 
     pub(crate) fn public_requests(&self) -> &Arc<crate::maintenance::Requests> {
@@ -275,7 +299,7 @@ mod tests {
                 threshold: 10,
                 window_secs: 900,
             },
-            trust_proxy_headers: false,
+            trusted_proxies: crate::client_ip::TrustedProxies::default(),
         }
     }
 

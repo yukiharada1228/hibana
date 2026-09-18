@@ -6,7 +6,7 @@ use crate::store::StoreError;
 
 /// reaper ループ。`main` から `tokio::spawn` される。
 ///
-/// `interval_secs` 周期で全 active テナントの孤立行を sweep し、カウンタを DB COUNT へ再同期する。
+/// `interval_secs` 周期で全テナントの入力清掃・孤立行回収・カウンタ再同期を行う。
 /// `inflight_ttl_secs` は再同期時にカウンタへ貼り直す TTL（孤立カウンタの保険）。
 /// `stuck_deadline_secs` は孤立 pending/running 行を failed 化する deadline（0 で sweep 無効）。
 pub async fn run(
@@ -34,21 +34,21 @@ pub async fn run(
     }
 }
 
-/// 1 周期分の sweep + 再同期。全 active テナントを処理する。
+/// 1 周期分の入力清掃・sweep・再同期。停止中のテナントも処理する。
 ///
 /// テナント列挙の失敗（DB 障害）はパス全体を失敗扱いにする（次周期で再試行）。個々の
 /// テナントの sweep / COUNT / resync 失敗はそのテナントだけスキップし、他テナントの処理は続ける
 /// （1 テナントの一時障害が全体を止めない）。
-async fn reconcile_once(
+pub(crate) async fn reconcile_once(
     state: &AppState,
     inflight_ttl_secs: u64,
     stuck_deadline_secs: u64,
 ) -> anyhow::Result<()> {
     // tenants は RLS 無し → GUC 不要でプールから直接列挙できる。
-    let tenants = crate::db::list_active_tenant_ids(state.pool()).await?;
+    let tenants = crate::db::list_tenants_for_admin(state.pool()).await?;
 
     let mut resynced = 0usize;
-    for tenant in &tenants {
+    for (tenant, _) in &tenants {
         match reconcile_tenant(state, tenant, inflight_ttl_secs, stuck_deadline_secs).await {
             Ok(()) => resynced += 1,
             Err(e) => {
@@ -85,6 +85,10 @@ async fn reconcile_tenant(
     // executions は FORCE RLS 下 → sweep / COUNT は GUC を設定した同一 tx で実行する。
     let tx = state.pool().begin().await?;
     crate::db::set_tenant_guc(&tx, tenant).await?;
+
+    // Also runs when stuck-job recovery is disabled. A completed request must
+    // not retain credentials just because an older Pod published its result.
+    crate::db::purge_terminal_execution_inputs(&tx, tenant).await?;
 
     // (1) stuck-execution sweep（§8 リーク回収）。deadline 0 ならスキップ。
     //     deadline を過ぎても終端化されない pending/running 行を failed に倒し、回収数を得る。
@@ -155,9 +159,9 @@ async fn reconcile_tenant(
 /// **Prometheus gauge にしか出さない**（HTTP 応答へ載せてはならない: テナント管理者へ返すと
 /// 他テナントの secret 総数が漏れる）。
 ///
-/// 運用上の使い方: KEK を切り替えたあと `POST /admin/secrets/rekey` を回し、旧 kid の gauge が
-/// 0 になったら `SECRETS_RETIRED_KEYS` から旧鍵を撤去してよい（0 になる前の撤去は復号不能
-/// ＝ データ喪失）。
+/// 現在世代と未完了の実行が参照する世代を数える。全 CP の書込み鍵を切り替えてから
+/// rekey し、受付停止・drain 後に最新の集計を確認して旧鍵をランタイム設定から外す。
+/// 周期集計なので、古い gauge の 0 だけを撤去判断に使わない。バックアップ用の鍵は別途保持する。
 pub async fn run_secret_kid_gauge(state: AppState, interval_secs: u64) {
     let period = Duration::from_secs(interval_secs.max(1));
     let mut ticker = tokio::time::interval(period);

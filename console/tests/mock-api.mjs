@@ -84,6 +84,12 @@ createServer(async (req, res) => {
     reset(body.empty);
     return send(200, {});
   }
+  if (url.pathname === "/__test/version-name") {
+    const v = versions.cmp_api.find((item) => item.version_id === body.id);
+    if (!v) return send(404, {});
+    v.version = body.name;
+    return send(200, {});
+  }
   if (url.pathname === "/__test/activity") {
     invocationCount++;
     return send(200, {});
@@ -167,11 +173,17 @@ createServer(async (req, res) => {
         },
       ],
     });
-  const [, , id, action, versionName] = url.pathname
+  const [, , id, action, versionName, versionId] = url.pathname
     .split("/")
     .map(decodeURIComponent);
   const component = components.find((c) => c.component_id === id);
   if (!component) return send(404, {});
+  const selectedVersion = () =>
+    (versions[id] || []).find((item) =>
+      versionName === "by-id" && versionId
+        ? item.version_id === versionId
+        : item.version === versionName,
+    );
   if (action === "egress") {
     if (req.method === "PATCH") {
       if (!scopes.includes("admin")) return send(403, {});
@@ -185,9 +197,7 @@ createServer(async (req, res) => {
   if (req.method === "DELETE") {
     if (!scopes.includes("admin")) return send(403, {});
     if (action === "versions" && versionName) {
-      const v = (versions[id] || []).find(
-        (item) => item.version === versionName,
-      );
+      const v = selectedVersion();
       if (!v) return send(404, {});
       if (deletionBlockedReason(component, v)) return send(409, {});
       versions[id] = versions[id].filter((item) => item !== v);
@@ -199,9 +209,7 @@ createServer(async (req, res) => {
   }
   if (action === "versions") {
     if (req.method === "GET" && versionName) {
-      const v = (versions[id] || []).find(
-        (item) => item.version === versionName,
-      );
+      const v = selectedVersion();
       if (!v) return send(404, {});
       return send(200, {
         version_id: v.version_id,

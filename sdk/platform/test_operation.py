@@ -194,6 +194,20 @@ def cp(name, state="running", *, ready=True, terminating=False):
 
 
 class MaintenanceDrainTests(unittest.TestCase):
+    def test_ordinary_preparation_rechecks_a_replaced_worker_without_changing_admission(self):
+        first = cp("worker-first")
+        first["status"]["podIP"] = "10.0.0.10"
+        first["status"]["conditions"] = [{"type": "Ready", "status": "True"}]
+        second = deepcopy(first)
+        second["metadata"].update(name="worker-second", uid="second")
+        second["status"]["podIP"] = "10.0.0.11"
+        before, after = {"first": first}, {"second": second}
+        maintenance = Maintenance(MagicMock())
+        with patch.object(maintenance, "pods", side_effect=[before, after, after, after]), patch.object(maintenance, "control_plane", return_value="cp"), patch.object(maintenance, "call") as call, patch("maintenance.time.sleep"):
+            maintenance.prepare()
+        self.assertEqual([c.args for c in call.call_args_list], [
+            ("cp", "prepare", "", "10.0.0.10"), ("cp", "prepare", "", "10.0.0.11")])
+
     def test_pending_and_crashloop_are_skipped_but_running_unready_and_terminating_are_checked(self):
         pods = {p["metadata"]["uid"]: p for p in [cp("healthy"), cp("starting", ready=False),
             cp("old", terminating=True), cp("pending", "waiting"), cp("crashed", "terminated")]}

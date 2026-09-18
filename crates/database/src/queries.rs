@@ -62,6 +62,49 @@ pub fn active_versions(tenant: &str) -> sea_orm::Select<component_versions::Enti
     )
 }
 
+/// Inventory for background preparation and Worker startup readiness. Each
+/// tenant's versions are read under its transaction-local RLS context.
+pub struct ActiveArtifact {
+    pub tenant_id: String,
+    pub storage_uri: String,
+    pub sha256: String,
+}
+
+pub async fn active_artifacts(db: &DatabaseConnection) -> Result<Vec<ActiveArtifact>, DbErr> {
+    let tenants = tenants::Entity::find()
+        .select_only()
+        .column(tenants::Column::Id)
+        .filter(tenants::Column::Status.eq("active"))
+        .into_tuple::<String>()
+        .all(db)
+        .await?;
+    let mut artifacts = Vec::new();
+    for tenant in tenants {
+        let tx = db.begin().await?;
+        set_tenant_guc(&tx, &tenant).await?;
+        let rows = active_versions(&tenant)
+            .select_only()
+            .columns([
+                component_versions::Column::StorageUri,
+                component_versions::Column::WasmSha256,
+            ])
+            .distinct()
+            .into_tuple::<(String, String)>()
+            .all(&tx)
+            .await?;
+        tx.commit().await?;
+        artifacts.extend(
+            rows.into_iter()
+                .map(|(storage_uri, sha256)| ActiveArtifact {
+                    tenant_id: tenant.clone(),
+                    storage_uri,
+                    sha256,
+                }),
+        );
+    }
+    Ok(artifacts)
+}
+
 /// One snapshot includes every bound live Secret, even if its historical
 /// generation is missing. The caller must reject missing envelopes.
 pub async fn secret_envelopes(

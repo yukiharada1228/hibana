@@ -183,6 +183,13 @@ async fn write_secret_version(
     .await?;
     if !created {
         db::bump_secret_current_version(tx, tenant, &secret_id, version).await?;
+        if !db::secret_environments_within_limit(tx, tenant, component_id, &secret_id).await? {
+            return Err(FaasError::Conflict(
+                "Secret update would exceed the environment size limit of a retained version"
+                    .into(),
+            )
+            .into());
+        }
     }
 
     Ok((version, created))
@@ -235,7 +242,7 @@ pub async fn set_secret_deploy_access(
     db::insert_audit_log(
         &tx,
         tenant,
-        principal.user_id.as_deref(),
+        principal.actor(),
         "secret_deploy_access_changed",
         Some(&component_id),
         Some(&serde_json::json!({"name": name, "allowed": req.allowed})),
@@ -284,7 +291,7 @@ pub async fn put_secret(
     db::insert_audit_log(
         &tx,
         tenant,
-        principal.user_id.as_deref(),
+        principal.actor(),
         "secret_updated",
         Some(&component_id),
         Some(&secrets::audit_detail(
@@ -348,7 +355,7 @@ pub async fn rotate_secret(
     db::insert_audit_log(
         &tx,
         tenant,
-        principal.user_id.as_deref(),
+        principal.actor(),
         "secret_rotated",
         Some(&component_id),
         Some(&secrets::audit_detail(&name, version, "rotate")),
@@ -388,7 +395,7 @@ pub async fn delete_secret(
     db::insert_audit_log(
         &tx,
         tenant,
-        principal.user_id.as_deref(),
+        principal.actor(),
         "secret_deleted",
         Some(&component_id),
         Some(&secrets::audit_detail(
@@ -729,6 +736,14 @@ pub async fn rekey_secrets(
         let tx = state.pool().begin().await?;
         db::set_tenant_guc(&tx, tenant).await?;
 
+        let Some(target) = db::find_secret_meta_by_id(&tx, tenant, &secret_id).await? else {
+            continue;
+        };
+        // Use the same parent lock as rotation, deletion and publication. The
+        // target list and metadata read above may be stale after waiting.
+        if !db::lock_component(&tx, tenant, &target.component_id).await? {
+            continue;
+        }
         let Some(meta) = db::find_secret_meta_by_id(&tx, tenant, &secret_id).await? else {
             continue;
         };
@@ -769,7 +784,7 @@ pub async fn rekey_secrets(
         db::insert_audit_log(
             &tx,
             tenant,
-            principal.user_id.as_deref(),
+            principal.actor(),
             "secret_rekeyed",
             Some(&secret_id),
             Some(&secrets::audit_detail(&meta.name, next_version, "rekey")),

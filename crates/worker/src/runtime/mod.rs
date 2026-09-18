@@ -1,7 +1,11 @@
 //! Wasmtime execution shared by fleet requests and local development.
 use crate::{env, metrics};
+mod dns;
 mod egress;
+pub(crate) use dns::ApprovedEgress;
 mod http;
+mod http_buffer;
+mod http_limits;
 mod limits;
 use anyhow::{anyhow, Context as _};
 use egress::gated_send_request;
@@ -27,9 +31,9 @@ use wasmtime_wasi_http::{
     WasiHttpView as _,
 };
 const GUEST_STDERR_CAPTURE_BYTES: usize = 64 * 1024;
-const MAX_HOST_RESOURCES: usize = 4096;
 pub(crate) struct Runtime {
     tcp_policy: crate::network::TcpPolicy,
+    http_buffer_budget: Arc<tokio::sync::Semaphore>,
     pub engine: Engine,
     pub metrics: Arc<metrics::Metrics>,
     _epoch_ticker: EpochTickerGuard,
@@ -52,6 +56,7 @@ impl PreparedComponent {
         let mut linker = Linker::new(component.engine());
         wasmtime_wasi::p2::add_to_linker_async(&mut linker)?;
         wasmtime_wasi_http::add_only_http_to_linker_async(&mut linker)?;
+        dns::add_to_linker(&mut linker)?;
         let prepared = linker.instantiate_pre(&component)?;
         tracing::debug!(target: "hibana_latency", stage = "component_preparation",
             copy_on_write_us = images_ready.duration_since(started).as_micros() as u64,
@@ -69,7 +74,8 @@ struct HostState {
     table: ResourceTable,
     limits: MeteredLimits,
     http_ctx: wasmtime_wasi_http::WasiHttpCtx,
-    allowed_addrs: Arc<std::collections::HashSet<std::net::SocketAddr>>,
+    approved_egress: Arc<ApprovedEgress>,
+    http_buffer_budget: http_buffer::Budget,
 }
 
 impl WasiView for HostState {
@@ -95,9 +101,10 @@ impl wasmtime_wasi_http::WasiHttpView for HostState {
         request: hyper::Request<wasmtime_wasi_http::body::HyperOutgoingBody>,
         config: wasmtime_wasi_http::types::OutgoingRequestConfig,
     ) -> wasmtime_wasi_http::HttpResult<wasmtime_wasi_http::types::HostFutureIncomingResponse> {
-        let allowed = Arc::clone(&self.allowed_addrs);
+        let allowed = Arc::clone(&self.approved_egress);
+        let budget = self.http_buffer_budget.clone();
         let handle = wasmtime_wasi::runtime::spawn(async move {
-            Ok(gated_send_request(request, config, allowed).await)
+            Ok(gated_send_request(request, config, allowed, budget).await)
         });
         Ok(wasmtime_wasi_http::types::HostFutureIncomingResponse::pending(handle))
     }
@@ -109,7 +116,13 @@ pub(crate) fn install_epoch_deadline<T: Send + 'static>(store: &mut Store<T>, de
         if Instant::now() >= deadline {
             Err(wasmtime::Trap::Interrupt.into())
         } else {
-            Ok(wasmtime::UpdateDeadline::Continue(1))
+            // Tokio's deferred wakeup gives its I/O/timer driver a turn too.
+            // Wasmtime's generic self-wake can keep a busy guest at the front
+            // of the executor queue across many epoch ticks.
+            Ok(wasmtime::UpdateDeadline::YieldCustom(
+                1,
+                Box::pin(tokio::task::yield_now()),
+            ))
         }
     });
 }
@@ -130,7 +143,9 @@ pub(crate) struct Invocation {
     pub request: HttpRequest,
     pub limits: ResourceLimits,
     pub built_env: env::BuiltEnv,
-    pub allowed_addrs: std::collections::HashSet<std::net::SocketAddr>,
+    pub approved_egress: ApprovedEgress,
+    /// Includes environment/DNS preparation; never restart the budget at instantiation.
+    pub deadline: Instant,
 }
 
 impl Runtime {
@@ -148,6 +163,7 @@ impl Runtime {
             })?;
         Ok(Self {
             tcp_policy: crate::network::TcpPolicy::default(),
+            http_buffer_budget: http_buffer::worker_budget(),
             engine,
             metrics,
             _epoch_ticker: EpochTickerGuard(stop),
@@ -174,8 +190,12 @@ impl Runtime {
             request,
             limits,
             built_env,
-            allowed_addrs,
+            approved_egress,
+            deadline,
         } = invocation;
+        if setup_started >= deadline {
+            return Err(ExecError::Timeout);
+        }
         let peak_memory = Arc::new(AtomicU64::new(0));
         let metered_limits =
             MeteredLimits::new(limits.max_memory_bytes as usize, Arc::clone(&peak_memory));
@@ -195,33 +215,34 @@ impl Runtime {
             wasi_builder.env(k, v);
         }
 
-        let allowed_arc = std::sync::Arc::new(allowed_addrs);
-        if !allowed_arc.is_empty() {
+        let allowed_arc = std::sync::Arc::new(approved_egress);
+        if !allowed_arc.addresses.is_empty() {
             let allowed = std::sync::Arc::clone(&allowed_arc);
             wasi_builder.allow_tcp(true);
             wasi_builder.allow_udp(false);
-            wasi_builder.allow_ip_name_lookup(true);
             let tcp_policy = self.tcp_policy.clone();
             wasi_builder.socket_addr_check(move |addr, use_| {
                 let allowed = std::sync::Arc::clone(&allowed);
                 let tcp_policy = tcp_policy.clone();
-                Box::pin(async move { tcp_policy.allows_connect(&allowed, addr, use_) })
+                Box::pin(async move { tcp_policy.allows_connect(&allowed.addresses, addr, use_) })
             });
         }
 
-        let mut table = ResourceTable::new();
-        table.set_max_capacity(MAX_HOST_RESOURCES);
         let host = HostState {
             ctx: wasi_builder.build(),
-            table,
+            table: http_limits::resource_table(),
             limits: metered_limits,
-            http_ctx: wasmtime_wasi_http::WasiHttpCtx::new(),
-            allowed_addrs: allowed_arc,
+            http_ctx: http_limits::context(),
+            approved_egress: allowed_arc,
+            http_buffer_budget: http_buffer::Budget::new(self.http_buffer_budget.clone()),
         };
         let mut store = Store::new(&self.engine, host);
         store.limiter(|state| &mut state.limits);
 
-        install_epoch_deadline(&mut store, Instant::now() + limits.max_wall_time());
+        install_epoch_deadline(
+            &mut store,
+            deadline.min(Instant::now() + limits.max_wall_time()),
+        );
 
         let fuel_to_set = limits.max_fuel.unwrap_or(u64::MAX);
         store
@@ -252,10 +273,16 @@ impl Runtime {
                 }
             }
             req.headers_mut().remove("x-hibana-event");
+            http_limits::check(req.headers()).map_err(|e| ExecError::Failed(e.to_string()))?;
             let (sender, receiver) = tokio::sync::oneshot::channel();
+            let scheme = if req.uri().scheme_str() == Some("https") {
+                Scheme::Https
+            } else {
+                Scheme::Http
+            };
             let req_res = store
                 .data_mut()
-                .new_incoming_request(Scheme::Http, req)
+                .new_incoming_request(scheme, req)
                 .map_err(|e| ExecError::Failed(format!("new_incoming_request: {e}")))?;
             let out = store
                 .data_mut()
@@ -264,7 +291,6 @@ impl Runtime {
             (req_res, out, receiver)
         };
 
-        let exec_timeout = limits.max_execution_time();
         let setup_us = setup_started.elapsed().as_micros() as u64;
         let exec_future = async {
             let link_started = Instant::now();
@@ -284,27 +310,21 @@ impl Runtime {
                 .call_handle(&mut store, req_res, out);
             let recv = async {
                 match receiver.await {
-                    Ok(Ok(resp)) => Some(stream.send(resp).await),
-                    _ => None,
+                    Ok(Ok(resp)) => stream.send(resp).await,
+                    _ => Err(anyhow!("guest did not set a response")),
                 }
             };
-            let (call_res, recv_res) = tokio::join!(call, recv);
+            // A trapped handler leaves its response-outparam in the Store. Do
+            // not wait for that sender to drop before reporting the original trap.
+            // Likewise, a failed/disconnected response must stop guest work.
+            let result = tokio::try_join!(call, recv);
             tracing::debug!(target: "hibana_latency", stage = "wasm_runtime", setup_us, link_us, instantiate_us,
                 handler_us = handler_started.elapsed().as_micros() as u64, "HTTP phase timing");
 
-            let call_result: std::result::Result<HttpResponseReceipt, anyhow::Error> =
-                match call_res {
-                    Err(e) => Err(e),
-                    Ok(()) => match recv_res {
-                        Some(Ok(bytes)) => Ok(bytes),
-                        Some(Err(e)) => Err(anyhow!("failed to encode response: {e}")),
-                        None => Err(anyhow!("guest did not set a response")),
-                    },
-                };
-            Ok::<_, ExecError>(call_result)
+            Ok::<_, ExecError>(result.map(|((), receipt)| receipt))
         };
 
-        let timed = tokio::time::timeout(exec_timeout, exec_future).await;
+        let timed = tokio::time::timeout_at(deadline, exec_future).await;
 
         if let Some(pipe) = captured_stderr {
             let dropped = pipe.contents().len() as u64;

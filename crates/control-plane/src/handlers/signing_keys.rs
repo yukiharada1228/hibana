@@ -68,7 +68,7 @@ pub async fn register_signing_key(
     db::insert_audit_log(
         &tx,
         tenant,
-        principal.user_id.as_deref(),
+        principal.actor(),
         "signing_key_registered",
         Some(&key_id),
         // 公開鍵は秘密ではないが、監査には key_id だけ残す（応答で公開鍵は返す）。
@@ -130,7 +130,7 @@ pub async fn retire_signing_key(
     db::insert_audit_log(
         &tx,
         tenant,
-        principal.user_id.as_deref(),
+        principal.actor(),
         "signing_key_retired",
         Some(&key_id),
         Some(&json!({ "key_id": key_id })),
@@ -174,7 +174,7 @@ pub async fn set_signing_policy(
     db::insert_audit_log(
         &tx,
         tenant,
-        principal.user_id.as_deref(),
+        principal.actor(),
         "signing_policy_updated",
         None,
         Some(&json!({ "require_signed_components": req.require_signed_components })),

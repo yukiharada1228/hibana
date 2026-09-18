@@ -80,7 +80,7 @@ export function Extensions({
     setError("");
     if (version)
       api
-        .versionDetails(component.component_id, version.version)
+        .versionDetails(component.component_id, version.version_id)
         .then((result) => {
           if (
             result.version_id !== version.version_id ||
@@ -181,9 +181,7 @@ export function Extensions({
                 <p className="muted">通信先を読み込み中…</p>
               ) : policy.allow_outbound !== null ? (
                 <>
-                  <p className="muted small">
-                    アプリ共通の設定を適用中。
-                  </p>
+                  <p className="muted small">アプリ共通の設定を適用中。</p>
                   {policy.allow_outbound.length ? (
                     <details className="extension-destination-details inline-help">
                       <summary>

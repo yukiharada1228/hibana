@@ -140,6 +140,7 @@ class LocalCluster(KubernetesTarget):
     def resume_admission(self):
         path = self.state / "maintenance.json"
         if not path.exists():
+            Maintenance(self).prepare()
             return
         owner = json.loads(path.read_text())["owner"]
         maintenance = Maintenance(self)

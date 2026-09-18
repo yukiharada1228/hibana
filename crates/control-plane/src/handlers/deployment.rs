@@ -75,6 +75,12 @@ impl VersionEnvironment {
             .exec(tx)
             .await?;
         }
+        if !crate::db::version_environment_within_limit(tx, tenant, component, version).await? {
+            return Err(FaasError::InvalidRequest(
+                "vars and selected Secrets together exceed the environment size limit".into(),
+            )
+            .into());
+        }
         Ok(())
     }
 }

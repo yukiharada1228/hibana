@@ -20,6 +20,45 @@ pub struct RateLimited {
 }
 
 impl RateLimited {
+    pub fn upload_capacity(tenant: bool) -> Self {
+        Self {
+            retry_after_secs: 1,
+            status: if tenant {
+                StatusCode::TOO_MANY_REQUESTS
+            } else {
+                StatusCode::SERVICE_UNAVAILABLE
+            },
+            code: "upload_capacity",
+            message: "deployment uploads are busy; retry later",
+        }
+    }
+
+    pub fn request_capacity() -> Self {
+        Self {
+            retry_after_secs: 1,
+            status: StatusCode::SERVICE_UNAVAILABLE,
+            code: "request_capacity",
+            message: "request reception is busy; retry later",
+        }
+    }
+
+    pub fn login_capacity() -> Self {
+        Self {
+            code: "login_capacity",
+            message: "password verification is busy; retry later",
+            ..Self::password_capacity()
+        }
+    }
+
+    pub fn password_capacity() -> Self {
+        Self {
+            retry_after_secs: 1,
+            status: StatusCode::TOO_MANY_REQUESTS,
+            code: "password_capacity",
+            message: "password processing is busy; retry later",
+        }
+    }
+
     pub fn unavailable() -> Self {
         Self {
             retry_after_secs: 1,
@@ -179,7 +218,13 @@ mod tests {
 
     #[tokio::test]
     async fn all_429_paths_include_retry_after_and_429_status() {
-        for r in [RateLimited::rate(7), RateLimited::concurrency()] {
+        for r in [
+            RateLimited::rate(7),
+            RateLimited::concurrency(),
+            RateLimited::login_capacity(),
+            RateLimited::password_capacity(),
+            RateLimited::upload_capacity(true),
+        ] {
             let resp = r.into_response();
             assert_eq!(
                 resp.status(),

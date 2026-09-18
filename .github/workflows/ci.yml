@@ -97,6 +97,9 @@ jobs:
       - name: test
         run: cargo test --workspace
 
+      - name: Redis TLS transport (isolated Redis)
+        run: bash scripts/test-redis-tls.sh
+
       - name: HTTP acceptance and provenance (isolated PostgreSQL)
         env:
           HIBANA_TEST_CONSOLE_IMAGE: hibana-console:verification

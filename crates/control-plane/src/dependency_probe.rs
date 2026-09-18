@@ -19,7 +19,7 @@ async fn database() -> anyhow::Result<()> {
 }
 
 async fn redis() -> anyhow::Result<()> {
-    let client = redis::Client::open(std::env::var("REDIS_URL")?)?;
+    let client = crate::store::redis_client(&std::env::var("REDIS_URL")?)?;
     let mut connection = client.get_multiplexed_async_connection().await?;
     let pong: String = redis::cmd("PING").query_async(&mut connection).await?;
     anyhow::ensure!(pong == "PONG", "invalid Redis response");

@@ -10,7 +10,7 @@ use axum::http::StatusCode;
 use axum::response::IntoResponse;
 use axum::Json;
 use hibana_database::prelude::*;
-use hibana_shared::{new_component_id, new_version_id, FaasError, ResourceLimits};
+use hibana_shared::{new_component_id, new_version_id, FaasError};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
@@ -41,8 +41,10 @@ pub async fn create_component(
 ) -> Result<impl IntoResponse, AppError> {
     let tenant = &principal.tenant_id;
 
-    if req.name.trim().is_empty() {
-        return Err(FaasError::InvalidRequest("name must not be empty".into()).into());
+    if !crate::public_apps::valid_label(&req.name) {
+        return Err(FaasError::InvalidRequest(
+            "name must be 1-63 lowercase ASCII letters, digits or hyphens, with no leading or trailing hyphen".into(),
+        ).into());
     }
 
     let component_id = new_component_id();
@@ -51,7 +53,13 @@ pub async fn create_component(
     db::set_tenant_guc(&tx, tenant).await?;
     db::create_component(&tx, tenant, &component_id, &req.name)
         .await
-        .map_err(|e| map_unique_violation(e, "component name already exists"))?;
+        .map_err(|error| {
+            if super::is_unique_violation(&error) {
+                FaasError::Conflict("component name already exists".into()).into()
+            } else {
+                AppError::from(error)
+            }
+        })?;
     tx.commit().await?;
 
     Ok((
@@ -78,7 +86,8 @@ pub struct UploadVersionResponse {
 /// POST /components/{component_id}/versions — アップロード+検証+デプロイ (§6.2)。
 ///
 /// multipart フィールド:
-/// - `version` (必須): semver
+/// - `version` (必須): 1..=128 ASCII characters, starting with a letter or digit;
+///   remaining characters may also include '.', '_', '+', '-'.
 /// - `wasm` (必須): wasm component バイナリ
 /// - `capabilities` (任意): JSON。M2 は受理して検証結果と整合確認するのみ（列保存は §4.4）
 /// - `resource_limits` (任意): JSON (hibana_shared::ResourceLimits)
@@ -97,9 +106,18 @@ pub async fn upload_version(
     State(state): State<AppState>,
     principal: Principal,
     Path(component_id): Path<String>,
-    mut multipart: Multipart,
-) -> Result<impl IntoResponse, AppError> {
+    multipart: Multipart,
+) -> Result<axum::response::Response, AppError> {
     let tenant = &principal.tenant_id;
+    // Retain these guards through validation, storage and publication: no queued
+    // upload may keep its payload outside the same bounded reception budget.
+    let capacity = state.upload_capacity();
+    let Some(_slot) = capacity.reserve() else {
+        return Ok(crate::admission::RateLimited::upload_capacity(false).into_response());
+    };
+    let Some(_tenant_slot) = capacity.reserve_tenant(tenant, 2) else {
+        return Ok(crate::admission::RateLimited::upload_capacity(true).into_response());
+    };
 
     let tx = state.pool().begin().await?;
     db::set_tenant_guc(&tx, tenant).await?;
@@ -111,122 +129,19 @@ pub async fn upload_version(
 
     tx.commit().await?; // No DB transaction while receiving or validating the upload.
 
-    // --- multipart フィールドを収集 ---
-    let mut version: Option<String> = None;
-    let mut wasm_bytes: Option<Vec<u8>> = None;
-    let mut capabilities: Option<Value> = None;
-    // M9a: 本体 sha256 に対する detached Ed25519 署名（base64url）。任意フィールド。
-    let mut signature: Option<String> = None;
-    let mut resource_limits: ResourceLimits = ResourceLimits::default();
-    let mut activate = true;
-    let mut ingress: Option<bool> = None;
-    let mut environment = super::deployment::VersionEnvironment::default();
-    let mut fields = std::collections::BTreeSet::new();
-
-    let max_bytes = state.max_wasm_upload_bytes();
-
-    while let Some(mut field) = multipart
-        .next_field()
-        .await
-        .map_err(|e| FaasError::InvalidRequest(format!("malformed multipart: {e}")))?
-    {
-        if let Some(name) = field.name() {
-            if !fields.insert(name.to_owned()) {
-                return Err(FaasError::InvalidRequest("duplicate multipart field".into()).into());
-            }
-        }
-        match field.name() {
-            Some("version") => {
-                let v = field.text().await.map_err(|e| {
-                    FaasError::InvalidRequest(format!("invalid version field: {e}"))
-                })?;
-                version = Some(v);
-            }
-            Some("capabilities") => {
-                let text = field.text().await.map_err(|e| {
-                    FaasError::InvalidRequest(format!("invalid capabilities field: {e}"))
-                })?;
-                let parsed: Value = serde_json::from_str(&text).map_err(|e| {
-                    FaasError::InvalidRequest(format!("capabilities is not valid JSON: {e}"))
-                })?;
-                // envはvarsと承認済みSecret参照から構築する。生のcapabilities.envは拒否。
-                validation::reject_env_in_declared_capabilities(&parsed)?;
-                capabilities = Some(parsed);
-            }
-            Some("resource_limits") => {
-                let text = field.text().await.map_err(|e| {
-                    FaasError::InvalidRequest(format!("invalid resource_limits field: {e}"))
-                })?;
-                resource_limits = serde_json::from_str(&text).map_err(|e| {
-                    FaasError::InvalidRequest(format!("resource_limits is not valid JSON: {e}"))
-                })?;
-                // M4b (§4.3): §4.3 表の上限を超える値（max_memory > 1 GiB / max_wall_time > 30s /
-                // max_execution_time > 60s）や論理不整合（max_execution_time < max_wall_time、
-                // 各ゼロ値、max_fuel = Some(0)）はここで 422 で拒否する。worker 側の防御もあるが、
-                // 受付時点で明示的に弾くことで「保存だけされて毎 invoke で落ちる」を防ぐ。
-                resource_limits.validate()?;
-            }
-            Some("wasm") => {
-                // (1) ストリーミング中にサイズ上限を強制。超過は即打ち切り。
-                let mut buf: Vec<u8> = Vec::new();
-                while let Some(chunk) = field.chunk().await.map_err(|e| {
-                    FaasError::InvalidRequest(format!("error reading wasm field: {e}"))
-                })? {
-                    if buf.len() as u64 + chunk.len() as u64 > max_bytes {
-                        return Err(FaasError::InvalidRequest(format!(
-                            "wasm exceeds max upload size of {max_bytes} bytes"
-                        ))
-                        .into());
-                    }
-                    buf.extend_from_slice(&chunk);
-                }
-                wasm_bytes = Some(buf);
-            }
-            Some("activate" | "ingress" | "vars" | "secrets") => {
-                let name = field.name().unwrap().to_owned();
-                let text = field
-                    .text()
-                    .await
-                    .map_err(|_| FaasError::InvalidRequest("invalid deployment field".into()))?;
-                // Do not include JSON parser errors: they can quote user-supplied values.
-                let invalid = || FaasError::InvalidRequest(format!("invalid {name} field"));
-                match name.as_str() {
-                    "activate" => activate = serde_json::from_str(&text).map_err(|_| invalid())?,
-                    "ingress" => {
-                        ingress = Some(serde_json::from_str(&text).map_err(|_| invalid())?)
-                    }
-                    "vars" => {
-                        environment.vars = serde_json::from_str(&text).map_err(|_| invalid())?
-                    }
-                    "secrets" => {
-                        environment.secrets = serde_json::from_str(&text).map_err(|_| invalid())?
-                    }
-                    _ => unreachable!(),
-                }
-            }
-            Some("signature") => {
-                // M9a: 本体 sha256 に対する detached Ed25519 署名（base64url）。
-                let v = field.text().await.map_err(|e| {
-                    FaasError::InvalidRequest(format!("invalid signature field: {e}"))
-                })?;
-                let v = v.trim().to_string();
-                if !v.is_empty() {
-                    signature = Some(v);
-                }
-            }
-            // 未知フィールドは無視（前方互換）。
-            _ => {
-                let _ = field.bytes().await;
-            }
-        }
-    }
-
-    let version = version
-        .filter(|v| !v.trim().is_empty())
-        .ok_or_else(|| FaasError::InvalidRequest("missing required field 'version'".into()))?;
-    let wasm_bytes = wasm_bytes
-        .filter(|b| !b.is_empty())
-        .ok_or_else(|| FaasError::InvalidRequest("missing required field 'wasm'".into()))?;
+    let super::upload::Upload {
+        version,
+        wasm_bytes,
+        capabilities,
+        signature,
+        resource_limits,
+        activate,
+        ingress,
+        environment,
+    } = match super::upload::receive(multipart, state.max_wasm_upload_bytes()).await {
+        Ok(upload) => upload,
+        Err(response) => return Ok(*response),
+    };
 
     let allowed_env = environment.validate()?;
     if ingress.is_some() && !activate {
@@ -237,7 +152,7 @@ pub async fn upload_version(
     //
     // Persist imports validated against Hibana's WASI host contract. Client
     // declarations cannot add host functions or grant runtime permissions.
-    let validated = validation::validate_wasm(wasm_bytes.clone()).await?;
+    let validated = validation::validate_wasm(&wasm_bytes).await?;
 
     if let Some(caps) = &capabilities {
         // 宣言値は監査・観測用にログするのみ（保存・付与には使わない, §4.4）。
@@ -292,53 +207,44 @@ pub async fn upload_version(
     // 署名対象は本体そのものではなく `validated.sha256`（検証パイプラインが算出済みの 16 進文字列）。
     let require_signed = db::require_signed_components(&tx, tenant).await?;
     if require_signed || signature.is_some() {
-        let audit_reject = |reason: &'static str| {
-            tracing::warn!(%component_id, reason, require_signed, "component signature rejected");
-        };
-        let sig = signature.as_deref().ok_or_else(|| {
-            audit_reject("signature_required");
-            FaasError::InvalidRequest(
+        let rejection = if let Some(sig) = signature.as_deref() {
+            let keys = db::list_signing_keys(&tx, tenant)
+                .await?
+                .into_iter()
+                .map(|k| (k.key_id, k.public_key))
+                .collect::<Vec<_>>();
+            if keys.is_empty() {
+                Some(("no_signing_keys_registered", "component signature present/required but no signing keys are registered for this tenant (register one via PUT /admin/signing-keys/{key_id})".to_owned()))
+            } else {
+                signing::verify_component_signature(&validated.sha256, sig, &keys)
+                    .err()
+                    .map(|error| (error.reason(), format!("component signature verification failed: {}", error.reason())))
+            }
+        } else {
+            Some(("signature_required",
                 "this tenant requires signed components; provide a 'signature' field \
                  (detached Ed25519 over the wasm sha256, base64url)"
-                    .into(),
-            )
-        })?;
-
-        let keys = db::list_signing_keys(&tx, tenant)
-            .await?
-            .into_iter()
-            .map(|k| (k.key_id, k.public_key))
-            .collect::<Vec<_>>();
-        if keys.is_empty() {
-            audit_reject("no_signing_keys_registered");
-            return Err(FaasError::InvalidRequest(
-                "component signature present/required but no signing keys are registered for this \
-                 tenant (register one via PUT /admin/signing-keys/{key_id})"
-                    .into(),
-            )
-            .into());
-        }
-
-        if let Err(e) = signing::verify_component_signature(&validated.sha256, sig, &keys) {
-            audit_reject(e.reason());
+                    .to_owned()))
+        };
+        if let Some((reason, message)) = rejection {
+            tracing::warn!(%component_id, reason, require_signed, "component signature rejected");
             db::insert_audit_log(
                 &tx,
                 tenant,
-                principal.user_id.as_deref(),
+                principal.actor(),
                 "component_signature_rejected",
                 Some(&component.id),
                 Some(&json!({
                     "version": version,
                     "sha256": validated.sha256,
-                    "reason": e.reason(),
+                    "reason": reason,
                 })),
             )
             .await?;
-            return Err(FaasError::InvalidRequest(format!(
-                "component signature verification failed: {}",
-                e.reason()
-            ))
-            .into());
+            // Only the rejection audit has been written in this transaction.
+            // Commit it before returning the error; publication starts below.
+            tx.commit().await?;
+            return Err(FaasError::InvalidRequest(message).into());
         }
     }
 
@@ -379,7 +285,7 @@ pub async fn upload_version(
     if let Some(enabled) = ingress {
         db::set_component_ingress(&tx, tenant, &component.id, enabled).await?;
     }
-    db::insert_audit_log(&tx, tenant, principal.user_id.as_deref(), "version_environment_published", Some(&component.id),
+    db::insert_audit_log(&tx, tenant, principal.actor(), "version_environment_published", Some(&component.id),
         Some(&json!({"version_id": version_id, "vars": environment.vars.keys().collect::<Vec<_>>(), "secrets": environment.secrets}))).await?;
     if activate {
         db::switch_active_version(&tx, tenant, &component.id, &version_id).await?;
@@ -412,7 +318,7 @@ pub async fn upload_version(
     ))
     }.await;
     reservation.finish().await;
-    result
+    result.map(IntoResponse::into_response)
 }
 
 // ---------------------------------------------------------------------------
@@ -573,7 +479,13 @@ pub async fn delete_component(
     principal: Principal,
     Path(component_id): Path<String>,
 ) -> Result<impl IntoResponse, AppError> {
-    delete_for_tenant(&state, &principal.tenant_id, &component_id).await?;
+    delete_for_tenant(
+        &state,
+        &principal.tenant_id,
+        &component_id,
+        principal.actor(),
+    )
+    .await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -581,6 +493,7 @@ async fn delete_for_tenant(
     state: &AppState,
     tenant: &str,
     component_id: &str,
+    actor: Option<&str>,
 ) -> Result<(), AppError> {
     let tx = state.pool().begin().await?;
     db::set_tenant_guc(&tx, tenant).await?;
@@ -600,6 +513,15 @@ async fn delete_for_tenant(
     }
 
     db::soft_delete_component(&tx, tenant, component_id).await?;
+    db::insert_audit_log(
+        &tx,
+        tenant,
+        actor,
+        "component_deleted",
+        Some(component_id),
+        None,
+    )
+    .await?;
 
     tx.commit().await?;
 
@@ -633,7 +555,7 @@ pub async fn admin_delete_component(
     Path((tenant_id, component_id)): Path<(String, String)>,
 ) -> Result<StatusCode, AppError> {
     super::tenants::require_bootstrap_admin(&headers, &state)?;
-    delete_for_tenant(&state, &tenant_id, &component_id).await?;
+    delete_for_tenant(&state, &tenant_id, &component_id, Some("bootstrap")).await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -650,7 +572,36 @@ pub async fn delete_version(
     State(state): State<AppState>,
     principal: Principal,
     Path((component_id, version)): Path<(String, String)>,
-) -> Result<impl IntoResponse, AppError> {
+) -> Result<StatusCode, AppError> {
+    delete_version_for(
+        &state,
+        &principal,
+        &component_id,
+        db::VersionRef::Name(&version),
+    )
+    .await
+}
+
+pub async fn delete_version_by_id(
+    State(state): State<AppState>,
+    principal: Principal,
+    Path((component_id, version_id)): Path<(String, String)>,
+) -> Result<StatusCode, AppError> {
+    delete_version_for(
+        &state,
+        &principal,
+        &component_id,
+        db::VersionRef::Id(&version_id),
+    )
+    .await
+}
+
+async fn delete_version_for(
+    state: &AppState,
+    principal: &Principal,
+    component_id: &str,
+    version: db::VersionRef<'_>,
+) -> Result<StatusCode, AppError> {
     let tenant = &principal.tenant_id;
 
     let tx = state.pool().begin().await?;
@@ -658,50 +609,54 @@ pub async fn delete_version(
 
     // Hold the same parent lock as publication, rollback and HTTP admission.
     // Read active/previous/execution state only after any earlier publisher commits.
-    if !db::lock_component(&tx, tenant, &component_id).await? {
+    if !db::lock_component(&tx, tenant, component_id).await? {
         return Err(FaasError::NotFound(format!("component '{component_id}'")).into());
     }
-    let component = db::find_component_by_id(&tx, tenant, &component_id)
+    let component = db::find_component_by_id(&tx, tenant, component_id)
         .await?
         .ok_or_else(|| FaasError::NotFound(format!("component '{component_id}'")))?;
 
     // 対象 version の解決（不在は 404）。
-    let target_version_id = db::find_version_id(&tx, tenant, &component_id, &version)
+    let target_version_id = db::resolve_version_id(&tx, tenant, component_id, version)
         .await?
-        .ok_or_else(|| {
-            FaasError::NotFound(format!("version '{version}' of component '{component_id}'"))
-        })?;
+        .ok_or_else(|| FaasError::NotFound("version".into()))?;
 
     // active version は削除不可（§6.7: 先に active-version を切替えること）。
     if component.active_version_id.as_deref() == Some(target_version_id.as_str()) {
-        return Err(FaasError::Conflict(format!(
-            "version '{version}' is the active version; switch active-version first"
-        ))
+        return Err(FaasError::Conflict(
+            "version is the active version; switch active-version first".into(),
+        )
         .into());
     }
 
     // M7a: rollback の戻り先も削除不可。消すと「ワンクリック rollback が 409 で失敗する」状態に
     // なるため、削除より先に active-version の切替 / rollback を済ませてもらう。
     if component.previous_active_version_id.as_deref() == Some(target_version_id.as_str()) {
-        return Err(FaasError::Conflict(format!(
-            "version '{version}' is the rollback target; switch active-version or roll back first"
-        ))
+        return Err(FaasError::Conflict(
+            "version is the rollback target; switch active-version or roll back first".into(),
+        )
         .into());
     }
 
     // 参照中の実行があれば保護（§6.7）。
     if db::has_active_executions_for_version(&tx, tenant, &target_version_id).await? {
-        return Err(FaasError::Conflict(format!(
-            "version '{version}' has pending/running executions"
-        ))
-        .into());
+        return Err(FaasError::Conflict("version has pending/running executions".into()).into());
     }
 
-    db::soft_delete_version(&tx, tenant, &component_id, &target_version_id).await?;
+    db::soft_delete_version(&tx, tenant, component_id, &target_version_id).await?;
+    db::insert_audit_log(
+        &tx,
+        tenant,
+        principal.actor(),
+        "version_deleted",
+        Some(&target_version_id),
+        Some(&json!({"component_id": component_id})),
+    )
+    .await?;
 
     tx.commit().await?;
 
-    tracing::info!(component_id = %component_id, %version, "version soft-deleted");
+    tracing::info!(%component_id, version_id = %target_version_id, "version soft-deleted");
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -711,7 +666,7 @@ pub async fn delete_version(
 
 #[derive(Debug, Deserialize)]
 pub struct SetActiveVersionRequest {
-    /// active 化する既存の version (semver)。
+    /// active 化する既存のバージョン名（旧形式の名前も指定可）。
     pub version: String,
 }
 
@@ -778,7 +733,7 @@ pub async fn set_active_version(
     db::insert_audit_log(
         &tx,
         tenant,
-        principal.user_id.as_deref(),
+        principal.actor(),
         "active_version_switched",
         Some(&component_id),
         Some(&json!({
@@ -939,7 +894,7 @@ pub async fn rollback_version(
     db::insert_audit_log(
         &tx,
         tenant,
-        principal.user_id.as_deref(),
+        principal.actor(),
         "version_rollback",
         Some(&component_id),
         Some(&json!({

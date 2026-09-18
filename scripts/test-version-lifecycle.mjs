@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import {spawn} from 'node:child_process';
 import {setTimeout as sleep} from 'node:timers/promises';
 
-async function holdComponent(pg, id) {
+export async function holdComponent(pg, id) {
   assert.match(pg, /^hibana-http-pg-[0-9]+$/);
   assert.match(id, /^cmp_[a-f0-9]{32}$/);
   const child = spawn('docker', ['exec','-i',pg,'psql','-XqAt','-U','postgres','-d','hibana_http','-v','ON_ERROR_STOP=1'], {
@@ -39,7 +39,7 @@ async function holdComponent(pg, id) {
   }
 }
 
-async function waitForBlocked(sql, count) {
+export async function waitForBlocked(sql, count) {
   const deadline = Date.now()+4000;
   while (Date.now()<deadline) {
     // Observe PostgreSQL lock waits, independent of ORM SQL formatting.
@@ -75,7 +75,7 @@ export async function testVersionLifecycle({api, sql, pg, token, wasm, upload, a
       const pending = {};
       const send = operation => {
         pending[operation] = operation==='delete'
-          ? api(`${base}/versions/${version}`,{token,method:'DELETE'})
+          ? api(`${base}/versions/${mode==='rollback' ? `by-id/${versionId}` : version}`,{token,method:'DELETE'})
           : api(`${base}/${mode}`,{token,method:mode==='rollback' ? 'POST' : 'PUT',body:{version}});
         pending[operation].catch(() => {});
       };
@@ -120,6 +120,8 @@ export async function testVersionLifecycle({api, sql, pg, token, wasm, upload, a
     .every(v => v.deletion_blocked_reason===null));
   assert.equal((await api(`${base}/versions/${previous}`,{token,method:'DELETE'})).status,409,
     'the previous version remains protected as the rollback destination');
+  for (const versionId of [live.active,live.previous])
+    assert.equal((await api(`${base}/versions/by-id/${versionId}`,{token,method:'DELETE'})).status,409);
 
   const idle = await upload(id,token,'inflight-list',wasm,0,{activate:false});
   assert.equal(idle.status,201);
@@ -131,7 +133,7 @@ export async function testVersionLifecycle({api, sql, pg, token, wasm, upload, a
     const listed = (await listedVersions()).find(v => v.version_id===idleId);
     assert.equal(listed.deletion_blocked_reason,status==='succeeded' ? null : 'active_executions',
       `${status}: the console protection matches the DELETE guard`);
-    assert.equal((await api(`${base}/versions/inflight-list`,{token,method:'DELETE'})).status,
+    assert.equal((await api(`${base}/versions/by-id/${idleId}`,{token,method:'DELETE'})).status,
       status==='succeeded' ? 204 : 409);
   }
   assert.ok(!(await listedVersions()).some(v => v.version_id===idleId));

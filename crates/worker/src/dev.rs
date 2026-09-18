@@ -51,6 +51,12 @@ pub async fn run(args: &[String]) -> Result<()> {
         &tokio::fs::read(settings.context("--dev-settings is required")?).await?,
     )?;
     settings.resources.validate()?;
+    env::build_env(
+        &settings.vars,
+        &BTreeMap::new(),
+        &settings.vars.keys().cloned().collect(),
+    )
+    .map_err(anyhow::Error::msg)?;
     let engine = crate::runtime::build_engine()?;
     let component =
         Component::from_file(&engine, component.context("--dev-component is required")?)?;
@@ -94,15 +100,21 @@ async fn invoke(State(state): State<Arc<DevState>>, request: Request<Body>) -> R
         return StatusCode::PAYLOAD_TOO_LARGE.into_response();
     };
     let request = hibana_shared::http::HttpRequest::from_parts(&parts, &body);
-    let (stream, response) = crate::runtime::response_channel();
-    let body_tx = stream.body.clone();
+    let is_head = request.method == "HEAD";
+    let (stream, response, completed) = crate::runtime::response_channel();
     tokio::spawn(async move {
         let _slot = slot;
-        let env = env::build_env(
+        let env = match env::build_env(
             &state.settings.vars,
             &BTreeMap::new(),
             &state.settings.vars.keys().cloned().collect(),
-        );
+        ) {
+            Ok(env) => env,
+            Err(message) => {
+                tracing::warn!(reason = message, "invalid development environment");
+                return;
+            }
+        };
         let result = state
             .runtime
             .run_http(
@@ -111,19 +123,19 @@ async fn invoke(State(state): State<Arc<DevState>>, request: Request<Body>) -> R
                     request,
                     limits: state.settings.resources,
                     built_env: env,
-                    allowed_addrs: Default::default(),
+                    approved_egress: Default::default(),
+                    deadline: tokio::time::Instant::now()
+                        + state.settings.resources.max_execution_time(),
                 },
                 stream,
             )
             .await;
-        if result.is_err() {
-            let _ = body_tx
-                .send(Err(std::io::Error::other("Wasm invocation failed")))
-                .await;
+        if result.is_ok() {
+            let _ = completed.send(());
         }
         // Keep EOF behind handler completion, including waitUntil and resource checks.
     });
-    match response.receive().await {
+    match response.receive(is_head).await {
         Ok((parts, body)) => Response::from_parts(parts, Body::from_stream(body)),
         Err(_) => (
             StatusCode::BAD_GATEWAY,

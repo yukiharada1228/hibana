@@ -9,8 +9,8 @@
 //! 1. **許可リストが権威**。`component_versions.capabilities.env`（admin 承認）に載っていないキーは、
 //!    値が DB に存在しても注入しない。CP 側（job-env 引き換え）でも同じフィルタを掛ける二重防御で、
 //!    片側の実装ミスが即漏洩にならないようにする。
-//! 2. **上限は `hibana_shared` の定数を共有する**。CP の受付バリデーションと同じ値でここでも clamp する
-//!    （DB を直接書き換えられた場合や将来の別経路に対する防御）。
+//! 2. **上限は `hibana_shared` の定数を共有する**。上限超過は実行前に拒否し、
+//!    許可された設定を部分的に省略したままゲストを実行しない。
 //! 3. **出力順は決定的**（キー名昇順）。同じ入力からは常に同じ `WasiCtx` が組み上がる。
 //! 4. `WasiCtx` は実行ごとに構築される（`Component` は sha256 キャッシュで共有されるが `WasiCtx` は
 //!    共有されない）ため、**テナント混線は構造的に起きない**。
@@ -28,8 +28,6 @@ pub struct BuiltEnv {
     pub pairs: Vec<(String, String)>,
     /// 許可リスト外で落としたキー数。
     pub dropped_unapproved: usize,
-    /// 上限（件数 / 値長 / 総バイト）で落としたキー数。
-    pub dropped_over_limit: usize,
     /// secret 由来のキーが 1 つ以上含まれるか。`true` のとき呼び出し側はゲスト stderr を
     /// 共有ログへ流さない（`inherit_stderr` を使わない）。
     pub has_secret: bool,
@@ -44,7 +42,7 @@ pub fn build_env(
     config: &BTreeMap<String, String>,
     secrets: &BTreeMap<String, Redacted<String>>,
     allowed: &BTreeSet<String>,
-) -> BuiltEnv {
+) -> Result<BuiltEnv, &'static str> {
     let mut out = BuiltEnv::default();
 
     // secret 優先でマージする（同名は secret が勝つ）。
@@ -63,22 +61,21 @@ pub fn build_env(
             out.dropped_unapproved += 1;
             continue;
         }
-        // (2) 上限の防御的 clamp。CP が受付で弾いているので通常は到達しない。
+        // Reject the entire environment, including legacy or corrupted data.
+        // Never include names, values or Secret lengths in the diagnostic.
         if value.len() > MAX_ENV_VALUE_BYTES || out.pairs.len() >= MAX_FUNCTION_ENV_KEYS {
-            out.dropped_over_limit += 1;
-            continue;
+            return Err("Environment exceeds the per-value or entry-count limit");
         }
         let next_total = total + key.len() + value.len();
         if next_total > MAX_FUNCTION_ENV_TOTAL_BYTES {
-            out.dropped_over_limit += 1;
-            continue;
+            return Err("Vars and Secrets together exceed the environment size limit");
         }
         total = next_total;
         out.has_secret |= is_secret;
         out.pairs.push((key.to_string(), value.to_string()));
     }
 
-    out
+    Ok(out)
 }
 
 /// Compare test fixtures at the existing plaintext boundary without logging them.
@@ -116,7 +113,8 @@ mod tests {
             &cfg(&[("LOG_LEVEL", "debug"), ("SNEAKY", "nope")]),
             &sec(&[("API_KEY", "s3cr3t")]),
             &allow(&["LOG_LEVEL", "API_KEY"]),
-        );
+        )
+        .unwrap();
         let keys: Vec<&str> = built.pairs.iter().map(|(k, _)| k.as_str()).collect();
         assert_eq!(keys, vec!["API_KEY", "LOG_LEVEL"]);
         assert_eq!(built.dropped_unapproved, 1);
@@ -129,7 +127,8 @@ mod tests {
             &cfg(&[("LOG_LEVEL", "debug")]),
             &sec(&[("API_KEY", "s3cr3t")]),
             &BTreeSet::new(),
-        );
+        )
+        .unwrap();
         assert!(built.pairs.is_empty());
         assert!(!built.has_secret);
         assert_eq!(built.dropped_unapproved, 2);
@@ -142,7 +141,8 @@ mod tests {
             &cfg(&[("ZULU", "z"), ("ALPHA", "a"), ("MIKE", "m")]),
             &BTreeMap::new(),
             &allow(&["ZULU", "ALPHA", "MIKE"]),
-        );
+        )
+        .unwrap();
         let keys: Vec<&str> = built.pairs.iter().map(|(k, _)| k.as_str()).collect();
         assert_eq!(keys, vec!["ALPHA", "MIKE", "ZULU"]);
     }
@@ -154,14 +154,16 @@ mod tests {
             &cfg(&[("LOG_LEVEL", "debug")]),
             &BTreeMap::new(),
             &allow(&["LOG_LEVEL"]),
-        );
+        )
+        .unwrap();
         assert!(!only_config.has_secret);
 
         let with_secret = build_env(
             &cfg(&[("LOG_LEVEL", "debug")]),
             &sec(&[("API_KEY", "x")]),
             &allow(&["LOG_LEVEL", "API_KEY"]),
-        );
+        )
+        .unwrap();
         assert!(with_secret.has_secret);
     }
 
@@ -172,25 +174,25 @@ mod tests {
             &cfg(&[("API_KEY", "plaintext-from-config")]),
             &sec(&[("API_KEY", "from-secret")]),
             &allow(&["API_KEY"]),
-        );
+        )
+        .unwrap();
         assert_eq!(built.pairs, vec![("API_KEY".into(), "from-secret".into())]);
         assert!(built.has_secret);
     }
 
-    /// 値長の上限を超えるものは落とす（DB 直書き等への防御的 clamp）。
+    /// 上限超過時は、残りの設定だけで実行を続けない。
     #[test]
-    fn oversized_values_are_dropped() {
+    fn oversized_values_reject_the_environment() {
         let big = "x".repeat(MAX_ENV_VALUE_BYTES + 1);
         let built = build_env(
             &cfg(&[("BIG", big.as_str()), ("OK", "small")]),
             &BTreeMap::new(),
             &allow(&["BIG", "OK"]),
         );
-        assert_eq!(built.pairs, vec![("OK".into(), "small".into())]);
-        assert_eq!(built.dropped_over_limit, 1);
+        assert!(built.is_err());
     }
 
-    /// キー数の上限で打ち切る。
+    /// キー数の上限は config と Secret の合計。
     #[test]
     fn key_count_is_capped() {
         let entries: Vec<(String, String)> = (0..MAX_FUNCTION_ENV_KEYS + 10)
@@ -199,11 +201,10 @@ mod tests {
         let config: BTreeMap<String, String> = entries.iter().cloned().collect();
         let allowed: BTreeSet<String> = entries.iter().map(|(k, _)| k.clone()).collect();
         let built = build_env(&config, &BTreeMap::new(), &allowed);
-        assert_eq!(built.pairs.len(), MAX_FUNCTION_ENV_KEYS);
-        assert_eq!(built.dropped_over_limit, 10);
+        assert!(built.is_err());
     }
 
-    /// 総バイト数の上限で打ち切る。
+    /// 総バイト数を超えた設定は部分的に注入しない。
     #[test]
     fn total_bytes_are_capped() {
         // 1 件あたり約 2 KiB を 32 件 = 64 KiB > 32 KiB。
@@ -214,11 +215,27 @@ mod tests {
         let config: BTreeMap<String, String> = entries.iter().cloned().collect();
         let allowed: BTreeSet<String> = entries.iter().map(|(k, _)| k.clone()).collect();
         let built = build_env(&config, &BTreeMap::new(), &allowed);
-        let total: usize = built.pairs.iter().map(|(k, v)| k.len() + v.len()).sum();
-        assert!(
-            total <= MAX_FUNCTION_ENV_TOTAL_BYTES,
-            "total {total} must stay within the cap"
+        assert!(built.is_err());
+    }
+
+    #[test]
+    fn combined_vars_and_secrets_use_bytes_and_accept_the_exact_limit() {
+        let vars: BTreeMap<_, _> = (0..8)
+            .map(|i| (format!("A{i}"), "あ".repeat(1333)))
+            .collect();
+        let vars_bytes: usize = vars.iter().map(|(k, v)| k.len() + v.len()).sum();
+        let remaining = MAX_FUNCTION_ENV_TOTAL_BYTES - vars_bytes - "Z_TOKEN".len();
+        let allowed = vars.keys().cloned().chain(["Z_TOKEN".into()]).collect();
+        let at_limit = sec(&[("Z_TOKEN", &"s".repeat(remaining))]);
+        let built = build_env(&vars, &at_limit, &allowed).unwrap();
+        assert_eq!(built.pairs.len(), 9);
+        let oversized = sec(&[("Z_TOKEN", &"s".repeat(remaining + 1))]);
+        let error = build_env(&vars, &oversized, &allowed).unwrap_err();
+        assert_eq!(
+            error,
+            "Vars and Secrets together exceed the environment size limit"
         );
-        assert!(built.dropped_over_limit > 0);
+        // Unapproved oversized entries cannot deny an otherwise valid invocation.
+        assert!(build_env(&vars, &oversized, &vars.keys().cloned().collect()).is_ok());
     }
 }

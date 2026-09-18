@@ -10,6 +10,14 @@ import yaml
 MIGRATION_JOB = "hibana-migrate"
 
 
+def management_api_prefixes(rule):
+    """Public API prefixes for the Hibana services behind an Ingress rule."""
+    prefixes = {"hibana-api": "", "hibana-console": "/api"}
+    services = {path.get("backend", {}).get("service", {}).get("name")
+                for path in rule.get("http", {}).get("paths", [])}
+    return {prefixes[service] for service in services if service in prefixes}
+
+
 def run(*args, capture=False, input=None, env=None, quiet=False, timeout=None):
     return subprocess.run([str(arg) for arg in args], check=True, text=True,
                           input=input, stdout=subprocess.PIPE if capture else None, env=env,

@@ -1,5 +1,6 @@
 //! Signed HTTP completion with a single CAS transition and accounting transaction.
 use crate::state::AppState;
+use hibana_shared::http::MAX_RESPONSE_BYTES;
 use hibana_shared::{ExecutionStatus, JobClaims, ResourceLimits, ResultMessage, UsageMetrics};
 use sea_orm::TransactionTrait as _;
 use serde_json::json;
@@ -293,15 +294,15 @@ async fn commit_finalize_and_release(
     }
     Ok(())
 }
-/// worker 自己申告の計量を `ResourceLimits` 上限で sanity clamp する (M5, §15)。
+/// worker 自己申告の計量を実行・HTTP 応答の上限で sanity clamp する (M5, §15)。
 ///
 /// worker は署名鍵を持たない**非特権・信頼境界外**ランタイム (§3.3) なので、申告値は無検証だと
 /// 課金水増しや桁あふれで rollup の SUM を破壊しうる。各指標を version の resource_limits（worker の
-/// `get_limits` と同じ権威値）の上限で頭打ちにしてから永続化する:
+/// `get_limits` と同じ権威値）または HTTP 応答の上限で頭打ちにしてから永続化する:
 /// - `wall_time_ms`  → `max_execution_time_ms`（実行に許される総壁時計上限）
 /// - `cpu_fuel_used` → `max_fuel`（fuel 無効化時は上限なし＝`u64::MAX`。worker 側でも 0 化済み）
 /// - `peak_memory_bytes` → `max_memory_bytes`（StoreLimits が強制する上限）
-/// - `output_bytes`  → `max_memory_bytes`（出力はメモリ上限を超え得ないため同上限で頭打ち）
+/// - `output_bytes`  → `MAX_RESPONSE_BYTES`（ストリーミングの累計はゲストメモリ上限を超え得る）
 ///
 /// 純関数（DB 不要）で clamp ロジックをテスト可能にする。`UsageMetrics` は `Copy`。
 fn clamp_usage(raw: &UsageMetrics, limits: &ResourceLimits) -> UsageMetrics {
@@ -309,7 +310,7 @@ fn clamp_usage(raw: &UsageMetrics, limits: &ResourceLimits) -> UsageMetrics {
         cpu_fuel_used: raw.cpu_fuel_used.min(limits.max_fuel.unwrap_or(u64::MAX)),
         wall_time_ms: raw.wall_time_ms.min(limits.max_execution_time_ms),
         peak_memory_bytes: raw.peak_memory_bytes.min(limits.max_memory_bytes),
-        output_bytes: raw.output_bytes.min(limits.max_memory_bytes),
+        output_bytes: raw.output_bytes.min(MAX_RESPONSE_BYTES as u64),
     }
 }
 /// drop パスで audit_logs に 1 行追記する（§3.7）。
@@ -359,13 +360,25 @@ mod tests {
             cpu_fuel_used: 5_000,         // > max_fuel 1_000
             wall_time_ms: 9_999,          // > max_execution_time_ms 500
             peak_memory_bytes: 1_000_000, // > max_memory_bytes 1024
-            output_bytes: 1_000_000,      // > max_memory_bytes 1024
+            output_bytes: u64::MAX,       // > MAX_RESPONSE_BYTES
         };
         let c = clamp_usage(&raw, &limits);
         assert_eq!(c.cpu_fuel_used, 1_000);
         assert_eq!(c.wall_time_ms, 500);
         assert_eq!(c.peak_memory_bytes, 1024);
-        assert_eq!(c.output_bytes, 1024);
+        assert_eq!(c.output_bytes, MAX_RESPONSE_BYTES as u64);
+    }
+
+    #[test]
+    fn clamp_usage_preserves_streamed_output_larger_than_guest_memory() {
+        let limits = test_limits();
+        for output_bytes in [limits.max_memory_bytes + 1, MAX_RESPONSE_BYTES as u64] {
+            let raw = UsageMetrics {
+                output_bytes,
+                ..Default::default()
+            };
+            assert_eq!(clamp_usage(&raw, &limits), raw);
+        }
     }
 
     /// 上限以下の値はそのまま通す（正規の計測値を歪めない）。

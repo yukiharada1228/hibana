@@ -25,6 +25,19 @@ def resource(kind, name, **fields):
         "labels": {"app.kubernetes.io/part-of": "hibana", LABEL: "hibana"}}, **fields}
 
 
+def management_ingress(service, host):
+    return resource("Ingress", service, spec={"tls": [{"hosts": [host]}], "rules": [{"host": host, "http": {
+        "paths": [{"path": "/", "pathType": "Prefix", "backend": {"service": {"name": service, "port": {"number": 8080}}}}]}}]})
+
+
+def ready_response(url, **kwargs):
+    response = MagicMock()
+    response.__enter__.return_value.status = 200
+    response.__enter__.return_value.geturl.return_value = url
+    response.__enter__.return_value.read.return_value = b'{"db":"ok","store":"ok"}'
+    return response
+
+
 class FakeCluster(ExistingCluster):
     def __init__(self, directory):
         root = Path(directory)
@@ -55,6 +68,9 @@ class FakeCluster(ExistingCluster):
 
     def verify_dependencies(self):
         self.events.append(("dependencies", deepcopy(self.live)))
+
+    def verify_applications(self):
+        self.events.append(("applications", deepcopy(self.live)))
 
     def get(self, kind, name):
         with self.api_mutex:
@@ -141,6 +157,44 @@ class ClusterFixture(unittest.TestCase):
 
 
 class PreflightTests(ClusterFixture):
+    def test_api_and_console_ingresses_require_tls_for_their_hostname(self):
+        self.cluster.docs[1]["data"]["TRUSTED_PROXY_CIDRS"] = "10.2.0.0/24"
+        for service, host in [("hibana-api", "api.test"), ("hibana-console", "console.test")]:
+            with self.subTest(service=service):
+                ingress = management_ingress(service, host)
+                docs = self.cluster.docs + [ingress]
+                for tls in ([], [{"hosts": ["another.test"]}]):
+                    ingress["spec"]["tls"] = tls
+                    with self.assertRaisesRegex(ValueError, "configure TLS for the management hostname"):
+                        Preflight(self.cluster).settings(docs)
+                ingress["spec"]["tls"] = [{"hosts": [host]}]
+                Preflight(self.cluster).settings(docs)
+        self.assert_read_only()
+
+    def test_console_ingress_requires_proxy_trust_without_a_console_deployment(self):
+        self.cluster.docs.append(management_ingress("hibana-console", "console.test"))
+        with self.assertRaisesRegex(ValueError, "TRUSTED_PROXY_CIDRS"):
+            Preflight(self.cluster).settings(self.cluster.docs)
+        self.cluster.docs[1]["data"]["TRUSTED_PROXY_CIDRS"] = "10.2.0.0/24"
+        Preflight(self.cluster).settings(self.cluster.docs)
+        self.assert_read_only()
+
+    def test_proxy_login_requires_explicit_trust(self):
+        preflight = Preflight(self.cluster)
+        preflight.settings(self.cluster.docs)  # Direct clients need no proxy trust.
+        self.cluster.docs.append(resource("Deployment", "hibana-console"))
+        settings = self.cluster.docs[1]["data"]
+        for value in ["", "0.0.0.0/0", "::/0", "10.2.0.1", "10.2.0.1/32,"]:
+            with self.subTest(value=value):
+                settings["TRUSTED_PROXY_CIDRS"] = value
+                with self.assertRaisesRegex(ValueError, "TRUSTED_PROXY_CIDRS"):
+                    preflight.settings(self.cluster.docs)
+        settings["TRUSTED_PROXY_CIDRS"] = "10.2.0.0/24, fd00::1/128"
+        preflight.settings(self.cluster.docs)
+        settings["TRUST_PROXY_HEADERS"] = "true"
+        with self.assertRaisesRegex(ValueError, "TRUST_PROXY_HEADERS"):
+            preflight.settings(self.cluster.docs)
+
     def settings_hash(self, docs=None):
         docs = deepcopy(docs or self.cluster.docs)
         stamp_runtime_settings(docs, [])
@@ -383,6 +437,18 @@ class PreflightTests(ClusterFixture):
         self.assertNotIn("private-malformed-credential", str(caught.exception))
         self.assert_read_only()
 
+    def test_redis_accepts_tcp_and_verified_tls_but_rejects_fragments(self):
+        settings = self.cluster.docs[3]["stringData"]
+        for scheme in ("redis", "rediss"):
+            settings["REDIS_URL"] = f"{scheme}://user:private-credential@redis.test:6379/0"
+            Preflight(self.cluster).settings(self.cluster.docs)
+        for suffix in ("#insecure", "#unknown"):
+            settings["REDIS_URL"] = "rediss://user:private-credential@redis.test:6379/0" + suffix
+            with self.assertRaisesRegex(ValueError, "REDIS_URL must be a valid") as caught:
+                Preflight(self.cluster).settings(self.cluster.docs)
+            self.assertNotIn("private-credential", str(caught.exception))
+        self.assert_read_only()
+
     def test_kubectl_render_and_apply_errors_do_not_print_secret_payloads(self):
         from common import KubernetesTarget
         target = KubernetesTarget()
@@ -398,6 +464,26 @@ class PreflightTests(ClusterFixture):
 
 
 class RemoteInstallTests(ClusterFixture):
+    def test_normal_update_checks_applications_and_records_failed_preparation(self):
+        self.output(self.cluster.install)
+        self.cluster.image = "registry.test/hibana:v2"
+        with patch.object(self.cluster, "verify_applications", side_effect=ValueError("not prepared")):
+            with self.assertRaisesRegex(ValueError, "not prepared"):
+                self.output(self.cluster.install)
+        record = self.cluster.record()["install"]
+        self.assertEqual(record["status"], "failed")
+        self.assertEqual(record["phase"], "application readiness")
+        self.assertNotIn("management API check", record["completed"])
+        with patch("existing.Maintenance") as maintenance:
+            with patch.object(self.cluster, "verify_applications", lambda: ExistingCluster.verify_applications(self.cluster)):
+                self.output(self.cluster.install)
+            maintenance.return_value.prepare.assert_called_once_with()
+            maintenance.return_value.close.assert_not_called()
+            maintenance.return_value.open.assert_not_called()
+        record = self.cluster.record()["install"]
+        self.assertEqual(record["status"], "complete")
+        self.assertIn("application readiness", record["completed"])
+
     def test_terminating_old_pod_keeps_old_network_access_until_it_exits(self):
         policy = self.network_update()
         old = {"metadata": {"name": "old-worker", "deletionTimestamp": "now"}, "status": {"phase": "Running"}}
@@ -759,25 +845,63 @@ class RemoteInstallTests(ClusterFixture):
         self.assertEqual([doc["kind"] for doc in mutations], ["Namespace"])
 
     def test_external_management_readiness_is_checked_before_success_guidance(self):
-        ingress = resource("Ingress", "hibana-management", spec={"tls": [{"hosts": ["api.test"]}], "rules": [{"host": "api.test", "http": {
-            "paths": [{"backend": {"service": {"name": "hibana-api"}}}]}}]})
-        with patch("existing.urllib.request.urlopen") as request:
-            request.return_value.__enter__.return_value.status = 200
-            request.return_value.__enter__.return_value.geturl.return_value = "https://api.test/readyz"
-            request.return_value.__enter__.return_value.read.return_value = b'{"db":"ok","store":"ok"}'
-            output = self.output(lambda: self.cluster.connection_guidance([ingress], verify=True))
-        request.assert_called_once_with("https://api.test/readyz", timeout=5)
-        self.assertIn("readiness verified", output)
-        self.assertIn("hibana login --profile onprem", output)
-        with patch("existing.urllib.request.urlopen", side_effect=OSError("certificate")), patch("existing.time.monotonic", side_effect=[0, 31]):
-            with self.assertRaisesRegex(ValueError, "Check DNS, TLS, Ingress"):
-                self.cluster.connection_guidance([ingress], verify=True)
-        with patch("existing.urllib.request.urlopen") as request, patch("existing.time.monotonic", side_effect=[0, 31]):
-            response = request.return_value.__enter__.return_value
-            response.status, response.geturl.return_value = 200, "https://api.test/readyz"
-            response.read.return_value = b'{"login":"please sign in"}'
-            with self.assertRaisesRegex(ValueError, "not reachable or ready"):
-                self.cluster.connection_guidance([ingress], verify=True)
+        for service, host, prefix in [("hibana-api", "api.test", ""), ("hibana-console", "console.test", "/api")]:
+            with self.subTest(service=service):
+                ingress = management_ingress(service, host)
+                url = "https://" + host + prefix
+                with patch("existing.urllib.request.urlopen", side_effect=ready_response) as request:
+                    output = self.output(lambda: self.cluster.connection_guidance([ingress], verify=True))
+                request.assert_called_once_with(url + "/readyz", timeout=5)
+                self.assertIn("readiness verified", output)
+                self.assertIn(f"hibana login --profile onprem --url {url} --tenant", output)
+                self.assertNotIn("port-forward", output)
+                with patch("existing.urllib.request.urlopen", side_effect=OSError("certificate")), patch("existing.time.monotonic", side_effect=[0, 31]):
+                    with self.assertRaisesRegex(ValueError, "Check DNS, TLS, Ingress"):
+                        self.cluster.connection_guidance([ingress], verify=True)
+                for returned_url, body in [(url + "/readyz", b'{"login":"please sign in"}'),
+                                           (url + "/readyz", b'<html>Sign in</html>'),
+                                           ("https://login.test/", b'{"db":"ok","store":"ok"}')]:
+                    with patch("existing.urllib.request.urlopen") as request, patch("existing.time.monotonic", side_effect=[0, 31]):
+                        response = request.return_value.__enter__.return_value
+                        response.status, response.geturl.return_value = 200, returned_url
+                        response.read.return_value = body
+                        with self.assertRaisesRegex(ValueError, "not reachable or ready"):
+                            self.cluster.connection_guidance([ingress], verify=True)
+
+    def test_both_management_endpoints_are_checked_once(self):
+        api = management_ingress("hibana-api", "api.test")
+        console = management_ingress("hibana-console", "console.test")
+        console["spec"]["rules"][0]["http"]["paths"].append({
+            "path": "/api", "pathType": "Prefix", "backend": {"service": {"name": "hibana-console", "port": {"number": 8080}}}})
+        with patch("existing.urllib.request.urlopen", side_effect=ready_response) as request:
+            output = self.output(lambda: self.cluster.connection_guidance([console, api], verify=True))
+        self.assertEqual([call.args[0] for call in request.call_args_list],
+                         ["https://api.test/readyz", "https://console.test/api/readyz"])
+        self.assertEqual(output.count("readiness verified"), 2)
+
+    def test_no_management_ingress_keeps_local_connection_guidance(self):
+        for docs in ([], [management_ingress("hibana-apps", "apps.test")]):
+            with self.subTest(docs=docs), patch("existing.urllib.request.urlopen") as request:
+                output = self.output(lambda: self.cluster.connection_guidance(docs, verify=True))
+            request.assert_not_called()
+            self.assertIn("port-forward service/hibana-api", output)
+            self.assertIn("--url http://127.0.0.1:18080", output)
+
+    def test_unreachable_console_fails_install_and_can_be_retried(self):
+        self.cluster.docs.append(management_ingress("hibana-console", "console.test"))
+        self.cluster.docs[1]["data"]["TRUSTED_PROXY_CIDRS"] = "10.2.0.0/24"
+        with patch("existing.urllib.request.urlopen", side_effect=OSError("unreachable")) as request, patch("existing.time") as clock:
+            clock.monotonic.side_effect = [0, 31]
+            with self.assertRaisesRegex(ValueError, "https://console.test/api"):
+                self.output(self.cluster.install)
+        request.assert_called_once_with("https://console.test/api/readyz", timeout=5)
+        record = self.cluster.record()["install"]
+        self.assertEqual((record["status"], record["phase"]), ("failed", "management API check"))
+        self.assertNotIn("management API check", record["completed"])
+        with patch("existing.urllib.request.urlopen", side_effect=ready_response):
+            output = self.output(self.cluster.install)
+        self.assertIn("Hibana installation complete", output)
+        self.assertEqual(self.cluster.record()["install"]["status"], "complete")
 
 
 if __name__ == "__main__":

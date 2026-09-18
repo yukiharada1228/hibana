@@ -104,7 +104,7 @@ impl Metrics {
             &registry,
             IntGauge::new(
                 "faas_reaper_tenants_last",
-                "Number of active tenants processed in the most recent reaper pass",
+                "Number of tenants, including suspended tenants, in the most recent reaper pass",
             ),
         );
 
@@ -124,7 +124,7 @@ impl Metrics {
             IntGaugeVec::new(
                 Opts::new(
                     "faas_secret_versions_by_kid",
-                    "Live secrets whose current generation is wrapped by each KEK kid",
+                    "Distinct Secret generations required by current Secrets or unfinished executions, by KEK kid",
                 ),
                 &["kid"],
             ),
@@ -150,6 +150,13 @@ impl Metrics {
     }
 
     pub fn observe_http(&self, method: &str, path: &str, status: u16, dur: std::time::Duration) {
+        // Extension methods are arbitrary client input, including on unauthenticated
+        // 405 responses. Keep both metric families bounded without rejecting them.
+        let method = match method {
+            "GET" | "HEAD" | "POST" | "PUT" | "DELETE" | "CONNECT" | "OPTIONS" | "TRACE"
+            | "PATCH" => method,
+            _ => "OTHER",
+        };
         self.http_request_duration_seconds
             .with_label_values(&[method, path])
             .observe(dur.as_secs_f64());
@@ -195,5 +202,50 @@ mod tests {
         let b = default_latency_buckets();
         assert!(!b.is_empty());
         assert!(b.windows(2).all(|w| w[0] < w[1]));
+    }
+
+    #[test]
+    fn arbitrary_methods_share_one_series_and_standard_methods_stay_distinct() {
+        let metrics = Metrics::init();
+        let standard = [
+            "GET", "HEAD", "POST", "PUT", "DELETE", "CONNECT", "OPTIONS", "TRACE", "PATCH",
+        ];
+        for method in standard {
+            metrics.observe_http(method, "/healthz", 200, std::time::Duration::ZERO);
+        }
+        for i in 0..40 {
+            metrics.observe_http(
+                &format!("CUSTOM{i}"),
+                "/healthz",
+                405,
+                std::time::Duration::ZERO,
+            );
+        }
+        // HTTP method names are case-sensitive; lowercase spellings are custom too.
+        metrics.observe_http("get", "/healthz", 405, std::time::Duration::ZERO);
+        let families = metrics.registry.gather();
+        for family in families.iter().filter(|family| {
+            matches!(
+                family.get_name(),
+                "faas_http_requests_total" | "faas_http_request_duration_seconds"
+            )
+        }) {
+            assert_eq!(family.get_metric().len(), standard.len() + 1);
+            for metric in family.get_metric() {
+                let method = metric
+                    .get_label()
+                    .iter()
+                    .find(|label| label.get_name() == "method")
+                    .unwrap()
+                    .get_value();
+                assert!(standard.contains(&method) || method == "OTHER");
+                let expected = if method == "OTHER" { 41 } else { 1 };
+                if family.get_name() == "faas_http_requests_total" {
+                    assert_eq!(metric.get_counter().get_value(), expected as f64);
+                } else {
+                    assert_eq!(metric.get_histogram().get_sample_count(), expected);
+                }
+            }
+        }
     }
 }

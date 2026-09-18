@@ -55,7 +55,7 @@ pub struct Config {
     pub login_lockout_window_secs: u64,
     pub reaper_interval_secs: u64,
     pub stuck_execution_deadline_secs: u64,
-    pub trust_proxy_headers: bool,
+    pub trusted_proxies: crate::client_ip::TrustedProxies,
 
     pub secrets_master_key: Redacted<String>,
     pub secrets_master_kid: String,
@@ -121,15 +121,28 @@ impl Config {
             );
         }
 
-        let endpoint = env_required("WORKER_HTTP_URL")?;
-        let url = reqwest::Url::parse(&endpoint)?;
-        anyhow::ensure!(
-            matches!(url.scheme(), "http" | "https") && url.host_str().is_some(),
-            "WORKER_HTTP_URL must be an HTTP(S) URL"
-        );
+        for (name, endpoint) in [
+            ("WORKER_HTTP_URL", Some(env_required("WORKER_HTTP_URL")?)),
+            (
+                "WORKER_PREPARATION_URL",
+                env_optional("WORKER_PREPARATION_URL"),
+            ),
+        ] {
+            if let Some(endpoint) = endpoint {
+                let url = reqwest::Url::parse(&endpoint)?;
+                anyhow::ensure!(
+                    matches!(url.scheme(), "http" | "https") && url.host_str().is_some(),
+                    "{name} must be an HTTP(S) URL"
+                );
+            }
+        }
         let database_url = env_required("DATABASE_URL")?;
         let migration_database_url =
             env_optional("MIGRATION_DATABASE_URL").unwrap_or_else(|| database_url.clone());
+        anyhow::ensure!(
+            !env_bool("TRUST_PROXY_HEADERS", false),
+            "TRUST_PROXY_HEADERS=true is no longer supported; configure TRUSTED_PROXY_CIDRS"
+        );
         let cfg = Self {
             database_url,
             migration_database_url,
@@ -170,7 +183,10 @@ impl Config {
                 "STUCK_EXECUTION_DEADLINE_SECS",
                 DEFAULT_STUCK_EXECUTION_DEADLINE_SECS,
             )?,
-            trust_proxy_headers: env_bool("TRUST_PROXY_HEADERS", false),
+            trusted_proxies: crate::client_ip::TrustedProxies::parse(&env_or(
+                "TRUSTED_PROXY_CIDRS",
+                "",
+            ))?,
 
             secrets_master_key: Redacted::new(secrets_master_key),
             secrets_master_kid: env_required("SECRETS_MASTER_KID")?,
@@ -222,7 +238,7 @@ impl Config {
                 threshold: self.login_lockout_threshold,
                 window_secs: self.login_lockout_window_secs,
             },
-            trust_proxy_headers: self.trust_proxy_headers,
+            trusted_proxies: self.trusted_proxies.clone(),
         }
     }
 }

@@ -3,12 +3,20 @@
 use crate::{db, dispatch, error::AppError, state::AppState};
 use axum::{extract::State, http::HeaderMap, Json};
 use futures::{stream, StreamExt};
-use hibana_database::prelude::*;
 use hibana_shared::{
     preparation::{Artifact, Claims, TOKEN_HEADER},
     FaasError,
 };
 use std::time::Duration;
+
+fn endpoint() -> Result<String, std::env::VarError> {
+    // Kubernetes preparation discovers cold Pods too; execution uses only ready
+    // Pods. A single endpoint remains sufficient outside Kubernetes.
+    match std::env::var("WORKER_PREPARATION_URL") {
+        Ok(value) if !value.trim().is_empty() => Ok(value),
+        _ => std::env::var("WORKER_HTTP_URL"),
+    }
+}
 
 pub(crate) async fn redeem(
     State(state): State<AppState>,
@@ -45,7 +53,7 @@ pub(crate) async fn prepare(
     storage_uri: &str,
     sha256: &str,
 ) -> Result<(), AppError> {
-    let Ok(endpoint) = std::env::var("WORKER_HTTP_URL") else {
+    let Ok(endpoint) = endpoint() else {
         // Management-only processes can store versions without an execution fleet.
         return Ok(());
     };
@@ -138,7 +146,7 @@ pub(crate) async fn prepare_active(
     state: &AppState,
     expected: &std::collections::BTreeSet<std::net::IpAddr>,
 ) -> Result<(), AppError> {
-    let endpoint = std::env::var("WORKER_HTTP_URL").map_err(|_| FaasError::Unavailable)?;
+    let endpoint = endpoint().map_err(|_| FaasError::Unavailable)?;
     let targets = dispatch::discover(&endpoint, "prepare")
         .await
         .map_err(|_| FaasError::Unavailable)?;
@@ -149,28 +157,18 @@ pub(crate) async fn prepare_active(
     if expected.is_empty() || &actual != expected || targets.len() != expected.len() {
         return Err(FaasError::Unavailable.into());
     }
-    let mut artifacts = Vec::new();
-    for tenant in db::list_active_tenant_ids(state.pool()).await? {
-        let tx = state.pool().begin().await?;
-        db::set_tenant_guc(&tx, &tenant).await?;
-        let rows = hibana_database::queries::active_versions(&tenant)
-            .select_only()
-            .columns([
-                component_versions::Column::StorageUri,
-                component_versions::Column::WasmSha256,
-            ])
-            .distinct()
-            .into_tuple::<(String, String)>()
-            .all(&tx)
-            .await?;
-        tx.commit().await?;
-        for row in rows {
-            artifacts.push((tenant.clone(), row.0, row.1));
-        }
-    }
+    let artifacts = hibana_database::queries::active_artifacts(state.pool()).await?;
     for check_only in [false, true] {
-        for (tenant, storage_uri, sha256) in &artifacts {
-            prepare_targets(state, tenant, storage_uri, sha256, &targets, check_only).await?;
+        for artifact in &artifacts {
+            prepare_targets(
+                state,
+                &artifact.tenant_id,
+                &artifact.storage_uri,
+                &artifact.sha256,
+                &targets,
+                check_only,
+            )
+            .await?;
         }
     }
     if dispatch::discover(&endpoint, "prepare")
@@ -188,6 +186,7 @@ pub(crate) async fn prepare_version(
     tenant: &str,
     version: &str,
 ) -> Result<crate::artifact_reservations::Reservation, AppError> {
+    use hibana_database::prelude::*;
     let tx = state.pool().begin().await?;
     db::set_tenant_guc(&tx, tenant).await?;
     let row = hibana_database::queries::live_versions(tenant)
@@ -211,31 +210,24 @@ pub(crate) async fn prepare_version(
 }
 
 async fn reconcile(state: &AppState) -> Result<(), AppError> {
-    for tenant in db::list_active_tenant_ids(state.pool()).await? {
-        let tx = state.pool().begin().await?;
-        db::set_tenant_guc(&tx, &tenant).await?;
-        let rows = hibana_database::queries::active_versions(&tenant)
-            .select_only()
-            .columns([
-                component_versions::Column::StorageUri,
-                component_versions::Column::WasmSha256,
-            ])
-            .distinct()
-            .into_tuple::<(String, String)>()
-            .all(&tx)
-            .await?;
-        tx.commit().await?;
-        for row in rows {
-            if prepare(state, &tenant, &row.0, &row.1).await.is_err() {
-                tracing::warn!("Active artifact preparation incomplete; will retry");
-            }
+    for artifact in hibana_database::queries::active_artifacts(state.pool()).await? {
+        if prepare(
+            state,
+            &artifact.tenant_id,
+            &artifact.storage_uri,
+            &artifact.sha256,
+        )
+        .await
+        .is_err()
+        {
+            tracing::warn!("Active artifact preparation incomplete; will retry");
         }
     }
     Ok(())
 }
 
 pub(crate) fn spawn(state: AppState) {
-    if std::env::var("WORKER_HTTP_URL").is_err() {
+    if endpoint().is_err() {
         return;
     }
     tokio::spawn(async move {

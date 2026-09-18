@@ -2,7 +2,7 @@
 use super::map_unique_violation;
 use crate::auth::{hash_token, Principal};
 use crate::authz::{require_admin_role, resolve_token_scopes};
-use crate::crypto::{generate_secret, hash_password};
+use crate::crypto::{generate_secret, hash_password_async};
 use crate::db;
 use crate::error::AppError;
 use crate::extract::JsonBody;
@@ -58,7 +58,10 @@ pub async fn create_user(
         return Err(FaasError::InvalidRequest("password must not be empty".into()).into());
     }
 
-    let password_hash = hash_password(&req.password)?;
+    let Some(permit) = state.reserve_password_work() else {
+        return Ok(crate::admission::RateLimited::password_capacity().into_response());
+    };
+    let password_hash = hash_password_async(permit, req.password).await?;
     let user_id = new_user_id();
 
     let tx = state.pool().begin().await?;
@@ -94,7 +97,8 @@ pub async fn create_user(
             email: req.email,
             role: req.role,
         }),
-    ))
+    )
+        .into_response())
 }
 
 // ---------------------------------------------------------------------------

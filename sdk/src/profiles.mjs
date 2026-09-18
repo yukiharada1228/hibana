@@ -9,6 +9,7 @@ import {
 import { homedir } from "node:os";
 import { join, resolve } from "node:path";
 import { randomUUID } from "node:crypto";
+import { setTimeout as sleep } from "node:timers/promises";
 
 export function profilesPath() {
   return join(
@@ -54,9 +55,9 @@ export function serverUrl(value) {
   return url.href.replace(/\/+$/, "");
 }
 
-export async function readProfiles() {
+export async function readProfiles(path = profilesPath()) {
   try {
-    const value = JSON.parse(await readFile(profilesPath(), "utf8"));
+    const value = JSON.parse(await readFile(path, "utf8"));
     if (
       !value ||
       !value.profiles ||
@@ -71,11 +72,7 @@ export async function readProfiles() {
   }
 }
 
-async function writeProfiles(value) {
-  const path = profilesPath();
-  const directory = resolve(path, "..");
-  await mkdir(directory, { recursive: true, mode: 0o700 });
-  await chmod(directory, 0o700);
+async function writeProfiles(path, value) {
   const temporary = `${path}.${randomUUID()}.tmp`;
   try {
     await writeFile(temporary, JSON.stringify(value, null, 2) + "\n", {
@@ -88,17 +85,49 @@ async function writeProfiles(value) {
   }
 }
 
+// Atomic rename protects readers; the lock also prevents concurrent commands
+// from overwriting each other's changes with an older snapshot.
+async function updateProfiles(change) {
+  const path = profilesPath();
+  const directory = resolve(path, "..");
+  await mkdir(directory, { recursive: true, mode: 0o700 });
+  await chmod(directory, 0o700);
+  const lock = `${path}.lock`;
+  const deadline = performance.now() + 5000;
+  for (;;) {
+    try {
+      await mkdir(lock, { mode: 0o700 });
+      break;
+    } catch (error) {
+      if (error.code !== "EEXIST") throw error;
+      if (performance.now() >= deadline)
+        throw new Error(
+          `Profiles are busy. Retry after other Hibana commands finish. If a command crashed, remove ${lock} only after confirming no profile command is running.`,
+        );
+      await sleep(25);
+    }
+  }
+  try {
+    const state = await readProfiles(path);
+    const result = change(state);
+    await writeProfiles(path, state);
+    return result;
+  } finally {
+    await rm(lock, { recursive: true, force: true });
+  }
+}
+
 export async function saveProfile(name, connection) {
   profileName(name);
-  const state = await readProfiles();
-  Object.defineProperty(state.profiles, name, {
-    value: connection,
-    enumerable: true,
-    configurable: true,
-    writable: true,
+  await updateProfiles((state) => {
+    Object.defineProperty(state.profiles, name, {
+      value: connection,
+      enumerable: true,
+      configurable: true,
+      writable: true,
+    });
+    state.current = name;
   });
-  state.current = name;
-  await writeProfiles(state);
 }
 
 export async function profileCommand([action, name, ...extra]) {
@@ -108,8 +137,8 @@ export async function profileCommand([action, name, ...extra]) {
     (action === "list" ? name !== undefined : !name)
   )
     throw new Error("Usage: hibana profile list | use NAME | remove NAME");
-  const state = await readProfiles();
   if (action === "list") {
+    const state = await readProfiles();
     for (const [key, value] of Object.entries(state.profiles))
       console.log(
         `${key === state.current ? "*" : " "} ${key}\t${value.url}\t${value.tenant || ""}\t${value.token ? "logged in" : "logged out"}`,
@@ -119,28 +148,29 @@ export async function profileCommand([action, name, ...extra]) {
     return;
   }
   profileName(name);
-  if (!Object.hasOwn(state.profiles, name))
-    throw new Error(`Unknown profile: ${name}`);
-  if (action === "use") state.current = name;
-  else {
-    delete state.profiles[name];
-    if (state.current === name) delete state.current;
-  }
-  await writeProfiles(state);
-  console.log(
-    action === "use"
+  const message = await updateProfiles((state) => {
+    if (!Object.hasOwn(state.profiles, name))
+      throw new Error(`Unknown profile: ${name}`);
+    if (action === "use") state.current = name;
+    else {
+      delete state.profiles[name];
+      if (state.current === name) delete state.current;
+    }
+    return action === "use"
       ? `Using ${name}: ${state.profiles[name].url}`
-      : `Removed profile ${name}`,
-  );
+      : `Removed profile ${name}`;
+  });
+  console.log(message);
 }
 
 export async function logout(options = {}) {
-  const state = await readProfiles();
-  const name = options.profile || process.env.HIBANA_PROFILE || state.current;
-  if (!name || !Object.hasOwn(state.profiles, name))
-    throw new Error("Select a saved profile with --profile NAME");
-  delete state.profiles[name].token;
-  await writeProfiles(state);
+  const name = await updateProfiles((state) => {
+    const name = options.profile || process.env.HIBANA_PROFILE || state.current;
+    if (!name || !Object.hasOwn(state.profiles, name))
+      throw new Error("Select a saved profile with --profile NAME");
+    delete state.profiles[name].token;
+    return name;
+  });
   console.log(`Logged out of ${name}. The locally saved token was removed.`);
 }
 

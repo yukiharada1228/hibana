@@ -1,5 +1,6 @@
 import {
   copyFile,
+  link,
   mkdir,
   mkdtemp,
   open,
@@ -8,6 +9,7 @@ import {
   rm,
   writeFile,
 } from "node:fs/promises";
+import { createHash } from "node:crypto";
 import { join, resolve } from "node:path";
 import { run } from "./process.mjs";
 import { resolveExtensions, prepareExtensionWit } from "./extensions.mjs";
@@ -92,15 +94,34 @@ export async function build(config, options = {}) {
       await checkComponent(composed);
       output = composed;
     }
-    await writeFile(
-      output,
-      withBuildMetadata(await readFile(output), extensions.metadata, {
+    const bytes = withBuildMetadata(
+      await readFile(output),
+      extensions.metadata,
+      {
         preserveExisting:
           !config.main && !extensionNames(config.extensions).length,
-      }),
+      },
     );
-    await rename(output, artifact);
-    return artifact;
+    await writeFile(output, bytes);
+    // Consumers keep an immutable snapshot across network awaits and other
+    // concurrent builds. app.wasm remains a convenient pointer to the latest build.
+    const snapshots = join(directory, "artifacts");
+    await mkdir(snapshots, { recursive: true });
+    const snapshot = join(
+      snapshots,
+      `${createHash("sha256").update(bytes).digest("hex")}.wasm`,
+    );
+    try {
+      // Publish a complete file atomically; identical concurrent builds reuse it.
+      await link(output, snapshot);
+    } catch (error) {
+      if (error.code !== "EEXIST") throw error;
+    }
+    // Do not hard-link the mutable convenience output to an immutable snapshot.
+    const latest = join(work, "latest.wasm");
+    await copyFile(output, latest);
+    await rename(latest, artifact);
+    return snapshot;
   } finally {
     await rm(work, { recursive: true, force: true });
   }

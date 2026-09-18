@@ -44,6 +44,10 @@ pub(crate) fn build_router(state: AppState) -> Router {
             "/components/{component_id}/versions/{version}",
             get(handlers::version_details::get),
         )
+        .route(
+            "/components/{component_id}/versions/by-id/{version_id}",
+            get(handlers::version_details::get_by_id),
+        )
         .route("/executions/{id}", get(handlers::executions::get_execution))
         .route(
             "/components/{component_id}/executions",
@@ -111,6 +115,10 @@ pub(crate) fn build_router(state: AppState) -> Router {
         .route(
             "/components/{component_id}/versions/{version}",
             delete(handlers::components::delete_version),
+        )
+        .route(
+            "/components/{component_id}/versions/by-id/{version_id}",
+            delete(handlers::components::delete_version_by_id),
         )
         .route(
             "/components/{component_id}/active-version",
@@ -250,6 +258,7 @@ pub(crate) fn build_router(state: AppState) -> Router {
 /// カーディナリティ対策として `path` は **MatchedPath**（ルートテンプレート）を使う。ルートに
 /// マッチしなかった（404 等）リクエストは 1 つの `<unmatched>` に畳んで、任意 URI による
 /// 系列の無限増殖を防ぐ。
+/// 任意の拡張メソッド名は observe_http 内で OTHER にまとめる。
 async fn http_metrics_middleware(
     axum::extract::State(state): axum::extract::State<AppState>,
     req: axum::extract::Request,

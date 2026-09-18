@@ -147,3 +147,18 @@ spec:
     - name: http
       port: 8084
       targetPort: 8084
+---
+# Preparation must reach cold Pods before readiness admits guest requests.
+apiVersion: v1
+kind: Service
+metadata:
+  name: hibana-worker-preparation
+spec:
+  clusterIP: None
+  publishNotReadyAddresses: true
+  selector:
+    app.kubernetes.io/name: hibana-worker
+  ports:
+    - name: http
+      port: 8084
+      targetPort: 8084

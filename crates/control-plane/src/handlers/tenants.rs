@@ -1,6 +1,6 @@
 //! Tenants management HTTP handlers.
 use super::map_unique_violation;
-use crate::crypto::hash_password;
+use crate::crypto::hash_password_async;
 use crate::db;
 use crate::error::AppError;
 use crate::extract::JsonBody;
@@ -21,7 +21,7 @@ use serde_json::{json, Value};
 
 #[derive(Debug, Deserialize)]
 pub struct CreateTenantRequest {
-    /// グローバル一意な人間可読 slug（subject-safe 化はしないが UNIQUE）。
+    /// グローバル一意な公開 URL の DNS ラベル。
     pub slug: String,
     pub name: String,
     /// 最初の admin ユーザの email（このテナント内）。
@@ -64,12 +64,21 @@ pub async fn create_tenant(
     if req.slug.trim().is_empty() || req.name.trim().is_empty() {
         return Err(FaasError::InvalidRequest("slug and name must not be empty".into()).into());
     }
+    let slug = req.slug.trim();
+    if !crate::public_apps::valid_label(slug) {
+        return Err(FaasError::InvalidRequest(
+            "slug must be 1-63 lowercase ASCII letters, digits or hyphens, with no leading or trailing hyphen".into(),
+        ).into());
+    }
     if req.admin_email.trim().is_empty() {
         return Err(FaasError::InvalidRequest("admin_email must not be empty".into()).into());
     }
     if req.admin_password.is_empty() {
         return Err(FaasError::InvalidRequest("admin_password must not be empty".into()).into());
     }
+    let Some(permit) = state.reserve_password_work() else {
+        return Ok(crate::admission::RateLimited::password_capacity().into_response());
+    };
 
     // テナント + 最初の admin ユーザを 1 トランザクションで作成（§9 bootstrap）。
     // M3b: bootstrap は Principal を持たない唯一の書き込み経路。users は FORCE RLS 下に
@@ -77,7 +86,7 @@ pub async fn create_tenant(
     // 呼ぶ（users INSERT の WITH CHECK を通すため。tenants には RLS は無い）。
     let tenant_id = new_tenant_id();
     let admin_user_id = new_user_id();
-    let admin_password_hash = hash_password(&req.admin_password)?;
+    let admin_password_hash = hash_password_async(permit, req.admin_password).await?;
     let tx = state.pool().begin().await.map_err(AppError::from)?;
     db::set_tenant_guc(&tx, &tenant_id)
         .await
@@ -85,7 +94,7 @@ pub async fn create_tenant(
     db::bootstrap_tenant(
         &tx,
         &tenant_id,
-        req.slug.trim(),
+        slug,
         req.name.trim(),
         &admin_user_id,
         req.admin_email.trim(),
@@ -102,23 +111,24 @@ pub async fn create_tenant(
         Some("bootstrap"),
         "tenant_created",
         Some(&tenant_id),
-        Some(&json!({ "slug": req.slug.trim(), "admin_user_id": admin_user_id })),
+        Some(&json!({ "slug": slug, "admin_user_id": admin_user_id })),
     )
     .await
     .map_err(AppError::from)?;
     tx.commit().await.map_err(AppError::from)?;
 
-    tracing::info!(tenant_id = %tenant_id, slug = %req.slug, admin_user_id = %admin_user_id, "tenant bootstrapped");
+    tracing::info!(tenant_id = %tenant_id, slug, admin_user_id = %admin_user_id, "tenant bootstrapped");
     Ok((
         StatusCode::CREATED,
         Json(CreateTenantResponse {
             tenant_id,
-            slug: req.slug,
+            slug: slug.to_owned(),
             name: req.name,
             admin_user_id,
             admin_email: req.admin_email,
         }),
-    ))
+    )
+        .into_response())
 }
 
 // ---------------------------------------------------------------------------
@@ -171,17 +181,17 @@ pub async fn set_tenant_status(
         );
     }
 
-    if !db::set_tenant_status(state.pool(), &tenant_id, status).await? {
+    // Apply the change and its audit together, under the target tenant's GUC.
+    let tx = state.pool().begin().await?;
+    db::set_tenant_guc(&tx, &tenant_id).await?;
+    if !db::set_tenant_status(&tx, &tenant_id, status).await? {
         return Err(FaasError::NotFound(format!("tenant '{tenant_id}'")).into());
     }
 
-    // 監査は当該テナント GUC 下で書く（audit_logs は FORCE RLS）。
-    let tx = state.pool().begin().await?;
-    db::set_tenant_guc(&tx, &tenant_id).await?;
     db::insert_audit_log(
         &tx,
         &tenant_id,
-        None,
+        Some("bootstrap"),
         "tenant_status_updated",
         Some(&tenant_id),
         Some(&json!({ "status": status })),
@@ -230,16 +240,16 @@ pub async fn set_tenant_quotas(
     }
     let quotas = Value::Object(obj);
 
-    if !db::set_tenant_quotas(state.pool(), &tenant_id, &quotas).await? {
+    let tx = state.pool().begin().await?;
+    db::set_tenant_guc(&tx, &tenant_id).await?;
+    if !db::set_tenant_quotas(&tx, &tenant_id, &quotas).await? {
         return Err(FaasError::NotFound(format!("tenant '{tenant_id}'")).into());
     }
 
-    let tx = state.pool().begin().await?;
-    db::set_tenant_guc(&tx, &tenant_id).await?;
     db::insert_audit_log(
         &tx,
         &tenant_id,
-        None,
+        Some("bootstrap"),
         "tenant_quotas_updated",
         Some(&tenant_id),
         Some(&quotas),

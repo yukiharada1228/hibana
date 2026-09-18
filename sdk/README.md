@@ -139,6 +139,8 @@ JS系は`main`を指定します。
 
 CLIはComponentのヘッダーを確認します。WITの一致や全体の検証はランタイム・配備先が行います。`GOOS=wasip1 GOARCH=wasm go build`だけで生成したcore Wasmをそのまま配備することはできません。
 
+完成した成果物は `.hibana/build/artifacts/<SHA-256>.wasm` に保存し、`build` がそのパスを返します。`deploy` と `dev` も同じ固定ファイルを使うため、並行ビルドで別のコードに置き換わりません。`.hibana/build/app.wasm` は最新ビルドのコピーです。同じ内容は再利用し、過去の成果物は保持します。実行中の `build`・`deploy`・`dev` がないときに `.hibana/build/` を削除するとキャッシュを整理できます。
+
 ## 開発・配備・Secrets
 
 `dev`は完成したComponentを`hibana-worker --dev-component`で動かします。`--runtime`、`HIBANA_RUNTIME_BIN`、CLIと同じバージョンの管理済みランタイム、PATHの順に選択します。見つからなければ、CLIと同じバージョンの対応OS/CPU版をGitHub Releasesから自動取得し、SHA-256を検証して保存します。次回以降は保存済みのランタイムを再利用します。
@@ -149,7 +151,9 @@ CLIはComponentのヘッダーを確認します。WITの一致や全体の検�
 
 外部 DB などへの通信は、管理者が初回配備後に `hibana egress allow db.example.com:5432` で許可します。`hibana egress list` で確認し、`hibana egress deny db.example.com:5432` で取り消します。アプリの全バージョンに共通で適用し、以後の `deploy` にも引き継ぎます。拡張や hibana.json は権限を自動付与しません。[コンソールでも同じ設定を操作](../docs/console.md#外部通信先の管理)できます。
 
-`hibana login --profile onprem --url https://api.example.internal --tenant team --email dev@example.internal`を実行し、`Password:` にパスワードを入力します（文字は非表示）。スクリプトでは末尾に `--password-stdin < password.txt` を付けます。`HIBANA_URL`・`HIBANA_TENANT`・`HIBANA_EMAIL`・`HIBANA_PASSWORD`でも設定できます。接続先と認証はPC共通のプロファイルに保存し、`--profile onprem`で選択できます。CIでは`HIBANA_TOKEN`を設定できます。配備先を変えた場合、保存済みの別サーバーのトークンは再利用しません。`deploy --version 1.0.0`で版を指定できます。省略時は一意な開発版を採番します。
+`hibana login --profile onprem --url https://api.example.internal --tenant team --email dev@example.internal`を実行し、`Password:` にパスワードを入力します（文字は非表示）。スクリプトでは末尾に `--password-stdin < password.txt` を付けます。`HIBANA_URL`・`HIBANA_TENANT`・`HIBANA_EMAIL`・`HIBANA_PASSWORD`でも設定できます。接続先と認証はPC共通のプロファイルに保存し、`--profile onprem`で選択できます。CIでは`HIBANA_TOKEN`を設定できます。配備先を変えた場合、保存済みの別サーバーのトークンは再利用しません。`deploy --version 1.0.0`で版を指定できます。名前は1〜128文字のASCII文字列で、先頭を英数字、残りを英数字または `.`・`_`・`+`・`-` にします。省略時は一意な開発版を採番します。
+
+プロファイルを変更するコマンドは、保存先の `profiles.json.lock` で同時更新を調整します。5秒待っても利用中ならエラーになります。コマンドの異常終了でロックが残った場合は、プロファイルを変更する Hibana コマンドが動いていないことを確認してから、エラーに表示されたロックディレクトリを削除して再実行してください。
 
 実行用Workerが設定された配備先では、`deploy`はWorkerでの事前コンパイルを待ってから公開します。初回HTTPへのコンパイル待ちを避けるため、その時間はデプロイ所要時間に含まれます。準備に失敗すると配備はエラーになり、旧版の公開設定を維持します。`rollback`も切替先を準備してから公開します。
 

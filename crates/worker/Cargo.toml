@@ -14,6 +14,7 @@ hibana-database = { workspace = true }
 sea-orm = { workspace = true }
 
 tokio = { workspace = true }
+tokio-util = { version = "0.7", features = ["rt"] }
 
 futures = "0.3"
 

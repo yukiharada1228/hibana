@@ -1,6 +1,15 @@
 import { readFile } from "node:fs/promises";
 
 import { connection, saveProfile } from "./profiles.mjs";
+import { validateVersionName } from "./version-name.mjs";
+
+export class ApiError extends Error {
+  constructor(method, path, status) {
+    super(`${method} ${path}: HTTP ${status}`);
+    this.name = "ApiError";
+    this.status = status;
+  }
+}
 
 export async function apiClient(options = {}) {
   const { token: savedToken, ...selected } = await connection(options);
@@ -33,8 +42,7 @@ export async function apiClient(options = {}) {
       result = {};
     }
     // Error bodies can contain user values; do not copy them into terminal/CI logs.
-    if (!response.ok)
-      throw new Error(`${method} ${path}: HTTP ${response.status}`);
+    if (!response.ok) throw new ApiError(method, path, response.status);
     return result;
   }
   return {
@@ -71,12 +79,22 @@ export async function findComponent(api, name) {
 }
 
 export async function deploy(api, config, artifact, version) {
+  validateVersionName(version);
   let component = await findComponent(api, config.name);
-  if (!component)
-    component = await api.request("/components", {
-      method: "POST",
-      body: { name: config.name },
-    });
+  if (!component) {
+    try {
+      component = await api.request("/components", {
+        method: "POST",
+        body: { name: config.name },
+      });
+    } catch (error) {
+      if (!(error instanceof ApiError) || error.status !== 409) throw error;
+      // Another first deploy may have created this application after our read.
+      // Reuse it once; neither creation nor version uploads are retried.
+      component = await findComponent(api, config.name);
+      if (!component) throw error;
+    }
+  }
   const id = component.component_id || component.id;
   const base = `/components/${encodeURIComponent(id)}`;
   const form = new FormData();

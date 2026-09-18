@@ -86,14 +86,43 @@ fn preparing_memory_images_does_not_execute_guest_start() {
     PreparedComponent::new(component).unwrap();
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn shared_runtime_ticker_interrupts_a_cpu_bound_guest() {
+#[tokio::test]
+async fn expired_preparation_deadline_prevents_guest_instantiation() {
+    let engine = build_engine().unwrap();
+    let runtime = Runtime::new(engine.clone(), crate::metrics::Metrics::init()).unwrap();
+    // Deliberately not an HTTP proxy: trying to instantiate it would return Failed.
+    let component =
+        PreparedComponent::new(Component::new(&engine, "(component)").unwrap()).unwrap();
+    let (stream, _response, _completed) = response_channel();
+    let result = runtime
+        .run_http(
+            Invocation {
+                component: Arc::new(component),
+                request: HttpRequest::default(),
+                limits: ResourceLimits::default(),
+                built_env: env::build_env(
+                    &Default::default(),
+                    &Default::default(),
+                    &Default::default(),
+                )
+                .unwrap(),
+                approved_egress: Default::default(),
+                deadline: Instant::now() - Duration::from_secs(1),
+            },
+            stream,
+        )
+        .await;
+    assert!(matches!(result, Err(ExecError::Timeout)));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+async fn cpu_bound_guest_yields_to_other_tasks_and_still_times_out() {
     let engine = build_engine().unwrap();
     let runtime = Runtime::new(engine.clone(), crate::metrics::Metrics::init()).unwrap();
     let module = Module::new(&engine, "(module (func (export \"run\") (loop br 0)))").unwrap();
     let mut store = Store::new(&engine, ());
     store.set_fuel(u64::MAX).unwrap();
-    install_epoch_deadline(&mut store, Instant::now() + Duration::from_millis(20));
+    install_epoch_deadline(&mut store, Instant::now() + Duration::from_millis(200));
     let instance = wasmtime::Instance::new_async(&mut store, &module, &[])
         .await
         .unwrap();
@@ -108,12 +137,25 @@ async fn shared_runtime_ticker_interrupts_a_cpu_bound_guest() {
         }
     });
     let started = Instant::now();
-    let error = run.call_async(&mut store, ()).await.unwrap_err();
+    let heartbeat = tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        started.elapsed()
+    });
+    // Fleet execution is a spawned task, not the outer block_on future. In a
+    // one-thread pool, direct self-wakes can starve the timer/I/O driver too.
+    let error = tokio::spawn(async move { run.call_async(&mut store, ()).await.unwrap_err() })
+        .await
+        .unwrap();
     let elapsed = started.elapsed();
     let _ = finished.send(());
     fallback.join().unwrap();
+    let heartbeat_elapsed = heartbeat.await.unwrap();
     drop(runtime);
     assert!(is_interrupt_trap(&error));
+    assert!(
+        heartbeat_elapsed < Duration::from_millis(150),
+        "CPU-bound Wasm starved the executor: {heartbeat_elapsed:?}"
+    );
     assert!(
         elapsed < Duration::from_secs(1),
         "shared ticker failed: {elapsed:?}"

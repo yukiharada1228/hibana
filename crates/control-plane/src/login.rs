@@ -20,6 +20,7 @@
 //! 経由する argon2 verify を踏まないため、そのままだとロックアウト 401 のほうが速くなる
 //! （タイミングオラクル）。これを防ぐため、ロックアウトで return する前に必ずダミー
 //! `verify_password` を 1 回走らせ、両 401 経路の所要時間を揃える。
+//! 照合枠が満杯ならアカウント照会前に 429 を返す。受理した照合は blocking タスクで行う。
 use sea_orm::TransactionTrait as _;
 
 use std::net::SocketAddr;
@@ -35,7 +36,7 @@ use hibana_shared::{new_token_id, FaasError, Scope};
 
 use crate::auth::hash_token;
 use crate::authz::resolve_login_scopes;
-use crate::crypto::{generate_secret, verify_password};
+use crate::crypto::{generate_secret, verify_password_async};
 use crate::db;
 use crate::error::AppError;
 use crate::extract::JsonBody;
@@ -75,16 +76,21 @@ pub struct LoginResponse {
 ///
 /// `ConnectInfo<SocketAddr>` は main.rs の `into_make_service_with_connect_info` で有効化される
 /// 接続元アドレス。ロックアウトの IP 鍵に使う（信頼境界外の詐称を防ぐため、既定では
-/// X-Forwarded-For を信頼しない —— `TRUST_PROXY_HEADERS=true` で明示オプトイン）。
+/// X-Forwarded-For は `TRUSTED_PROXY_CIDRS` に含まれるプロキシのみ信頼する）。
 pub async fn login(
     State(state): State<AppState>,
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
     JsonBody(req): JsonBody<LoginRequest>,
 ) -> Result<impl IntoResponse, AppError> {
+    // Capacity rejection is independent of account existence and lockout state.
+    // Never enqueue arbitrary numbers of expensive unauthenticated checks.
+    let Some(permit) = state.reserve_password_work() else {
+        return Ok(crate::admission::RateLimited::login_capacity().into_response());
+    };
     // ロックアウトの 2 鍵を組み立てる（§6.0）: (tenant_slug, email) と クライアント IP。
     let id_key = format!("{}\u{0}{}", req.tenant_slug, req.email);
-    let client_ip = client_ip(&headers, peer, state.admission().trust_proxy_headers);
+    let client_ip = state.admission().trusted_proxies.client_ip(&headers, peer);
     let ip_key = format!("ip:{client_ip}");
     let lockout_params = state.admission().lockout;
 
@@ -95,7 +101,8 @@ pub async fn login(
     if is_locked_out(id_locked, ip_locked) {
         // TIMING-ORACLE 不変条件 (MUST): 資格情報失敗 401 と所要時間を揃えるため、ここで
         // return する前に必ずダミー verify を 1 回走らせる（argon2 のコストを両経路に課す）。
-        let _ = verify_password(&req.password, state.dummy_password_hash());
+        let _ = verify_password_async(permit, req.password, state.dummy_password_hash().to_owned())
+            .await?;
         // §3.7: ロックアウト発火を監査する。テナントが解決できる場合のみ（audit_logs は
         // FORCE RLS + tenant_id FK のため、紐づけられる tenant_id が要る）。生パスワードは載せない。
         if let Ok(Some(tid)) = db::find_tenant_id_by_slug(state.pool(), &req.tenant_slug).await {
@@ -127,17 +134,12 @@ pub async fn login(
     };
 
     // (3) argon2 verify。no-user パスでも必ず固定ダミーで verify を実行する。
-    let (verified, resolved) = match &user {
-        Some(u) => {
-            let ok = verify_password(&req.password, &u.password_hash);
-            (ok, Some(u))
-        }
-        None => {
-            // ダミー verify（結果は捨てる）。応答時間を存在ありパスと揃える。
-            let _ = verify_password(&req.password, state.dummy_password_hash());
-            (false, None)
-        }
-    };
+    let password_hash = user
+        .as_ref()
+        .map(|u| u.password_hash.as_str())
+        .unwrap_or_else(|| state.dummy_password_hash());
+    let verified = verify_password_async(permit, req.password, password_hash.to_owned()).await?
+        && user.is_some();
 
     if !verified {
         // 失敗を **両鍵** に記録する（§6.0）。fail-closed クラスだが record 失敗で 401 応答を
@@ -170,7 +172,7 @@ pub async fn login(
         return Err(FaasError::Unauthorized.into());
     }
 
-    let user = resolved.expect("verified implies user present");
+    let user = user.expect("verified implies user present");
     // verified=true は user=Some を含意し、user=Some は tenant_id=Some を含意する。
     let tenant_id = tenant_id.expect("verified implies tenant resolved");
     let role = db::parse_role(Some(&user.role)).ok_or(FaasError::Unauthorized)?;
@@ -226,7 +228,8 @@ pub async fn login(
             scopes,
             expires_at: expires_at.to_rfc3339(),
         }),
-    ))
+    )
+        .into_response())
 }
 
 /// 失敗パス用の best-effort audit 追記（§3.7）。
@@ -313,39 +316,12 @@ async fn clear_failures(state: &AppState, key: &str) {
     }
 }
 
-/// クライアント IP を解決する（§6.0）。
-///
-/// 既定では接続元 `SocketAddr`（`ConnectInfo`）の IP を使う。`trust_proxy`（env
-/// `TRUST_PROXY_HEADERS`、既定 false）が真のときに限り `X-Forwarded-For` の **先頭** エントリ
-/// を信頼する。プロキシ信頼を明示オプトインにするのは、信頼境界外で X-Forwarded-For を
-/// 信じると攻撃者が IP を詐称してロックアウトを回避（毎回別 IP を名乗る）したり、他者を
-/// ロックアウト（被害者 IP を名乗って失敗を積む）できてしまうため（fail-safe な既定）。
-///
-/// 純関数（DB/ストア非依存）にしてユニットテストする。
-fn client_ip(headers: &HeaderMap, peer: SocketAddr, trust_proxy: bool) -> String {
-    if trust_proxy {
-        if let Some(xff) = headers.get("x-forwarded-for").and_then(|v| v.to_str().ok()) {
-            // X-Forwarded-For: client, proxy1, proxy2 ... 先頭が originating client。
-            if let Some(first) = xff.split(',').next() {
-                let ip = first.trim();
-                if !ip.is_empty() {
-                    return ip.to_string();
-                }
-            }
-        }
-    }
-    // ポートは鍵に含めない（同一 IP の別ポートを別 client 扱いしない）。
-    peer.ip().to_string()
-}
-
 #[cfg(test)]
 mod tests {
-    use super::{client_ip, is_locked_out, LockoutCheck};
+    use super::{is_locked_out, LockoutCheck};
     use crate::authz::resolve_login_scopes;
     use crate::crypto::{dummy_password_hash, verify_password};
-    use axum::http::HeaderMap;
     use hibana_shared::{Role, Scope};
-    use std::net::SocketAddr;
 
     /// uniform-failure: ダミーハッシュ verify は決して成功しない（no-user パスで
     /// 実行しても認証が通ることはない）。
@@ -389,44 +365,5 @@ mod tests {
             LockoutCheck::Unavailable,
             LockoutCheck::Unavailable
         ));
-    }
-
-    // ---- M3d ロックアウト: クライアント IP 抽出 (§6.0) -------------------------
-
-    fn peer(s: &str) -> SocketAddr {
-        s.parse().unwrap()
-    }
-
-    /// 既定（trust_proxy=false）は接続元 SocketAddr の IP を使い、ポートは含めない。
-    #[test]
-    fn client_ip_uses_peer_when_proxy_untrusted() {
-        let mut h = HeaderMap::new();
-        h.insert("x-forwarded-for", "1.2.3.4".parse().unwrap());
-        // 信頼しない → XFF は無視して接続元を使う（詐称防止）。
-        assert_eq!(
-            client_ip(&h, peer("203.0.113.9:55555"), false),
-            "203.0.113.9"
-        );
-    }
-
-    /// trust_proxy=true のとき X-Forwarded-For の先頭エントリ（originating client）を使う。
-    #[test]
-    fn client_ip_uses_xff_first_when_trusted() {
-        let mut h = HeaderMap::new();
-        h.insert(
-            "x-forwarded-for",
-            "9.9.9.9, 10.0.0.1, 10.0.0.2".parse().unwrap(),
-        );
-        assert_eq!(client_ip(&h, peer("203.0.113.9:55555"), true), "9.9.9.9");
-    }
-
-    /// trust_proxy=true でも XFF が無ければ接続元へフォールバックする。
-    #[test]
-    fn client_ip_falls_back_to_peer_without_xff() {
-        let h = HeaderMap::new();
-        assert_eq!(
-            client_ip(&h, peer("198.51.100.7:40000"), true),
-            "198.51.100.7"
-        );
     }
 }

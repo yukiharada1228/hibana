@@ -1,3 +1,4 @@
+import { isApplicationName } from "./application-name.mjs";
 import { readFile } from "node:fs/promises";
 import { resolve, dirname, isAbsolute } from "node:path";
 import { validateExtensionList } from "./extension-manifest.mjs";
@@ -42,7 +43,7 @@ export async function loadConfig(file = "hibana.json") {
   for (const key of Object.keys(value))
     if (!supported.has(key))
       throw new Error(`Unsupported hibana.json field: ${key}`);
-  if (!/^[a-z](?:[a-z0-9-]{0,61}[a-z0-9])?$/.test(value.name || ""))
+  if (!isApplicationName(value.name))
     throw new Error("name must be a lowercase DNS label (1..63 characters)");
   if ((value.main !== undefined) === (value.component !== undefined))
     throw new Error(

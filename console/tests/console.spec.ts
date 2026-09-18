@@ -20,6 +20,62 @@ test.beforeEach(async ({ request }) => {
   await request.post("/api/__test/reset", { data: {} });
 });
 
+test("execution history keeps its page across polling, focus and manual refresh", async ({
+  page,
+}) => {
+  await page.clock.install();
+  await login(page, "reader@example.internal");
+  await page.getByRole("link", { name: "hello-api", exact: true }).click();
+  await page.getByRole("tab", { name: "実行履歴", exact: true }).click();
+  await page.getByRole("button", { name: "次の20件", exact: true }).click();
+  const errors = page.getByText("Execution deadline exceeded", {
+    exact: false,
+  });
+  await expect(errors).toHaveCount(1);
+  const queries: URL[] = [];
+  page.on("request", (request) => {
+    if (request.url().includes("/executions?"))
+      queries.push(new URL(request.url()));
+  });
+  const refreshes = [
+    () => page.clock.fastForward(31_000),
+    () => page.evaluate(() => window.dispatchEvent(new Event("focus"))),
+    () => page.getByRole("button", { name: "更新", exact: true }).click(),
+  ];
+  for (const refresh of refreshes) {
+    queries.length = 0;
+    const response = page.waitForResponse((response) =>
+      response.url().includes("/executions?"),
+    );
+    await refresh();
+    await response;
+    await expect(errors).toHaveCount(1);
+    await expect(
+      page.getByRole("button", { name: "最新に戻る", exact: true }),
+    ).toBeEnabled();
+    expect(queries.length).toBeGreaterThan(0);
+    expect(queries.every((url) => url.searchParams.has("before"))).toBe(true);
+  }
+  await page
+    .getByRole("checkbox", { name: "失敗・タイムアウトのみ" })
+    .uncheck();
+  await expect(errors).toHaveCount(20);
+  await expect(
+    page.getByRole("button", { name: "最新に戻る", exact: true }),
+  ).toBeDisabled();
+  await page.getByRole("button", { name: "次の20件", exact: true }).click();
+  await expect(errors).toHaveCount(1);
+  await page
+    .getByRole("link", { name: "← アプリケーション", exact: true })
+    .click();
+  await page.getByRole("link", { name: "docs-preview", exact: true }).click();
+  await page.getByRole("tab", { name: "実行履歴", exact: true }).click();
+  await expect(errors).toHaveCount(20);
+  await expect(
+    page.getByRole("button", { name: "最新に戻る", exact: true }),
+  ).toBeDisabled();
+});
+
 test("administrator manages shared egress with persistence, revocation and visible errors", async ({
   page,
 }, info) => {
@@ -183,7 +239,7 @@ test("extension details fail visibly and do not display another version's metada
 }) => {
   await login(page);
   await page.getByRole("link", { name: "hello-api", exact: true }).click();
-  await page.route("**/components/cmp_api/versions/2.0.0", (route) =>
+  await page.route("**/components/cmp_api/versions/by-id/ver_2", (route) =>
     route.fulfill({ status: 503, json: {} }),
   );
   await page.getByRole("tab", { name: "拡張", exact: true }).click();
@@ -193,13 +249,16 @@ test("extension details fail visibly and do not display another version's metada
   await expect(
     page.getByText("指定された拡張はありません。", { exact: true }),
   ).toHaveCount(0);
-  await page.unroute("**/components/cmp_api/versions/2.0.0");
-  await page.route("**/components/cmp_api/versions/2.0.0", async (route) => {
-    const response = await route.fetch();
-    await route.fulfill({
-      json: { ...(await response.json()), version_id: "wrong-version" },
-    });
-  });
+  await page.unroute("**/components/cmp_api/versions/by-id/ver_2");
+  await page.route(
+    "**/components/cmp_api/versions/by-id/ver_2",
+    async (route) => {
+      const response = await route.fetch();
+      await route.fulfill({
+        json: { ...(await response.json()), version_id: "wrong-version" },
+      });
+    },
+  );
   await page.getByRole("button", { name: "更新", exact: true }).click();
   await expect(page.getByRole("alert")).toContainText(
     "バージョンの情報が一致しません",
@@ -235,9 +294,9 @@ test("Read users can inspect shared egress and failed policy reads do not imply 
   await expect(
     page.getByText("shared.example.internal:443", { exact: true }),
   ).toBeVisible();
-  await expect(page.getByRole("tab", { name: "設定", exact: true })).toHaveCount(
-    0,
-  );
+  await expect(
+    page.getByRole("tab", { name: "設定", exact: true }),
+  ).toHaveCount(0);
   await expect(
     page.getByRole("button", { name: "通信先の設定を開く", exact: true }),
   ).toHaveCount(0);
@@ -436,9 +495,14 @@ test("CLI guide is available while the initial application list is pending or fa
     await page.goto("/#deploy");
     await page.getByLabel("テナント", { exact: true }).fill("team");
     await page.getByLabel("メールアドレス").fill("developer@example.internal");
-    await page.getByLabel("パスワード", { exact: true }).fill("fixture-password");
+    await page
+      .getByLabel("パスワード", { exact: true })
+      .fill("fixture-password");
     await page.getByRole("button", { name: "ログイン", exact: true }).click();
-    const guide = page.getByRole("heading", { name: "CLI の接続", exact: true });
+    const guide = page.getByRole("heading", {
+      name: "CLI の接続",
+      exact: true,
+    });
     await expect(guide).toBeVisible();
     await expect(page.locator("pre").first()).toContainText("--tenant 'team'");
     await expect(page.locator("pre").last()).toHaveText("hibana deploy");
@@ -460,7 +524,9 @@ test("CLI guide is available while the initial application list is pending or fa
     });
 
     await page.unroute("**/api/components");
-    await page.getByRole("link", { name: "アプリケーション", exact: true }).click();
+    await page
+      .getByRole("link", { name: "アプリケーション", exact: true })
+      .click();
     await page.getByRole("button", { name: "更新", exact: true }).click();
     await expect(
       page.getByRole("link", { name: "hello-api", exact: true }),
@@ -682,7 +748,7 @@ test("version deletion protects live versions, confirms the full identifier and 
     "バージョン 自動 d26b94ca を削除しました",
   );
   expect(deletes).toEqual([
-    `http://127.0.0.1:4173/api/components/cmp_api/versions/${version}`,
+    `http://127.0.0.1:4173/api/components/cmp_api/versions/by-id/ver_old`,
   ]);
   await expect(current).toContainText("現在のバージョン");
   await expect(
@@ -772,7 +838,7 @@ test("a failed deletion keeps the version and can be retried", async ({
   await login(page);
   await page.getByRole("link", { name: "hello-api", exact: true }).click();
   const version = "0.0.0-dev.1789484656916.d26b94ca";
-  const path = `**/components/cmp_api/versions/${version}`;
+  const path = `**/components/cmp_api/versions/by-id/ver_old`;
   await page.route(path, (route) => route.fulfill({ status: 503, json: {} }));
   const old = page.getByRole("row").filter({ hasText: version });
   await old.getByRole("button", { name: "削除", exact: true }).click();
@@ -787,3 +853,41 @@ test("a failed deletion keeps the version and can be retried", async ({
   await expect(dialog).toHaveCount(0);
   await expect(old).toHaveCount(0);
 });
+
+for (const name of [".", ".."]) {
+  test(`legacy version ${name} can be inspected and deleted by ID`, async ({
+    page,
+    request,
+  }) => {
+    await request.post("/api/__test/version-name", {
+      data: { id: "ver_old", name },
+    });
+    await login(page);
+    await page.getByRole("link", { name: "hello-api", exact: true }).click();
+    await page.getByRole("tab", { name: "拡張", exact: true }).click();
+    const details = page.waitForResponse(
+      (response) =>
+        response.url().endsWith("/versions/by-id/ver_old") &&
+        response.request().method() === "GET",
+    );
+    await page.getByLabel("確認するバージョン").selectOption(name);
+    expect((await details).status()).toBe(200);
+    await expect(page.getByText(/構成情報が未記録です/)).toBeVisible();
+    await page.getByRole("tab", { name: "バージョン", exact: true }).click();
+    const row = page
+      .getByRole("row")
+      .filter({ has: page.getByText(name, { exact: true }) });
+    await row.getByRole("button", { name: "削除", exact: true }).click();
+    const deleted = page.waitForResponse(
+      (response) =>
+        response.request().method() === "DELETE" &&
+        response.url().endsWith("/versions/by-id/ver_old"),
+    );
+    await page
+      .getByRole("dialog")
+      .getByRole("button", { name: "削除する", exact: true })
+      .click();
+    expect((await deleted).status()).toBe(204);
+    await expect(row).toHaveCount(0);
+  });
+}

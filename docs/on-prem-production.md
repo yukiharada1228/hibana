@@ -9,12 +9,16 @@ Kubernetesの上にHibanaを置く構成は、Workerの複数配置・ローリ�
 
 - 複数の物理ノード/障害ドメイン、CNIによるNetworkPolicy強制、Ingress、DNSとTLS。管理APIとアプリ公開口を分離する。
 - PostgreSQLの永続化・レプリケーション・フェイルオーバー・バックアップ/PITR。マイグレーション専用ロールとRLS適用ランタイムロールを分離する。
-- Redisは現在の接続方式に合うHAエンドポイントを用意する（Sentinel自動検出を実装済みとはしない）。
+- Redisは`redis://`またはTLSの`rediss://`で接続できるHAエンドポイントを用意する（Sentinel自動検出を実装済みとはしない）。
 - Wasm保存先のS3互換ストレージの冗長化・バックアップ。署名鍵・Secrets暗号鍵・DB認証情報の保管、ローテーションと復元手順。
 - Worker用ノードプール、非root・read-only rootfs・seccomp。信頼できないテナントを実行する場合は、検証済みVMベースRuntimeClassなどの追加隔離を導入する。
 - Prometheus/ログ/OTelの収集、SLO・アラート・容量上限、障害復旧・キー喪失・ノード停止・ネットワーク分断の訓練。
 
 `deploy/kubernetes/base`はCP/Worker各2 Pod、PDB、配置分散、リソース制限、段階更新、ネットワーク分離の土台です。`hardened`は管理者が用意する`hibana-sandbox` RuntimeClassを要求します。`persistent-dependencies`は開発依存サービスをPVC化するだけでHA構成ではありません。
+
+RedisのTLS接続はControl Planeの`REDIS_URL`に`rediss://ユーザー:パスワード@ホスト:ポート/DB番号`を設定します。Rustlsで証明書の信頼チェーンとホスト名を検証します。通常はコンテナのシステムCAを使い、社内CAの場合はPEM形式のCA証明書バンドルをPodへ読み取り専用でマウントし、Control Planeの`SSL_CERT_FILE`にそのパスを指定してください。既存Kubernetesの導入時のRedis疎通確認もPod内の同じ設定を使います。これは基盤用Redisの設定で、アプリの拡張や`hibana.json`への追加は不要です。
+
+`SSL_CERT_FILE`を指定するとシステムCAの代わりにそのバンドルを使うため、必要な信頼ルートをまとめてください。証明書検証を無効にする`#insecure`はサポートしません。`bash scripts/test-redis-tls.sh`で、使い捨てRedisへのTCP/TLS接続と、不明なCA・ホスト名不一致の拒否、導入時の疎通確認を検証できます。
 
 Workerの過負荷拒否、メモリ予約、コンパイル同時数と任意のHPAは[スケール設定](scaling.md)を参照してください。Podの増加はDB接続・コンパイル負荷も増やします。CPUだけではI/O待ちの飽和を検出できないため、実アプリの負荷に合う指標・最大Pod数・DB接続予算を測定して決めます。
 

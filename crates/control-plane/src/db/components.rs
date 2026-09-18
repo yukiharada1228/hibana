@@ -383,11 +383,26 @@ pub struct VersionDetails {
     pub capabilities: Value,
 }
 
+/// Explicit selectors keep legacy names distinct from immutable version IDs.
+pub enum VersionRef<'a> {
+    Name(&'a str),
+    Id(&'a str),
+}
+
+impl VersionRef<'_> {
+    fn condition(self) -> sea_orm::sea_query::SimpleExpr {
+        match self {
+            Self::Name(value) => component_versions::Column::Version.eq(value),
+            Self::Id(value) => component_versions::Column::Id.eq(value),
+        }
+    }
+}
+
 pub async fn version_details(
     executor: &impl ConnectionTrait,
     tenant_id: &str,
     component_id: &str,
-    version: &str,
+    version: VersionRef<'_>,
 ) -> Result<Option<VersionDetails>, DbErr> {
     component_versions::Entity::find()
         .select_only()
@@ -399,7 +414,7 @@ pub async fn version_details(
         ])
         .filter(component_versions::Column::TenantId.eq(tenant_id))
         .filter(component_versions::Column::ComponentId.eq(component_id))
-        .filter(component_versions::Column::Version.eq(version))
+        .filter(version.condition())
         .filter(component_versions::Column::DeletedAt.is_null())
         .into_model::<VersionDetails>()
         .one(executor)
@@ -434,12 +449,21 @@ pub async fn find_version_id(
     component_id: &str,
     version: &str,
 ) -> Result<Option<String>, DbErr> {
+    resolve_version_id(executor, tenant_id, component_id, VersionRef::Name(version)).await
+}
+
+pub async fn resolve_version_id(
+    executor: &impl ConnectionTrait,
+    tenant_id: &str,
+    component_id: &str,
+    version: VersionRef<'_>,
+) -> Result<Option<String>, DbErr> {
     component_versions::Entity::find()
         .select_only()
         .column(component_versions::Column::Id)
         .filter(component_versions::Column::TenantId.eq(tenant_id))
         .filter(component_versions::Column::ComponentId.eq(component_id))
-        .filter(component_versions::Column::Version.eq(version))
+        .filter(version.condition())
         .filter(component_versions::Column::DeletedAt.is_null())
         .into_tuple::<String>()
         .one(executor)
