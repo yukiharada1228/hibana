@@ -211,7 +211,7 @@ jobs:
           version=$(node scripts/release.mjs version)
           dist_tag=latest
           if [[ "$version" == *-* ]]; then dist_tag=next; fi
-          npm publish "dist/hibana-cli-$version.tgz" --access public --tag "$dist_tag" --provenance
+          npm publish "./dist/hibana-cli-$version.tgz" --access public --tag "$dist_tag" --provenance
       - name: Verify npx against the public registry
         run: |
           version=$(node scripts/release.mjs version)
