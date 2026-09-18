@@ -6,6 +6,8 @@ CLI・PC用Wasmtimeランタイム・Control Plane・Workerを`0.2.0-rc.2`に揃
 
 ## 含まれる変更
 
+- Hono・JavaScriptプロジェクトで作成時のCLIバージョンを固定し、`npm run dev`・`build`・`deploy`からプロジェクト内のCLIを実行。
+- `dev.allow_outbound`でローカル開発時の接続先を明示。接続先の検証・DNSの固定・内部IPの拒否を適用し、配備先の通信許可とは独立して管理。
 - 単独CLIによるサイト設定生成、実際のKubernetes dry-run、導入段階の記録と修復。
 - 受付を閉じた後の処理完了待ち、停止・再開・撤去、複数CLIの操作競合防止。
 - 初回起動前のNetworkPolicy、更新中の旧Podの通信維持、最終ポリシー適用後の全Podの依存先検査。
