@@ -4,6 +4,12 @@ import type { Component, ExecutionsPage, Version } from "./types";
 import { date, Empty, Notice, versionLabel } from "./components/common";
 import { Button } from "./components/ui/button";
 import {
+  executionError,
+  executionFailed,
+  executionResult,
+  runtimeStatuses,
+} from "./lib/execution";
+import {
   Table,
   TableBody,
   TableCell,
@@ -11,15 +17,6 @@ import {
   TableHeader,
   TableRow,
 } from "./components/ui/table";
-
-const statuses: Record<string, string> = {
-  pending: "受付済み",
-  running: "実行中",
-  succeeded: "成功",
-  failed: "失敗",
-  timeout: "タイムアウト",
-  cancelled: "キャンセル",
-};
 
 export function Executions({
   api,
@@ -30,7 +27,7 @@ export function Executions({
   component: Component;
   versions: Version[];
 }) {
-  const [errorsOnly, setErrorsOnly] = useState(true),
+  const [errorsOnly, setErrorsOnly] = useState(false),
     [cursor, setCursor] = useState<string>();
   const [data, setData] = useState<ExecutionsPage | null>(null),
     [error, setError] = useState("");
@@ -38,8 +35,12 @@ export function Executions({
     setCursor(undefined);
   }, [component.component_id]);
   useEffect(() => {
-    let current = true;
+    // Clear only when the requested page changes. Background refreshes keep
+    // the same keyed rows mounted, including their open details and focus.
     setData(null);
+  }, [api, component.component_id, errorsOnly, cursor]);
+  useEffect(() => {
+    let current = true;
     setError("");
     api
       .executions(component.component_id, errorsOnly, cursor)
@@ -59,11 +60,14 @@ export function Executions({
         <div>
           <h2>直近24時間の実行</h2>
           <p className="muted small">
-            新しい順に20件表示します。ランタイムの実行結果で、HTTP
-            ステータスやアプリのログは含みません。
+            新しい順に20件表示します。HTTP
+            応答とランタイムの結果を確認できます。
           </p>
         </div>
-        <label className="execution-filter">
+        <label
+          className="execution-filter"
+          title="HTTP 4xx・5xx、実行失敗、タイムアウトを表示"
+        >
           <input
             type="checkbox"
             checked={errorsOnly}
@@ -72,26 +76,28 @@ export function Executions({
               setErrorsOnly(e.target.checked);
             }}
           />
-          失敗・タイムアウトのみ
+          HTTPエラー・実行失敗のみ
         </label>
       </div>
-      {error ? (
-        <Notice error>{error}</Notice>
-      ) : !data ? (
-        <Notice>実行履歴を読み込み中…</Notice>
+      {error && (
+        <Notice error>
+          {error}
+          {data && " 表示中の履歴は前回取得した内容です。"}
+        </Notice>
+      )}
+      {!data ? (
+        !error && <Notice>実行履歴を読み込み中…</Notice>
       ) : !data.items.length ? (
         <Empty
           title={
-            errorsOnly
-              ? "該当する実行エラーはありません"
-              : "実行記録はありません"
+            errorsOnly ? "該当するエラーはありません" : "実行記録はありません"
           }
         >
           保存されている直近24時間の記録が対象です。
         </Empty>
       ) : (
         <div className="table-scroll">
-          <Table>
+          <Table className="execution-table">
             <TableHeader>
               <TableRow>
                 <TableHead>日時</TableHead>
@@ -108,26 +114,47 @@ export function Executions({
                 )?.version;
                 return (
                   <TableRow key={item.execution_id}>
-                    <TableCell className="nowrap">
+                    <TableCell className="nowrap" data-label="日時">
                       {date(item.created_at)}
                     </TableCell>
-                    <TableCell>{statuses[item.status] || "不明"}</TableCell>
-                    <TableCell title={version}>
+                    <TableCell data-label="結果" className="nowrap">
+                      <strong
+                        className={
+                          executionFailed(item) ? "execution-failed" : undefined
+                        }
+                      >
+                        {executionResult(item)}
+                      </strong>
+                      {item.status === "succeeded" &&
+                        item.http_status == null && (
+                          <div className="muted small">HTTP 応答は未記録</div>
+                        )}
+                    </TableCell>
+                    <TableCell title={version} data-label="バージョン">
                       {version ? versionLabel(version) : "削除済み"}
                     </TableCell>
-                    <TableCell className="nowrap">
+                    <TableCell className="nowrap" data-label="実行時間">
                       {item.wall_time_ms === null
                         ? "—"
                         : `${item.wall_time_ms} ms`}
                     </TableCell>
-                    <TableCell>
-                      {item.error != null && (
-                        <pre className="execution-error">
-                          {JSON.stringify(item.error, null, 2)}
-                        </pre>
+                    <TableCell data-label="詳細">
+                      {executionError(item) && (
+                        <p className="execution-message">
+                          {executionError(item)}
+                        </p>
                       )}
                       <details>
                         <summary>実行の詳細</summary>
+                        <p>
+                          ランタイム：{runtimeStatuses[item.status] || "不明"}
+                        </p>
+                        <p>HTTP 応答：{item.http_status ?? "未記録"}</p>
+                        {item.error != null && (
+                          <pre className="execution-error">
+                            {JSON.stringify(item.error, null, 2)}
+                          </pre>
+                        )}
                         <p className="hash">
                           実行 ID <code>{item.execution_id}</code>
                         </p>

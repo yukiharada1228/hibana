@@ -1,6 +1,12 @@
 import { findComponent } from "./api.mjs";
+import { egressPolicy } from "./output.mjs";
 
-export async function egress(api, config, [action, ...destinations]) {
+export async function egress(
+  api,
+  config,
+  [action, ...destinations],
+  options = {},
+) {
   const component = await findComponent(api, config.name);
   if (!component)
     throw new Error("Deploy this application before managing egress");
@@ -11,8 +17,10 @@ export async function egress(api, config, [action, ...destinations]) {
       ? undefined
       : { method: "PATCH", body: { [action]: destinations } },
   );
-  if (action === "list") console.log(JSON.stringify(policy, null, 2));
-  else {
+  if (action === "list") {
+    if (options.json) console.log(JSON.stringify(policy, null, 2));
+    else egressPolicy(policy);
+  } else {
     console.log(
       "Updated outbound destinations for all existing and future versions:",
     );

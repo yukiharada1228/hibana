@@ -49,7 +49,7 @@ chacha20poly1305 = { workspace = true }
 futures = "0.3"
 http-body-util = "0.1"
 
-# 共有ストア（M3d, §8）。レート制限 / in-flight / login ロックアウトを全 Axum
+# 共有ストア（M3d, §8）。レート制限 / login ロックアウトを全 Axum
 # インスタンスで共有するカウンタ。Lua アトミック操作で TOCTOU を避ける。pure-Rust 構成。
 redis = { workspace = true }
 # Redis uses Rustls's process default; select ring explicitly when other clients

@@ -54,13 +54,21 @@ export function Extensions({
   onOpenSettings?: () => void;
 }) {
   const version = versions.find((v) => v.version === selected);
-  const [data, setData] = useState<VersionDetails | null>(null);
+  const [loaded, setData] = useState<VersionDetails | null>(null);
+  const data =
+    version &&
+    loaded?.version_id === version.version_id &&
+    loaded.wasm_sha256 === version.wasm_sha256
+      ? loaded
+      : null;
   const [error, setError] = useState("");
   const [policy, setPolicy] = useState<EgressPolicy | null>(null);
   const [policyError, setPolicyError] = useState("");
   useEffect(() => {
-    let current = true;
     setPolicy(null);
+  }, [api, component.component_id]);
+  useEffect(() => {
+    let current = true;
     setPolicyError("");
     api
       .egress(component.component_id)
@@ -75,8 +83,10 @@ export function Extensions({
     };
   }, [api, component]);
   useEffect(() => {
-    let current = true;
     setData(null);
+  }, [api, component.component_id, version?.version_id, version?.wasm_sha256]);
+  useEffect(() => {
+    let current = true;
     setError("");
     if (version)
       api
@@ -136,12 +146,16 @@ export function Extensions({
             </option>
           ))}
         </select>
-        {error ? (
-          <Notice error>{error}</Notice>
-        ) : !version ? (
+        {error && (
+          <Notice error>
+            {error}
+            {data && " 表示中の拡張構成は前回取得した内容です。"}
+          </Notice>
+        )}
+        {!version ? (
           <Notice>確認するバージョンを選択してください。</Notice>
         ) : !data ? (
-          <Notice>拡張の構成を読み込み中…</Notice>
+          !error && <Notice>拡張の構成を読み込み中…</Notice>
         ) : (
           <>
             {metadata == null ? (
@@ -173,12 +187,15 @@ export function Extensions({
             )}
             <div className="extension-egress">
               <h3>外部通信</h3>
-              {policyError ? (
+              {policyError && (
                 <Notice error>
                   通信先の適用元を取得できませんでした。{policyError}
+                  {policy &&
+                    " 表示中の通信先は前回取得した内容です。現在の許可状態は確認できていません。"}
                 </Notice>
-              ) : !policy ? (
-                <p className="muted">通信先を読み込み中…</p>
+              )}
+              {!policy ? (
+                !policyError && <p className="muted">通信先を読み込み中…</p>
               ) : policy.allow_outbound !== null ? (
                 <>
                   <p className="muted small">アプリ共通の設定を適用中。</p>

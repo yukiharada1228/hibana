@@ -24,6 +24,7 @@ import { ApplicationSettings } from "./ApplicationSettings";
 import { EgressSettings } from "./EgressSettings";
 import { Executions } from "./Executions";
 import { Extensions } from "./Extensions";
+import { ApplicationActivity } from "./ApplicationActivity";
 
 function deletionReason(version: Version, component: Component): string | null {
   const reason = version.deletion_blocked_reason;
@@ -147,6 +148,11 @@ export function Applications({ components }: { components: Component[] }) {
                           ? versionLabel(component.active_version)
                           : "—"}
                       </strong>
+                      {component.active_version_created_at && (
+                        <div className="muted small">
+                          登録 {date(component.active_version_created_at)}
+                        </div>
+                      )}
                     </TableCell>
                     <TableCell>
                       <Badge>{publication(component)}</Badge>
@@ -176,8 +182,9 @@ export function Application({
   session: Session;
   onChange: () => Promise<void>;
 }) {
-  const [versions, setVersions] = useState<Version[]>([]),
+  const [versionData, setVersions] = useState<Version[] | null>(null),
     [tab, setTab] = useState("versions");
+  const versions = versionData ?? [];
   const [error, setError] = useState(""),
     [message, setMessage] = useState("");
   const [loadError, setLoadError] = useState("");
@@ -198,6 +205,9 @@ export function Application({
         ? deletionReason(deleteTarget, component)
         : "このバージョンは一覧にありません。削除済みの可能性があります。"
       : null;
+  useEffect(() => {
+    setVersions(null);
+  }, [api, component.component_id]);
   useEffect(() => {
     let current = true;
     setLoading(true);
@@ -235,7 +245,7 @@ export function Application({
       } else if (confirm.action === "delete-version") {
         await api.deleteVersion(component.component_id, confirm.versionId);
         setVersions((items) =>
-          items.filter((item) => item.version_id !== confirm.versionId),
+          (items ?? []).filter((item) => item.version_id !== confirm.versionId),
         );
         setMessage(
           `バージョン ${versionLabel(confirm.version)} を削除しました。`,
@@ -285,6 +295,14 @@ export function Application({
           {appUrl(component) && <PublicUrl component={component} />}
         </div>
       </div>
+      {tab !== "executions" && (
+        <ApplicationActivity
+          api={api}
+          component={component}
+          versions={versions}
+          onOpen={() => setTab("executions")}
+        />
+      )}
       <div className="tabs" role="tablist" aria-label="アプリの詳細">
         <button
           role="tab"
@@ -323,11 +341,15 @@ export function Application({
       </div>
       {error && !confirm && <Notice error>{error}</Notice>}
       {message && <Notice>{message}</Notice>}
+      {loadError && (tab === "versions" || tab === "extensions") && (
+        <Notice error>
+          {loadError}
+          {versionData && " 表示中のバージョン一覧は前回取得した内容です。"}
+        </Notice>
+      )}
       {tab === "extensions" ? (
-        loadError ? (
-          <Notice error>{loadError}</Notice>
-        ) : loading ? (
-          <Notice>読み込み中…</Notice>
+        !versionData ? (
+          !loadError && <Notice>読み込み中…</Notice>
         ) : (
           <Extensions
             api={api}
@@ -375,10 +397,8 @@ export function Application({
             </div>
           )}
         </>
-      ) : loadError ? (
-        <Notice error>{loadError}</Notice>
-      ) : loading ? (
-        <Notice>読み込み中…</Notice>
+      ) : !versionData ? (
+        !loadError && <Notice>読み込み中…</Notice>
       ) : (
         <section className="panel">
           <div className="panel-toolbar">

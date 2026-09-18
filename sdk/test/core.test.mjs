@@ -42,6 +42,27 @@ test("config rejects ambiguous workloads and limits rejected by the server", asy
   } finally { await rm(dir, { recursive: true, force: true }); }
 });
 
+test("vars reject NUL without rejecting ordinary Unicode, whitespace or literal escapes", async t => {
+  const dir = await mkdtemp(join(tmpdir(), "hibana-vars-"));
+  t.after(() => rm(dir, { recursive: true, force: true }));
+  const path = join(dir, "hibana.json");
+  const configure = value => writeFile(path, JSON.stringify({
+    name: "vars-test", main: "src/index.ts", vars: { VALUE: value },
+  }));
+  for (const value of ["", "日本語 🔥", "line1\r\n\tline2", String.raw`\u0000`, String.raw`\0`]) {
+    await configure(value);
+    assert.equal((await loadConfig(path)).vars.VALUE, value);
+  }
+  for (const value of ["\0sensitive-fixture", "sensitive-fixture\0tail", "sensitive-fixture\0"]) {
+    await configure(value);
+    await assert.rejects(loadConfig(path), error => {
+      assert.match(error.message, /vars\.VALUE.*NUL.*U\+0000/);
+      assert.doesNotMatch(error.message, /sensitive-fixture|\u0000/);
+      return true;
+    });
+  }
+});
+
 test("deploy publishes code, vars and selected Secrets with one request and no admin operations", async () => {
   const dir = await mkdtemp(join(tmpdir(), "hibana-deploy-"));
   try {

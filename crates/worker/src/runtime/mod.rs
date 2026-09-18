@@ -247,7 +247,7 @@ impl Runtime {
         let fuel_to_set = limits.max_fuel.unwrap_or(u64::MAX);
         store
             .set_fuel(fuel_to_set)
-            .map_err(|e| ExecError::Failed(format!("failed to set fuel: {e}")))?;
+            .map_err(|e| ExecError::failed(format_args!("failed to set fuel: {e}")))?;
 
         let wall = limits.max_wall_time();
         let started = Instant::now();
@@ -255,7 +255,7 @@ impl Runtime {
         let streamed_bytes = Arc::clone(&stream.bytes);
         let (req_res, out, receiver) = {
             let mut req = into_request(request)
-                .map_err(|e| ExecError::Failed(format!("bad ingress request: {e}")))?;
+                .map_err(|e| ExecError::failed(format_args!("bad ingress request: {e}")))?;
             req.headers_mut()
                 .remove(hyper::header::HeaderName::from_static("x-hibana-env"));
             if !built_env.pairs.is_empty() {
@@ -265,7 +265,7 @@ impl Runtime {
                     .map(|(k, v)| (k.clone(), serde_json::Value::String(v.clone())))
                     .collect();
                 let json = serde_json::to_vec(&serde_json::Value::Object(map))
-                    .map_err(|e| ExecError::Failed(format!("env encode: {e}")))?;
+                    .map_err(|e| ExecError::failed(format_args!("env encode: {e}")))?;
                 let encoded = hibana_shared::b64url_encode(&json);
                 if let Ok(hv) = hyper::header::HeaderValue::from_str(&encoded) {
                     req.headers_mut()
@@ -273,7 +273,7 @@ impl Runtime {
                 }
             }
             req.headers_mut().remove("x-hibana-event");
-            http_limits::check(req.headers()).map_err(|e| ExecError::Failed(e.to_string()))?;
+            http_limits::check(req.headers()).map_err(ExecError::failed)?;
             let (sender, receiver) = tokio::sync::oneshot::channel();
             let scheme = if req.uri().scheme_str() == Some("https") {
                 Scheme::Https
@@ -283,11 +283,11 @@ impl Runtime {
             let req_res = store
                 .data_mut()
                 .new_incoming_request(scheme, req)
-                .map_err(|e| ExecError::Failed(format!("new_incoming_request: {e}")))?;
+                .map_err(|e| ExecError::failed(format_args!("new_incoming_request: {e}")))?;
             let out = store
                 .data_mut()
                 .new_response_outparam(sender)
-                .map_err(|e| ExecError::Failed(format!("new_response_outparam: {e}")))?;
+                .map_err(|e| ExecError::failed(format_args!("new_response_outparam: {e}")))?;
             (req_res, out, receiver)
         };
 
@@ -295,13 +295,13 @@ impl Runtime {
         let exec_future = async {
             let link_started = Instant::now();
             let ppre = ProxyPre::new(component.0.clone())
-                .map_err(|e| ExecError::Failed(format!("not a proxy component: {e}")))?;
+                .map_err(|e| ExecError::failed(format_args!("not a proxy component: {e}")))?;
             let link_us = link_started.elapsed().as_micros() as u64;
             let instantiate_started = Instant::now();
             let proxy = ppre
                 .instantiate_async(&mut store)
                 .await
-                .map_err(|e| ExecError::Failed(format!("failed to instantiate proxy: {e}")))?;
+                .map_err(|e| ExecError::failed(format_args!("failed to instantiate proxy: {e}")))?;
             let instantiate_us = instantiate_started.elapsed().as_micros() as u64;
             let handler_started = Instant::now();
 
@@ -356,11 +356,11 @@ impl Runtime {
                 }
                 Err(trap) => {
                     if is_out_of_fuel_trap(&trap) {
-                        Err(ExecError::Failed(format!("fuel exhausted: {trap}")))
+                        Err(ExecError::failed(format_args!("fuel exhausted: {trap}")))
                     } else if is_interrupt_trap(&trap) || started.elapsed() >= wall {
                         Err(ExecError::Timeout)
                     } else {
-                        Err(ExecError::Failed(format!("wasm trap: {trap}")))
+                        Err(ExecError::failed(format_args!("wasm trap: {trap}")))
                     }
                 }
             },
@@ -370,6 +370,12 @@ impl Runtime {
 pub(crate) enum ExecError {
     Timeout,
     Failed(String),
+}
+
+impl ExecError {
+    pub(crate) fn failed(message: impl std::fmt::Display) -> Self {
+        Self::Failed(hibana_shared::diagnostics::format_error(message))
+    }
 }
 
 pub(crate) fn is_interrupt_trap(err: &anyhow::Error) -> bool {

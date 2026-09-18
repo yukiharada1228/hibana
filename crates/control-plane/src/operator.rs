@@ -25,6 +25,8 @@ pub(crate) async fn run(args: &[String]) -> anyhow::Result<()> {
                 ),
             )
         }
+        // Older servers ignore unknown arguments. The SDK inspects this literal
+        // without executing the binary to recognize the maintenance protocol.
         _ => anyhow::bail!(
             "Usage: --maintenance close|open OWNER | status | prepare OWNER WORKER_IPS"
         ),

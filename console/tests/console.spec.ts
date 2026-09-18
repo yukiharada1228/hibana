@@ -20,6 +20,469 @@ test.beforeEach(async ({ request }) => {
   await request.post("/api/__test/reset", { data: {} });
 });
 
+for (const tab of ["バージョン", "拡張"]) {
+  test(`${tab} refresh preserves expanded details and focus through failures`, async ({
+    page,
+  }) => {
+    await page.clock.install();
+    let revision = 0;
+    let fail = "";
+    let hold: Promise<void> | undefined;
+    await page.route("**/api/components/cmp_api/versions**", async (route) => {
+      await hold;
+      const list = new URL(route.request().url()).pathname.endsWith(
+        "/versions",
+      );
+      if (fail === (list ? "versions" : "details"))
+        return route.fulfill({ status: 503, json: {} });
+      const response = await route.fetch();
+      const data = await response.json();
+      if (list && revision)
+        data.push({
+          ...data[0],
+          version_id: "refresh-version",
+          version: "3.0.0",
+        });
+      else if (!list && data.version_id === "ver_2")
+        data.build_metadata.extensions[1].version = `1.2.${3 + revision}`;
+      return route.fulfill({ response, json: data });
+    });
+    await page.route("**/api/components/cmp_api/egress", async (route) => {
+      await hold;
+      return fail === "egress"
+        ? route.fulfill({ status: 503, json: {} })
+        : route.fulfill({
+            json: { allow_outbound: ["db.example.internal:5432"] },
+          });
+    });
+    await login(page);
+    await page.getByRole("link", { name: "hello-api", exact: true }).click();
+    await page.getByRole("tab", { name: tab, exact: true }).click();
+    const details =
+      tab === "バージョン"
+        ? page.locator(".version-table .artifact-details").first()
+        : page.locator(".extension-dependencies");
+    const summary = details.locator("summary");
+    await summary.click();
+    const destinations = page.locator(".extension-destination-details");
+    if (tab === "拡張") {
+      await destinations.locator("summary").click();
+      await summary.focus();
+    }
+    async function expectPreserved() {
+      await expect(details).toHaveAttribute("open", "");
+      await expect(summary).toBeFocused();
+      if (tab === "拡張")
+        await expect(destinations).toHaveAttribute("open", "");
+    }
+    let release!: () => void;
+    hold = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const refreshing = page.waitForRequest(
+      "**/api/components/cmp_api/versions",
+    );
+    await page.clock.fastForward(30_000);
+    await refreshing;
+    await expectPreserved();
+    revision = 1;
+    release();
+    hold = undefined;
+    if (tab === "拡張")
+      await expect(page.getByText("1.2.4", { exact: true })).toBeVisible();
+    else
+      await expect(
+        page.getByRole("cell", { name: "3.0.0", exact: false }),
+      ).toBeVisible();
+    await expectPreserved();
+
+    fail = "versions";
+    await page.evaluate(() => window.dispatchEvent(new Event("focus")));
+    await expect(page.getByRole("alert")).toContainText(
+      "表示中のバージョン一覧は前回取得した内容です。",
+    );
+    await expectPreserved();
+    if (tab === "バージョン") {
+      const old = page.getByRole("row").filter({ hasText: "d26b94ca" });
+      await old.getByRole("button", { name: "削除", exact: true }).click();
+      await expect(
+        page
+          .getByRole("dialog")
+          .getByRole("button", { name: "削除する", exact: true }),
+      ).toBeDisabled();
+      await page
+        .getByRole("button", { name: "キャンセル", exact: true })
+        .click();
+      await summary.focus();
+    } else {
+      for (const [failure, message] of [
+        ["details", "表示中の拡張構成は前回取得した内容です。"],
+        ["egress", "現在の許可状態は確認できていません。"],
+      ]) {
+        fail = failure;
+        await page.evaluate(() => window.dispatchEvent(new Event("focus")));
+        await expect(page.getByRole("alert")).toContainText(message);
+        await expectPreserved();
+      }
+    }
+    fail = "";
+    revision = 2;
+    await page.evaluate(() => window.dispatchEvent(new Event("focus")));
+    await expect(page.getByRole("alert")).toHaveCount(0);
+    if (tab === "拡張")
+      await expect(page.getByText("1.2.5", { exact: true })).toBeVisible();
+    await expectPreserved();
+
+    if (tab === "拡張") {
+      fail = "details";
+      await page.getByLabel("確認するバージョン").selectOption("1.0.0");
+      await expect(page.getByRole("alert")).toContainText(
+        "基盤が処理を受け付けられません",
+      );
+      await expect(page.getByRole("alert")).not.toContainText("前回取得");
+      await expect(details).toHaveCount(0);
+      await expect(page.getByText("./database", { exact: true })).toHaveCount(
+        0,
+      );
+      fail = "";
+      await page.evaluate(() => window.dispatchEvent(new Event("focus")));
+      await expect(
+        page.getByText("指定された拡張はありません。", { exact: true }),
+      ).toBeVisible();
+      await expect(page.getByRole("alert")).toHaveCount(0);
+    }
+  });
+}
+
+test("skip link focuses the current main content without changing its route or form", async ({
+  page,
+}) => {
+  await login(page);
+  await page.getByRole("link", { name: "hello-api", exact: true }).click();
+  await page.getByRole("tab", { name: "拡張", exact: true }).click();
+  await page.getByLabel("確認するバージョン").selectOption("1.0.0");
+  const appUrl = page.url();
+  async function skip() {
+    await page.getByRole("link", { name: "本文へ移動" }).focus();
+    await page.keyboard.press("Enter");
+    await expect(page.getByRole("main")).toBeFocused();
+  }
+  await skip();
+  await expect(page).toHaveURL(appUrl);
+  await expect(
+    page.getByRole("tab", { name: "拡張", exact: true }),
+  ).toHaveAttribute("aria-selected", "true");
+  await expect(page.getByLabel("確認するバージョン")).toHaveValue("1.0.0");
+  await page.keyboard.press("Tab");
+  await expect(
+    page.getByRole("button", { name: "更新", exact: true }),
+  ).toBeFocused();
+
+  await page.getByRole("link", { name: "利用状況", exact: true }).click();
+  await page.getByLabel("開始日").fill("2026-09-01");
+  const usageUrl = page.url();
+  await skip();
+  await expect(page).toHaveURL(usageUrl);
+  await expect(page.getByLabel("開始日")).toHaveValue("2026-09-01");
+});
+
+test("execution refresh preserves open details and focus through updates and errors", async ({
+  page,
+}) => {
+  await page.clock.install();
+  let httpStatus = 200;
+  let unavailable = false;
+  let hold: Promise<void> | undefined;
+  await page.route("**/api/components/cmp_api/executions?*", async (route) => {
+    await hold;
+    if (unavailable) return route.fulfill({ status: 503, json: {} });
+    const errorsOnly =
+      new URL(route.request().url()).searchParams.get("errors_only") === "true";
+    return route.fulfill({
+      json: {
+        items: errorsOnly
+          ? []
+          : [
+              {
+                execution_id: "refresh-execution",
+                version_id: "ver_2",
+                created_at: "2026-09-18T01:00:00Z",
+                wall_time_ms: 12,
+                status: "succeeded",
+                http_status: httpStatus,
+                error: null,
+              },
+            ],
+        next_cursor: null,
+      },
+    });
+  });
+  await login(page);
+  await page.getByRole("link", { name: "hello-api", exact: true }).click();
+  await page.getByRole("button", { name: "実行履歴を見る" }).click();
+  const details = page.locator(".execution-table details");
+  const summary = details.locator("summary");
+  await summary.click();
+  await expect(summary).toBeFocused();
+
+  let release!: () => void;
+  hold = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  const refreshing = page.waitForRequest(
+    "**/api/components/cmp_api/executions?*",
+  );
+  await page.clock.fastForward(30_000);
+  await refreshing;
+  await expect(details).toHaveAttribute("open", "");
+  await expect(summary).toBeFocused();
+  httpStatus = 503;
+  release();
+  hold = undefined;
+  await expect(
+    page.getByRole("cell", { name: "HTTP 503", exact: true }),
+  ).toBeVisible();
+  await expect(details).toHaveAttribute("open", "");
+  await expect(summary).toBeFocused();
+
+  unavailable = true;
+  await page.evaluate(() => window.dispatchEvent(new Event("focus")));
+  await expect(page.getByRole("alert")).toContainText(
+    "表示中の履歴は前回取得した内容です。",
+  );
+  await expect(details).toHaveAttribute("open", "");
+  await expect(summary).toBeFocused();
+
+  unavailable = false;
+  httpStatus = 200;
+  await page.evaluate(() => window.dispatchEvent(new Event("focus")));
+  await expect(
+    page.getByRole("cell", { name: "HTTP 200", exact: true }),
+  ).toBeVisible();
+  await expect(page.getByRole("alert")).toHaveCount(0);
+  await expect(details).toHaveAttribute("open", "");
+  await expect(summary).toBeFocused();
+
+  await page
+    .getByRole("checkbox", { name: "HTTPエラー・実行失敗のみ" })
+    .check();
+  await expect(
+    page.getByText("該当するエラーはありません", { exact: true }),
+  ).toBeVisible();
+  await expect(details).toHaveCount(0);
+});
+
+test("usage refresh preserves details and focus but clears results for a new range", async ({
+  page,
+}) => {
+  await page.clock.install();
+  let invocationCount = 12_408;
+  let unavailable = false;
+  let hold: Promise<void> | undefined;
+  await page.route("**/api/usage?*", async (route) => {
+    await hold;
+    if (unavailable) return route.fulfill({ status: 503, json: {} });
+    const response = await route.fetch();
+    const data = await response.json();
+    data.totals.invocation_count = invocationCount;
+    data.by_component[0].invocation_count = invocationCount;
+    return route.fulfill({ response, json: data });
+  });
+  await login(page);
+  await page.getByRole("link", { name: "利用状況", exact: true }).click();
+  const details = page.locator("details").filter({ hasText: "リソース使用量" });
+  const summary = details.locator("summary");
+  await summary.click();
+  await expect(summary).toBeFocused();
+
+  let release!: () => void;
+  hold = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  const refreshing = page.waitForRequest("**/api/usage?*");
+  await page.clock.fastForward(30_000);
+  await refreshing;
+  await expect(
+    page.getByRole("cell", { name: "12,408", exact: true }),
+  ).toBeVisible();
+  await expect(details).toHaveAttribute("open", "");
+  await expect(summary).toBeFocused();
+  invocationCount = 12_409;
+  release();
+  hold = undefined;
+  await expect(
+    page.getByRole("cell", { name: "12,409", exact: true }),
+  ).toBeVisible();
+  await expect(details).toHaveAttribute("open", "");
+  await expect(summary).toBeFocused();
+
+  unavailable = true;
+  await page.evaluate(() => window.dispatchEvent(new Event("focus")));
+  await expect(page.getByRole("alert")).toContainText(
+    "表示中の利用量は前回取得した内容です。",
+  );
+  await expect(
+    page.getByRole("cell", { name: "12,409", exact: true }),
+  ).toBeVisible();
+  await expect(details).toHaveAttribute("open", "");
+  await expect(summary).toBeFocused();
+
+  unavailable = false;
+  invocationCount = 12_410;
+  await page.evaluate(() => window.dispatchEvent(new Event("focus")));
+  await expect(
+    page.getByRole("cell", { name: "12,410", exact: true }),
+  ).toBeVisible();
+  await expect(page.getByRole("alert")).toHaveCount(0);
+  await expect(details).toHaveAttribute("open", "");
+  await expect(summary).toBeFocused();
+
+  // Submitting the same dates refreshes without replacing the table.
+  invocationCount = 12_411;
+  await page.getByRole("button", { name: "集計する" }).click();
+  await expect(
+    page.getByRole("cell", { name: "12,411", exact: true }),
+  ).toBeVisible();
+  await expect(details).toHaveAttribute("open", "");
+
+  await page.getByLabel("開始日").fill("2026-09-10");
+  await page.getByLabel("終了日").fill("2026-09-09");
+  await page.getByRole("button", { name: "集計する" }).click();
+  await expect(page.getByRole("alert")).toHaveText(
+    "開始日は終了日以前を指定してください。",
+  );
+  await expect(details).toHaveAttribute("open", "");
+
+  // A changed range must not display counts belonging to the previous dates,
+  // either while loading or after a failed request.
+  await page.getByLabel("開始日").fill("2026-09-01");
+  hold = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  const newRange = page.waitForRequest(
+    "**/api/usage?from=2026-09-01&to=2026-09-09",
+  );
+  await page.getByRole("button", { name: "集計する" }).click();
+  await newRange;
+  await expect(
+    page.getByText("利用量を読み込み中…", { exact: true }),
+  ).toBeVisible();
+  await expect(page.getByText("12,411", { exact: true })).toHaveCount(0);
+  await expect(details).toHaveCount(0);
+  unavailable = true;
+  release();
+  hold = undefined;
+  await expect(page.getByRole("alert")).toContainText(
+    "基盤が処理を受け付けられません",
+  );
+  await expect(page.getByRole("alert")).not.toContainText("前回取得");
+  await expect(details).toHaveCount(0);
+
+  unavailable = false;
+  invocationCount = 7;
+  await page.evaluate(() => window.dispatchEvent(new Event("focus")));
+  await expect(
+    page.getByRole("cell", { name: "7", exact: true }),
+  ).toBeVisible();
+  await expect(
+    page.getByText("2026-09-01 — 2026-09-09 UTC", { exact: true }),
+  ).toBeVisible();
+  await expect(page.getByRole("alert")).toHaveCount(0);
+  await expect(details).not.toHaveAttribute("open", "");
+});
+
+test("HTTP errors are distinct from runtime completion and remain readable on mobile", async ({
+  page,
+}, info) => {
+  const base = {
+    version_id: "ver_2",
+    created_at: "2026-09-18T01:00:00Z",
+    wall_time_ms: 12,
+    error: null,
+  };
+  const items = [
+    {
+      ...base,
+      execution_id: "http-error",
+      status: "succeeded",
+      http_status: 503,
+    },
+    { ...base, execution_id: "http-ok", status: "succeeded", http_status: 200 },
+    {
+      ...base,
+      execution_id: "runtime-timeout",
+      status: "timeout",
+      http_status: null,
+      error: {
+        code: "execution_timeout",
+        message: "Execution deadline exceeded",
+      },
+    },
+  ];
+  await page.route("**/api/components/cmp_api/executions?*", (route) => {
+    const errorsOnly =
+      new URL(route.request().url()).searchParams.get("errors_only") === "true";
+    return route.fulfill({
+      json: {
+        items: errorsOnly ? [items[0], items[2]] : items,
+        next_cursor: null,
+      },
+    });
+  });
+  await login(page);
+  await page.getByRole("link", { name: "hello-api", exact: true }).click();
+  await expect(page.getByLabel("最新の実行")).toContainText("HTTP 503");
+  await page.getByRole("button", { name: "実行履歴を見る" }).click();
+  const errors = page.getByRole("checkbox", {
+    name: "HTTPエラー・実行失敗のみ",
+  });
+  await expect(errors).not.toBeChecked();
+  await expect(
+    page.getByRole("cell", { name: "HTTP 200", exact: true }),
+  ).toBeVisible();
+  await errors.check();
+  await expect(
+    page.getByRole("cell", { name: "HTTP 200", exact: true }),
+  ).toHaveCount(0);
+  const httpError = page.getByRole("row").filter({ hasText: "HTTP 503" });
+  await expect(httpError).toContainText("アプリが HTTP エラーを返しました");
+  await httpError.getByText("実行の詳細", { exact: true }).click();
+  await expect(httpError.locator("details")).toContainText(
+    "ランタイム：実行完了",
+  );
+  await httpError.getByText("実行の詳細", { exact: true }).click();
+  await expect(page.locator(".execution-error")).not.toBeVisible();
+  await page.screenshot({
+    path: info.outputPath("execution-http-desktop.png"),
+    fullPage: true,
+  });
+  await page.setViewportSize({ width: 390, height: 844 });
+  const timeout = page.getByRole("cell", {
+    name: "結果 タイムアウト",
+    exact: true,
+  });
+  await expect(timeout).toBeVisible();
+  expect(
+    await timeout
+      .locator("strong")
+      .evaluate((el) => el.getBoundingClientRect().height),
+  ).toBeLessThan(35);
+  expect(
+    await page.evaluate(
+      () => document.documentElement.scrollWidth <= innerWidth,
+    ),
+  ).toBe(true);
+  expect(
+    await page
+      .locator(".execution-table")
+      .evaluate((el) => el.getBoundingClientRect().right <= innerWidth),
+  ).toBe(true);
+  await page.screenshot({
+    path: info.outputPath("execution-http-mobile.png"),
+    fullPage: true,
+  });
+});
+
 test("execution history keeps its page across polling, focus and manual refresh", async ({
   page,
 }) => {
@@ -27,10 +490,13 @@ test("execution history keeps its page across polling, focus and manual refresh"
   await login(page, "reader@example.internal");
   await page.getByRole("link", { name: "hello-api", exact: true }).click();
   await page.getByRole("tab", { name: "実行履歴", exact: true }).click();
+  await page
+    .getByRole("checkbox", { name: "HTTPエラー・実行失敗のみ" })
+    .check();
   await page.getByRole("button", { name: "次の20件", exact: true }).click();
-  const errors = page.getByText("Execution deadline exceeded", {
-    exact: false,
-  });
+  const errors = page
+    .locator(".execution-message")
+    .filter({ hasText: "Execution deadline exceeded" });
   await expect(errors).toHaveCount(1);
   const queries: URL[] = [];
   page.on("request", (request) => {
@@ -57,7 +523,7 @@ test("execution history keeps its page across polling, focus and manual refresh"
     expect(queries.every((url) => url.searchParams.has("before"))).toBe(true);
   }
   await page
-    .getByRole("checkbox", { name: "失敗・タイムアウトのみ" })
+    .getByRole("checkbox", { name: "HTTPエラー・実行失敗のみ" })
     .uncheck();
   await expect(errors).toHaveCount(20);
   await expect(
@@ -374,7 +840,7 @@ test("CLI versions have concise labels while console rollback preserves the full
       version: automatic,
     });
     await expect(previous).toContainText("現在のバージョン");
-    const listed = await run(process.execPath, [cli, "list"], {
+    const listed = await run(process.execPath, [cli, "list", "--json"], {
       cwd: directory,
       env,
     });
@@ -395,7 +861,7 @@ test("CLI versions have concise labels while console rollback preserves the full
     });
     await page.getByRole("tab", { name: "実行履歴", exact: true }).click();
     await expect(
-      page.getByRole("cell", { name: "自動 d26b94ca", exact: true }),
+      page.getByRole("cell", { name: "バージョン 自動 d26b94ca", exact: true }),
     ).toHaveCount(20);
     await page.getByText("実行の詳細", { exact: true }).first().click();
     await expect(
@@ -504,7 +970,10 @@ test("CLI guide is available while the initial application list is pending or fa
       exact: true,
     });
     await expect(guide).toBeVisible();
-    await expect(page.locator("pre").first()).toContainText("--tenant 'team'");
+    await expect(page.locator("pre").first()).toContainText(
+      "npm install -g ./hibana-cli-",
+    );
+    await expect(page.locator("pre").nth(1)).toContainText("--tenant 'team'");
     await expect(page.locator("pre").last()).toHaveText("hibana deploy");
 
     releaseList();
@@ -514,7 +983,7 @@ test("CLI guide is available while the initial application list is pending or fa
     await expect(guide).toBeVisible();
     await expect(
       page.getByRole("button", { name: "コマンドをコピー", exact: true }),
-    ).toHaveCount(3);
+    ).toHaveCount(4);
     await expect(
       page.getByRole("button", { name: "更新", exact: true }),
     ).toHaveCount(0);
@@ -580,15 +1049,15 @@ test("mobile layout, empty state, command guide and failed login", async ({
     .getByRole("navigation")
     .getByRole("link", { name: "CLI の接続", exact: true })
     .click();
-  await expect(page.locator("pre").first()).toContainText(
+  await expect(page.locator("pre").nth(1)).toContainText(
     "http://127.0.0.1:4173/api",
   );
-  await expect(page.locator("pre").first()).not.toContainText(
+  await expect(page.locator("pre").nth(1)).not.toContainText(
     "--password-stdin",
   );
   await expect(page.getByText(/Password: と表示されたら/)).toBeVisible();
-  await expect(page.locator("pre").first()).not.toContainText("--profile");
-  await expect(page.locator("pre").first()).not.toContainText(
+  await expect(page.locator("pre").nth(1)).not.toContainText("--profile");
+  await expect(page.locator("pre").nth(1)).not.toContainText(
     "--ingress-domain",
   );
   await expect(page.locator("pre").last()).toHaveText("hibana deploy");
@@ -650,15 +1119,21 @@ test("operational details, pagination and usage refresh reflect the platform", a
   await expect(page.getByText("公開設定済み", { exact: true })).toBeVisible();
   await page.getByRole("tab", { name: "実行履歴" }).click();
   await expect(
-    page.getByText("Execution deadline exceeded", { exact: false }),
+    page
+      .locator(".execution-message")
+      .filter({ hasText: "Execution deadline exceeded" }),
   ).toHaveCount(20);
   await page.getByRole("button", { name: "次の20件" }).click();
   await expect(
-    page.getByText("Execution deadline exceeded", { exact: false }),
+    page
+      .locator(".execution-message")
+      .filter({ hasText: "Execution deadline exceeded" }),
   ).toHaveCount(1);
   await page.getByRole("button", { name: "最新に戻る" }).click();
   await expect(
-    page.getByText("Execution deadline exceeded", { exact: false }),
+    page
+      .locator(".execution-message")
+      .filter({ hasText: "Execution deadline exceeded" }),
   ).toHaveCount(20);
   await page.getByRole("tab", { name: "設定" }).click();
   await expect(

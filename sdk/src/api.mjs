@@ -2,6 +2,7 @@ import { readFile } from "node:fs/promises";
 
 import { connection, saveProfile } from "./profiles.mjs";
 import { validateVersionName } from "./version-name.mjs";
+import { quote } from "./output.mjs";
 
 export class ApiError extends Error {
   constructor(method, path, status) {
@@ -42,7 +43,21 @@ export async function apiClient(options = {}) {
       result = {};
     }
     // Error bodies can contain user values; do not copy them into terminal/CI logs.
-    if (!response.ok) throw new ApiError(method, path, response.status);
+    if (!response.ok) {
+      const error = new ApiError(method, path, response.status);
+      const login = `hibana login --profile ${quote(selected.profile)} --url ${quote(url)}`;
+      if (response.status === 401)
+        error.hint = auth
+          ? `Authentication failed or expired (HTTP 401). Run ${login} to sign in again. If using HIBANA_TOKEN, replace the expired token.`
+          : "Login failed (HTTP 401). Check the tenant, email and password.";
+      else if (response.status === 403)
+        error.hint =
+          "Permission denied (HTTP 403). Sign in with an account authorized for this operation.";
+      else if (response.status === 503)
+        error.hint =
+          "The platform is unavailable (HTTP 503). Check its status before retrying.";
+      throw error;
+    }
     return result;
   }
   return {

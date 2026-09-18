@@ -105,10 +105,12 @@ python3 scripts/k8s_resilience.py fault --target hibana-worker --seconds 60 --pr
 | 依存先 | Hibana側の対応 | 本番環境で必要な試験 |
 | --- | --- | --- |
 | PostgreSQL | SQLx再接続、SQL10秒/ロック3秒/idle transaction15秒、TCP keepalive/user timeout | 同じ書込み先名でprimary昇格、接続の再確立、RLS・署名・実行記録・Secrets・rollbackの確認 |
-| Redis | 接続/応答2秒、再接続2回・待機最大500ms、到達不能時は受付/ログインを拒否 | HAのprimary切替、ロックアウトとカウンタの保持、復旧後のDBとの整合。Sentinel直接検出は未実装 |
+| Redis | 接続/応答2秒、再接続2回・待機最大500ms、到達不能時は受付/ログインを拒否 | HAのprimary切替、レート制限・ロックアウト・一回限りのトークンの保持。同時実行数はDBだけで管理。Sentinel直接検出は未実装 |
 | S3 | SDK接続3秒/1試行10秒/全体30秒・最大2試行。Worker取得は30秒 | 冗長ストレージの障害・復旧、未キャッシュWasm取得、アップロード、ハッシュ一致 |
 
 SQLのstatement timeoutはDBサーバー側です。ネットワーク全体の応答時間を単独で保証しません。ゲストを開始した可能性があるHTTP呼出しは自動再実行せず、結果不明の書込みはアプリ側の冪等性で扱います。Worker喪失後の孤立実行は既存reaper（既定1800秒）で回収します。
+
+実行エラーの診断文は、生成・送信・保存の各段階で16KiBまでに制限します。長いスタックトレースは書き出し途中で止め、末尾に`[diagnostic truncated]`を表示します。UTF-8の文字境界を保ち、NULは`\u0000`表記へ変換します。診断文の大きさやNULによって完了通知やJSONB保存が失敗し、同時実行枠が残ることを防ぎます。
 
 Secrets取得は`hibana_worker_control_plane_request_duration_seconds`で応答本文の受信まで計測します。`operation="job_env"`、`outcome`は`ok`・`timeout`・`connect`・`authorization`・`rate_limited`・`server_error`・`malformed_response`・`transport`・`unexpected_status`です。タイムアウトは本文受信中も同じ分類で、URL・トークン・応答本文はメトリクスやエラーへ含めません。Worker転送失敗のログにはDNS探索とHTTP送信の段階、送信失敗の分類と所要時間を残します。これらは原因調査のための観測であり、タイムアウトの延長やゲストの再実行は追加していません。
 

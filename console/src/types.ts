@@ -75,6 +75,7 @@ export type Execution = {
   execution_id: string;
   version_id: string;
   status: string;
+  http_status?: number | null;
   error: unknown;
   created_at: string;
   wall_time_ms: number | null;

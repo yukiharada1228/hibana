@@ -855,6 +855,70 @@ footer {
   max-height: 200px;
   overflow: auto;
 }
+.application-activity {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 8px 16px;
+  margin: 0 0 24px;
+  font-size: 13px;
+}
+.application-activity button {
+  color: #0000ff;
+  text-decoration: underline;
+  cursor: pointer;
+}
+.execution-failed {
+  color: #b42318;
+}
+.execution-message {
+  margin: 0 0 8px;
+  max-width: 360px;
+  overflow-wrap: anywhere;
+}
+.execution-table details {
+  max-width: 360px;
+}
+@media (max-width: 760px) {
+  .execution-table thead {
+    position: absolute;
+    width: 1px;
+    height: 1px;
+    overflow: hidden;
+    clip-path: inset(50%);
+  }
+  .execution-table,
+  .execution-table tbody,
+  .execution-table tr {
+    display: block;
+  }
+  .execution-table tr {
+    padding: 16px;
+  }
+  .table-scroll .execution-table td {
+    display: grid;
+    grid-template-columns: 6em minmax(0, 1fr);
+    gap: 6px 12px;
+    padding: 5px 0;
+    border: 0;
+    white-space: normal;
+    overflow-wrap: anywhere;
+  }
+  .execution-table td::before {
+    content: attr(data-label);
+    grid-column: 1;
+    grid-row: 1;
+    color: #646b78;
+    font-size: 12px;
+  }
+  .execution-table td > * {
+    min-width: 0;
+    grid-column: 2;
+  }
+  .execution-table .execution-error {
+    min-width: 0;
+  }
+}
 @media (max-width: 760px) {
   .account-menu summary {
     max-width: 130px;

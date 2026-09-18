@@ -224,7 +224,7 @@ impl Worker {
             .inc();
 
         let persistence_started = std::time::Instant::now();
-        if let Err(e) = self.control_plane.complete(&result).await {
+        if let Err(e) = self.control_plane.complete(result).await {
             warn!(%execution_id, error = %e, "HTTP result persistence failed; request will not be replayed");
             return false;
         }

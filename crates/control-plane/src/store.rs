@@ -37,15 +37,6 @@ pub struct RateDecision {
     pub retry_after_secs: u64,
 }
 
-/// in-flight reserve の結果。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct ReserveDecision {
-    /// 予約できたか（カウンタを上限内で +1 できたか）。false なら 429。
-    pub admitted: bool,
-    /// 予約後（または拒否時の現在）の in-flight カウント。観測・デバッグ用。
-    pub current: i64,
-}
-
 /// login ロックアウトの 1 キー分の判定結果。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct LockoutDecision {
@@ -64,16 +55,6 @@ pub struct RateLimitParams {
     pub capacity: f64,
 }
 
-/// in-flight 予約のパラメータ。
-#[derive(Debug, Clone, Copy)]
-pub struct InflightParams {
-    /// テナントごとの in-flight 上限（`max_concurrent_executions`, §8）。
-    pub max: i64,
-    /// カウンタキーの TTL（秒）。reaper が再同期する安全網の一方で、孤立カウンタが
-    /// 永久に残らないよう保険として張る（reaper は別途 DB COUNT を真実として上書きする）。
-    pub ttl_secs: u64,
-}
-
 /// login ロックアウトのパラメータ（§6.0）。
 #[derive(Debug, Clone, Copy)]
 pub struct LockoutParams {
@@ -85,7 +66,7 @@ pub struct LockoutParams {
 
 /// 共有ストア契約（M3d, §8）。
 ///
-/// invoke admission（レート制限 + in-flight）と login ロックアウトを集約する。RedisStore が
+/// invoke admission（レート制限）と login ロックアウトを集約する。RedisStore が
 /// 本実装、`InProcStore` がテスト用スタブ、`FailingStore` が fail-mode 検証用。
 ///
 /// すべての操作は冪等／原子的であること（同一往復で read-modify-write）。
@@ -101,30 +82,6 @@ pub trait Store: Send + Sync {
         params: RateLimitParams,
         now_ms: u64,
     ) -> Result<RateDecision, StoreError>;
-
-    /// in-flight を原子的に予約する（INCR-then-compare-then-condDECR を 1 往復で, §8）。
-    ///
-    /// 上限超過なら +1 を巻き戻して `admitted=false` を返す（TOCTOU 無し）。
-    async fn reserve_inflight(
-        &self,
-        tenant: &str,
-        params: InflightParams,
-    ) -> Result<ReserveDecision, StoreError>;
-
-    /// in-flight を 1 つ解放する（終端化時に呼ぶ, §8）。
-    ///
-    /// 0 を下回らないよう floor する（二重 DECR の自己治癒。reaper が真実へ再同期する）。
-    async fn release_inflight(&self, tenant: &str) -> Result<i64, StoreError>;
-
-    /// in-flight カウンタを DB COUNT（真実）へ原子的に再同期する（reaper, §8）。
-    ///
-    /// `count` は `SELECT COUNT(*) FROM executions WHERE status IN ('pending','running')`。
-    async fn resync_inflight(
-        &self,
-        tenant: &str,
-        count: i64,
-        ttl_secs: u64,
-    ) -> Result<(), StoreError>;
 
     /// login 失敗を 1 件記録し、当該キーの現在状態を返す（§6.0）。
     ///
@@ -185,13 +142,11 @@ mod redis_impl {
     ///
     /// キーレイアウト（テナント境界をキー空間で明示）:
     /// - レート: `rl:{tenant}` （HASH: tokens, last_ms）
-    /// - in-flight: `inflight:{tenant}` （INTEGER）
     /// - ロックアウト: `lockout:{key}` （INTEGER + TTL）
     #[derive(Clone)]
     pub struct RedisStore {
         conn: ConnectionManager,
         rate_script: Script,
-        reserve_script: Script,
         lockout_incr_script: Script,
     }
 
@@ -229,7 +184,6 @@ mod redis_impl {
             Ok(Self {
                 conn,
                 rate_script: Script::new(RATE_LUA),
-                reserve_script: Script::new(RESERVE_LUA),
                 lockout_incr_script: Script::new(LOCKOUT_INCR_LUA),
             })
         }
@@ -272,20 +226,6 @@ redis.call('EXPIRE', KEYS[1], ttl)
 return {allowed, retry}
 "#;
 
-    /// in-flight reserve: `KEYS[1]`=counter key, `ARGV`=[max, ttl_secs]。
-    /// INCR → 上限超なら DECR で巻き戻す（原子）。戻り値 `[admitted(0/1), current]`。
-    const RESERVE_LUA: &str = r#"
-local maxv = tonumber(ARGV[1])
-local ttl = tonumber(ARGV[2])
-local cur = redis.call('INCR', KEYS[1])
-if cur > maxv then
-  cur = redis.call('DECR', KEYS[1])
-  return {0, cur}
-end
-if ttl > 0 then redis.call('EXPIRE', KEYS[1], ttl) end
-return {1, cur}
-"#;
-
     /// login 失敗 INCR: `KEYS[1]`=counter key, `ARGV`=[threshold, window_secs]。
     /// INCR → 窓 TTL を貼り直す。戻り値 `[locked(0/1), failures]`。
     const LOCKOUT_INCR_LUA: &str = r#"
@@ -300,9 +240,6 @@ return {locked, n}
 
     fn rate_key(tenant: &str) -> String {
         format!("rl:{tenant}")
-    }
-    fn inflight_key(tenant: &str) -> String {
-        format!("inflight:{tenant}")
     }
     fn lockout_key(key: &str) -> String {
         format!("lockout:{key}")
@@ -330,74 +267,6 @@ return {locked, n}
                 allowed: res.0 == 1,
                 retry_after_secs: res.1.max(0) as u64,
             })
-        }
-
-        async fn reserve_inflight(
-            &self,
-            tenant: &str,
-            params: InflightParams,
-        ) -> Result<ReserveDecision, StoreError> {
-            let mut conn = self.conn.clone();
-            let res: (i64, i64) = self
-                .reserve_script
-                .key(inflight_key(tenant))
-                .arg(params.max)
-                .arg(params.ttl_secs)
-                .invoke_async(&mut conn)
-                .await
-                .map_err(map_err)?;
-            Ok(ReserveDecision {
-                admitted: res.0 == 1,
-                current: res.1,
-            })
-        }
-
-        async fn release_inflight(&self, tenant: &str) -> Result<i64, StoreError> {
-            // DECR して 0 未満なら 0 へ補正（二重 DECR 自己治癒）。2 コマンドだが
-            // 単調減少なので競合してもカウンタが負に居座らないことのみ保証すればよい。
-            let mut conn = self.conn.clone();
-            let key = inflight_key(tenant);
-            let cur: i64 = redis::cmd("DECR")
-                .arg(&key)
-                .query_async(&mut conn)
-                .await
-                .map_err(map_err)?;
-            if cur < 0 {
-                let _: () = redis::cmd("SET")
-                    .arg(&key)
-                    .arg(0)
-                    .query_async(&mut conn)
-                    .await
-                    .map_err(map_err)?;
-                return Ok(0);
-            }
-            Ok(cur)
-        }
-
-        async fn resync_inflight(
-            &self,
-            tenant: &str,
-            count: i64,
-            ttl_secs: u64,
-        ) -> Result<(), StoreError> {
-            let mut conn = self.conn.clone();
-            let key = inflight_key(tenant);
-            let v = count.max(0);
-            let _: () = redis::cmd("SET")
-                .arg(&key)
-                .arg(v)
-                .query_async(&mut conn)
-                .await
-                .map_err(map_err)?;
-            if ttl_secs > 0 {
-                let _: () = redis::cmd("EXPIRE")
-                    .arg(&key)
-                    .arg(ttl_secs)
-                    .query_async(&mut conn)
-                    .await
-                    .map_err(map_err)?;
-            }
-            Ok(())
         }
 
         async fn record_login_failure(
@@ -547,67 +416,6 @@ mod tests {
         assert!(!s.rate_limit("a", p, t0).await.unwrap().allowed);
         // 別テナントは別バケット → 許可。
         assert!(s.rate_limit("b", p, t0).await.unwrap().allowed);
-    }
-
-    /// in-flight reserve: 上限まで許可、超過で拒否（current は据え置き）。
-    #[tokio::test]
-    async fn inflight_reserve_allows_up_to_max_then_denies() {
-        let s = InProcStore::new();
-        let p = InflightParams {
-            max: 3,
-            ttl_secs: 60,
-        };
-        for i in 1..=3 {
-            let d = s.reserve_inflight("t", p).await.unwrap();
-            assert!(d.admitted);
-            assert_eq!(d.current, i);
-        }
-        let d = s.reserve_inflight("t", p).await.unwrap();
-        assert!(!d.admitted, "over max must be denied");
-        assert_eq!(d.current, 3, "denied reserve must not increment");
-        assert_eq!(s.peek_inflight("t"), 3);
-    }
-
-    /// in-flight DECR: 解放で枠が空き、再 reserve できる。
-    #[tokio::test]
-    async fn inflight_release_frees_a_slot() {
-        let s = InProcStore::new();
-        let p = InflightParams {
-            max: 1,
-            ttl_secs: 60,
-        };
-        assert!(s.reserve_inflight("t", p).await.unwrap().admitted);
-        assert!(!s.reserve_inflight("t", p).await.unwrap().admitted);
-        // 解放 → 1 枠空く。
-        assert_eq!(s.release_inflight("t").await.unwrap(), 0);
-        assert!(s.reserve_inflight("t", p).await.unwrap().admitted);
-    }
-
-    /// in-flight DECR: 0 を下回らない（二重 DECR の自己治癒）。
-    #[tokio::test]
-    async fn inflight_release_floors_at_zero() {
-        let s = InProcStore::new();
-        assert_eq!(s.release_inflight("t").await.unwrap(), 0);
-        assert_eq!(s.release_inflight("t").await.unwrap(), 0);
-        assert_eq!(s.peek_inflight("t"), 0);
-    }
-
-    /// reaper 再同期: カウンタを DB COUNT（真実）へ上書きする。
-    #[tokio::test]
-    async fn inflight_resync_overwrites_counter() {
-        let s = InProcStore::new();
-        let p = InflightParams {
-            max: 100,
-            ttl_secs: 60,
-        };
-        // ドリフトで膨らんだカウンタ。
-        for _ in 0..10 {
-            s.reserve_inflight("t", p).await.unwrap();
-        }
-        assert_eq!(s.peek_inflight("t"), 10);
-        // DB の真実は 3 件 → 再同期。
-        s.resync_inflight("t", 3, 60).await.unwrap();
-        assert_eq!(s.peek_inflight("t"), 3);
     }
 
     /// login ロックアウト: 閾値到達で locked。それ未満は許可。

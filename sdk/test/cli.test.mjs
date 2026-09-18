@@ -36,6 +36,7 @@ test("help is contextual, has examples, and works outside a project without side
   assert.equal(rootHelp.code, 0, rootHelp.stderr);
   assert.match(rootHelp.stdout, /hibana init my-api/);
   assert.match(rootHelp.stdout, /npm run dev/);
+  assert.match(rootHelp.stdout, /egress\s+Manage application outbound destinations/);
   assert.doesNotMatch(rootHelp.stdout, /--sha256|--kubeconfig/);
   for (const command of ["init", "dev", "build", "deploy", "rollback", "list", "delete", "login", "logout", "runtime", "profile", "secret", "platform"]) {
     const direct = await f.invoke([command, "--help"]);
@@ -129,6 +130,29 @@ test("missing and malformed project files explain how to recover without exposin
   assert.equal(result.code, 1, result.stderr);
   assert.match(result.stderr, /Invalid JSON.*broken.json/);
   assert.doesNotMatch(result.stderr, /sensitive-test-value/);
+});
+
+test("NUL vars fail before build, runtime startup or deployment API access", async t => {
+  const f = await fixture(t), requests = [];
+  const server = createServer((req, res) => { requests.push(req.url); res.end("{}"); });
+  await new Promise(resolve => server.listen(0, "127.0.0.1", resolve));
+  t.after(() => new Promise(resolve => server.close(resolve)));
+  await writeFile(join(f.root, "hibana.json"), JSON.stringify({
+    name: "vars-test", component: "missing.wasm",
+    build: { commands: [[process.execPath, "-e", "require('node:fs').writeFileSync('build-started', '')"]] },
+    vars: { VALUE: "sensitive-fixture\u0000tail" },
+  }));
+  const env = { HIBANA_URL: `http://127.0.0.1:${server.address().port}`, HIBANA_TOKEN: "test-token" };
+  for (const args of [["build"], ["dev", "--runtime", process.execPath], ["deploy"]]) {
+    const result = await f.invoke(args, { env });
+    assert.equal(result.code, 1, result.stderr);
+    assert.equal(result.stdout, "");
+    assert.match(result.stderr, /vars\.VALUE.*NUL.*U\+0000/);
+    assert.match(result.stderr, /Remove.*hibana\.json/);
+    assert.doesNotMatch(result.stderr, /sensitive-fixture|\u0000/);
+  }
+  assert.deepEqual(requests, []);
+  assert.deepEqual(await readdir(f.root), ["hibana.json"]);
 });
 
 test("init offers executable next steps and recovers from failed dependency installation", async t => {

@@ -771,6 +771,7 @@ pub struct RollbackVersionRequest {
 pub struct RollbackVersionResponse {
     pub component_id: String,
     pub active_version_id: String,
+    pub version: String,
     /// 直前まで stable だった版（今回の rollback で置き換えられた側）。
     pub rolled_back_from: Option<String>,
 }
@@ -891,6 +892,16 @@ pub async fn rollback_version(
         };
     };
 
+    let version: String = component_versions::Entity::find()
+        .select_only()
+        .column(component_versions::Column::Version)
+        .filter(component_versions::Column::TenantId.eq(tenant))
+        .filter(component_versions::Column::Id.eq(&active_version_id))
+        .into_tuple()
+        .one(&tx)
+        .await?
+        .ok_or_else(|| FaasError::NotFound("rollback version".into()))?;
+
     db::insert_audit_log(
         &tx,
         tenant,
@@ -912,6 +923,7 @@ pub async fn rollback_version(
     Ok(Json(RollbackVersionResponse {
         component_id,
         active_version_id,
+        version,
         rolled_back_from,
     }))
 }

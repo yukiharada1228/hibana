@@ -26,9 +26,12 @@ export function Usage({
   const [range, setRange] = useState({ from: monthAgo(), to: today() });
   const [data, setData] = useState<UsageData | null>(null),
     [error, setError] = useState("");
+  const [rangeError, setRangeError] = useState("");
+  useEffect(() => {
+    setData(null);
+  }, [api, range.from, range.to]);
   useEffect(() => {
     let current = true;
-    setData(null);
     setError("");
     api
       .usage(range.from, range.to)
@@ -61,9 +64,10 @@ export function Usage({
           const from = String(form.get("from")),
             to = String(form.get("to"));
           if (from > to) {
-            setError("開始日は終了日以前を指定してください。");
+            setRangeError("開始日は終了日以前を指定してください。");
             return;
           }
+          setRangeError("");
           setRange({ from, to });
         }}
       >
@@ -79,7 +83,13 @@ export function Usage({
           集計する
         </Button>
       </form>
-      {error && <Notice error>{error}</Notice>}
+      {rangeError && <Notice error>{rangeError}</Notice>}
+      {error && (
+        <Notice error>
+          {error}
+          {data && " 表示中の利用量は前回取得した内容です。"}
+        </Notice>
+      )}
       {!data && !error && <Notice>利用量を読み込み中…</Notice>}
       {data && (
         <>
@@ -92,17 +102,17 @@ export function Usage({
               </strong>
             </div>
             <div>
-              <span>失敗 / タイムアウト</span>
+              <span>実行失敗</span>
               <strong>
                 {number(data.totals.failed_count)}
-                <small>/ {number(data.totals.timeout_count)}</small>
+                <small>回</small>
               </strong>
             </div>
             <div>
-              <span>累計実行時間</span>
+              <span>タイムアウト</span>
               <strong>
-                {number(data.totals.wall_time_ms)}
-                <small>ms</small>
+                {number(data.totals.timeout_count)}
+                <small>回</small>
               </strong>
             </div>
           </div>
@@ -127,7 +137,7 @@ export function Usage({
                       <TableHead>成功</TableHead>
                       <TableHead>失敗</TableHead>
                       <TableHead>タイムアウト</TableHead>
-                      <TableHead>出力量</TableHead>
+                      <TableHead>詳細</TableHead>
                     </TableRow>
                   </TableHeader>
                   <TableBody>
@@ -144,7 +154,13 @@ export function Usage({
                         <TableCell>{number(row.succeeded_count)}</TableCell>
                         <TableCell>{number(row.failed_count)}</TableCell>
                         <TableCell>{number(row.timeout_count)}</TableCell>
-                        <TableCell>{bytes(row.output_bytes)}</TableCell>
+                        <TableCell>
+                          <details>
+                            <summary>リソース使用量</summary>
+                            <p>累計実行時間：{number(row.wall_time_ms)} ms</p>
+                            <p>出力量：{bytes(row.output_bytes)}</p>
+                          </details>
+                        </TableCell>
                       </TableRow>
                     ))}
                   </TableBody>

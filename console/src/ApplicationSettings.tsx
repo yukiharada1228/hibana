@@ -18,16 +18,26 @@ export function ApplicationSettings({
   api: Api;
   component: Component;
 }) {
-  const [data, setData] = useState<Settings | null>(null),
+  const [loaded, setData] = useState<Settings | null>(null),
     [error, setError] = useState("");
+  const data =
+    loaded?.version_id === component.active_version_id ? loaded : null;
   useEffect(() => {
-    let current = true;
     setData(null);
     setError("");
+  }, [api, component.component_id, component.active_version_id]);
+  useEffect(() => {
+    let current = true;
     api
       .config(component.component_id)
       .then((result) => {
-        if (current) setData(result);
+        if (!current) return;
+        if (result.version_id !== component.active_version_id)
+          throw new Error(
+            "配備が変更されました。「更新」で現在の設定を取得してください。",
+          );
+        setData(result);
+        setError("");
       })
       .catch((error) => {
         if (current) setError(errorMessage(error));
@@ -36,18 +46,23 @@ export function ApplicationSettings({
       current = false;
     };
   }, [api, component]);
-  if (error) return <Notice error>{error}</Notice>;
-  if (!data) return <Notice>設定を読み込み中…</Notice>;
+  const warning = error && (
+    <Notice error>
+      {error}
+      {data && " 表示中の設定は前回取得した内容です。"}
+    </Notice>
+  );
+  if (!data) return warning || <Notice>設定を読み込み中…</Notice>;
   if (!data.version_id)
-    return <Notice>配備されたバージョンはありません。</Notice>;
-  if (data.version_id !== component.active_version_id)
     return (
-      <Notice>
-        配備が変更されました。「更新」で現在の設定を取得してください。
-      </Notice>
+      <>
+        {warning}
+        <Notice>配備されたバージョンはありません。</Notice>
+      </>
     );
   return (
     <div className="settings-sections">
+      {warning}
       <section className="panel">
         <div className="panel-toolbar">
           <div>

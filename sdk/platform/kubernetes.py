@@ -9,6 +9,7 @@ import re
 import secrets
 import shlex
 import shutil
+import signal
 import subprocess
 import sys
 import time
@@ -19,6 +20,8 @@ from urllib.parse import urlsplit
 import yaml
 from common import KubernetesTarget, stamp_runtime_settings
 from maintenance import Maintenance, NoControlPlane
+from local_operation import LocalOperationLock
+from operation import exclusive
 
 ROOT = Path(__file__).resolve().parents[2]
 LOCAL = ROOT / "deploy/kubernetes/local"
@@ -47,6 +50,9 @@ class LocalCluster(KubernetesTarget):
     def run(self, *args, **kwargs):
         return run(*args, **kwargs)
 
+    def operation(self, action):
+        return LocalOperationLock(self.state, action)
+
     def ensure_cluster(self):
         for tool in ["docker", "kubectl", self.kind]:
             if not shutil.which(tool):
@@ -67,7 +73,8 @@ class LocalCluster(KubernetesTarget):
                         "back up and recreate the old cluster; see deploy/kubernetes/README.md."
                     )
             if any(not node["State"]["Running"] for node in self.owned_nodes()):
-                self.start(wait_runtime=False)
+                # install already holds the operation lock through final readiness.
+                self._start(wait_runtime=False)
         else:
             self.state.mkdir(parents=True, exist_ok=True, mode=0o700)
             run(self.kind, "create", "cluster", "--name", self.name, "--config", LOCAL / "kind.yaml",
@@ -93,7 +100,11 @@ class LocalCluster(KubernetesTarget):
             raise ValueError("Unexpected kind node names; no changes made.")
         return nodes
 
+    @exclusive
     def start(self, wait_runtime=True):
+        self._start(wait_runtime=wait_runtime)
+
+    def _start(self, wait_runtime=True):
         nodes = self.owned_nodes()
         stopped = [n["Id"] for n in nodes if not n["State"]["Running"]]
         resumed_at = datetime.now(timezone.utc) if stopped else None
@@ -123,8 +134,12 @@ class LocalCluster(KubernetesTarget):
         maintenance = Maintenance(self)
         try:
             maintenance.control_plane()
+            supported = maintenance.supports_protocol()
         except NoControlPlane:
             print("No Control Plane is running. The owned local cluster will stop using container termination grace periods.")
+            return
+        if not supported:
+            print("Legacy Control Plane detected. Stopping with container termination grace periods; fleet drain is unavailable.")
             return
         path = self.state / "maintenance.json"
         if path.exists():
@@ -138,12 +153,17 @@ class LocalCluster(KubernetesTarget):
         maintenance.drain()
 
     def resume_admission(self):
+        maintenance = Maintenance(self)
+        if not maintenance.supports_protocol():
+            # Retain any owner left by an older CLI or a failed upgrade. A later
+            # compatible install must still be able to reopen that same gate.
+            print("Legacy Control Plane detected. Workloads are ready; application preparation is unavailable.")
+            return
         path = self.state / "maintenance.json"
         if not path.exists():
-            Maintenance(self).prepare()
+            maintenance.prepare()
             return
         owner = json.loads(path.read_text())["owner"]
-        maintenance = Maintenance(self)
         maintenance.close(owner)
         maintenance.prepare(owner)
         maintenance.open(owner)
@@ -163,6 +183,7 @@ class LocalCluster(KubernetesTarget):
                 raise ValueError("Hibana workloads did not become healthy after restart within 300 seconds")
             time.sleep(2)
 
+    @exclusive
     def stop(self):
         nodes = self.owned_nodes()
         running = [n["Id"] for n in nodes if n["State"]["Running"]]
@@ -173,6 +194,7 @@ class LocalCluster(KubernetesTarget):
             raise ValueError("Some kind nodes are still running.")
         print(f"Stopped local cluster {self.name}. Data is preserved; use hibana platform start --source {shlex.quote(str(ROOT))} --cluster {self.name} to resume.")
 
+    @exclusive
     def uninstall(self):
         nodes = self.owned_nodes()
         if nodes and all(n["State"]["Running"] for n in nodes):
@@ -311,6 +333,7 @@ class LocalCluster(KubernetesTarget):
                 print("  delete the owned cluster's data and local credentials")
         print("Dry run complete. No resources were changed.")
 
+    @exclusive
     def install(self):
         self.install_phase = "local preflight"
         self.preflight()
@@ -413,6 +436,9 @@ def main():
     parser.add_argument("--dry-run", action="store_true")
     args = parser.parse_args()
     os.umask(0o077)
+    def interrupted(signum, frame):
+        raise KeyboardInterrupt
+    signal.signal(signal.SIGTERM, interrupted)
     try:
         if args.kubeconfig or args.context:
             from existing import ExistingCluster

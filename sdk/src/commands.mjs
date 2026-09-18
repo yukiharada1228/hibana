@@ -13,6 +13,8 @@ const boolean = (description, short) => ({
 });
 const options = {
   help: boolean("Show help for this command", "h"),
+  json: boolean("Output the complete API response as JSON"),
+  verbose: boolean("Include internal identifiers and the full version"),
   config: string("FILE", "Project configuration (default: hibana.json)", "c"),
   template: string("NAME", "hono (default), javascript, rust or go"),
   "no-install": boolean(
@@ -104,7 +106,7 @@ const commands = {
   deploy: leaf(
     "Build and deploy your application",
     "hibana deploy",
-    [...projectRemote, "version", "frozen-lockfile"],
+    [...projectRemote, "version", "frozen-lockfile", "verbose"],
     {
       examples: [
         "hibana deploy",
@@ -119,7 +121,7 @@ const commands = {
   rollback: leaf(
     "Restore a previously deployed version",
     "hibana rollback",
-    [...projectRemote, "version"],
+    [...projectRemote, "version", "verbose"],
     {
       examples: ["hibana rollback", "hibana rollback --version 1.0.0"],
       notes:
@@ -128,9 +130,9 @@ const commands = {
     },
   ),
   list: leaf(
-    "List deployed applications as JSON",
+    "List deployed applications",
     "hibana list",
-    [...remote, "all-tenants"],
+    [...remote, "all-tenants", "json"],
     { notes: connectionHelp },
   ),
   delete: leaf(
@@ -193,9 +195,9 @@ const commands = {
     description: "Manage application outbound destinations",
     actions: {
       list: leaf(
-        "List the application egress policy as JSON",
+        "List allowed outbound destinations",
         "hibana egress list",
-        projectRemote,
+        [...projectRemote, "json"],
         {
           notes:
             "allow_outbound: null means unconfigured (legacy version permissions remain); [] denies all outbound access.\n" +
@@ -233,9 +235,9 @@ const commands = {
           connectionHelp,
       },
       list: leaf(
-        "List application secrets as JSON",
+        "List application secrets",
         "hibana secret list",
-        projectRemote,
+        [...projectRemote, "json"],
         { notes: connectionHelp },
       ),
       delete: secret("delete", "Delete a stored secret"),
@@ -336,7 +338,7 @@ Development:
 ${rows(["init", "dev", "build", "deploy"].map((name) => [name, commands[name].description]))}
 
 Applications and connections:
-${rows(["login", "logout", "list", "rollback", "delete", "secret", "profile"].map((name) => [name, commands[name].description]))}
+${rows(["login", "logout", "list", "rollback", "delete", "secret", "egress", "profile"].map((name) => [name, commands[name].description]))}
 
 Advanced:
 ${rows(["runtime", "platform"].map((name) => [name, commands[name].description]))}

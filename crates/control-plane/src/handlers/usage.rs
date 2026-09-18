@@ -6,6 +6,7 @@ use crate::state::AppState;
 use axum::extract::{Query, State};
 use axum::response::IntoResponse;
 use axum::Json;
+use chrono::Datelike;
 use hibana_shared::FaasError;
 use sea_orm::TransactionTrait as _;
 use serde::{Deserialize, Serialize};
@@ -16,7 +17,7 @@ use serde::{Deserialize, Serialize};
 
 /// `GET /usage` のクエリパラメータ。
 ///
-/// `from`/`to` は `YYYY-MM-DD`（UTC 日境界）。`usage_rollups` は UTC 日次粒度で集計されるため
+/// `from`/`to` は `YYYY-MM-DD`（0001〜9999 年、UTC 日境界）。`usage_rollups` は UTC 日次粒度で集計されるため
 /// レスポンスも UTC 日次（period の両端含む）になる。既定は `to`=今日(UTC) / `from`=`to`-30 日。
 /// `component_id` 指定時はその component のみに絞り込む（未指定なら全 component）。
 #[derive(Debug, Deserialize)]
@@ -77,8 +78,15 @@ pub(super) fn resolve_usage_range(
     today: chrono::NaiveDate,
 ) -> Result<(chrono::NaiveDate, chrono::NaiveDate), FaasError> {
     let parse = |label: &str, s: &str| {
-        chrono::NaiveDate::parse_from_str(s, "%Y-%m-%d")
-            .map_err(|_| FaasError::InvalidRequest(format!("{label} must be YYYY-MM-DD")))
+        let invalid = || FaasError::InvalidRequest(format!("{label} must be YYYY-MM-DD"));
+        if s.len() != 10 {
+            return Err(invalid());
+        }
+        let date = chrono::NaiveDate::parse_from_str(s, "%Y-%m-%d").map_err(|_| invalid())?;
+        if date.format("%Y-%m-%d").to_string() != s {
+            return Err(invalid());
+        }
+        Ok(date)
     };
 
     let to = match to {
@@ -87,8 +95,21 @@ pub(super) fn resolve_usage_range(
     };
     let from = match from {
         Some(s) => parse("from", s)?,
-        None => to - chrono::Duration::days(30),
+        None => to
+            .checked_sub_signed(chrono::Duration::days(30))
+            .ok_or_else(|| {
+                FaasError::InvalidRequest("default usage range is outside supported dates".into())
+            })?,
     };
+
+    if [from, to]
+        .iter()
+        .any(|date| !(1..=9999).contains(&date.year()))
+    {
+        return Err(FaasError::InvalidRequest(
+            "from and to must be between 0001-01-01 and 9999-12-31".into(),
+        ));
+    }
 
     if from > to {
         return Err(FaasError::InvalidRequest(

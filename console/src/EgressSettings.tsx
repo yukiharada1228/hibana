@@ -19,6 +19,7 @@ export function EgressSettings({
   const [policy, setPolicy] = useState<EgressPolicy | null>(null);
   const [destination, setDestination] = useState("");
   const [error, setError] = useState("");
+  const [loadError, setLoadError] = useState("");
   const [message, setMessage] = useState("");
   const [busy, setBusy] = useState(false);
   const revision = useRef(0);
@@ -39,13 +40,12 @@ export function EgressSettings({
       .then((result) => {
         if (revision.current === current) {
           setPolicy(result);
-          setError("");
+          setLoadError("");
         }
       })
       .catch((error) => {
         if (revision.current === current) {
-          setPolicy(null);
-          setError(errorMessage(error));
+          setLoadError(errorMessage(error));
         }
       });
     return () => {
@@ -69,6 +69,7 @@ export function EgressSettings({
       if (!mounted.current) return;
       ++revision.current;
       setPolicy(result);
+      setLoadError("");
       if (action === "allow") setDestination("");
       setMessage("外部通信の許可を更新しました。");
       changing.current = false;
@@ -97,10 +98,17 @@ export function EgressSettings({
         </div>
       </div>
       <div className="egress-content">
+        {loadError && (
+          <Notice error>
+            {loadError}
+            {policy &&
+              " 表示中の通信先は前回取得した内容です。現在の許可状態は確認できていません。"}
+          </Notice>
+        )}
         {error && <Notice error>{error}</Notice>}
         {message && <p role="status">{message}</p>}
         {!policy ? (
-          !error && <p>通信先を読み込み中…</p>
+          !loadError && <p>通信先を読み込み中…</p>
         ) : (
           <>
             {policy.allow_outbound === null ? (

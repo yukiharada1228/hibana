@@ -30,7 +30,7 @@ pub struct SecretBindingResponse {
     pub available: bool,
 }
 
-/// config の入力（キー名・値長・件数・総バイト）を検証する純関数（DB / ストア非依存）。
+/// config の入力（キー名・NUL・値長・件数・総バイト）を検証する純関数（DB / ストア非依存）。
 ///
 /// 上限は `hibana_shared` の定数を使う（CP の受付と worker の防御的 clamp で同じ値を参照する
 /// 二重防御）。超過は 400（`error.rs` は `InvalidRequest` を 400 にしか写像しない）。
@@ -49,6 +49,12 @@ pub(super) fn validate_env_map(
             return Err(FaasError::InvalidRequest(format!(
                 "invalid env key '{k}': must match ^[A-Z_][A-Z0-9_]{{0,{}}}$",
                 hibana_shared::MAX_ENV_KEY_LEN - 1
+            )));
+        }
+        // PostgreSQL text cannot store NUL. Reject before Wasm preparation and storage.
+        if v.contains('\0') {
+            return Err(FaasError::InvalidRequest(format!(
+                "env value for '{k}' contains NUL (U+0000); remove NUL characters before deploying"
             )));
         }
         if v.len() > hibana_shared::MAX_ENV_VALUE_BYTES {

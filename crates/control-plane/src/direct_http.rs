@@ -265,7 +265,7 @@ pub async fn accept(
     }
     let Some(_tenant_request) = state
         .request_capacity()
-        .reserve_tenant(tenant, resolved.inflight.max as usize)
+        .reserve_tenant(tenant, resolved.max_concurrent_executions as usize)
     else {
         return Ok(admission::RateLimited::concurrency().into_response());
     };
@@ -309,15 +309,15 @@ pub async fn accept(
         .one(&tx)
         .await?
         .ok_or_else(|| FaasError::NotFound("HTTP application".into()))?;
-    // Serialize only acceptance for this tenant, not guest execution. Redis can
-    // temporarily undercount during reconciliation; the committed DB records
-    // are the authoritative concurrency bound across Control Plane instances.
+    // Serialize acceptance for this tenant across Control Plane instances.
+    // Counting and inserting in this transaction makes the DB the only source
+    // of concurrency slots; completion releases a slot by committing its status.
     hibana_database::postgres::lock_tenant_admission(
         &tx,
         &format!("hibana:http-admission:{tenant}"),
     )
     .await?;
-    if db::count_inflight_executions(&tx, tenant).await? >= resolved.inflight.max {
+    if db::count_inflight_executions(&tx, tenant).await? >= resolved.max_concurrent_executions {
         state
             .metrics()
             .admission_rejections_total
@@ -325,40 +325,22 @@ pub async fn accept(
             .inc();
         return Ok(admission::RateLimited::concurrency().into_response());
     }
-    let (decision, reserved) = admission::reserve_inflight(state, tenant, &resolved).await;
-    if let Decision::Rejected(r) = decision {
-        state
-            .metrics()
-            .admission_rejections_total
-            .with_label_values(&[r.code])
-            .inc();
-        return Ok(r.into_response());
-    }
     let id = hibana_shared::new_execution_id();
-    let inserted: Result<(), sea_orm::DbErr> = async {
-        executions::Entity::insert(executions::ActiveModel {
-            id: Set(id.clone()),
-            tenant_id: Set(tenant.into()),
-            component_id: Set(component_id),
-            version_id: Set(version_id.clone()),
-            status: Set("pending".into()),
-            input: Set(Some(input.clone())),
-            job_token_kid: Set(Some(state.signer().kid().into())),
-            http_request: Set(true),
-            created_at: Set(accepted_at),
-            ..Default::default()
-        })
-        .exec(&tx)
-        .await?;
-        tx.commit().await
-    }
-    .await;
-    if let Err(error) = inserted {
-        if reserved {
-            let _ = state.store().release_inflight(tenant).await;
-        }
-        return Err(error.into());
-    }
+    executions::Entity::insert(executions::ActiveModel {
+        id: Set(id.clone()),
+        tenant_id: Set(tenant.into()),
+        component_id: Set(component_id),
+        version_id: Set(version_id.clone()),
+        status: Set("pending".into()),
+        input: Set(Some(input.clone())),
+        job_token_kid: Set(Some(state.signer().kid().into())),
+        http_request: Set(true),
+        created_at: Set(accepted_at),
+        ..Default::default()
+    })
+    .exec(&tx)
+    .await?;
+    tx.commit().await?;
     let guard = PendingDispatch {
         state: state.clone(),
         tenant: tenant.into(),
@@ -378,7 +360,7 @@ pub async fn accept(
 }
 
 /// The same pending predicate as the Worker claim prevents cancelling an execution
-/// that may have performed side effects. Only the winning transition releases Redis.
+/// that may have performed side effects. The committed status frees the DB slot.
 /// Rejected dispatches are not guest invocations and do not accrue usage.
 pub(crate) async fn cancel_pending(
     state: &AppState,
@@ -413,9 +395,6 @@ pub(crate) async fn cancel_pending(
             .admission_rejections_total
             .with_label_values(&["worker_unavailable"])
             .inc();
-        if let Err(error) = state.store().release_inflight(tenant).await {
-            tracing::warn!(execution_id = %id, %error, "dispatch cancellation counter release failed; reaper will reconcile");
-        }
     }
     Ok(changed)
 }

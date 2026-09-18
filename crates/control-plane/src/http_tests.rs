@@ -65,6 +65,14 @@ async fn scalar(owner: &DatabaseConnection, query: &str) -> i64 {
     fixture_scalar(owner, query, vec![]).await.unwrap()
 }
 
+async fn inflight(pool: &DatabaseConnection, tenant: &str) -> i64 {
+    let tx = pool.begin().await.unwrap();
+    db::set_tenant_guc(&tx, tenant).await.unwrap();
+    let count = db::count_inflight_executions(&tx, tenant).await.unwrap();
+    tx.commit().await.unwrap();
+    count
+}
+
 #[tokio::test]
 #[ignore = "requires disposable PostgreSQL; bash scripts/test-http.sh"]
 async fn http_mvp_regression() {
@@ -216,18 +224,6 @@ async fn http_mvp_regression() {
         .status(),
         StatusCode::SERVICE_UNAVAILABLE
     );
-    let params = unavailable
-        .admission()
-        .resolve_for_tenant("http", &Default::default());
-    let (decision, reserved) =
-        crate::admission::reserve_inflight(&unavailable, "http", &params).await;
-    assert!(!reserved);
-    match decision {
-        crate::admission::Decision::Rejected(r) => {
-            assert_eq!(r.into_response().status(), StatusCode::SERVICE_UNAVAILABLE)
-        }
-        _ => panic!("store failure must reject"),
-    }
     assert_eq!(scalar(&owner, "SELECT count(*) FROM executions").await, 0);
     println!("PASS shared store failure rejects HTTP without accepting an execution");
 
@@ -243,7 +239,7 @@ async fn http_mvp_regression() {
             .await
             .is_err()
     );
-    assert_eq!(store.peek_inflight("http"), 0);
+    assert_eq!(inflight(&pool, "http").await, 0);
     assert_eq!(scalar(&owner, "SELECT count(*) FROM executions").await, 0);
     fixture_execute(
         &owner,
@@ -276,7 +272,7 @@ async fn http_mvp_regression() {
         scalar(&owner, "SELECT count(*) FROM information_schema.tables WHERE table_schema='public' AND table_name='execution_outbox'").await,
         0
     );
-    assert_eq!(store.peek_inflight("http"), 0);
+    assert_eq!(inflight(&pool, "http").await, 0);
     assert_eq!(scalar(&owner, "SELECT count(*) FROM executions WHERE status='failed' AND error->>'code'='dispatch_not_started'").await, 1);
     assert_eq!(
         scalar(
@@ -292,7 +288,7 @@ async fn http_mvp_regression() {
     assert!(!direct_http::cancel_pending(&state, "http", &rejected)
         .await
         .unwrap());
-    assert_eq!(store.peek_inflight("http"), 0);
+    assert_eq!(inflight(&pool, "http").await, 0);
     assert_eq!(
         scalar(&owner, "SELECT count(*) FROM usage_rollups").await,
         0
@@ -317,8 +313,6 @@ async fn http_mvp_regression() {
     )
     .await
     .unwrap();
-    use crate::store::Store as _;
-    store.resync_inflight("http", 1, 3600).await.unwrap();
     println!("PASS unavailable Worker releases reservation once without invocation usage; late claim fails");
     assert_eq!(
         direct_http::accept(&state, "http", "source", std::future::ready(Ok(json!({}))))
@@ -327,11 +321,11 @@ async fn http_mvp_regression() {
             .status(),
         StatusCode::TOO_MANY_REQUESTS
     );
-    // A stale Redis reconciliation must never admit more than the DB limit.
-    store.resync_inflight("http", 0, 3600).await.unwrap();
+    // Separate Control Plane instances must observe the same DB limit.
+    let peer = self::state(pool.clone(), store.clone());
     let (a, b) = tokio::join!(
         direct_http::accept(&state, "http", "source", std::future::ready(Ok(json!({})))),
-        direct_http::accept(&state, "http", "source", std::future::ready(Ok(json!({}))))
+        direct_http::accept(&peer, "http", "source", std::future::ready(Ok(json!({}))))
     );
     assert_eq!(a.unwrap().status(), StatusCode::TOO_MANY_REQUESTS);
     assert_eq!(b.unwrap().status(), StatusCode::TOO_MANY_REQUESTS);
@@ -339,8 +333,7 @@ async fn http_mvp_regression() {
         scalar(&owner, "SELECT count(*) FROM executions WHERE http_request").await,
         1
     );
-    store.resync_inflight("http", 1, 3600).await.unwrap();
-    println!("PASS HTTP admission / no outbox / active version only / DB concurrency despite stale Redis");
+    println!("PASS HTTP admission / no outbox / active version only / DB concurrency across Control Planes");
 
     let id: String = fixture_scalar(&owner, "SELECT id FROM executions", vec![])
         .await
@@ -412,7 +405,7 @@ async fn http_mvp_regression() {
     assert!(!direct_http::cancel_pending(&state, "http", &id)
         .await
         .unwrap());
-    assert_eq!(store.peek_inflight("http"), 1);
+    assert_eq!(inflight(&pool, "http").await, 1);
     let mut result = ResultMessage {
         execution_id: id.clone(),
         tenant_id: "http".into(),
@@ -529,7 +522,7 @@ async fn http_mvp_regression() {
             StatusCode::NO_CONTENT
         );
     }
-    assert_eq!(store.peek_inflight("http"), 0);
+    assert_eq!(inflight(&pool, "http").await, 0);
     assert_eq!(
         scalar(
             &owner,
@@ -578,7 +571,6 @@ async fn http_mvp_regression() {
     for attempt in 0..16 {
         let raced = format!("dispatch-race-{attempt}");
         fixture_execute(&owner, "INSERT INTO executions (id,tenant_id,component_id,version_id,status,input,http_request) VALUES ($1,'http','source','source-v1','pending','{}',true)", vec![raced.clone().into()]).await.unwrap();
-        store.resync_inflight("http", 1, 3600).await.unwrap();
         let claim = async {
             let tx = pool.begin().await.unwrap();
             db::set_tenant_guc(&tx, "http").await.unwrap();
@@ -590,13 +582,12 @@ async fn http_mvp_regression() {
             tokio::join!(claim, direct_http::cancel_pending(&state, "http", &raced));
         let cancelled = cancelled.unwrap();
         assert_ne!(claimed, cancelled, "exactly one transition must win");
-        assert_eq!(store.peek_inflight("http"), i64::from(claimed));
+        assert_eq!(inflight(&pool, "http").await, i64::from(claimed));
         assert!(!direct_http::cancel_pending(&state, "http", &raced)
             .await
             .unwrap());
         // Finish the synthetic claim without executing a guest; preserve no test reservations.
         fixture_execute(&owner, "UPDATE executions SET status='failed',finished_at=now() WHERE id=$1 AND status='running'", vec![raced.clone().into()]).await.unwrap();
-        store.resync_inflight("http", 0, 3600).await.unwrap();
     }
     println!(
         "PASS concurrent Worker claim / dispatch cancellation: one winner, one reservation release"
@@ -775,7 +766,243 @@ async fn http_mvp_regression() {
         .unwrap();
     tx.commit().await.unwrap();
     console_information_regression(&state).await;
+    direct_http_dispatch_regression(&owner, &pool).await;
+    completion_diagnostic_regression(&owner, &state).await;
     println!("PASS admin deletion: authentication / RLS / active execution guard / suspended tenant inventory / name reuse / retained history");
+}
+
+async fn completion_diagnostic_regression(owner: &DatabaseConnection, state: &AppState) {
+    use hibana_database::prelude::*;
+
+    fixture_execute(owner, r#"
+        INSERT INTO tenants (id,slug,name,status) VALUES ('diagnostics','diagnostics','Diagnostics','active');
+        INSERT INTO components (id,tenant_id,name) VALUES ('diagnostics-app','diagnostics','app');
+        INSERT INTO component_versions (id,tenant_id,component_id,version,storage_uri,wasm_sha256,status)
+            VALUES ('diagnostics-v1','diagnostics','diagnostics-app','1','unused','abcd','active');
+    "#, vec![]).await.unwrap();
+
+    // Wasmtime preserves NUL in debug names when formatting a trap backtrace.
+    // Exercise the signed completion handler and JSONB storage, not just JSON encoding.
+    let long_error = "雪".repeat(32 * 1024);
+    let marker = "\n[diagnostic truncated]";
+    let truncated_error = format!(
+        "{}{marker}",
+        "雪".repeat((hibana_shared::diagnostics::MAX_DIAGNOSTIC_BYTES - marker.len()) / "雪".len())
+    );
+    let cases = [
+        (
+            Some("wasm trap: error while executing at wasm backtrace:\n    0: module\0fixture!func\0fixture"),
+            Some("wasm trap: error while executing at wasm backtrace:\n    0: module\\u0000fixture!func\\u0000fixture"),
+        ),
+        (Some("\0雪\0\0"), Some("\\u0000雪\\u0000\\u0000")),
+        (Some("失敗\n\t原因\r\n"), Some("失敗\n\t原因\r\n")),
+        (Some(r"literal \u0000"), Some(r"literal \u0000")),
+        (Some(long_error.as_str()), Some(truncated_error.as_str())),
+        (Some(""), Some("")),
+        (None, None),
+    ];
+    for (index, (message, expected)) in cases.into_iter().enumerate() {
+        let id = format!("diagnostics-{index}");
+        fixture_execute(owner,
+            "INSERT INTO executions (id,tenant_id,component_id,version_id,status,input,input_ref,http_request,started_at) VALUES ($1,'diagnostics','diagnostics-app','diagnostics-v1','running','{}','fixture-input',true,now())",
+            vec![id.clone().into()]).await.unwrap();
+        assert_eq!(inflight(state.pool(), "diagnostics").await, 1);
+        let result = ResultMessage {
+            execution_id: id.clone(),
+            tenant_id: "diagnostics".into(),
+            status: ExecutionStatus::Failed,
+            output: None,
+            error: message.map(str::to_owned),
+            job_token: token(state, &id, "diagnostics", "diagnostics-v1"),
+            usage: Some(UsageMetrics::default()),
+        };
+        for _ in 0..2 {
+            assert_eq!(
+                direct_http::complete(
+                    State(state.clone()),
+                    headers(&result.job_token),
+                    Json(result.clone()),
+                )
+                .await
+                .unwrap(),
+                StatusCode::NO_CONTENT,
+            );
+            assert_eq!(inflight(state.pool(), "diagnostics").await, 0);
+        }
+        let tx = state.pool().begin().await.unwrap();
+        db::set_tenant_guc(&tx, "diagnostics").await.unwrap();
+        let saved = executions::Entity::find_by_id(&id)
+            .one(&tx)
+            .await
+            .unwrap()
+            .unwrap();
+        tx.commit().await.unwrap();
+        assert_eq!(saved.status, "failed");
+        assert_eq!(
+            saved.error,
+            expected.map(|message| json!({ "message": message }))
+        );
+        assert!(saved.finished_at.is_some());
+        assert!(saved.input.is_none());
+        assert!(saved.input_ref.is_none());
+        for field in ["invocation_count", "failed_count"] {
+            assert_eq!(
+                scalar(owner, &format!("SELECT sum({field})::bigint FROM usage_rollups WHERE tenant_id='diagnostics'")).await,
+                (index + 1) as i64,
+                "completion retries must not double-count usage",
+            );
+        }
+    }
+    println!("PASS completion diagnostics: bounded UTF-8 / NUL-safe JSONB / unchanged text / terminal state / input cleanup / immediate slot release / idempotent usage");
+}
+
+async fn direct_http_dispatch_regression(owner: &DatabaseConnection, pool: &DatabaseConnection) {
+    use axum::{routing::post, Router};
+    use hibana_shared::http::HttpRequest;
+    use std::time::Duration;
+    use tokio::sync::{mpsc, Semaphore};
+    use tokio::time::timeout;
+
+    fixture_execute(owner, r#"
+        INSERT INTO tenants (id,slug,name,status,quotas)
+            VALUES ('slots','slots','Slots','active','{"max_concurrent_executions":1}');
+        INSERT INTO components (id,tenant_id,name,ingress_enabled) VALUES ('slots-app','slots','app',true);
+        INSERT INTO component_versions (id,tenant_id,component_id,version,storage_uri,wasm_sha256,status)
+            VALUES ('slots-v1','slots','slots-app','1','unused','abcd','active');
+        UPDATE components SET active_version_id='slots-v1' WHERE id='slots-app';
+    "#, vec![]).await.unwrap();
+
+    let store = Arc::new(crate::store::InProcStore::new());
+    // Separate process-local request capacity, sharing only DB and rate limits.
+    let first = state(pool.clone(), store.clone());
+    let second = state(pool.clone(), store);
+    // Completing and cleaning executions must not require a healthy Redis.
+    let finalizer = state(pool.clone(), Arc::new(crate::store::FailingStore));
+    let worker_state = finalizer.clone();
+    let gate = Arc::new(Semaphore::new(0));
+    let worker_gate = gate.clone();
+    let (started, mut started_rx) = mpsc::channel::<()>(4);
+    let worker = Router::new().route("/invoke", post(move |request_headers: HeaderMap| {
+        let state = worker_state.clone();
+        let gate = worker_gate.clone();
+        let started = started.clone();
+        async move {
+            let Json(job) = direct_http::redeem(State(state.clone()), request_headers).await.unwrap();
+            let request: HttpRequest = serde_json::from_value(job.input).unwrap();
+            let tx = state.pool().begin().await.unwrap();
+            db::set_tenant_guc(&tx, "slots").await.unwrap();
+            let claimed = fixture_execute(&tx,
+                "UPDATE executions SET status='running',started_at=now() WHERE tenant_id='slots' AND id=$1 AND status='pending'",
+                vec![job.execution_id.clone().into()]).await.unwrap();
+            assert_eq!(claimed.rows_affected(), 1);
+            tx.commit().await.unwrap();
+            started.send(()).await.unwrap();
+            gate.acquire().await.unwrap().forget();
+            let result = ResultMessage {
+                execution_id: job.execution_id,
+                tenant_id: job.tenant_id,
+                status: ExecutionStatus::Succeeded,
+                output: Some(json!({"status":200,"streamed":true})),
+                error: None,
+                job_token: job.job_token.clone(),
+                usage: Some(UsageMetrics::default()),
+            };
+            assert_eq!(direct_http::complete(State(state), headers(&job.job_token), Json(result)).await.unwrap(),
+                StatusCode::NO_CONTENT);
+            (StatusCode::OK, request.body_bytes().unwrap())
+        }
+    }));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let endpoint = format!("http://{}", listener.local_addr().unwrap());
+    let server = tokio::spawn(async move { axum::serve(listener, worker).await.unwrap() });
+    // This ignored regression runs alone against a disposable DB in its own process.
+    let previous_endpoint = std::env::var("WORKER_HTTP_URL").unwrap();
+    std::env::set_var("WORKER_HTTP_URL", endpoint);
+
+    for _ in 0..3 {
+        let invoke = |state: AppState| {
+            tokio::spawn(async move {
+                direct_http::accept(&state, "slots", "app", std::future::ready(Ok(json!({}))))
+                    .await
+                    .unwrap()
+                    .status()
+            })
+        };
+        let mut a = invoke(first.clone());
+        let mut b = invoke(second.clone());
+        timeout(Duration::from_secs(5), started_rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        let a_rejected = timeout(Duration::from_secs(5), async {
+            tokio::select! {
+                result = &mut a => {
+                    assert_eq!(result.unwrap(), StatusCode::TOO_MANY_REQUESTS);
+                    true
+                },
+                result = &mut b => {
+                    assert_eq!(result.unwrap(), StatusCode::TOO_MANY_REQUESTS);
+                    false
+                },
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(inflight(pool, "slots").await, 1);
+        let winner = if a_rejected { b } else { a };
+        gate.add_permits(1);
+        let (completed, reaped) = tokio::join!(
+            timeout(Duration::from_secs(5), winner),
+            crate::reaper::reconcile_once(&finalizer, 0),
+        );
+        assert_eq!(completed.unwrap().unwrap(), StatusCode::OK);
+        reaped.unwrap();
+        assert_eq!(inflight(pool, "slots").await, 0);
+        // The next round must be admitted immediately, without a later reaper pass.
+    }
+    assert_eq!(
+        scalar(
+            owner,
+            "SELECT count(*) FROM executions WHERE tenant_id='slots' AND status='succeeded'"
+        )
+        .await,
+        3
+    );
+    println!("PASS shared DB concurrency: two Control Planes enforce one slot, completion/reaper release immediately without Redis");
+
+    // Echo the stored envelope through the Worker handoff, including UTF-8
+    // bodies that JSONB cannot represent directly because they contain NUL.
+    for body in [
+        b"hello".as_slice(),
+        b"hello\0world",
+        "雪\0".as_bytes(),
+        &[0, 255, 128],
+    ] {
+        let (parts, ()) = axum::http::Request::builder()
+            .method("POST")
+            .uri("/echo")
+            .body(())
+            .unwrap()
+            .into_parts();
+        let input = serde_json::to_value(HttpRequest::from_parts(&parts, body)).unwrap();
+        gate.add_permits(1);
+        let response = timeout(
+            Duration::from_secs(5),
+            direct_http::accept(&first, "slots", "app", std::future::ready(Ok(input))),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(response.status(), StatusCode::OK, "body: {body:?}");
+        let echoed = axum::body::to_bytes(response.into_body(), 4096)
+            .await
+            .unwrap();
+        assert_eq!(echoed.as_ref(), body);
+        started_rx.recv().await.unwrap();
+    }
+    std::env::set_var("WORKER_HTTP_URL", previous_endpoint);
+    server.abort();
+    println!("PASS HTTP body: text, NUL and binary survive JSONB persistence and Worker handoff byte-for-byte");
 }
 
 async fn console_information_regression(state: &AppState) {
@@ -947,6 +1174,68 @@ async fn console_information_regression(state: &AppState) {
             .unwrap()
             .iter()
             .any(|p| p["execution_id"] == e["execution_id"])));
+
+    // HTTP errors are operational failures even when Wasm completed successfully.
+    // Project only the status, including if old records contain response bodies.
+    for (status, expected, is_error) in [
+        (json!(200), json!(200), false),
+        (json!(404), json!(404), true),
+        (json!(503), json!(503), true),
+        (json!(599), json!(599), true),
+        (json!(600), json!(null), false),
+        (json!("500"), json!(null), false),
+        (json!(null), json!(null), false),
+    ] {
+        let tx = state.pool().begin().await.unwrap();
+        db::set_tenant_guc(&tx, "http").await.unwrap();
+        executions::Entity::update_many()
+            .col_expr(executions::Column::HttpRequest, Expr::val(true))
+            .col_expr(
+                executions::Column::Output,
+                Expr::val(json!({"status": status, "body": "private-response-body"})),
+            )
+            .filter(executions::Column::Id.eq("console-25"))
+            .exec(&tx)
+            .await
+            .unwrap();
+        tx.commit().await.unwrap();
+        let detail = body(
+            get_execution(
+                State(state.clone()),
+                principal("http"),
+                Path("console-25".into()),
+            )
+            .await
+            .unwrap(),
+        )
+        .await;
+        assert_eq!(detail["http_status"], expected);
+        assert_eq!(detail["status"], "succeeded");
+        assert!(!detail.to_string().contains("private-response-body"));
+        let errors = body(
+            list_executions(
+                State(state.clone()),
+                principal("http"),
+                Path("console".into()),
+                Query(ExecutionsQuery {
+                    errors_only: true,
+                    before: None,
+                }),
+            )
+            .await
+            .unwrap(),
+        )
+        .await;
+        assert_eq!(
+            errors["items"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|item| item["execution_id"] == "console-25"),
+            is_error
+        );
+        assert!(!errors.to_string().contains("private-response-body"));
+    }
     let denied = list_executions(
         State(state.clone()),
         principal("other"),
@@ -1270,7 +1559,7 @@ async fn assert_execution_input_upgrade(owner: &DatabaseConnection) {
         .unwrap();
     let state = state(runtime.clone(), Arc::new(crate::store::InProcStore::new()));
     // The production reaper must clean even with stuck-job recovery disabled.
-    crate::reaper::reconcile_once(&state, 60, 0).await.unwrap();
+    crate::reaper::reconcile_once(&state, 0).await.unwrap();
     assert_eq!(scalar(owner, "SELECT count(*) FROM executions WHERE id LIKE 'retention-upgrade-%' AND status='succeeded' AND (input IS NOT NULL OR input_ref IS NOT NULL)").await, 0);
     assert_eq!(scalar(owner, "SELECT count(*) FROM executions WHERE id='retention-upgrade-other-pending' AND input IS NOT NULL AND input_ref IS NOT NULL").await, 1);
     // More than one batch must progress without touching live or foreign inputs.

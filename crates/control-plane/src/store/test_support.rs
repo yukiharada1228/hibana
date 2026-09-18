@@ -3,8 +3,8 @@ use std::collections::HashMap;
 use std::sync::Mutex;
 
 use super::{
-    now_unix_millis, InflightParams, LockoutDecision, LockoutParams, RateDecision, RateLimitParams,
-    ReserveDecision, Store, StoreError,
+    now_unix_millis, LockoutDecision, LockoutParams, RateDecision, RateLimitParams, Store,
+    StoreError,
 };
 use async_trait::async_trait;
 
@@ -19,7 +19,6 @@ use async_trait::async_trait;
 /// token-bucket 補充・閾値判定）を live Redis 無しで検証するためのもの。
 #[derive(Default)]
 pub struct InProcStore {
-    inflight: Mutex<HashMap<String, i64>>,
     buckets: Mutex<HashMap<String, Bucket>>,
     failures: Mutex<HashMap<String, Failures>>,
 }
@@ -42,11 +41,6 @@ struct Failures {
 impl InProcStore {
     pub fn new() -> Self {
         Self::default()
-    }
-
-    /// テスト用: 現在の in-flight カウントを覗く。
-    pub fn peek_inflight(&self, tenant: &str) -> i64 {
-        *self.inflight.lock().unwrap().get(tenant).unwrap_or(&0)
     }
 }
 
@@ -88,46 +82,6 @@ impl Store for InProcStore {
                 retry_after_secs: secs.max(1),
             })
         }
-    }
-
-    async fn reserve_inflight(
-        &self,
-        tenant: &str,
-        params: InflightParams,
-    ) -> Result<ReserveDecision, StoreError> {
-        let mut map = self.inflight.lock().unwrap();
-        let entry = map.entry(tenant.to_string()).or_insert(0);
-        if *entry >= params.max {
-            Ok(ReserveDecision {
-                admitted: false,
-                current: *entry,
-            })
-        } else {
-            *entry += 1;
-            Ok(ReserveDecision {
-                admitted: true,
-                current: *entry,
-            })
-        }
-    }
-
-    async fn release_inflight(&self, tenant: &str) -> Result<i64, StoreError> {
-        let mut map = self.inflight.lock().unwrap();
-        let entry = map.entry(tenant.to_string()).or_insert(0);
-        // 0 を下回らない（二重 DECR の自己治癒）。
-        *entry = (*entry - 1).max(0);
-        Ok(*entry)
-    }
-
-    async fn resync_inflight(
-        &self,
-        tenant: &str,
-        count: i64,
-        _ttl_secs: u64,
-    ) -> Result<(), StoreError> {
-        let mut map = self.inflight.lock().unwrap();
-        map.insert(tenant.to_string(), count.max(0));
-        Ok(())
     }
 
     async fn record_login_failure(
@@ -207,24 +161,6 @@ impl Store for FailingStore {
         _params: RateLimitParams,
         _now_ms: u64,
     ) -> Result<RateDecision, StoreError> {
-        Self::down()
-    }
-    async fn reserve_inflight(
-        &self,
-        _tenant: &str,
-        _params: InflightParams,
-    ) -> Result<ReserveDecision, StoreError> {
-        Self::down()
-    }
-    async fn release_inflight(&self, _tenant: &str) -> Result<i64, StoreError> {
-        Self::down()
-    }
-    async fn resync_inflight(
-        &self,
-        _tenant: &str,
-        _count: i64,
-        _ttl_secs: u64,
-    ) -> Result<(), StoreError> {
         Self::down()
     }
     async fn record_login_failure(

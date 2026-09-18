@@ -1,5 +1,5 @@
 //! Real Redis transport tests; scripts/test-redis-tls.sh supplies disposable servers.
-use super::{InflightParams, RateLimitParams, RedisStore, Store};
+use super::{RateLimitParams, RedisStore, Store};
 
 fn endpoint(name: &str) -> String {
     let value = std::env::var(name).expect("run scripts/test-redis-tls.sh");
@@ -33,13 +33,6 @@ async fn redis_transport_runs_store_operations_over_tcp_and_tls() {
         };
         assert!(store.rate_limit(&key, rate, 1000).await.unwrap().allowed);
         assert!(!store.rate_limit(&key, rate, 1000).await.unwrap().allowed);
-        let limit = InflightParams {
-            max: 1,
-            ttl_secs: 60,
-        };
-        assert!(store.reserve_inflight(&key, limit).await.unwrap().admitted);
-        assert!(!store.reserve_inflight(&key, limit).await.unwrap().admitted);
-        assert_eq!(store.release_inflight(&key).await.unwrap(), 0);
     }
 }
 

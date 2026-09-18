@@ -77,6 +77,8 @@ Rust・GoのプロジェクトにはWIT定義と依存ロックもコピーさ�
 
 `hibana --help`で基本の流れとコマンド一覧、`hibana dev --help`でその操作のオプションと実行例を確認できます。`hibana help deploy`の形式も使えます。`runtime`や`platform`などのサブコマンドも同じ形式でヘルプを表示します。
 
+`list`・`secret list`・`egress list`は人が読める一覧を表示します。スクリプトから従来のJSONを読む場合は`hibana list --json`のように`--json`を指定してください。`deploy`はビルド前に認証と権限を確認し、接続先・テナント・アプリ名を表示します。成功時は短いバージョンと公開URL、`--verbose`を付けると内部IDと完全なバージョンも表示します。
+
 不明なコマンド、未対応のオプション、余分な引数は実行前にエラーにします。たとえば`hibana deploy --dry-run`は未対応なので、配備せずに使い方を案内します。CLIの設計方針は[CLIの操作設計](../docs/cli-design.md)にまとめています。
 
 ```bash
@@ -135,7 +137,7 @@ JS系は`main`を指定します。
 - `memory_mb`は実行内のWasm線形メモリの合計上限です。ホストのHTTPバッファ・コンパイル・コードキャッシュを含むPod全体のメモリとは異なります。Wasm threadsは対象外です。
 - `timeout_ms`: 1–30000、既定15000。ホスト処理込みの期限はさらに5秒。
 - `fuel`: 任意の正整数。Wasmtimeの命令量上限。
-- `vars`: 文字列の環境変数。JSは`fetch`の第2引数（Honoでは`c.env`）、Rust・GoはWASI環境変数として使用します。
+- `vars`: 文字列の環境変数。JSは`fetch`の第2引数（Honoでは`c.env`）、Rust・GoはWASI環境変数として使用します。NUL文字（U+0000）は指定できません。CLIとサーバーで拒否するため、含まれている場合は値から除去してください。
 
 CLIはComponentのヘッダーを確認します。WITの一致や全体の検証はランタイム・配備先が行います。`GOOS=wasip1 GOARCH=wasm go build`だけで生成したcore Wasmをそのまま配備することはできません。
 

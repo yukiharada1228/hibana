@@ -50,8 +50,9 @@ impl Default for HttpRequest {
 impl HttpRequest {
     pub fn from_parts(parts: &::http::request::Parts, body: &[u8]) -> Self {
         let (body, body_base64) = match std::str::from_utf8(body) {
-            Ok(text) => (text.to_owned(), false),
-            Err(_) => (crate::b64url_encode(body), true),
+            // PostgreSQL JSONB cannot store NUL, even in valid UTF-8 text.
+            Ok(text) if !text.contains('\0') => (text.to_owned(), false),
+            _ => (crate::b64url_encode(body), true),
         };
         let mut headers = BTreeMap::new();
         let mut additional_headers: BTreeMap<String, Vec<String>> = BTreeMap::new();
@@ -200,11 +201,18 @@ mod tests {
     }
     #[test]
     fn preserves_binary_and_text_requests_across_the_wire() {
-        for body in [
-            b"hello".as_slice(),
-            &[0, 255, 128, 10],
-            "雪".as_bytes(),
-            &[],
+        for (body, encoded) in [
+            (b"hello".as_slice(), false),
+            (b"line\n\tend", false),
+            ("雪".as_bytes(), false),
+            (b"", false),
+            (b"\0", true),
+            (b"hello\0world", true),
+            (b"\0hello", true),
+            (b"hello\0", true),
+            ("雪\0".as_bytes(), true),
+            (&[0, 255, 128, 10], true),
+            (&[255, 128], true),
         ] {
             let (parts, ()) = ::http::Request::builder()
                 .method("POST")
@@ -214,6 +222,7 @@ mod tests {
                 .unwrap()
                 .into_parts();
             let input = HttpRequest::from_parts(&parts, body);
+            assert_eq!(input.body_base64, encoded, "body: {body:?}");
             let decoded: HttpRequest =
                 serde_json::from_value(serde_json::to_value(&input).unwrap()).unwrap();
             assert_eq!(decoded.body_bytes().unwrap(), body);

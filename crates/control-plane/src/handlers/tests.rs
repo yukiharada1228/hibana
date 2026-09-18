@@ -11,6 +11,38 @@ use axum::http::StatusCode;
 use hibana_shared::{FaasError, Role, Scope};
 use serde_json::Value;
 
+#[tokio::test]
+async fn deployment_vars_reject_nul_as_bad_request_without_exposing_values() {
+    use axum::{body::to_bytes, response::IntoResponse};
+    use deployment::VersionEnvironment;
+
+    let environment = |value: &str| VersionEnvironment {
+        // Exercise JSON decoding too: escaped NUL must not bypass validation.
+        vars: serde_json::from_str(&serde_json::json!({"VALUE": value}).to_string()).unwrap(),
+        ..Default::default()
+    };
+    for value in ["", "日本語 🔥", "line1\r\n\tline2", r"\u0000", r"\0"] {
+        environment(value).validate().unwrap();
+    }
+    for value in [
+        "\0sensitive-fixture",
+        "sensitive-fixture\0tail",
+        "sensitive-fixture\0",
+    ] {
+        let response = AppError::from(environment(value).validate().unwrap_err()).into_response();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let bytes = to_bytes(response.into_body(), 4096).await.unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(body["error"]["code"], "invalid_request");
+        assert_eq!(body["error"]["retryable"], false);
+        let message = body["error"]["message"].as_str().unwrap();
+        assert!(message.contains("VALUE"));
+        assert!(message.contains("NUL (U+0000)"));
+        assert!(!message.contains("sensitive-fixture"));
+        assert!(!message.contains('\0'));
+    }
+}
+
 // --- GET /usage 純関数 ---
 
 /// from/to 未指定の既定: to=today / from=today-30d。
@@ -43,6 +75,58 @@ fn usage_range_rejects_malformed_date() {
         resolve_usage_range(None, Some("not-a-date"), today),
         Err(FaasError::InvalidRequest(_))
     ));
+}
+
+#[test]
+fn usage_range_rejects_extended_years_and_noncanonical_dates() {
+    let today = chrono::NaiveDate::from_ymd_opt(2026, 9, 18).unwrap();
+    for input in [
+        "-262143-01-01",
+        "-0001-01-01",
+        "+262142-12-31",
+        "+10000-01-01",
+        "0000-01-01",
+        "2026-9-18",
+        "2026-09-1",
+        "2026-02-29",
+        " 2026-09-18",
+    ] {
+        for (from, to) in [(Some(input), None), (None, Some(input))] {
+            let error = resolve_usage_range(from, to, today).unwrap_err();
+            assert!(matches!(error, FaasError::InvalidRequest(_)), "{input}");
+            // Confirm the actual API error mapping, not just the parser's result.
+            use axum::response::IntoResponse;
+            assert_eq!(
+                crate::error::AppError(error).into_response().status(),
+                StatusCode::BAD_REQUEST
+            );
+        }
+    }
+}
+
+#[test]
+fn usage_range_checks_default_subtraction_and_calendar_boundaries() {
+    let first = chrono::NaiveDate::from_ymd_opt(1, 1, 1).unwrap();
+    let last = chrono::NaiveDate::from_ymd_opt(9999, 12, 31).unwrap();
+    assert_eq!(
+        resolve_usage_range(Some("0001-01-01"), Some("9999-12-31"), first).unwrap(),
+        (first, last)
+    );
+    assert_eq!(
+        resolve_usage_range(None, Some("0001-01-31"), first)
+            .unwrap()
+            .0,
+        first
+    );
+    assert!(matches!(
+        resolve_usage_range(None, Some("0001-01-01"), first),
+        Err(FaasError::InvalidRequest(_))
+    ));
+    assert!(matches!(
+        resolve_usage_range(None, None, chrono::NaiveDate::MIN),
+        Err(FaasError::InvalidRequest(_))
+    ));
+    assert!(resolve_usage_range(Some("2024-02-29"), Some("2024-02-29"), first).is_ok());
 }
 
 /// from > to は空でない範囲を保証するため 400。

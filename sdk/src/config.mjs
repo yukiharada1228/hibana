@@ -117,6 +117,12 @@ function validateEnvironment(inputVars, inputSecrets) {
     )
   )
     throw new Error("vars must contain string environment values");
+  for (const [name, value] of Object.entries(vars)) {
+    if (value.includes("\0"))
+      throw new Error(
+        `vars.${name} contains NUL (U+0000). Remove NUL characters from this value in hibana.json.`,
+      );
+  }
   const secrets = inputSecrets === undefined ? [] : inputSecrets;
   if (
     !Array.isArray(secrets) ||

@@ -63,6 +63,7 @@ function Console({
   const [loading, setLoading] = useState(false),
     [leaving, setLeaving] = useState(false);
   const [updatedAt, setUpdatedAt] = useState<string>();
+  const main = useRef<HTMLElement>(null);
   const revision = useRef(0);
   const reload = useCallback(async () => {
     const current = ++revision.current;
@@ -112,7 +113,15 @@ function Console({
   const selected = components?.find((c) => route === `apps/${c.component_id}`);
   return (
     <div className="shell">
-      <a className="skip-link" href="#main">
+      <a
+        className="skip-link"
+        href="#main"
+        onClick={(event) => {
+          event.preventDefault();
+          main.current?.focus();
+          main.current?.scrollIntoView();
+        }}
+      >
         本文へ移動
       </a>
       <header className="header">
@@ -166,16 +175,19 @@ function Console({
           <small>{location.host}</small>
         </div>
       </aside>
-      <main id="main" className="main">
+      <main id="main" className="main" ref={main} tabIndex={-1}>
         <div className="context-bar">
-          <span>
-            {session.tenant_slug}
-            {route === "apps" && updatedAt && (
-              <span className="muted"> · 一覧取得 {date(updatedAt)}</span>
-            )}
-          </span>
+          <span>{session.tenant_slug}</span>
           {route !== "deploy" && (
-            <Button variant="text" size="sm" onClick={reload} disabled={loading}>
+            <Button
+              variant="text"
+              size="sm"
+              onClick={reload}
+              disabled={loading}
+              title={
+                updatedAt ? `一覧の最終取得：${date(updatedAt)}` : undefined
+              }
+            >
               <Icon name="refresh" />
               {loading ? "更新中…" : "更新"}
             </Button>

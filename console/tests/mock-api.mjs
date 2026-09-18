@@ -280,6 +280,7 @@ createServer(async (req, res) => {
       execution_id: `exe_${offset + i}`,
       version_id: component.active_version_id,
       status: "timeout",
+      http_status: null,
       error: {
         code: "execution_timeout",
         message: "Execution deadline exceeded",

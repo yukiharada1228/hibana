@@ -156,25 +156,6 @@ pub async fn check_rate_limit(
     }
 }
 
-pub async fn reserve_inflight(
-    state: &AppState,
-    tenant: &str,
-    params: &ResolvedAdmissionParams,
-) -> (Decision, bool) {
-    match state
-        .store()
-        .reserve_inflight(tenant, params.inflight)
-        .await
-    {
-        Ok(d) if d.admitted => (Decision::Admitted, true),
-        Ok(_) => (Decision::Rejected(RateLimited::concurrency()), false),
-        Err(e) => {
-            fail_closed_degraded(state, tenant, "inflight", &e).await;
-            (Decision::Rejected(RateLimited::unavailable()), false)
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

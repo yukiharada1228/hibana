@@ -2,6 +2,7 @@ import { useState } from "react";
 import type { Session } from "./types";
 import { Button } from "./components/ui/button";
 import { Notice } from "./components/common";
+import { version } from "../package.json";
 const quote = (value: string) => `'${value.replaceAll("'", "'\\''")}'`;
 
 export function Deploy({
@@ -15,9 +16,14 @@ export function Deploy({
   const login = `hibana login \\\n  --url ${quote(`${location.origin}/api`)} \\\n  --tenant ${quote(session.tenant_slug)} \\\n  --email ${quote(email)}`;
   const commands = [
     {
+      title: "CLI をインストール",
+      description: `Node.js 24 以上を用意します。管理者から、この基盤に対応する hibana-cli-${version}.tgz を受け取り、保存先のフォルダで実行してください。既に導入済みなら次へ進めます。`,
+      command: `npm install -g ./hibana-cli-${version}.tgz\nhibana --version`,
+    },
+    {
       title: "この基盤にログイン",
       description:
-        "最新の hibana CLI を PC に導入し、以下のコマンドを実行してください。Password: と表示されたらパスワードを入力して Enter を押します。入力した文字は表示されません。",
+        "Password: と表示されたらパスワードを入力します。入力した文字は表示されません。接続先は保存され、次回から指定を省略できます。",
       command: login,
     },
     {
@@ -55,6 +61,18 @@ export function Deploy({
             <div>
               <h2>{step.title}</h2>
               <p className="muted">{step.description}</p>
+              {i === 0 && (
+                <p className="small">
+                  <a
+                    href="https://github.com/yukiharada1228/hibana/releases"
+                    target="_blank"
+                    rel="noopener noreferrer"
+                  >
+                    配布ページ
+                  </a>
+                  からも取得できます。未公開の候補版・社内用の版は管理者から受け取ってください。
+                </p>
+              )}
               <pre>
                 <code>{step.command}</code>
               </pre>
@@ -74,16 +92,18 @@ export function Deploy({
               >
                 コマンドをコピー
               </Button>
+              {copied === step.title && (
+                <span role="status" className="small">
+                  {" "}
+                  コピーしました
+                </span>
+              )}
             </div>
           </section>
         ))}
       </div>
-      {copied && (
-        <Notice>
-          {commands.some((c) => c.title === copied)
-            ? `「${copied}」のコマンドをコピーしました。`
-            : copied}
-        </Notice>
+      {copied && !commands.some((c) => c.title === copied) && (
+        <Notice>{copied}</Notice>
       )}
     </>
   );

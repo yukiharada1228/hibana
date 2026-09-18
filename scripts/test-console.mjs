@@ -190,7 +190,7 @@ export async function testConsole({ api, token, url, app, wasm, folder }) {
       "browser rollback changes real Wasmtime HTTP response",
     );
     const listed = JSON.parse(
-      await runCommand(process.execPath, [resolve("sdk/src/cli.mjs"), "list"], {
+      await runCommand(process.execPath, [resolve("sdk/src/cli.mjs"), "list", "--json"], {
         cwd: project,
         env,
       }),

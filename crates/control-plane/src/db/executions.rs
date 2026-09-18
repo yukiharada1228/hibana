@@ -7,7 +7,33 @@ use chrono::NaiveDate;
 use chrono::Utc;
 use hibana_shared::ExecutionStatus;
 use hibana_shared::UsageMetrics;
+use sea_orm::sea_query::extension::postgres::PgExpr;
 use serde_json::Value;
+
+/// Select only the status from HTTP result metadata, never the response body.
+pub fn http_status_expression() -> Expr {
+    Expr::case(
+        Condition::all()
+            .add(executions::Column::HttpRequest.eq(true))
+            .add(executions::Column::Status.eq("succeeded")),
+        Expr::col(executions::Column::Output).get_json_field("status"),
+    )
+    .finally(Expr::val(None::<Value>))
+    .into()
+}
+
+pub fn http_status_code(value: Option<&Value>) -> Option<u16> {
+    value
+        .and_then(Value::as_u64)
+        .filter(|status| (100..=599).contains(status))
+        .map(|status| status as u16)
+}
+
+pub fn execution_errors_condition() -> Condition {
+    Condition::any()
+        .add(executions::Column::Status.is_in(["failed", "timeout"]))
+        .add(http_status_expression().between(serde_json::json!(400), serde_json::json!(599)))
+}
 
 /// Old Control Planes can still finish requests after the retention migration.
 /// Sweep those inputs repeatedly, including after rolling upgrades. Bound each
@@ -50,6 +76,7 @@ pub struct ExecutionRow {
     pub component_id: String,
     pub version_id: String,
     pub status: String,
+    pub http_status: Option<Value>,
     pub error: Option<Value>,
     pub created_at: DateTime<Utc>,
     pub started_at: Option<DateTime<Utc>>,
@@ -83,6 +110,7 @@ pub async fn get_execution(
 ) -> Result<Option<ExecutionRow>, DbErr> {
     executions::Entity::find()
         .select_only()
+        .column_as(http_status_expression(), "http_status")
         .columns([
             executions::Column::Id,
             executions::Column::TenantId,
@@ -182,12 +210,9 @@ pub async fn has_active_executions_for_version(
         > 0)
 }
 
-/// reaper 用: 当該テナントの in-flight（pending/running）execution 数を数える (M3d, §8)。
-///
-/// **DB COUNT は in-flight 同時実行数の唯一の真実**であり、Redis カウンタはその速い近似に
-/// 過ぎない。reaper はこの値で共有カウンタを上書き再同期し、終端パスでの DECR 取りこぼし／
-/// 二重 DECR によるドリフトを定期的に消す。executions は FORCE RLS 下にあるため、呼び出し側は
-/// 事前に `set_tenant_guc(tenant)` を同一 tx に設定していること（GUC 未設定は fail-closed ERROR）。
+/// 同時実行枠を使用している pending/running の HTTP 実行数。
+/// 受付時はテナントの admission ロックを取得し、同一トランザクションで集計・挿入する。
+/// FORCE RLS 下のため、事前に `set_tenant_guc(tenant)` を同一 tx に設定する。
 pub async fn count_inflight_executions(
     executor: &impl ConnectionTrait,
     tenant_id: &str,

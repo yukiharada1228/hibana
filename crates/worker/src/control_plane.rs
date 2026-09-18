@@ -71,8 +71,12 @@ impl ControlPlaneClient {
     }
     pub(crate) async fn complete(
         &self,
-        result: &hibana_shared::ResultMessage,
+        mut result: hibana_shared::ResultMessage,
     ) -> anyhow::Result<()> {
+        // Keep every producer within the transport budget, including setup failures.
+        if let Some(error) = &mut result.error {
+            *error = hibana_shared::diagnostics::format_error(&*error);
+        }
         for attempt in 0..3 {
             let response = self
                 .http
@@ -81,7 +85,7 @@ impl ControlPlaneClient {
                     self.control_plane_internal_url.trim_end_matches('/')
                 ))
                 .header("x-hibana-job-token", &result.job_token)
-                .json(result)
+                .json(&result)
                 .timeout(std::time::Duration::from_secs(5))
                 .send()
                 .await;
@@ -119,7 +123,7 @@ impl ControlPlaneClient {
                 elapsed_ms = started.elapsed().as_millis() as u64,
                 "Control-plane request failed before guest execution"
             );
-            ExecError::Failed(format!("secret material unavailable: {reason}"))
+            ExecError::failed(format_args!("secret material unavailable: {reason}"))
         })
     }
 
@@ -183,6 +187,65 @@ mod tests {
     use super::*;
     use axum::{body::Body, response::Response, routing::post, Router};
     use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[tokio::test]
+    async fn completion_diagnostics_fit_the_default_http_body_limit() {
+        use hibana_shared::{diagnostics::MAX_DIAGNOSTIC_BYTES, ExecutionStatus, ResultMessage};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let (sent, mut received) = tokio::sync::mpsc::channel(2);
+        let calls = Arc::new(AtomicUsize::new(0));
+        let observed = calls.clone();
+        // Match the internal route's Json extractor without raising its default limit.
+        let app = Router::new().route(
+            "/internal/direct-result",
+            post(move |axum::Json(result): axum::Json<ResultMessage>| {
+                let sent = sent.clone();
+                let attempt = observed.fetch_add(1, Ordering::SeqCst);
+                async move {
+                    sent.send(result).await.unwrap();
+                    // Exercise a retry: both attempts must carry the same bounded message.
+                    if attempt == 0 {
+                        StatusCode::SERVICE_UNAVAILABLE
+                    } else {
+                        StatusCode::NO_CONTENT
+                    }
+                }
+            }),
+        );
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let client = ControlPlaneClient::new(
+            reqwest::Client::builder().no_proxy().build().unwrap(),
+            endpoint,
+            Duration::from_secs(2),
+            crate::metrics::Metrics::init(),
+        );
+        let result = ResultMessage {
+            execution_id: "fixture-execution".into(),
+            tenant_id: "fixture-tenant".into(),
+            status: ExecutionStatus::Failed,
+            output: None,
+            error: Some("\0雪\u{1}".repeat(512 * 1024)),
+            job_token: "fixture-token".into(),
+            usage: None,
+        };
+        assert!(serde_json::to_vec(&result).unwrap().len() > 2 * 1024 * 1024);
+        let outcome = client.complete(result).await;
+        server.abort();
+        outcome.unwrap();
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        let first = received.recv().await.unwrap();
+        let retry = received.recv().await.unwrap();
+        assert_eq!(first.error, retry.error);
+        assert_eq!(first.execution_id, "fixture-execution");
+        assert_eq!(first.status, ExecutionStatus::Failed);
+        let message = first.error.as_ref().unwrap();
+        assert!(message.len() <= MAX_DIAGNOSTIC_BYTES);
+        assert!(message.ends_with("\n[diagnostic truncated]"));
+        assert!(!message.contains('\0'));
+        assert!(serde_json::to_vec(&first).unwrap().len() < 100 * 1024);
+    }
 
     #[tokio::test]
     async fn secret_failures_are_classified_without_retries_or_sensitive_details() {

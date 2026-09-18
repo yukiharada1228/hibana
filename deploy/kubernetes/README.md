@@ -35,6 +35,10 @@ node sdk/src/cli.mjs platform install --source .
 
 クラスタ名の既定値は`hibana`です。`--cluster NAME`で変更でき、状態は`.local/kubernetes-NAME/`に保存します。管理APIは`http://127.0.0.1:18080`、アプリHTTPは`http://127.0.0.1:18084`です。ホストポートは共通なので、この構成のクラスタは同時に1つだけ起動してください。専用kubeconfigを使い、普段のcontextは変更しません。
 
+ローカルの`install`・`start`・`stop`・`uninstall`は、クラスタの管理ディレクトリ内の`operation.lock/`で排他制御します。同じ環境への別の操作は、停止情報やノードを変更する前にエラーになります。Kubernetesが停止中でも有効で、`status`と`--dry-run`はロックを取得しません。
+
+通常終了・エラー・Ctrl+C・SIGTERMではロックを解放します。強制終了などで残った場合は、エラーに表示されたディレクトリ内のJSONで操作名・PID・開始日時を確認してください。元のCLIとその子コマンドが終了したことを確認してから、`operation.lock/`だけを削除して再実行します。子コマンドが動き続けている可能性があるため、自動失効はさせません。`maintenance.json`や資格情報は削除しないでください。
+
 ```bash
 set -a
 source .local/kubernetes-hibana/sdk.env
@@ -133,6 +137,8 @@ python3 scripts/test-platform-install.py --image hibana-platform:review-recovery
 ### 旧hibana-dev環境
 
 旧環境の状態は互換性のため`.local/kubernetes/`を使います。`hibana platform stop|start|status --source . --cluster hibana-dev`で操作できます。作成済みkindのポート公開設定は変更できないため、古い設定への`install`は既存データを変更せずエラーにします。新しい`hibana`クラスタを作るか、バックアップ後に明示的に旧クラスタを撤去してください。
+
+ローカルの停止・再開では、実行中のControl Planeのバイナリを起動せずに検査し、メンテナンス操作への対応を確認します。未対応の旧版では、停止にDockerの60秒の終了猶予を使い、再開にAPI・ノード・ワークロードの復帰確認を使います。この経路は受付停止・実行のdrain・アプリの事前準備を行わないため、それらが必要なら新しい検証クラスタへ移行してください。検査時の通信エラー、権限エラー、旧新版の混在では旧版用の経路へ切り替えず、操作を中断します。古いCLIの失敗などで残った`maintenance.json`は旧版操作中に削除せず、対応版へ更新した後の再開で同じownerを使って解除します。
 
 ## マニフェスト
 

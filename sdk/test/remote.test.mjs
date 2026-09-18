@@ -51,7 +51,10 @@ async function fixture(t) {
     });
   }
   const calls = [];
-  async function server(token, { tls, redirect } = {}) {
+  async function server(
+    token,
+    { tls, redirect, scopes = ["read", "deploy", "admin"] } = {},
+  ) {
     let components = [];
     let egress = null;
     const handler = async (req, res) => {
@@ -85,6 +88,10 @@ async function fixture(t) {
         res.end();
         return;
       }
+      if (req.url === "/api/auth/session") {
+        res.end(JSON.stringify({ tenant_slug: "team", scopes }));
+        return;
+      }
       if (req.url === "/api/components") {
         if (req.method === "POST") {
           components = [{ name: JSON.parse(body).name, component_id: "cmp" }];
@@ -106,7 +113,20 @@ async function fixture(t) {
           }),
         );
       else if (req.url.endsWith("/rollback"))
-        res.end('{"active_version_id":"old-version"}');
+        res.end('{"active_version_id":"old-version","version":"0.9.0"}');
+      else if (req.url.endsWith("/secrets") && req.method === "GET")
+        res.end(
+          JSON.stringify({
+            secrets: [
+              {
+                name: "API_KEY",
+                has_value: true,
+                version: 1,
+                updated_at: "2026-09-18T00:00:00Z",
+              },
+            ],
+          }),
+        );
       else {
         if (req.method === "DELETE" && req.url === "/api/components/cmp")
           components = [];
@@ -174,6 +194,17 @@ test("remote login, deploy, rollback, secrets and deletion work across directori
   );
   assert.match(f.calls.at(-1).body, /application\/wasm/);
   assert.match(f.calls.at(-1).body, /versioned/);
+  assert.match(deployed.output, /Target:.*\nTenant: team\nApp: hello/);
+  assert.match(deployed.output, /Deployed hello · auto [a-f0-9]{8}/);
+  assert.doesNotMatch(deployed.output, /0\.0\.0-dev\.|\(cmp\)/);
+  const secretList = await f.invoke(["secret", "list"]);
+  assert.match(secretList.output, /NAME\s+VALUE\s+UPDATED/);
+  assert.match(secretList.output, /API_KEY\s+Stored/);
+  assert.equal(
+    JSON.parse((await f.invoke(["secret", "list", "--json"])).output).secrets[0]
+      .name,
+    "API_KEY",
+  );
   for (const args of [
     ["rollback", "--version", "0.9.0"],
     ["secret", "put", "API_KEY"],
@@ -182,10 +213,18 @@ test("remote login, deploy, rollback, secrets and deletion work across directori
   ]) {
     const r = await f.invoke(args, { input: "secret-value\n" });
     assert.equal(r.code, 0, r.output);
+    if (args[0] === "rollback") {
+      assert.match(r.output, /Rolled back hello to 0.9.0/);
+      assert.doesNotMatch(r.output, /old-version/);
+    }
   }
-  assert.deepEqual(JSON.parse((await f.invoke(["egress", "list"])).output), {
-    allow_outbound: null,
-  });
+  assert.match((await f.invoke(["egress", "list"])).output, /No shared policy/);
+  assert.deepEqual(
+    JSON.parse((await f.invoke(["egress", "list", "--json"])).output),
+    {
+      allow_outbound: null,
+    },
+  );
   const approved = await f.invoke([
     "egress",
     "allow",
@@ -202,9 +241,12 @@ test("remote login, deploy, rollback, secrets and deletion work across directori
     (await f.invoke(["egress", "deny", "api.example.com:443"])).code,
     0,
   );
-  assert.deepEqual(JSON.parse((await f.invoke(["egress", "list"])).output), {
-    allow_outbound: ["db.example.com:5432"],
-  });
+  assert.deepEqual(
+    JSON.parse((await f.invoke(["egress", "list", "--json"])).output),
+    {
+      allow_outbound: ["db.example.com:5432"],
+    },
+  );
   const beforeInvalidEgress = f.calls.length;
   assert.notEqual((await f.invoke(["egress", "allow"])).code, 0);
   assert.notEqual(
@@ -217,8 +259,46 @@ test("remote login, deploy, rollback, secrets and deletion work across directori
   assert.match(listed.output, /hello/);
   const deleted = await f.invoke(["delete", "hello", "--yes"], { cwd: f.root });
   assert.equal(deleted.code, 0, deleted.output);
-  assert.match((await f.invoke(["list"], { cwd: f.root })).output, /\[\]/);
+  assert.match(
+    (await f.invoke(["list"], { cwd: f.root })).output,
+    /No applications/,
+  );
+  assert.deepEqual(
+    JSON.parse((await f.invoke(["list", "--json"], { cwd: f.root })).output),
+    [],
+  );
   assert.ok(f.calls.slice(1).every((c) => c.auth === "Bearer tenant-token"));
+});
+
+test("deploy checks expired credentials and permissions before creating any build artifacts", async (t) => {
+  const f = await fixture(t);
+  await writeFile(
+    join(f.project, "hibana.json"),
+    JSON.stringify({ name: "hello", component: "missing.wasm" }),
+  );
+  for (const [token, scopes, expected] of [
+    [
+      "expired-token",
+      ["read", "deploy"],
+      /Authentication failed or expired.*hibana login/,
+    ],
+    ["valid-token", ["read"], /Read and Deploy permissions are required/],
+    ["valid-token", ["deploy"], /Read and Deploy permissions are required/],
+  ]) {
+    const url = await f.server("valid-token", { scopes });
+    const result = await f.invoke(["deploy"], {
+      env: { HIBANA_URL: url, HIBANA_TOKEN: token },
+    });
+    assert.equal(result.code, 1, result.output);
+    assert.match(result.output, expected);
+    assert.doesNotMatch(
+      result.output,
+      /Building|missing.wasm|expired-token|valid-token/,
+    );
+    assert.equal(f.calls.at(-1).url, "/api/auth/session");
+    await assert.rejects(stat(join(f.project, ".hibana")), { code: "ENOENT" });
+  }
+  assert.equal(f.calls.length, 3);
 });
 
 test("profiles isolate servers, support selection/logout and never leak saved tokens to overrides", async (t) => {

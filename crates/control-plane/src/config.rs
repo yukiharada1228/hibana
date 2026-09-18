@@ -8,7 +8,6 @@ const DEFAULT_REDIS_URL: &str = "redis://127.0.0.1:6379";
 const DEFAULT_INVOKE_RATE_PER_SEC: u64 = 50;
 const DEFAULT_INVOKE_BURST: u64 = 500;
 const DEFAULT_MAX_CONCURRENT: u64 = 20;
-const DEFAULT_INFLIGHT_TTL_SECS: u64 = 3600;
 const DEFAULT_LOGIN_LOCKOUT_THRESHOLD: u64 = 10;
 const DEFAULT_LOGIN_LOCKOUT_WINDOW_SECS: u64 = 900;
 const DEFAULT_REAPER_INTERVAL_SECS: u64 = 30;
@@ -50,7 +49,6 @@ pub struct Config {
     pub invoke_rate_per_sec: u64,
     pub invoke_burst: u64,
     pub max_concurrent_executions: u64,
-    pub inflight_ttl_secs: u64,
     pub login_lockout_threshold: u64,
     pub login_lockout_window_secs: u64,
     pub reaper_interval_secs: u64,
@@ -169,7 +167,6 @@ impl Config {
                 "QUOTA_MAX_CONCURRENT_EXECUTIONS",
                 DEFAULT_MAX_CONCURRENT,
             )?,
-            inflight_ttl_secs: env_u64("INFLIGHT_TTL_SECS", DEFAULT_INFLIGHT_TTL_SECS)?,
             login_lockout_threshold: env_u64(
                 "LOGIN_LOCKOUT_THRESHOLD",
                 DEFAULT_LOGIN_LOCKOUT_THRESHOLD,
@@ -224,16 +221,13 @@ impl Config {
     }
 
     pub fn admission(&self) -> crate::state::AdmissionConfig {
-        use crate::store::{InflightParams, LockoutParams, RateLimitParams};
+        use crate::store::{LockoutParams, RateLimitParams};
         crate::state::AdmissionConfig {
             rate: RateLimitParams {
                 refill_per_sec: self.invoke_rate_per_sec as f64,
                 capacity: self.invoke_burst as f64,
             },
-            inflight: InflightParams {
-                max: self.max_concurrent_executions as i64,
-                ttl_secs: self.inflight_ttl_secs,
-            },
+            max_concurrent_executions: self.max_concurrent_executions as i64,
             lockout: LockoutParams {
                 threshold: self.login_lockout_threshold,
                 window_secs: self.login_lockout_window_secs,

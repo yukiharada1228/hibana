@@ -116,18 +116,14 @@ pub(crate) async fn run() -> anyhow::Result<()> {
         config.public_apps.clone(),
     );
 
-    // --- in-flight reaper タスク (M3d, §8) ---
-    // 共有カウンタは終端パスの DECR で減るが、取りこぼし／二重 DECR／プロセスクラッシュで
-    // 真実（DB COUNT）からドリフトする。reaper が定期的に `SELECT COUNT(*) ... pending|running`
-    // でテナントごとに再同期する（DB COUNT が唯一の真実; Redis は速い近似）。
+    // 完了済み入力の清掃と孤立した pending/running 行の回収。
     let reaper_state = state.clone();
     let reaper_interval = config.reaper_interval_secs;
-    let inflight_ttl = config.inflight_ttl_secs;
     // stuck-execution sweeper の deadline。invoke ハンドラの post-commit publish 失敗や worker 側
     // 取りこぼしで孤立した pending/running 行を回収し、in-flight スロットの恒久リークを防ぐ（§8）。
     let stuck_deadline = config.stuck_execution_deadline_secs;
     tokio::spawn(async move {
-        reaper::run(reaper_state, reaper_interval, inflight_ttl, stuck_deadline).await;
+        reaper::run(reaper_state, reaper_interval, stuck_deadline).await;
     });
 
     // --- KEK ローテーション進捗の gauge 更新（M7c-4, §4.7.2）---

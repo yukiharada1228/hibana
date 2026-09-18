@@ -120,8 +120,11 @@ pub(crate) async fn handle_message(
         return Ok(());
     }
 
-    // error は文字列を JSONB に包んで保存 (executions.error は JSONB)。
-    let error_json = result.error.as_ref().map(|msg| json!({ "message": msg }));
+    // Also bound older Workers' diagnostics and render NUL before JSONB storage.
+    let error_json = result
+        .error
+        .as_ref()
+        .map(|msg| json!({ "message": hibana_shared::diagnostics::format_error(msg) }));
 
     // M3b/M3c: finalize は FORCE RLS 下で走る。tx を開いて GUC を設定してから、
     // まず行をひいて claim を権威値と突き合わせ、exp 判定の後に CAS finalize する。
@@ -284,14 +287,6 @@ async fn commit_finalize_and_release(
         .with_label_values(&[status.as_str()])
         .inc();
 
-    if let Err(e) = state.store().release_inflight(tenant).await {
-        tracing::warn!(
-            %execution_id,
-            tenant = %tenant,
-            error = %e,
-            "failed to DECR in-flight counter on finalize; reaper will reconcile"
-        );
-    }
     Ok(())
 }
 /// worker 自己申告の計量を実行・HTTP 応答の上限で sanity clamp する (M5, §15)。

@@ -9,6 +9,18 @@ use hibana_shared::{
 };
 use std::time::Duration;
 
+pub(crate) fn http_client() -> reqwest::Client {
+    // Compilation sends no headers until it finishes. Do not inherit the
+    // invocation client's shorter idle-read timeout; bound the whole request.
+    reqwest::Client::builder()
+        .no_proxy()
+        .redirect(reqwest::redirect::Policy::none())
+        .connect_timeout(Duration::from_secs(3))
+        .timeout(Duration::from_secs(85))
+        .build()
+        .expect("artifact preparation HTTP client")
+}
+
 fn endpoint() -> Result<String, std::env::VarError> {
     // Kubernetes preparation discovers cold Pods too; execution uses only ready
     // Pods. A single endpoint remains sufficient outside Kubernetes.
@@ -89,7 +101,7 @@ async fn prepare_targets(
         stream::iter(targets.to_vec())
             .map(|target| {
                 prepare_target(
-                    state.worker_http().clone(),
+                    state.preparation_http().clone(),
                     token.clone(),
                     target,
                     check_only,
@@ -125,7 +137,6 @@ async fn prepare_target(
                 target.clone(),
             )
             .header(TOKEN_HEADER, &token)
-            .timeout(Duration::from_secs(85))
             .send()
             .await
             .map_err(|_| FaasError::Unavailable)?;
@@ -238,4 +249,71 @@ pub(crate) fn spawn(state: AppState) {
             tokio::time::sleep(Duration::from_secs(5)).await;
         }
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::{http::StatusCode, routing::post, Router};
+    use std::sync::Arc;
+    use tokio::sync::Notify;
+
+    #[tokio::test]
+    async fn preparation_waits_past_invocation_idle_limit_but_has_a_total_deadline() {
+        for (check_only, elapsed, succeeds) in
+            [(false, 61, true), (true, 61, true), (false, 86, false)]
+        {
+            let entered = Arc::new(Notify::new());
+            let finish = Arc::new(Notify::new());
+            let handler = {
+                let entered = entered.clone();
+                let finish = finish.clone();
+                move || {
+                    let entered = entered.clone();
+                    let finish = finish.clone();
+                    async move {
+                        entered.notify_one();
+                        finish.notified().await;
+                        StatusCode::NO_CONTENT
+                    }
+                }
+            };
+            let app = Router::new().route("/prepare", post(handler.clone()).head(handler));
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let target = format!("http://{}/prepare", listener.local_addr().unwrap())
+                .parse()
+                .unwrap();
+            let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+            let request = tokio::spawn(prepare_target(
+                http_client(),
+                "fixture".into(),
+                target,
+                check_only,
+            ));
+            tokio::time::timeout(Duration::from_secs(5), entered.notified())
+                .await
+                .unwrap();
+            // Pause only after real TCP I/O. Advancing the clock simulates a
+            // silent compiler without slowing the suite or racing connection setup.
+            tokio::time::pause();
+            tokio::time::advance(Duration::from_secs(elapsed)).await;
+            tokio::task::yield_now().await;
+            tokio::time::resume();
+            finish.notify_one();
+            let result = tokio::time::timeout(Duration::from_secs(5), request)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                result.is_ok(),
+                succeeds,
+                "check_only={check_only}, elapsed={elapsed}"
+            );
+            if !succeeds {
+                assert!(matches!(result, Err(FaasError::Unavailable)));
+            }
+            server.abort();
+            let _ = server.await;
+        }
+    }
 }

@@ -59,7 +59,7 @@ tracing-opentelemetry = "0.33"
 # レート制限（token-bucket）/ 同時実行 in-flight / login 失敗ロックアウトを集計する。
 # `tokio-rustls-comp` で通常の TCP と Rustls/ring の TLS 接続を提供し、
 # `connection-manager` で自動再接続プールを有効化する。
-# `script` で Lua アトミック操作（INCR-cmp-condDECR / token-bucket）を使う。
+# `script` でレート制限とログイン失敗回数の Lua アトミック操作を使う。
 # 既定機能に C 依存（native TLS の openssl-sys 等）が紛れ込まないよう
 # default-features = false で必要分だけ取り込む。証明書はシステムの CA
 # または SSL_CERT_FILE / SSL_CERT_DIR で検証し、検証無効化の機能は含めない。

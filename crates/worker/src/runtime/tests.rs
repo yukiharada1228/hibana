@@ -115,6 +115,82 @@ async fn expired_preparation_deadline_prevents_guest_instantiation() {
     assert!(matches!(result, Err(ExecError::Timeout)));
 }
 
+#[tokio::test]
+async fn long_wasm_backtraces_are_bounded_during_execution_and_instantiation() {
+    use hibana_shared::diagnostics::MAX_DIAGNOSTIC_BYTES;
+
+    let engine = build_engine().unwrap();
+    let runtime = Runtime::new(engine.clone(), crate::metrics::Metrics::init()).unwrap();
+    for (start, fuel, prefix) in [
+        (false, None, "wasm trap:"),
+        (true, None, "failed to instantiate proxy:"),
+        (false, Some(1000), "fuel exhausted:"),
+    ] {
+        // This small, valid HTTP component previously produced a multi-MiB
+        // diagnostic. Include NUL in its debug name to cover JSONB compatibility too.
+        let source = format!(
+            r#"(component
+            (import "wasi:http/types@0.2.3" (instance $types
+                (export "incoming-request" (type (sub resource)))
+                (export "response-outparam" (type (sub resource)))))
+            (alias export $types "incoming-request" (type $req))
+            (alias export $types "response-outparam" (type $res))
+            (core module $m
+                (func $"{}\00" (export "handle") (param i32 i32)
+                    local.get 0 local.get 1 call 0)
+                {})
+            (core instance $i (instantiate $m))
+            (func $handle (param "request" (own $req)) (param "response-out" (own $res))
+                (canon lift (core func $i "handle")))
+            (instance $handler
+                (export "incoming-request" (type $req))
+                (export "response-outparam" (type $res))
+                (export "handle" (func $handle)))
+            (export "wasi:http/incoming-handler@0.2.3" (instance $handler)))"#,
+            "recursive".repeat(128),
+            if start {
+                "(func $start i32.const 0 i32.const 0 call 0) (start $start)"
+            } else {
+                ""
+            }
+        );
+        let component = PreparedComponent::new(Component::new(&engine, source).unwrap()).unwrap();
+        let (stream, _response, _completed) = response_channel();
+        let result = runtime
+            .run_http(
+                Invocation {
+                    component: Arc::new(component),
+                    request: HttpRequest {
+                        authority: "fixture.invalid".into(),
+                        ..Default::default()
+                    },
+                    limits: ResourceLimits {
+                        max_fuel: fuel,
+                        ..Default::default()
+                    },
+                    built_env: env::build_env(
+                        &Default::default(),
+                        &Default::default(),
+                        &Default::default(),
+                    )
+                    .unwrap(),
+                    approved_egress: Default::default(),
+                    deadline: Instant::now() + Duration::from_secs(5),
+                },
+                stream,
+            )
+            .await;
+        let Err(ExecError::Failed(message)) = result else {
+            panic!("expected {prefix}")
+        };
+        assert!(message.starts_with(prefix), "{message}");
+        assert!(message.len() <= MAX_DIAGNOSTIC_BYTES);
+        assert!(message.ends_with("\n[diagnostic truncated]"));
+        assert!(message.contains("\\u0000"));
+        assert!(!message.contains('\0'));
+    }
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
 async fn cpu_bound_guest_yields_to_other_tasks_and_still_times_out() {
     let engine = build_engine().unwrap();

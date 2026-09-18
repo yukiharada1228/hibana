@@ -24,9 +24,18 @@ pub struct ExecutionSummary {
     pub execution_id: String,
     pub version_id: String,
     pub status: String,
+    #[serde(serialize_with = "serialize_http_status")]
+    pub http_status: Option<Value>,
     pub error: Option<Value>,
     pub created_at: chrono::DateTime<chrono::Utc>,
     pub wall_time_ms: Option<i64>,
+}
+
+fn serialize_http_status<S: serde::Serializer>(
+    value: &Option<Value>,
+    serializer: S,
+) -> Result<S::Ok, S::Error> {
+    db::http_status_code(value.as_ref()).serialize(serializer)
 }
 
 pub async fn list_executions(
@@ -44,6 +53,7 @@ pub async fn list_executions(
     let mut select = executions::Entity::find()
         .select_only()
         .column_as(executions::Column::Id, "execution_id")
+        .column_as(db::http_status_expression(), "http_status")
         .columns([
             executions::Column::VersionId,
             executions::Column::Status,
@@ -57,7 +67,7 @@ pub async fn list_executions(
             executions::Column::CreatedAt.gte(chrono::Utc::now() - chrono::Duration::hours(24)),
         );
     if query.errors_only {
-        select = select.filter(executions::Column::Status.is_in(["failed", "timeout"]));
+        select = select.filter(db::execution_errors_condition());
     }
     if let Some(cursor) = query.before {
         let invalid = || FaasError::InvalidRequest("invalid execution cursor".into());
@@ -108,6 +118,7 @@ pub struct ExecutionResponse {
     pub component_id: String,
     pub version_id: String,
     pub status: String,
+    pub http_status: Option<u16>,
     pub error: Option<Value>,
     pub created_at: String,
     pub started_at: Option<String>,
@@ -136,6 +147,7 @@ pub async fn get_execution(
         component_id: row.component_id,
         version_id: row.version_id,
         status: row.status,
+        http_status: db::http_status_code(row.http_status.as_ref()),
         error: row.error,
         created_at: row.created_at.to_rfc3339(),
         started_at: row.started_at.map(|t| t.to_rfc3339()),
