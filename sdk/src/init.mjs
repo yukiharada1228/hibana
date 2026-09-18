@@ -3,6 +3,7 @@ import { cp, mkdir, readdir, writeFile } from "node:fs/promises";
 import { resolve, join, dirname, basename } from "node:path";
 import { fileURLToPath } from "node:url";
 import { run } from "./process.mjs";
+import { packageInfo } from "./package.mjs";
 
 const sdk = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 export const templates = ["hono", "javascript", "rust", "go"];
@@ -42,6 +43,8 @@ export async function init(
     limits: { memory_mb: 256, timeout_ms: 15000 },
   };
   const javascript = template === "hono" || template === "javascript";
+  const { name: cliName, version } = await packageInfo();
+  const cli = cliPackage ? "hibana" : `npx --yes ${cliName}@${version}`;
   if (javascript) {
     config.main = "src/index.ts";
     await writeFile(
@@ -52,17 +55,16 @@ export async function init(
           private: true,
           type: "module",
           scripts: {
-            dev: "hibana dev",
-            build: "hibana build",
-            deploy: "hibana deploy",
+            dev: `${cli} dev`,
+            build: `${cli} build`,
+            deploy: `${cli} deploy`,
           },
           ...(template === "hono" ? { dependencies: { hono: "^4.6.0" } } : {}),
-          // The CLI that created the project is already installed on this PC.
-          // A project-local CLI is an explicit opt-in, never an assumed release URL.
+          // Unpublished/offline builds can explicitly use a project-local CLI.
           ...(cliPackage
             ? {
                 devDependencies: {
-                  "@hibana/cli": `file:${resolve(cliPackage)}`,
+                  [cliName]: `file:${resolve(cliPackage)}`,
                 },
               }
             : {}),
@@ -146,7 +148,7 @@ export async function init(
   const next = [
     ...changeDirectory,
     ...(javascript && !install ? ["npm install"] : []),
-    javascript ? "npm run dev" : "hibana dev",
+    javascript ? "npm run dev" : `npx --yes ${cliName}@${version} dev`,
   ];
   console.log(`\nNext:\n${next.map((command) => `  ${command}`).join("\n")}`);
   if (!javascript)

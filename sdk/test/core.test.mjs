@@ -96,9 +96,12 @@ test("init scaffolds ordinary Hono and refuses to overwrite files", async () => 
     assert.equal((await loadConfig(join(dir, "hibana.json"))).main, "src/index.ts");
     const pkg = JSON.parse(await readFile(join(dir, "package.json"), "utf8"));
     assert.deepEqual(Object.keys(pkg.dependencies), ["hono"]);
-    assert.equal(JSON.parse(await readFile(new URL("../package.json", import.meta.url), "utf8")).private, true, "The CLI must not be published to npm");
-    assert.equal(pkg.devDependencies?.["@hibana/cli"], undefined, "init uses the installed CLI, including unpublished versions");
-    assert.deepEqual(pkg.scripts, { dev: "hibana dev", build: "hibana build", deploy: "hibana deploy" });
+    const metadata = JSON.parse(await readFile(new URL("../package.json", import.meta.url), "utf8"));
+    assert.notEqual(metadata.private, true);
+    assert.equal(metadata.publishConfig.access, "public");
+    assert.equal(pkg.devDependencies?.["@yukiharada1228/hibana"], undefined);
+    const command = `npx --yes @yukiharada1228/hibana@${metadata.version}`;
+    assert.deepEqual(pkg.scripts, { dev: `${command} dev`, build: `${command} build`, deploy: `${command} deploy` });
     assert.throws(() => execFileSync(process.execPath, [cli.pathname, "init", dir, "--no-install"], { stdio: "pipe" }));
   } finally { await rm(dir, { recursive: true, force: true }); }
 });
@@ -111,7 +114,8 @@ test("init can explicitly pin a project-local CLI without changing the default",
     const project = join(dir, "app");
     execFileSync(process.execPath, [cli.pathname, "init", project, "--cli-package", supplied, "--no-install"]);
     const pkg = JSON.parse(await readFile(join(project, "package.json"), "utf8"));
-    assert.equal(pkg.devDependencies["@hibana/cli"], `file:${supplied}`);
+    assert.equal(pkg.devDependencies["@yukiharada1228/hibana"], `file:${supplied}`);
+    assert.deepEqual(pkg.scripts, { dev: "hibana dev", build: "hibana build", deploy: "hibana deploy" });
   } finally { await rm(dir, { recursive: true, force: true }); }
 });
 

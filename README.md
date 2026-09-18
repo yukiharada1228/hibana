@@ -8,7 +8,7 @@ Cloudflare Workersのような短い開発・配備の流れを参考にして�
 
 GitHubから導入できるMVP v0.1.0です。2時間のHTTP負荷と、配備・復元・停止・削除の[自動受入結果](docs/pilot-validation.md)を公開しています。実オンプレでの本番利用の条件は[運用ガイド](docs/on-prem-production.md)にまとめています。
 
-このソースは次期候補`0.2.0-rc.1`です。停止・導入・回収処理の修正を含み、以下の公開済みv0.1.0とは配布物が異なります。候補版を試す場合は[候補版の導入手順](docs/release-candidate.md)でCLIと基盤を揃えてください。
+このソースは次期候補`0.2.0-rc.1`です。停止・導入・回収処理の修正を含み、公開済みv0.1.0とは配布物が異なります。候補版を試す場合は[候補版の導入手順](docs/release-candidate.md)でCLIと基盤を揃えてください。
 
 この候補の基盤DBはSeaORMの初期スキーマへ整理しています。検証には空のDBを使い、既存の稼働DBは後から切り替えます。[DB構成・マイグレーション](docs/database.md)を参照してください。
 
@@ -25,16 +25,15 @@ HTTPのバイナリ入出力と、SSEなどのレスポンスストリーミン�
 
 ## ローカルで試す
 
-Node.js 24以上とnpmが必要です。CLIとPC用ランタイムはGitHub Releasesから導入します。Hibanaをnpmレジストリへ公開することはありません。
+Node.js 24以上とnpmが必要です。npm に公開した CLI は `npx` から実行でき、グローバルインストールは不要です。次の例は `0.2.0-rc.1` の公開後に利用できます。未公開の候補は[候補版の導入手順](docs/release-candidate.md)を使います。
 
 ```bash
-npm install -g https://github.com/yukiharada1228/hibana/releases/download/v0.1.0/hibana-cli-0.1.0.tgz
-hibana init my-api
+npx --yes @yukiharada1228/hibana@0.2.0-rc.1 init my-api
 cd my-api
 npm run dev
 ```
 
-初回の`dev`でPC用ランタイムを自動取得します。次回以降は保存済みのランタイムを再利用します。ソースからビルドする手順と閉域環境への搬入は[配布ガイド](docs/releases.md)を参照してください。
+生成した npm scripts は同じ CLI バージョンを `npx` で使用します。初回の`dev`で同じバージョンのPC用ランタイムをGitHub Releasesから自動取得します。次回以降は保存済みのランタイムを再利用します。ソースからビルドする手順と閉域環境への搬入は[配布ガイド](docs/releases.md)を参照してください。
 
 `http://127.0.0.1:8787`でAPIが起動します。別のターミナルから呼び出せます。
 
@@ -68,11 +67,11 @@ export default app
 
 `--template`で選択します。`javascript`はTypeScriptの雛形を生成し、通常の`.js`ファイルもエントリーポイントに指定できます。Goのビルドツールはテンプレートでバージョンを固定しています。
 
-Hono・JavaScriptのプロジェクトでは`npm run dev`や`npx hibana deploy`を使えます。Rust・Goのプロジェクトにはnpm依存を追加せず、インストールした共通CLIから設定ファイルを指定して操作します。
+Hono・JavaScriptのプロジェクトでは`npm run dev`や`npm run deploy`を使えます。Rust・Goのプロジェクトにはnpm依存を追加せず、`npx`から設定ファイルを指定して操作します。
 
 ```bash
-hibana init my-rust --template rust
-hibana dev -c my-rust/hibana.json
+npx --yes @yukiharada1228/hibana@0.2.0-rc.1 init my-rust --template rust
+npx --yes @yukiharada1228/hibana@0.2.0-rc.1 dev -c my-rust/hibana.json
 ```
 
 ビルド済みのWASI HTTP Componentも配備できます。言語別のツール要件とビルド設定は[CLIガイド](sdk/README.md)を参照してください。
@@ -86,14 +85,14 @@ hibana dev -c my-rust/hibana.json
 ```bash
 export HIBANA_URL="https://api.hibana.example.com"
 export HIBANA_TOKEN="<Read・Deployスコープのトークン>"
-npx hibana deploy
+npm run deploy
 ```
 
-`deploy`がアプリをビルドし、コード・環境変数・選択したSecretsの参照を一つのバージョンとして公開します。失敗時には稼働中のコードと設定を維持します。ビルドだけを行う場合は`npx hibana build`を使います。
+`deploy`がアプリをビルドし、コード・環境変数・選択したSecretsの参照を一つのバージョンとして公開します。失敗時には稼働中のコードと設定を維持します。ビルドだけを行う場合は`npm run build`を使います。
 
 アプリのホスト名は`<アプリ名>.<テナントのスラッグ>.<アプリ用ドメイン>`です。たとえば`my-api.my-team.apps.example.com`のようになります。DNS・TLS・アプリ用ドメインは基盤管理者が設定します。
 
-トークンの代わりに`hibana login`でログインする方法もあります。認証方法とバージョンの指定は[CLIガイド](sdk/README.md)に記載しています。
+トークンの代わりに`npx --yes @yukiharada1228/hibana@0.2.0-rc.1 login`でログインする方法もあります。認証方法とバージョンの指定は[CLIガイド](sdk/README.md)に記載しています。
 
 ## 設定・Secrets・rollback
 
@@ -117,11 +116,11 @@ npx hibana deploy
 
 ```bash
 # テナント管理者が登録し、このアプリへの利用を許可
-npx hibana secret put API_KEY < /path/to/secret.txt
-npx hibana secret allow-deploy API_KEY
+npx --yes @yukiharada1228/hibana@0.2.0-rc.1 secret put API_KEY < /path/to/secret.txt
+npx --yes @yukiharada1228/hibana@0.2.0-rc.1 secret allow-deploy API_KEY
 # hibana.jsonに "secrets": ["API_KEY"] を追加してから配備
-npx hibana deploy
-npx hibana secret list
+npm run deploy
+npx --yes @yukiharada1228/hibana@0.2.0-rc.1 secret list
 ```
 
 `hibana.json`の`secrets`には使用する名前だけを列挙します。管理者が許可したSecretのうち、列挙したものだけを配備先へ渡します。通常の`deploy`・`rollback`はRead・Deployスコープで実行でき、Adminは不要です。`secret deny-deploy API_KEY`は今後の配備への許可を止めます。既存バージョンからも利用を止める場合は`secret delete API_KEY`を使います。ローカル専用の秘密値は`.dev.vars`にdotenv形式で記述できます。`.dev.vars`と、ビルド成果物を格納する`.hibana/`はGitに含めません。
@@ -129,9 +128,9 @@ npx hibana secret list
 コードを以前の状態に戻すときは次のコマンドを使います。
 
 ```bash
-npx hibana rollback
+npx --yes @yukiharada1228/hibana@0.2.0-rc.1 rollback
 # 配備済みの版を指定する場合
-npx hibana rollback --version 1.0.0
+npx --yes @yukiharada1228/hibana@0.2.0-rc.1 rollback --version 1.0.0
 ```
 
 rollbackはコード・環境変数・選択したSecretsの参照を一緒に戻します。Secretsの値と外部データは巻き戻しません。旧環境から更新する場合は[デプロイと移行の仕様](docs/deployment.md)を確認してください。

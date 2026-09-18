@@ -971,10 +971,12 @@ test("CLI guide is available while the initial application list is pending or fa
     });
     await expect(guide).toBeVisible();
     await expect(page.locator("pre").first()).toContainText(
-      "npm install -g ./hibana-cli-",
+      "npx --yes @yukiharada1228/hibana@",
     );
-    await expect(page.locator("pre").nth(1)).toContainText("--tenant 'team'");
-    await expect(page.locator("pre").last()).toHaveText("hibana deploy");
+    await expect(page.locator("pre").first()).toContainText("--tenant 'team'");
+    await expect(page.locator("pre").last()).toHaveText(
+      /^npx --yes @yukiharada1228\/hibana@\S+ deploy$/,
+    );
 
     releaseList();
     await expect(page.getByRole("alert")).toContainText(
@@ -983,7 +985,7 @@ test("CLI guide is available while the initial application list is pending or fa
     await expect(guide).toBeVisible();
     await expect(
       page.getByRole("button", { name: "コマンドをコピー", exact: true }),
-    ).toHaveCount(4);
+    ).toHaveCount(3);
     await expect(
       page.getByRole("button", { name: "更新", exact: true }),
     ).toHaveCount(0);
@@ -1049,18 +1051,20 @@ test("mobile layout, empty state, command guide and failed login", async ({
     .getByRole("navigation")
     .getByRole("link", { name: "CLI の接続", exact: true })
     .click();
-  await expect(page.locator("pre").nth(1)).toContainText(
+  await expect(page.locator("pre").first()).toContainText(
     "http://127.0.0.1:4173/api",
   );
-  await expect(page.locator("pre").nth(1)).not.toContainText(
+  await expect(page.locator("pre").first()).not.toContainText(
     "--password-stdin",
   );
   await expect(page.getByText(/Password: と表示されたら/)).toBeVisible();
-  await expect(page.locator("pre").nth(1)).not.toContainText("--profile");
-  await expect(page.locator("pre").nth(1)).not.toContainText(
+  await expect(page.locator("pre").first()).not.toContainText("--profile");
+  await expect(page.locator("pre").first()).not.toContainText(
     "--ingress-domain",
   );
-  await expect(page.locator("pre").last()).toHaveText("hibana deploy");
+  await expect(page.locator("pre").last()).toHaveText(
+    /^npx --yes @yukiharada1228\/hibana@\S+ deploy$/,
+  );
   await expect(
     page.getByRole("button", { name: "更新", exact: true }),
   ).toHaveCount(0);

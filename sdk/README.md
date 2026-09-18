@@ -1,6 +1,6 @@
 # Hibana CLI
 
-このソースは候補版`0.2.0-rc.1`です。以下のGitHub Release URLは公開済みv0.1.0用です。今回の修正を試す場合は[候補版の導入手順](../docs/release-candidate.md)を使ってください。
+このソースは候補版`0.2.0-rc.1`です。npm に公開した版は `npx` で利用できます。未公開の候補を試す場合は[候補版の導入手順](../docs/release-candidate.md)を使ってください。
 
 Hibanaの実行契約はWebAssembly Componentです。Honoは対応するJavaScriptフレームワークの一つで、専用SDKのインポートは必要ありません。
 
@@ -34,17 +34,16 @@ export default app
 
 素のJavaScript/TypeScriptでも、`export default { fetch(request, env, context) { ... } }`を使えます。CLI内部の共通変換層がFetch APIをWASI HTTPへ接続します。[Honoのfetch契約](https://hono.dev/docs/api/hono#fetch)をそのまま利用します。
 
-## インストールとテンプレート
+## npx とテンプレート
 
-CLIはNode.js 24以上が必要です。ローカル実行ランタイムは初回の`dev`で自動取得し、Kubernetes基盤は管理者が別途導入します。開発者のPCに基盤のソースやDocker/kubectlは不要です。[リモートCLI構成・配布・オンプレ接続](../docs/remote-cli.md)に全手順があります。配布先はGitHub Releasesです。npmレジストリへの公開は無効にしています。
+CLIはNode.js 24以上が必要です。ローカル実行ランタイムは初回の`dev`で自動取得し、Kubernetes基盤は管理者が別途導入します。開発者のPCに基盤のソースやDocker/kubectlは不要です。[リモートCLI構成・配布・オンプレ接続](../docs/remote-cli.md)に全手順があります。CLI は npm の `@yukiharada1228/hibana` と GitHub Releases の tarball で配布します。通常はバージョンを指定した `npx` を使い、グローバルインストールは任意です。
 
 [コンソール](../docs/console.md)のある基盤には`hibana login --url https://hibana.example.internal/api ...`で接続できます。ブラウザでは同じホストの`https://hibana.example.internal/`を開きます。CLIとコンソールは同じ管理APIを使い、配備済みアプリの実行・配信は接続先のKubernetesが担当します。
 
 ```bash
-npm install -g https://github.com/yukiharada1228/hibana/releases/download/v0.1.0/hibana-cli-0.1.0.tgz
-hibana init my-app
+npx --yes @yukiharada1228/hibana@0.2.0-rc.1 init my-app
 cd my-app
-hibana dev
+npm run dev
 ```
 
 | `--template` | アプリの記述 | 必要なビルドツール |
@@ -54,7 +53,7 @@ hibana dev
 | `rust` | RustのWASI HTTP handler | Rust、`wasm32-wasip2`ターゲット |
 | `go` | GoのWASI HTTP handler | Go 1.25.9以上、固定したcomponentize-go v0.4.2 |
 
-`init`は空のディレクトリに生成します。JS系にはnpm scriptsを生成し、PCに導入済みの`hibana`を使用します。通常のHonoプロジェクトのnpm依存は`hono`だけです。プロジェクト専用のCLIを固定したい場合は`--cli-package PATH`でtarballや開発用ディレクトリを指定できます。別のPCでも、先にHibana CLIを導入してください。`--no-install`でnpmインストールを省略できます。Rust・Goにはnpm依存を生成しません。CLIの実装自体はどの言語でもNode.jsを使用します。
+`init`は空のディレクトリに生成します。JS系のnpm scriptsは作成時のCLIバージョンを指定して`npx`から実行するため、別のPCでもグローバルCLIは不要です。通常のHonoプロジェクトのnpm依存は`hono`だけです。未公開の候補や閉域環境では`--cli-package PATH`でtarballや開発用ディレクトリを指定すると、プロジェクトのdevDependencyとしてCLIを導入し、npm scriptsからそのCLIを使います。`--no-install`でnpmインストールを省略できます。Rust・Goにはnpm依存を生成しません。CLIの実装自体はどの言語でもNode.jsを使用します。
 
 Rust・Go・ビルド済みComponentだけを扱う場合、`npm ci --prefix sdk --omit=optional --omit=dev`でJSコンパイラーとHonoをインストールせずにCLIを使えます。JS向けビルドを追加するときは`npm ci --prefix sdk`を実行してください。
 
@@ -72,6 +71,8 @@ node sdk/src/cli.mjs deploy -c my-go/hibana.json
 Goの`componentize-go`は`go.mod`のtool依存として固定しています。初回のビルドで公式バイナリとGo依存を取得します。バインディングは`bindings/`へ生成し、アプリの`go.mod`やHTTP実装を上書きしません。Goサンプルは生成されたWASI HTTPバインディングを使用します。既存の`net/http.ListenAndServe`アプリを無変更で動かす機能ではありません。[公式ツール](https://github.com/bytecodealliance/componentize-go/tree/v0.4.2)を利用しています。
 
 Rust・GoのプロジェクトにはWIT定義と依存ロックもコピーされるので、生成後のビルドはHibana固有の言語SDKに依存しません。Honoテンプレートは公式の最小サンプルの応答テキストを変更した`GET /`だけです。JavaScript・Rust・Goには`GET /`とバイナリを返す`POST /echo`があります。Rust・Goサンプルのecho入力上限は1 MiBです。
+
+以降の `hibana ...` は `npx --yes @yukiharada1228/hibana@0.2.0-rc.1 ...` として実行できます。
 
 ## アプリと基盤の操作
 

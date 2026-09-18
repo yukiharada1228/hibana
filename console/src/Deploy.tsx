@@ -13,13 +13,9 @@ export function Deploy({
   email: string;
 }) {
   const [copied, setCopied] = useState("");
-  const login = `hibana login \\\n  --url ${quote(`${location.origin}/api`)} \\\n  --tenant ${quote(session.tenant_slug)} \\\n  --email ${quote(email)}`;
+  const cli = `npx --yes @yukiharada1228/hibana@${version}`;
+  const login = `${cli} login \\\n  --url ${quote(`${location.origin}/api`)} \\\n  --tenant ${quote(session.tenant_slug)} \\\n  --email ${quote(email)}`;
   const commands = [
-    {
-      title: "CLI をインストール",
-      description: `Node.js 24 以上を用意します。管理者から、この基盤に対応する hibana-cli-${version}.tgz を受け取り、保存先のフォルダで実行してください。既に導入済みなら次へ進めます。`,
-      command: `npm install -g ./hibana-cli-${version}.tgz\nhibana --version`,
-    },
     {
       title: "この基盤にログイン",
       description:
@@ -30,12 +26,12 @@ export function Deploy({
       title: "アプリを作成",
       description:
         "Hono アプリを作成します。既存の Hibana プロジェクトがあれば、そのディレクトリへ移動してください。",
-      command: "hibana init hello\ncd hello",
+      command: `${cli} init hello\ncd hello`,
     },
     {
       title: "デプロイ",
       description: "PC でビルドした Wasm が、この基盤へアップロードされます。",
-      command: "hibana deploy",
+      command: `${cli} deploy`,
     },
   ];
   return (
@@ -44,7 +40,8 @@ export function Deploy({
         <div>
           <h1>CLI の接続</h1>
           <p className="muted">
-            手元の PC から、この Hibana 基盤へ接続します。
+            Node.js 24 以上がある PC から接続できます。CLI は npx
+            が取得するため、事前のインストールは不要です。
           </p>
         </div>
       </div>
@@ -61,18 +58,6 @@ export function Deploy({
             <div>
               <h2>{step.title}</h2>
               <p className="muted">{step.description}</p>
-              {i === 0 && (
-                <p className="small">
-                  <a
-                    href="https://github.com/yukiharada1228/hibana/releases"
-                    target="_blank"
-                    rel="noopener noreferrer"
-                  >
-                    配布ページ
-                  </a>
-                  からも取得できます。未公開の候補版・社内用の版は管理者から受け取ってください。
-                </p>
-              )}
               <pre>
                 <code>{step.command}</code>
               </pre>

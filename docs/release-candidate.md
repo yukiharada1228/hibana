@@ -2,7 +2,7 @@
 
 このソースの基盤DBは空DB用の新しい初期スキーマです。旧DBへの自動更新は拒否します。[DBの作成と切替](database.md)を確認し、既存の稼働DBとは別の検証先を指定してください。
 
-CLI・PC用Wasmtimeランタイム・Control Plane・Workerを`0.2.0-rc.1`に揃えた候補版です。npmレジストリには公開しません。GitHub Actionsで作成した候補を取得し、検証環境へ導入します。正式なReleaseを公開するまで、候補版のGitHub Release URLによる自動取得は使えません。
+CLI・PC用Wasmtimeランタイム・Control Plane・Workerを`0.2.0-rc.1`に揃えた候補版です。npm 公開前はGitHub Actionsで作成した候補を取得し、検証環境へ導入します。公開後は `npx --yes @yukiharada1228/hibana@0.2.0-rc.1` を使用できます。正式なReleaseを公開するまで、候補版のGitHub Release URLによる自動取得は使えません。
 
 ## 含まれる変更
 
@@ -16,7 +16,7 @@ CLI・PC用Wasmtimeランタイム・Control Plane・Workerを`0.2.0-rc.1`に揃
 
 ## 配布物を取得する
 
-`release/v0.2.0-rc.1`ブランチの同じコミットに対して、CI、Security dependencies、GitHub releaseの全ジョブが成功した候補を選びます。`RUN_ID`はそのGitHub release実行のIDです。Actionsの成果物は14日間保持されます。
+`release/v0.2.0-rc.1`ブランチの同じコミットに対して、CI、Security dependencies、Hibana releaseの全ジョブが成功した候補を選びます。`RUN_ID`はそのGitHub release実行のIDです。Actionsの成果物は14日間保持されます。
 
 ```bash
 gh run download RUN_ID --repo yukiharada1228/hibana \
@@ -43,17 +43,16 @@ shasum -a 256 -c SHA256SUMS
 
 ```bash
 # 取得したファイルがあるディレクトリで実行
-npm install -g ./hibana-cli-0.2.0-rc.1.tgz
-hibana --version
-hibana runtime install --from ./hibana-worker-0.2.0-rc.1-darwin-arm64 --sha256 HASH
-hibana init hello
+npx --yes --package=./hibana-cli-0.2.0-rc.1.tgz hibana --version
+npx --yes --package=./hibana-cli-0.2.0-rc.1.tgz hibana runtime install --from ./hibana-worker-0.2.0-rc.1-darwin-arm64 --sha256 HASH
+npx --yes --package=./hibana-cli-0.2.0-rc.1.tgz hibana init hello --cli-package ./hibana-cli-0.2.0-rc.1.tgz
 cd hello
 npm run dev
 # 別ターミナルで curl http://127.0.0.1:8787/
 # Ctrl+Cで開発サーバーを終了
 ```
 
-生成するHonoプロジェクトは、PCに導入したCLIを使います。正式公開前にローカル実行する場合は、上記のランタイムの事前導入が必要です。Hono・JavaScriptコンパイラーの依存はnpmまたは社内ミラーから取得します。
+この手順のHonoプロジェクトは、指定したtarballから導入したプロジェクト内のCLIを使います。グローバルインストールは不要で、未公開のnpmバージョンも参照しません。正式公開前にローカル実行する場合は、上記のランタイムの事前導入が必要です。Hono・JavaScriptコンパイラーの依存はnpmまたは社内ミラーから取得します。
 
 ## オンプレ検証環境へ導入する
 

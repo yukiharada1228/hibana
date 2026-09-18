@@ -65,18 +65,17 @@ CLIは`--url https://hibana.example.internal/api`のようにパス付きの管�
 
 ## CLIの配布
 
-Node.js 24以上が必要です。CLIはGitHub Releasesのtarballから導入します。npmレジストリへは公開しません。CLIの実行時にHibanaリポジトリは不要です。
+Node.js 24以上が必要です。CLI は `npx --yes @yukiharada1228/hibana@VERSION` で実行します。グローバルインストールやHibanaリポジトリは不要です。未公開の候補はtarballを `npx --package=/path/to/hibana-cli-VERSION.tgz hibana ...` で実行できます。
 
 ```bash
 # 配布担当者がリポジトリ内で実行
 npm ci --prefix sdk
 mkdir -p .local/dist
-cd sdk
-npm pack --pack-destination ../.local/dist
+node scripts/release.mjs cli .local/dist
 
 # 開発者のPC。配布したファイルを任意の場所に置く
-npm install -g https://github.com/yukiharada1228/hibana/releases/download/v0.1.0/hibana-cli-0.1.0.tgz
-hibana --help
+npx --yes @yukiharada1228/hibana@0.2.0-rc.1 --version
+npx --yes @yukiharada1228/hibana@0.2.0-rc.1 --help
 ```
 
 パッケージに含めるのはCLI、言語テンプレート、WIT、既存クラスタを操作する小さな管理ツールとマイグレーションの公開マニフェストです。Control Plane/Workerのソース・バイナリ、Dockerfile、kind構築処理、開発用資格情報は含みません。アプリの配備・削除・Secrets操作でPython・Docker・kubectlを起動することはありません。
@@ -84,6 +83,8 @@ hibana --help
 JS/TSのビルドには同梱のoptionalDependenciesを使います。ビルド済みWasmだけを配備するPCでは`npm install -g /path/to/hibana-cli-0.1.0.tgz --omit=optional`でJSコンパイラーを省略できます。
 
 ## 開発者の操作
+
+以下の `hibana ...` は `npx --yes @yukiharada1228/hibana@0.2.0-rc.1 ...` として実行します。コンソールの「CLI の接続」から、自分の接続先とバージョンを含むコマンドをコピーできます。
 
 管理者から管理API URL・テナント名・アカウントを受け取ります。公開 URL は基盤から自動取得します。通常のログインでは `Password:` に続けてパスワードを入力します。文字は表示されません。スクリプトでは `--password-stdin < /secure/login-password.txt` または `HIBANA_PASSWORD` を使えます。
 
@@ -105,7 +106,7 @@ hibana logout
 
 複数の接続先を使う場合だけ `hibana login --profile NAME ...` で名前を付け、`hibana profile use NAME` で切り替えます。`--version` も任意で、省略すると自動生成されます。
 
-`init`のnpm scriptsはPCに導入済みのHibana CLIを使用します。未公開の候補版でもCLIの再ダウンロードは発生しません。別のPCで作業する場合もCLIを導入してください。`--cli-package PATH`を指定した場合だけ、tarballや開発用ディレクトリをプロジェクトのCLI依存として追加します。通常のHonoをWasm Componentへ変換してアップロードし、実行・配置・準備済みコードの管理はオンプレのWorker群が担当します。
+`init`のnpm scriptsは作成時のCLIバージョンを指定して`npx`から実行します。別のPCでもグローバルCLIは不要です。未公開の候補版では`--cli-package PATH`を使用してください。`--cli-package PATH`を指定した場合だけ、tarballや開発用ディレクトリをプロジェクトのCLI依存として追加します。通常のHonoをWasm Componentへ変換してアップロードし、実行・配置・準備済みコードの管理はオンプレのWorker群が担当します。
 
 通常の配備はRead・Deploy、アプリ削除はRead・Adminのスコープが必要です。`onprem-admin`には同じテナントの管理者でログインしてください。
 

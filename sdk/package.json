@@ -1,7 +1,10 @@
 {
-  "name": "@hibana/cli",
+  "name": "@yukiharada1228/hibana",
   "version": "0.2.0-rc.1",
-  "private": true,
+  "publishConfig": {
+    "access": "public",
+    "registry": "https://registry.npmjs.org"
+  },
   "type": "module",
   "description": "Independent CLI for local WebAssembly development and remote Hibana deployments",
   "scripts": {

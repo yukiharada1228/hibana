@@ -1,6 +1,6 @@
-name: GitHub release
+name: Hibana release
 
-# Branches build candidates; version tags publish the verified files to GitHub only.
+# Branches build candidates; version tags publish verified assets and the npm CLI.
 on:
   workflow_dispatch:
   push:
@@ -67,8 +67,7 @@ jobs:
       - run: npm ci --prefix sdk
       - run: npm test --prefix sdk
       - run: mkdir dist
-      - working-directory: sdk
-        run: npm pack --pack-destination ../dist
+      - run: node scripts/release.mjs cli dist
       - run: node scripts/release.mjs platform dist
       - uses: actions/upload-artifact@v4
         with:
@@ -187,3 +186,49 @@ jobs:
         env:
           HIBANA_GITHUB_RELEASE: '1'
         run: npm run test:package --prefix sdk
+
+  publish-npm:
+    name: Publish CLI to npm
+    if: github.ref_type == 'tag'
+    needs: publish
+    runs-on: ubuntu-22.04
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+          registry-url: 'https://registry.npmjs.org'
+      - uses: actions/download-artifact@v4
+        with:
+          name: hibana-release-candidate
+          path: dist
+      - name: Publish the verified tarball using npm trusted publishing
+        run: |
+          version=$(node scripts/release.mjs version)
+          dist_tag=latest
+          if [[ "$version" == *-* ]]; then dist_tag=next; fi
+          npm publish "dist/hibana-cli-$version.tgz" --access public --tag "$dist_tag" --provenance
+      - name: Verify npx against the public registry
+        run: |
+          version=$(node scripts/release.mjs version)
+          available=false
+          for attempt in {1..45}; do
+            if published=$(npm view "@yukiharada1228/hibana@$version" version --prefer-online --fetch-retries=0 --fetch-timeout=15000); then
+              if [[ "$published" == "$version" ]]; then
+                available=true
+                break
+              fi
+            fi
+            echo "Waiting for npm publish-time scanning ($attempt/45)..."
+            sleep 20
+          done
+          if [[ "$available" != true ]]; then
+            echo 'The published CLI is not installable yet. Check npm before retrying; do not republish the same version.' >&2
+            exit 1
+          fi
+          result=$(npx --yes "@yukiharada1228/hibana@$version" --version)
+          test "$result" = "hibana $version"

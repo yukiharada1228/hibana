@@ -13,7 +13,7 @@
 - アプリの「設定」→「許可された外部通信先」で通信先を追加・取り消し（管理者のみ）。CLI と同じアプリ単位の設定を使い、再デプロイ後も維持する。
 - UTC 日付の期間を指定した利用量集計。
 - 管理権限を持つアカウントによるアプリ削除。
-- CLIの導入・ログイン・配備手順を表示。対応する配布ファイルは管理者から受け取るか、配布ページから取得する。
+- CLIのログイン・アプリ作成・配備を3ステップで表示。基盤と同じバージョンの `npx --yes @yukiharada1228/hibana@VERSION` を使用し、グローバルインストールは不要。
 
 アプリ一覧と表示中の利用状況・詳細は画面の「更新」、ブラウザに戻った時、表示中の30秒間隔で再取得します。CLI と画面は同じ API とテナントの状態を使います。コンソールは基盤管理用の kubeconfig、DB・Redis・S3 の資格情報を保持しません。
 
@@ -57,7 +57,7 @@ hibana egress deny db.example.com:5432
 
 ## Kubernetes への導入
 
-候補版 `0.2.0-rc.1` の CLI・Control Plane と同じソースから作ったコンソールを使用してください。以前の公開版には新しい `/auth/session`・`/auth/logout` API がありません。
+候補版 `0.2.0-rc.1` の CLI・Control Plane と同じソースから作ったコンソールを使用してください。CLI 接続画面は npm の同じ版を案内するため、コンソールの公開前に `npm view @yukiharada1228/hibana@VERSION version` で取得できることを確認します。以前の公開版には新しい `/auth/session`・`/auth/logout` API がありません。
 
 `deploy/kubernetes/remote` および `hibana platform init` が生成するサイト設定にはコンソールを含めています。既存のサイト設定では `console/` 一式をコピーし、サイトの `kustomization.yaml` の `resources` に `console` を追加します。
 

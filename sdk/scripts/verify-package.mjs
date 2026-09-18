@@ -1,8 +1,9 @@
 // Exercise the actual npm tarball outside the source tree. No platform is started.
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
-import { mkdtemp, mkdir, readFile, rm } from "node:fs/promises";
+import { mkdtemp, mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { createServer } from "node:net";
+import { createServer as createRegistry } from "node:http";
 import { tmpdir } from "node:os";
 import { join, resolve, delimiter } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -12,6 +13,7 @@ import { cliRelease, releaseBase } from "../src/package.mjs";
 const sdk = fileURLToPath(new URL("../", import.meta.url));
 const temporary = await mkdtemp(join(tmpdir(), "hibana-package-"));
 const env = { ...process.env, HIBANA_CONFIG_HOME: join(temporary, "profiles"), HIBANA_RUNTIME_HOME: join(temporary, "runtimes"), HIBANA_RUNTIME_BIN: "", HIBANA_PROFILE: "", HIBANA_URL: "", HIBANA_TOKEN: "" };
+let registry;
 async function run(command, args, cwd = temporary, overrides = {}) {
   return new Promise((resolve, reject) => {
     const child = spawn(command, args, { cwd, env: { ...env, ...overrides }, stdio: ["ignore", "pipe", "pipe"] });
@@ -40,13 +42,38 @@ try {
     const response = await fetch(releaseBase(metadata.version) + "SHA256SUMS", { signal: AbortSignal.timeout(30000) });
     assert.equal(response.status, 200);
     const { releaseChecksum } = await import("../src/runtime.mjs");
-    assert.equal(createHash("sha256").update(await readFile(tarball)).digest("hex"), releaseChecksum(await response.text(), packed.filename));
+    assert.equal(createHash("sha256").update(await readFile(tarball)).digest("hex"), releaseChecksum(await response.text(), `hibana-cli-${metadata.version}.tgz`));
   }
+  // Serve only this candidate through an isolated scoped registry. The exact
+  // npx command must work before public release, without a global hibana binary.
+  const bytes = await readFile(tarball);
+  registry = createRegistry((req, res) => {
+    const path = decodeURIComponent(new URL(req.url, "http://localhost").pathname);
+    if (path === "/cli.tgz") {
+      res.setHeader("Content-Type", "application/octet-stream");
+      return res.end(bytes);
+    }
+    if (path !== `/${metadata.name}`) { res.writeHead(404); return res.end(); }
+    res.setHeader("Content-Type", "application/json");
+    res.end(JSON.stringify({name: metadata.name, "dist-tags": {latest: metadata.version}, versions: {
+      [metadata.version]: {...metadata, dist: {
+        tarball: `http://127.0.0.1:${registry.address().port}/cli.tgz`,
+        integrity: `sha512-${createHash("sha512").update(bytes).digest("base64")}`,
+      }},
+    }}));
+  });
+  await new Promise(resolve => registry.listen(0, "127.0.0.1", resolve));
+  // A previous run may have cached a different candidate with the same version.
+  env.npm_config_cache = join(temporary, "npm-cache");
+  env.npm_config_userconfig = join(temporary, ".npmrc");
+  await writeFile(env.npm_config_userconfig, `${metadata.name.split("/")[0]}:registry=http://127.0.0.1:${registry.address().port}\n`);
+  const guard = join(temporary, "bin"); await mkdir(guard);
+  await writeFile(join(guard, "hibana"), '#!/bin/sh\necho "Unexpected global hibana dependency" >&2\nexit 99\n', {mode: 0o755});
+  env.PATH = [guard, process.env.PATH].filter(Boolean).join(delimiter);
   const installation = join(temporary, "installation"); await mkdir(installation);
   const npmFlags = ["--no-audit", "--no-fund", ...(process.env.HIBANA_PACKAGE_OFFLINE ? ["--offline"] : [])];
   await run("npm", ["install", "--omit=optional", "--ignore-scripts", ...npmFlags, github ? release : tarball], installation);
-  const cli = join(installation, "node_modules/@hibana/cli/src/cli.mjs");
-  env.PATH = [join(installation, "node_modules/.bin"), process.env.PATH].filter(Boolean).join(delimiter);
+  const cli = join(installation, "node_modules", metadata.name, "src/cli.mjs");
   assert.equal((await run(process.execPath, [cli, "--version"])).trim(), `hibana ${packed.version}`);
   assert.match(await run(process.execPath, [cli, "--help"]), /--profile/);
   console.log("Packed CLI installed without JS compilers, Docker, platform source or a local runtime.");
@@ -54,16 +81,18 @@ try {
   assert.match(await run(process.execPath, [cli, "platform", "install", "--help"]), /--kubeconfig/);
 
   const project = join(temporary, "hello");
-  await run(process.execPath, [cli, "init", project, "--template", "hono", "--no-install"]);
+  const npx = ["--yes", `${metadata.name}@${metadata.version}`];
+  assert.equal((await run("npx", [...npx, "--version"])).trim(), `hibana ${metadata.version}`);
+  await run("npx", [...npx, "init", project, "--template", "hono", "--no-install"]);
   const projectPackage = JSON.parse(await readFile(join(project, "package.json"), "utf8"));
-  assert.equal(projectPackage.devDependencies?.["@hibana/cli"], undefined);
+  assert.equal(projectPackage.devDependencies?.["@yukiharada1228/hibana"], undefined);
   assert.deepEqual(Object.keys(projectPackage.dependencies), ["hono"]);
   await run("npm", ["install", ...npmFlags], project);
   await run("npm", ["install", "--include=optional", ...npmFlags], installation);
   await run("npm", ["run", "build"], project);
   const wasm = await readFile(join(project, ".hibana/build/app.wasm"));
   assert.deepEqual(wasm.subarray(0, 8), Buffer.from([0, 97, 115, 109, 13, 0, 1, 0]));
-  console.log(`Installed Hono project built a ${wasm.length}-byte Wasm Component (SHA-256 ${createHash("sha256").update(wasm).digest("hex")}).`);
+  console.log(`npx init and npm run build succeeded without global CLI installation: ${wasm.length}-byte Wasm Component (SHA-256 ${createHash("sha256").update(wasm).digest("hex")}).`);
 
   if (process.env.HIBANA_RUNTIME_BIN || github) {
     const listener = createServer();
@@ -103,4 +132,7 @@ try {
     console.log("Ctrl+C stopped the runtime and closed its HTTP listener.");
   } else console.log("Runtime execution skipped: set HIBANA_RUNTIME_BIN to verify Wasmtime execution and shutdown.");
   console.log("Standalone package verification passed.");
-} finally { await rm(temporary, { recursive: true, force: true }); }
+} finally {
+  if (registry) { registry.closeAllConnections(); await new Promise(resolve => registry.close(resolve)); }
+  await rm(temporary, { recursive: true, force: true });
+}

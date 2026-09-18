@@ -1,7 +1,7 @@
 // Assemble public release files from explicit inputs; never copy a checkout wholesale.
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
-import { chmod, copyFile, mkdir, readFile, readdir, stat, writeFile } from "node:fs/promises";
+import { chmod, copyFile, mkdir, readFile, readdir, rename, stat, writeFile } from "node:fs/promises";
 import { createHash } from "node:crypto";
 import { resolve, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -15,13 +15,27 @@ assert.match(version, /^\d+\.\d+\.\d+(?:-[a-zA-Z0-9.-]+)?$/);
 assert.equal(/\[workspace.package\][\s\S]*?version\s*=\s*"([^"]+)"/.exec(cargo)?.[1], version, "CLI and runtime versions differ");
 assert.equal(lock.packages[""].version, version, "npm lock version differs");
 assert.equal(lock.packages[""].name, pkg.name, "npm lock name differs");
-assert.equal(pkg.private, true, "Hibana is distributed through GitHub; npm publication must stay disabled");
+assert.notEqual(pkg.private, true, "The CLI must be publishable to npm");
+assert.equal(pkg.publishConfig.access, "public");
+assert.equal(pkg.publishConfig.registry, "https://registry.npmjs.org");
 assert.equal(JSON.parse(await readFile(join(root, "console/package.json"), "utf8")).version, version, "Console and platform versions differ");
 if (process.env.GITHUB_REF_TYPE === "tag") assert.equal(process.env.GITHUB_REF_NAME, `v${version}`, "Release tag and package version differ");
 
 const targets = ["linux-x64", "linux-arm64", "darwin-x64", "darwin-arm64"];
 const [command, ...args] = process.argv.slice(2);
 if (command === "version" && !args.length) console.log(version);
+else if (command === "cli" && args.length === 1) {
+  const output = resolve(args[0]); await mkdir(output, { recursive: true });
+  const [packed] = JSON.parse(execFileSync("npm", ["pack", "--json", "--pack-destination", output],
+    { cwd: join(root, "sdk"), encoding: "utf8" }));
+  assert.equal(packed.name, pkg.name);
+  assert.equal(packed.version, version);
+  // Keep GitHub/offline asset names independent of the npm account scope.
+  const source = join(output, packed.filename);
+  const destination = join(output, `hibana-cli-${version}.tgz`);
+  if (source !== destination) await rename(source, destination);
+  console.log(destination);
+}
 else if (command === "runtime" && args.length === 2) {
   const [binary, output] = args.map(arg => resolve(arg));
   const target = `${process.platform}-${process.arch}`;
@@ -54,4 +68,4 @@ else if (command === "runtime" && args.length === 2) {
   }
   await writeFile(join(directory, "SHA256SUMS"), lines.join("\n") + "\n");
   console.log(`Checksummed ${names.length} release files${args[1] ? " (complete matrix)" : " (available local targets only)"}.`);
-} else throw new Error("Usage: node scripts/release.mjs version | runtime BINARY OUTPUT | platform OUTPUT | checksums OUTPUT [--complete]");
+} else throw new Error("Usage: node scripts/release.mjs version | cli OUTPUT | runtime BINARY OUTPUT | platform OUTPUT | checksums OUTPUT [--complete]");
