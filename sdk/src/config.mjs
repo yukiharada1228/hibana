@@ -2,6 +2,7 @@ import { isApplicationName } from "./application-name.mjs";
 import { readFile } from "node:fs/promises";
 import { resolve, dirname, isAbsolute } from "node:path";
 import { validateExtensionList } from "./extension-manifest.mjs";
+import { devConfig } from "./dev-config.mjs";
 export async function readConfigFile(file = "hibana.json") {
   const path = resolve(file);
   let contents, value;
@@ -39,6 +40,7 @@ export async function loadConfig(file = "hibana.json") {
     "secrets",
     "limits",
     "extensions",
+    "dev",
   ]);
   for (const key of Object.keys(value))
     if (!supported.has(key))
@@ -54,6 +56,7 @@ export async function loadConfig(file = "hibana.json") {
   if (typeof input !== "string" || !input.trim() || input.includes("\0"))
     throw new Error("main/component must be a non-empty path");
   validateBuild(value.build, value.component);
+  const dev = devConfig(value.dev);
   const { vars, secrets } = validateEnvironment(value.vars, value.secrets);
   const limits = validateLimits(value.limits);
   const resources = {
@@ -62,7 +65,7 @@ export async function loadConfig(file = "hibana.json") {
     max_execution_time_ms: limits.timeout_ms + 5000,
   };
   if (limits.fuel !== undefined) resources.max_fuel = limits.fuel;
-  return { ...value, vars, secrets, root: dirname(path), path, resources };
+  return { ...value, vars, secrets, dev, root: dirname(path), path, resources };
 }
 
 function validateBuild(build, component) {

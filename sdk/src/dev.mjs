@@ -6,6 +6,7 @@ import { dirname, resolve, relative, join, delimiter } from "node:path";
 import { loadConfig } from "./config.mjs";
 import { installedRuntime, installRuntime } from "./runtime.mjs";
 import { resolveExtensions } from "./extensions.mjs";
+import { devConfig } from "./dev-config.mjs";
 import {
   isLocalExtension,
   extensionNames,
@@ -134,6 +135,7 @@ export async function dev(config, options, build) {
     return childStopping;
   }
   async function start() {
+    const localNetwork = devConfig(config.dev);
     const artifact = await build(config, extensionOptions);
     let local = {};
     try {
@@ -149,6 +151,9 @@ export async function dev(config, options, build) {
       JSON.stringify({
         vars: { ...config.vars, ...local },
         resources: config.resources,
+        ...(localNetwork.allow_outbound.length
+          ? { net_allow_outbound: localNetwork.allow_outbound }
+          : {}),
       }),
       { mode: 0o600 },
     );

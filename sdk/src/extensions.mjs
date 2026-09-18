@@ -278,9 +278,13 @@ export async function resolveExtensions(config, options = {}) {
   );
   plan.imports = [...imports.keys()];
   plan.permissions = [...permissions];
-  if (mode === "dev" && permissions.has("outbound-network")) {
+  if (
+    mode === "dev" &&
+    permissions.has("outbound-network") &&
+    !config.dev?.allow_outbound?.length
+  ) {
     throw new Error(
-      "This extension requires outbound-network, which hibana dev does not currently allow. Use a deployment with administrator-approved destinations.",
+      'This extension requires outbound-network. Set dev.allow_outbound in hibana.json: "dev": { "allow_outbound": ["db.example.com:5432"] }. Deployment permissions are managed separately with hibana egress allow.',
     );
   }
   // Do not replace a working lock with an invalid or conflicting extension graph.

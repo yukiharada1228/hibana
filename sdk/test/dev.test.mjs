@@ -143,3 +143,26 @@ test("building a Component and reading dev help do not install a runtime", async
   assert.doesNotMatch(help.output, /HIBANA_NO_RUNTIME_INSTALL/);
   assert.deepEqual(await f.downloads(), []);
 });
+
+test("dev passes only explicit local destinations and keeps local Secrets in private settings", async t => {
+  const f = await fixture(t);
+  const project = { name: "hello", component: "app.wasm" };
+  await f.writeRuntime(f.managed, "managed");
+  let result = await f.invoke();
+  assert.equal(result.code, 0, result.output);
+  const settingsPath = join(f.root, ".hibana/dev-settings.json");
+  assert.equal(JSON.parse(await readFile(settingsPath, "utf8")).net_allow_outbound, undefined);
+  await writeFile(join(f.root, "hibana.json"), JSON.stringify({ ...project, dev: { allow_outbound: ["DB.Example.COM.:05432", "db.example.com:5432"] } }));
+  await writeFile(join(f.root, ".dev.vars"), 'DATABASE_URL="local-test-secret"\n');
+  result = await f.invoke();
+  assert.equal(result.code, 0, result.output);
+  assert.doesNotMatch(result.output, /local-test-secret/);
+  const settings = JSON.parse(await readFile(settingsPath, "utf8"));
+  assert.deepEqual(settings.net_allow_outbound, ["db.example.com:5432"]);
+  assert.equal(settings.vars.DATABASE_URL, "local-test-secret");
+  assert.equal((await stat(settingsPath)).mode & 0o777, 0o600);
+  await writeFile(join(f.root, "hibana.json"), JSON.stringify(project));
+  result = await f.invoke();
+  assert.equal(result.code, 0, result.output);
+  assert.equal(JSON.parse(await readFile(settingsPath, "utf8")).net_allow_outbound, undefined);
+});

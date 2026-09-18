@@ -36,7 +36,10 @@ async function checkComponent(path) {
 
 export async function build(config, options = {}) {
   const extensions = await resolveExtensions(config, options);
-  if (extensions.permissions.includes("outbound-network"))
+  if (
+    extensions.permissions.includes("outbound-network") &&
+    options.mode !== "dev"
+  )
     console.error(
       "Extension requires outbound-network. An administrator must approve application destinations with hibana egress allow HOST:PORT; deployments inherit that policy.",
     );
