@@ -1,6 +1,6 @@
 # 手元のCLIからオンプレHibanaを操作する
 
-このソースの候補版は`0.2.0-rc.1`です。公開済みv0.1.0への導入例と、今回の変更を含む[候補版の導入手順](release-candidate.md)を区別してください。新しい基盤操作には同じ候補版のCLIと基盤イメージが必要です。
+このソースの候補版は`0.2.0-rc.2`です。公開済みv0.1.0への導入例と、今回の変更を含む[候補版の導入手順](release-candidate.md)を区別してください。新しい基盤操作には同じ候補版のCLIと基盤イメージが必要です。
 
 CLIを導入すると、ローカル開発ランタイムは初回の`dev`で自動取得します。Kubernetes上の基盤は管理者が別途導入します。開発者のPCにはクラスタの資格情報を渡さず、Hibanaのテナント用認証でHTTPS管理APIを操作します。
 
@@ -74,8 +74,8 @@ mkdir -p .local/dist
 node scripts/release.mjs cli .local/dist
 
 # 開発者のPC。配布したファイルを任意の場所に置く
-npx --yes @yukiharada1228/hibana@0.2.0-rc.1 --version
-npx --yes @yukiharada1228/hibana@0.2.0-rc.1 --help
+npx --yes @yukiharada1228/hibana@0.2.0-rc.2 --version
+npx --yes @yukiharada1228/hibana@0.2.0-rc.2 --help
 ```
 
 パッケージに含めるのはCLI、言語テンプレート、WIT、既存クラスタを操作する小さな管理ツールとマイグレーションの公開マニフェストです。Control Plane/Workerのソース・バイナリ、Dockerfile、kind構築処理、開発用資格情報は含みません。アプリの配備・削除・Secrets操作でPython・Docker・kubectlを起動することはありません。
@@ -84,7 +84,7 @@ JS/TSのビルドには同梱のoptionalDependenciesを使います。ビルド�
 
 ## 開発者の操作
 
-以下の `hibana ...` は、グローバル導入済みならそのまま実行できます。CLIを導入済みのプロジェクト内では `npm exec -- hibana ...`、作成前は `npx --yes @yukiharada1228/hibana@0.2.0-rc.1 ...` として実行します。コンソールの「CLI の接続」から、自分の接続先とバージョンを含む初回コマンドと、作成後の`npm run deploy`をコピーできます。
+以下の `hibana ...` は、グローバル導入済みならそのまま実行できます。CLIを導入済みのプロジェクト内では `npm exec -- hibana ...`、作成前は `npx --yes @yukiharada1228/hibana@0.2.0-rc.2 ...` として実行します。コンソールの「CLI の接続」から、自分の接続先とバージョンを含む初回コマンドと、作成後の`npm run deploy`をコピーできます。
 
 管理者から管理API URL・テナント名・アカウントを受け取ります。公開 URL は基盤から自動取得します。通常のログインでは `Password:` に続けてパスワードを入力します。文字は表示されません。スクリプトでは `--password-stdin < /secure/login-password.txt` または `HIBANA_PASSWORD` を使えます。
 

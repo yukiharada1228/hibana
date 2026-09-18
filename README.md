@@ -8,7 +8,7 @@ Cloudflare Workersのような短い開発・配備の流れを参考にして�
 
 GitHubから導入できるMVP v0.1.0です。2時間のHTTP負荷と、配備・復元・停止・削除の[自動受入結果](docs/pilot-validation.md)を公開しています。実オンプレでの本番利用の条件は[運用ガイド](docs/on-prem-production.md)にまとめています。
 
-このソースは次期候補`0.2.0-rc.1`です。停止・導入・回収処理の修正を含み、公開済みv0.1.0とは配布物が異なります。候補版を試す場合は[候補版の導入手順](docs/release-candidate.md)でCLIと基盤を揃えてください。
+このソースは次期候補`0.2.0-rc.2`です。停止・導入・回収処理の修正を含み、公開済みv0.1.0とは配布物が異なります。候補版を試す場合は[候補版の導入手順](docs/release-candidate.md)でCLIと基盤を揃えてください。
 
 この候補の基盤DBはSeaORMの初期スキーマへ整理しています。検証には空のDBを使い、既存の稼働DBは後から切り替えます。[DB構成・マイグレーション](docs/database.md)を参照してください。
 
@@ -25,10 +25,10 @@ HTTPのバイナリ入出力と、SSEなどのレスポンスストリーミン�
 
 ## ローカルで試す
 
-Node.js 24以上とnpmが必要です。npm に公開した CLI は `npx` から実行でき、グローバルインストールは不要です。次の例は `0.2.0-rc.1` の公開後に利用できます。未公開の候補は[候補版の導入手順](docs/release-candidate.md)を使います。
+Node.js 24以上とnpmが必要です。npm に公開した CLI は `npx` から実行でき、グローバルインストールは不要です。次の例は `0.2.0-rc.2` の公開後に利用できます。未公開の候補は[候補版の導入手順](docs/release-candidate.md)を使います。
 
 ```bash
-npx --yes @yukiharada1228/hibana@0.2.0-rc.1 init my-api
+npx --yes @yukiharada1228/hibana@0.2.0-rc.2 init my-api
 cd my-api
 npm run dev
 ```
@@ -72,8 +72,8 @@ export default app
 Hono・JavaScriptのプロジェクトでは`npm run dev`や`npm run deploy`を使えます。Rust・Goのプロジェクトにはnpm依存を追加せず、`npx`から設定ファイルを指定して操作します。
 
 ```bash
-npx --yes @yukiharada1228/hibana@0.2.0-rc.1 init my-rust --template rust
-npx --yes @yukiharada1228/hibana@0.2.0-rc.1 dev -c my-rust/hibana.json
+npx --yes @yukiharada1228/hibana@0.2.0-rc.2 init my-rust --template rust
+npx --yes @yukiharada1228/hibana@0.2.0-rc.2 dev -c my-rust/hibana.json
 ```
 
 ビルド済みのWASI HTTP Componentも配備できます。言語別のツール要件とビルド設定は[CLIガイド](sdk/README.md)を参照してください。
