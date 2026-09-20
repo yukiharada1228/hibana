@@ -162,7 +162,7 @@ try {
   );
   await runCommand(
     "npm",
-    ["install", "--ignore-scripts", "--offline", "--no-audit", "--no-fund"],
+    ["install", "--ignore-scripts", "--no-audit", "--no-fund"],
     { cwd: application },
   );
   await assert.rejects(

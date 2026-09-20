@@ -605,7 +605,7 @@ try {
   );
   await run(
     "npm",
-    ["install", "--offline", "--ignore-scripts", "--no-audit", "--no-fund"],
+    ["install", "--ignore-scripts", "--no-audit", "--no-fund"],
     application,
   );
   await assert.rejects(

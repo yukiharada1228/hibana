@@ -97,7 +97,6 @@ async function buildApplication() {
     "npm",
     [
       "install",
-      "--offline",
       "--ignore-scripts",
       "--no-audit",
       "--no-fund",
