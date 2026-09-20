@@ -57,7 +57,7 @@ hibana egress deny db.example.com:5432
 
 ## Kubernetes への導入
 
-候補版 `0.2.0-rc.3` の CLI・Control Plane と同じソースから作ったコンソールを使用してください。CLI 接続画面は npm の同じ版を案内するため、コンソールの公開前に `npm view @yukiharada1228/hibana@VERSION version` で取得できることを確認します。以前の公開版には新しい `/auth/session`・`/auth/logout` API がありません。
+候補版 `0.2.0-rc.4` の CLI・Control Plane と同じソースから作ったコンソールを使用してください。CLI 接続画面は npm の同じ版を案内するため、コンソールの公開前に `npm view @yukiharada1228/hibana@VERSION version` で取得できることを確認します。以前の公開版には新しい `/auth/session`・`/auth/logout` API がありません。
 
 `deploy/kubernetes/remote` および `hibana platform init` が生成するサイト設定にはコンソールを含めています。既存のサイト設定では `console/` 一式をコピーし、サイトの `kustomization.yaml` の `resources` に `console` を追加します。
 
@@ -70,8 +70,8 @@ hibana egress deny db.example.com:5432
 イメージの作成例:
 
 ```sh
-docker build -t registry.example.internal/hibana/console:0.2.0-rc.3 console
-docker push registry.example.internal/hibana/console:0.2.0-rc.3
+docker build -t registry.example.internal/hibana/console:0.2.0-rc.4 console
+docker push registry.example.internal/hibana/console:0.2.0-rc.4
 ```
 
 アプリの公開先は基盤の `APP_PUBLIC_ORIGIN` に一度だけ設定します。例は `https://apps.example.internal`、標準以外のポートなら `https://apps.example.internal:8443` です。基盤が `<app>.<tenant>` を付けた完全な公開 URL を返し、CLI とコンソールは同じ値を表示します。開発時は `http://localhost:28084` のように指定できます（HTTP は localhost のみ）。コンソールのイメージは接続先ごとに再ビルドする必要がありません。
