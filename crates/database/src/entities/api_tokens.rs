@@ -13,6 +13,8 @@ pub struct Model {
     pub created_at: DateTimeUtc,
     pub expires_at: DateTimeUtc,
     pub revoked_at: Option<DateTimeUtc>,
+    pub auth_method: String,
+    pub user_auth_version: i64,
 }
 
 #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]

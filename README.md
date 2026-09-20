@@ -84,6 +84,8 @@ npx --yes @yukiharada1228/hibana@0.2.0-rc.2 dev -c my-rust/hibana.json
 
 基盤管理者から、Hibanaの管理APIのURLとテナントの認証情報を受け取ります。アプリ開発者がKubernetesの資格情報を持つ必要はありません。
 
+対話ログインは開発環境も含め、組織のOIDC認証基盤を使用します。`hibana login --url https://hibana.example.com/api --tenant team`でブラウザが開きます。既存認証からの移行とKeycloakの接続例は[認証・OIDC](docs/authentication.md)を参照してください。
+
 先ほどの`my-api`ディレクトリで、接続先とトークンを自分の環境の値に置き換えて実行します。通常の配備には**Read・Deployスコープ**のトークンを使います。
 
 ```bash

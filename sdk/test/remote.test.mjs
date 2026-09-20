@@ -1,6 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { createServer } from "node:http";
+import { createHash, randomBytes } from "node:crypto";
 import { createServer as createHttpsServer } from "node:https";
 import { spawn, execFileSync } from "node:child_process";
 import {
@@ -25,6 +26,7 @@ async function fixture(t) {
   const project = join(root, "project");
   await mkdir(project);
   function invoke(args, { cwd = project, input = "", env = {} } = {}) {
+    if (args[0] === "login") args = [...args, "--no-browser"];
     return new Promise((resolve, reject) => {
       const child = spawn(process.execPath, [cli, ...args], {
         cwd,
@@ -57,6 +59,7 @@ async function fixture(t) {
   ) {
     let components = [];
     let egress = null;
+    const grants = new Map();
     const handler = async (req, res) => {
       const chunks = [];
       for await (const chunk of req) chunks.push(chunk);
@@ -69,14 +72,28 @@ async function fixture(t) {
         token,
       });
       res.setHeader("Content-Type", "application/json");
-      if (req.url === "/api/auth/login") {
-        if (JSON.parse(body).password === "wrong") {
-          res.writeHead(401);
-          res.end("{}");
-          return;
+      if (req.url === "/api/auth/oidc/start") {
+        const request = JSON.parse(body);
+        if (request.tenant_slug === "denied") {
+          res.writeHead(401).end("{}"); return;
         }
-        res.end(JSON.stringify({ token }));
+        const code = randomBytes(32).toString("hex");
+        grants.set(code, request.code_challenge);
+        res.end(JSON.stringify({ authorization_url: "https://fixture-idp.invalid/authorize" }));
+        const callback = new URL(request.redirect_uri);
+        callback.searchParams.set("oidc_code", code);
+        callback.searchParams.set("oidc_state", request.state);
+        // Drive the loopback browser callback without opening a desktop browser.
+        void fetch(callback).catch(() => {});
         return;
+      }
+      if (req.url === "/api/auth/oidc/exchange") {
+        const request = JSON.parse(body), challenge = grants.get(request.code);
+        grants.delete(request.code);
+        if (!challenge || challenge !== createHash("sha256").update(request.code_verifier).digest("base64url")) {
+          res.writeHead(401).end("{}"); return;
+        }
+        res.end(JSON.stringify({ token })); return;
       }
       if (req.headers.authorization !== `Bearer ${token}`) {
         res.writeHead(401);
@@ -146,30 +163,12 @@ async function fixture(t) {
 test("remote login, deploy, rollback, secrets and deletion work across directories with only API credentials", async (t) => {
   const f = await fixture(t);
   const url = await f.server("tenant-token");
-  const login = await f.invoke(
-    [
-      "login",
-      "--url",
-      url,
-      "--tenant",
-      "team",
-      "--email",
-      "dev@example.com",
-      "--password-stdin",
-    ],
-    { input: "test-password\n" },
-  );
+  const login = await f.invoke(["login", "--url", url, "--tenant", "team"]);
   assert.equal(login.code, 0, login.output);
-  assert.ok(
-    !login.output.includes("tenant-token") &&
-      !login.output.includes("test-password"),
-  );
-  assert.deepEqual(JSON.parse(f.calls[0].body), {
-    tenant_slug: "team",
-    email: "dev@example.com",
-    password: "test-password",
-  });
-  assert.equal(f.calls[0].auth, undefined);
+  assert.ok(!login.output.includes("tenant-token"));
+  const loginCall = f.calls.find(call => call.url.endsWith("/auth/oidc/start"));
+  assert.equal(JSON.parse(loginCall.body).tenant_slug, "team");
+  assert.equal(loginCall.auth, undefined);
   assert.equal((await stat(join(f.home, "profiles.json"))).mode & 0o777, 0o600);
   await assert.rejects(stat(join(f.project, ".hibana/auth.json")), {
     code: "ENOENT",
@@ -267,7 +266,12 @@ test("remote login, deploy, rollback, secrets and deletion work across directori
     JSON.parse((await f.invoke(["list", "--json"], { cwd: f.root })).output),
     [],
   );
-  assert.ok(f.calls.slice(1).every((c) => c.auth === "Bearer tenant-token"));
+  assert.equal(f.calls.find((c) => c.url === "/api/auth/oidc/exchange").auth, undefined);
+  assert.ok(
+    f.calls
+      .filter((c) => !["/api/auth/oidc/start", "/api/auth/oidc/exchange"].includes(c.url))
+      .every((c) => c.auth === "Bearer tenant-token"),
+  );
 });
 
 test("deploy checks expired credentials and permissions before creating any build artifacts", async (t) => {
@@ -318,10 +322,8 @@ test("profiles isolate servers, support selection/logout and never leak saved to
         url,
         "--tenant",
         "team",
-        "--email",
-        "dev@example.com",
       ],
-      { env: { HIBANA_PASSWORD: "password" } },
+
     );
     assert.equal(r.code, 0, r.output);
   }
@@ -356,7 +358,7 @@ test("profiles isolate servers, support selection/logout and never leak saved to
   assert.notEqual(
     (
       await f.invoke(["login", "--profile", "prod"], {
-        env: { HIBANA_PASSWORD: "wrong" },
+        env: { HIBANA_TENANT: "denied" },
       })
     ).code,
     0,
@@ -467,4 +469,15 @@ test("no implicit local target, unsafe URLs rejected, explicit CI token supporte
   );
   assert.match((await f.invoke(["list"])).output, /No Hibana server selected/);
   assert.notEqual((await f.invoke(["list", "--profile", "missing"])).code, 0);
+});
+
+
+test("removed password options fail before contacting the server", async (t) => {
+  const f = await fixture(t);
+  const url = await f.server("tenant-token");
+  for (const args of [["--password-stdin"], ["--email", "dev@example.com"]]) {
+    const result = await f.invoke(["login", "--url", url, "--tenant", "team", ...args]);
+    assert.notEqual(result.code, 0);
+  }
+  assert.equal(f.calls.length, 0);
 });

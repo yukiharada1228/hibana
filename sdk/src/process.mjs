@@ -103,13 +103,11 @@ export function run(command, args, options = {}) {
   });
 }
 
-// Explicit stdin input for scripts, shared by passwords and secrets.
+// Explicit stdin input for secret values.
 export async function readStdin(label, input = process.stdin) {
   if (input.isTTY)
     throw new Error(
-      label === "Password"
-        ? "Use --password-stdin < password.txt, or omit --password-stdin to enter the password interactively"
-        : `Pipe the ${label.toLowerCase()} value through stdin; it is not accepted as a command argument`,
+      `Pipe the ${label.toLowerCase()} value through stdin; it is not accepted as a command argument`,
     );
   const chunks = [];
   let size = 0;

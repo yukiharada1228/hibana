@@ -24,6 +24,11 @@ export S3_ENDPOINT=http://127.0.0.1:19000 S3_REGION=us-east-1 S3_BUCKET=test-com
 export BOOTSTRAP_ADMIN_TOKEN=test-only JOB_SIGNING_KEY=0001020304050607080900010203040506070809000102030405060708090001 JOB_SIGNING_KID=test
 export SECRETS_MASTER_KEY=0001020304050607080900010203040506070809000102030405060708090001 SECRETS_MASTER_KID=test
 export WORKER_HTTP_URL=http://127.0.0.1:1
+# Non-login HTTP tests seed scoped API credentials in this disposable database.
+# Real provider flows are covered by scripts/test-oidc.sh.
+unset AUTH_MODE
+export OIDC_ISSUER_URL=https://fixture-idp.invalid OIDC_CLIENT_ID=hibana OIDC_CLIENT_SECRET=test-only
+export OIDC_CALLBACK_URL=https://console.invalid/api/auth/oidc/callback OIDC_CONSOLE_URL=https://console.invalid/
 export HTTP_TEST_PG_CONTAINER="$pg"
 cargo test --locked -p hibana-control-plane http_mvp_regression -- --ignored --nocapture
 cargo test --locked -p hibana-worker execution_configuration_survives_reused_names -- --ignored --nocapture

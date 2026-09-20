@@ -195,7 +195,7 @@ function Console({
         </div>
         {error && <Notice error>{error}</Notice>}
         {route === "deploy" ? (
-          <Deploy session={session} email={email} />
+          <Deploy session={session} />
         ) : !components ? (
           !error && <Notice>アプリケーションを読み込み中…</Notice>
         ) : route === "usage" ? (

@@ -10,7 +10,7 @@ export async function testJsonReception({url, operator}) {
   try {
     const responses = Array.from({length: 8}, (_, index) => new Promise((resolve, reject) => {
       const trickle = index % 2 === 0;
-      const route = index % 2 === 0 ? "/auth/login" : "/admin/tenants";
+      const route = index % 2 === 0 ? "/auth/oidc/start" : "/admin/tenants";
       const req = request(url + route, {method: 'POST', headers: {
         'Content-Type': index % 2 ? 'application/problem+json' : 'application/json', 'Content-Length': '2097152',
       }, signal: AbortSignal.timeout(15000)}, async res => {
@@ -29,7 +29,7 @@ export async function testJsonReception({url, operator}) {
     completed.catch(() => {});
     await delay(500);
     const excess = await Promise.all(Array.from({length: 120}, async (_, index) => {
-      const response = await fetch(url + (index % 2 ? '/auth/login' : '/admin/tenants'), {
+      const response = await fetch(url + (index % 2 ? '/auth/oidc/start' : '/admin/tenants'), {
         method: 'POST', headers: {'Content-Type': index % 2 ? 'application/json' : 'application/problem+json'},
         body: '{}', signal: AbortSignal.timeout(3000),
       });
@@ -44,13 +44,13 @@ export async function testJsonReception({url, operator}) {
     const probe = await fetch(url + '/healthz', {headers: {'Content-Type': 'application/json'}, signal: AbortSignal.timeout(3000)});
     assert.equal(probe.status, 200);
     await probe.text();
-    const wrongType = await fetch(url + '/auth/login', {method: 'POST', headers: {'Content-Type': 'text/plain'}, body: '{}'});
+    const wrongType = await fetch(url + '/auth/oidc/start', {method: 'POST', headers: {'Content-Type': 'text/plain'}, body: '{}'});
     assert.equal(wrongType.status, 400);
     await wrongType.text();
     await operator('close', 'json-reception');
     closed = true;
     assert.deepEqual(JSON.parse(await operator('status')), {active_requests: 8, inflight_executions: 0});
-    const denied = await fetch(url + '/auth/login', {method: 'POST', body: '{}'});
+    const denied = await fetch(url + '/auth/oidc/start', {method: 'POST', body: '{}'});
     assert.equal(denied.status, 503);
     await denied.text();
     for (const response of await completed) {
@@ -64,7 +64,7 @@ export async function testJsonReception({url, operator}) {
     if (closed) await operator('open', 'json-reception');
   }
   await Promise.all(Array.from({length: 8}, async () => {
-    const healthy = await fetch(url + '/auth/login', {method: 'POST', headers: {'Content-Type': 'application/json'}, body: '{'});
+    const healthy = await fetch(url + '/auth/oidc/start', {method: 'POST', headers: {'Content-Type': 'application/json'}, body: '{'});
     assert.equal(healthy.status, 400);
     await healthy.text();
   }));

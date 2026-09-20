@@ -1,6 +1,5 @@
 //! Tenants management HTTP handlers.
-use super::map_unique_violation;
-use crate::crypto::hash_password_async;
+use super::map_unique_conflict;
 use crate::db;
 use crate::error::AppError;
 use crate::extract::JsonBody;
@@ -20,14 +19,14 @@ use serde_json::{json, Value};
 // ---------------------------------------------------------------------------
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct CreateTenantRequest {
     /// グローバル一意な公開 URL の DNS ラベル。
     pub slug: String,
     pub name: String,
     /// 最初の admin ユーザの email（このテナント内）。
     pub admin_email: String,
-    /// 最初の admin ユーザのパスワード（argon2id でハッシュして保存）。
-    pub admin_password: String,
+    pub admin_oidc_subject: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -35,7 +34,7 @@ pub struct CreateTenantResponse {
     pub tenant_id: String,
     pub slug: String,
     pub name: String,
-    /// 作成された最初の admin ユーザ。以後は `/auth/login` でトークンを取得する。
+    /// 作成された最初の admin ユーザ。以後は OIDC でログインする。
     pub admin_user_id: String,
     pub admin_email: String,
 }
@@ -73,12 +72,7 @@ pub async fn create_tenant(
     if req.admin_email.trim().is_empty() {
         return Err(FaasError::InvalidRequest("admin_email must not be empty".into()).into());
     }
-    if req.admin_password.is_empty() {
-        return Err(FaasError::InvalidRequest("admin_password must not be empty".into()).into());
-    }
-    let Some(permit) = state.reserve_password_work() else {
-        return Ok(crate::admission::RateLimited::password_capacity().into_response());
-    };
+    super::identity::validate_subject(&req.admin_oidc_subject)?;
 
     // テナント + 最初の admin ユーザを 1 トランザクションで作成（§9 bootstrap）。
     // M3b: bootstrap は Principal を持たない唯一の書き込み経路。users は FORCE RLS 下に
@@ -86,7 +80,6 @@ pub async fn create_tenant(
     // 呼ぶ（users INSERT の WITH CHECK を通すため。tenants には RLS は無い）。
     let tenant_id = new_tenant_id();
     let admin_user_id = new_user_id();
-    let admin_password_hash = hash_password_async(permit, req.admin_password).await?;
     let tx = state.pool().begin().await.map_err(AppError::from)?;
     db::set_tenant_guc(&tx, &tenant_id)
         .await
@@ -98,13 +91,13 @@ pub async fn create_tenant(
         req.name.trim(),
         &admin_user_id,
         req.admin_email.trim(),
-        &admin_password_hash,
+        &state.auth_config().issuer,
+        &req.admin_oidc_subject,
     )
     .await
-    .map_err(|e| map_unique_violation(e, "tenant slug already exists"))?;
+    .map_err(|e| map_unique_conflict(e, "tenant slug already exists"))?;
     // §3.7: 最高権限の identity プロビジョニング。GUC は新 tenant_id に設定済みなので
     // WITH CHECK を通る。bootstrap 主体由来であることを示し、target は新 tenant_id。
-    // admin_password は決して載せない。
     db::insert_audit_log(
         &tx,
         &tenant_id,

@@ -336,7 +336,7 @@ class ExistingCluster(KubernetesTarget):
         if not urls:
             print("No management Ingress is configured. To connect locally:")
             print("  " + shlex.join([*self.kubectl, "-n", "hibana", "port-forward", "service/hibana-api", "18080:8080"]))
-            print("  hibana login --url http://127.0.0.1:18080 --tenant TEAM --email EMAIL --password-stdin < password.txt")
+            print("  hibana login --url http://127.0.0.1:18080 --tenant TEAM")
             return
         for url in sorted(urls):
             print(f"Management API: {url}")
@@ -359,7 +359,7 @@ class ExistingCluster(KubernetesTarget):
                         time.sleep(1)
                 print("Management API readiness verified from this computer.")
             print("Next (use an existing tenant account):")
-            print(f"  hibana login --profile onprem --url {shlex.quote(url)} --tenant TEAM --email EMAIL --password-stdin < password.txt")
+            print(f"  hibana login --profile onprem --url {shlex.quote(url)} --tenant TEAM")
             print("  hibana deploy --profile onprem")
 
     def verify_dependencies(self):

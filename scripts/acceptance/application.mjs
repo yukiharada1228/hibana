@@ -6,6 +6,7 @@ import http from 'node:http';
 import {setTimeout as sleep} from 'node:timers/promises';
 import {apiClient} from '../../sdk/src/api.mjs';
 import {runCommand} from '../bounded-process.mjs';
+import {issueAcceptanceToken} from './credentials.mjs';
 
 const root=resolve(import.meta.dirname,'../..');
 const folder=resolve(['--verify-restored','--verify-lifecycle'].includes(process.argv[2]) ? process.argv[3] : process.env.HIBANA_ACCEPTANCE_FOLDER);
@@ -107,11 +108,10 @@ if (process.argv[2] === '--verify-restored') {
   state={url:process.env.HIBANA_URL,gateway:process.env.GATEWAY,upstream:process.env.HIBANA_UPSTREAM_URL,cliEntry:process.env.HIBANA_CLI_ENTRY,
          apiToken:randomBytes(32).toString('hex'),upstreamToken:process.env.HIBANA_UPSTREAM_TOKEN};
   const tenant=await api('/admin/tenants',{method:'POST',token:process.env.BOOTSTRAP_ADMIN_TOKEN,
-    body:{slug:'smoke',name:'MVP acceptance',admin_email:process.env.HIBANA_EMAIL,admin_password:process.env.HIBANA_PASSWORD}});
-  state.adminToken=(await api('/auth/login',{method:'POST',token:null,
-    body:{tenant_slug:'smoke',email:process.env.HIBANA_EMAIL,password:process.env.HIBANA_PASSWORD}})).token;
+    body:{slug:'smoke',name:'MVP acceptance',admin_email:process.env.HIBANA_ADMIN_EMAIL,admin_oidc_subject:process.env.HIBANA_ADMIN_OIDC_SUBJECT}});
+  state.adminToken=(await issueAcceptanceToken()).token;
   state.tenant=tenant.tenant_id;
-  const user=await api(`/tenants/${state.tenant}/users`,{method:'POST',body:{email:'developer@example.invalid',password:randomBytes(32).toString('hex'),role:'member'}});
+  const user=await api(`/tenants/${state.tenant}/users`,{method:'POST',body:{email:'developer@example.invalid',oidc_subject:'fixture-acceptance-developer',role:'member'}});
   state.deployToken=(await api('/tokens',{method:'POST',body:{user_id:user.user_id,scopes:['read','deploy'],ttl_secs:seconds+3600}})).token;
   // All builds and credentials belong to this run; the checked-in example is untouched.
   const source=join(root,'sdk/test/fixtures/inventory-api.ts');

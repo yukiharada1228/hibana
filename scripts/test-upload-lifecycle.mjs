@@ -1,3 +1,4 @@
+import { issueFixtureToken } from "./test-api-credentials.mjs";
 // Invoked only by test-http.sh against its disposable PostgreSQL container.
 import assert from 'node:assert/strict';
 import {spawn} from 'node:child_process';
@@ -27,7 +28,6 @@ import {testConsole} from './test-console.mjs';
 import {testBuildMetadata} from './test-build-metadata.mjs';
 import {testApplicationEgress} from './test-application-egress.mjs';
 import {testHttpBoundaries, testHttpMetrics, testPublicNames} from './test-http-boundaries.mjs';
-import {testIdentityCapacity, testLoginCapacity, testProxyLogin} from './test-login-capacity.mjs';
 import {testRuntimeBoundaries} from './test-runtime-boundaries.mjs';
 import {testRequestCapacity} from './test-request-capacity.mjs';
 import {testUploadCapacity} from './test-upload-capacity.mjs';
@@ -203,10 +203,10 @@ try {
   await testJsonReception({url, operator});
   await testHttpMetrics({api});
   await startWorker();
-  const created = await api('/admin/tenants', {method:'POST', token:'test-only', body:{slug:' upload ',name:'Upload regression',admin_email:'test@example.invalid',admin_password:'test-password'}});
+  const created = await api('/admin/tenants', {method:'POST', token:'test-only', body:{slug:' upload ',name:'Upload regression',admin_email:'test@example.invalid',admin_oidc_subject: 'fixture-admin'}});
   assert.equal(created.status,201);
   assert.equal((await created.json()).slug, 'upload');
-  const login = await api('/auth/login', {method:'POST', body:{tenant_slug:'upload',email:'test@example.invalid',password:'test-password'}});
+  const login = await issueFixtureToken(sql, {tenant_slug:'upload',email:'test@example.invalid',});
   const {token} = await login.json(); assert.ok(token);
   await testPublicNames({api, token, sql});
   const component = await (await api('/components', {method:'POST',token,body:{name:'upload'}})).json();
@@ -371,9 +371,9 @@ try {
   await testFirstDeploy({api, token, url, folder, artifact, app});
   await testVersionAddressing({api, sql, token, wasm, upload});
   await testSignatureAudit({api, sql, token, wasm, upload, url, objects});
-  await testBuildMetadata({api, token, wasm, unrecordedWasm, upload});
+  await testBuildMetadata({api, sql, token, wasm, unrecordedWasm, upload});
   await testApplicationEgress({api, sql, token, wasm, upload, holdStorage, releaseStorage:() => releasePut()});
-  await testConsole({api, token, url, app, wasm, folder});
+  await testConsole({api, sql, token, url, app, wasm, folder});
 
   const acceptedObjects = objects.size;
   const waitingPolicy = holdStorage();
@@ -457,11 +457,8 @@ try {
   for (let i=1; i<=25; i++) assert.ok(!objects.has(`/test-components/denied-${i}.wasm`));
   console.log('PASS per-object 403 failures preserve retry journals without starving another tenant or rows beyond the batch, and recovery reclaims every orphan');
   await testRequestCapacity({api, token, sql, wasm, upload, url});
-  await testUploadCapacity({api, token, wasm, upload, url, holdStorage, releaseStorage:() => releasePut()});
+  await testUploadCapacity({api, sql, token, wasm, upload, url, holdStorage, releaseStorage:() => releasePut()});
   await testSecretRekey({api, sql, pg, restart:async env => { await stop(); await start(env); }});
-  await testIdentityCapacity({api, token});
-  await testProxyLogin({url});
-  await testLoginCapacity({api});
   await testExecutionShutdown({api, token, wasm, upload, url, internal, metricsUrl:`http://127.0.0.1:${metricsPort}`, startWorker, stopWorker:() => stop(worker)});
   await testRuntimeBoundaries({api, token, wasm, upload, url, internal, metricsUrl:`http://127.0.0.1:${metricsPort}`, startWorker, stopWorker:() => stop(worker)});
 } finally {

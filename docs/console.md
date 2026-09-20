@@ -91,12 +91,12 @@ CLI 管理 API    https://hibana.example.internal/api
 ```sh
 hibana login \
   --url https://hibana.example.internal/api \
-  --tenant team --email developer@example.internal
-# Password: と表示されたらパスワードを入力して Enter（入力文字は非表示）
+  --tenant team
+# 開いたブラウザで組織のアカウントにログイン
 hibana deploy
 ```
 
-この入力方式には最新の候補版 CLI が必要です。スクリプトや以前の CLI では、ログインコマンドの末尾に `--password-stdin < /secure/login-password.txt` を追加し、パスワードだけを保存したファイルを指定します。`--password-stdin` だけを付けても対話入力にはなりません。
+Control Plane・コンソール・CLIを同じソース版に揃えてください。CIでは`HIBANA_TOKEN`を使用します。ログインはOIDCのみです。[OIDCの設定と移行手順](authentication.md)を参照してください。
 
 既存の専用管理 URL（例 `https://api.example.internal`）も使えます。コンソールの `/api/` は Nginx が接頭辞を取り除いて `http://hibana-api:8080/` へ転送します。外側の Ingress では `/api` を書き換えず、そのままコンソール Service に渡してください。アプリのホストは既存のアプリ用 Service へ接続します。
 
@@ -108,11 +108,13 @@ hibana deploy
 
 ## 認証と画面の状態
 
-CLI とブラウザはそれぞれ既存の `/auth/login` でトークンを発行します。ブラウザはトークンをページ内メモリにだけ保持し、localStorage・sessionStorage・Cookie には保存しません。ページを再読み込みした場合は再ログインします。有効期限は既存 API と同じ12時間です。
+CLIとブラウザはOIDCの認可コード方式とPKCEでログインします。Hibanaのログインセッションは既定15分で失効します。ブラウザでは資格情報をHttpOnly・SameSite=Strictのホスト限定Cookieに保持し、HTTPSではSecureも付けます。資格情報をJavaScriptへ返さず、localStorage・sessionStorageには保存しません。リダイレクト中の照合値とPKCE verifierだけをsessionStorageへ保存し、復帰時に削除します。再読み込みや新しいタブでは、サーバーでセッションを検証してログイン状態と表示中のルートを復元します。有効期限は延長しません。
 
-「ログアウト」は `/auth/logout` で現在のトークンを失効させます。別の PC・CLI のトークンは失効しません。タブを閉じるだけではサーバー側の失効は行わず、そのトークンは期限まで残ります。パスワード・トークンを URL や画面のコマンドに埋め込みません。
+「ログアウト」は `/auth/logout` で現在のセッションをサーバー側で失効させ、Cookieを削除します。同じブラウザのタブはこのセッションを共有するため、ほかのタブも次回のAPI操作や再読み込みでログイン画面へ戻ります。別のPC・CLIのトークンは失効しません。タブを閉じるだけではサーバー側の失効は行わず、期限内なら再び開けます。パスワード・トークンをURLや画面のコマンドに埋め込みません。
 
-ブラウザからの API は同じオリジンへの Bearer 認証です。権限は画面と API の双方で確認し、Read のみのアカウントには切り戻し・設定・削除の操作を表示しません。認証失効時は画面上のテナントデータを破棄してログイン画面へ戻ります。イントラネットでも HTTPS が必要です。開発時の loopback HTTP のみ許可します。社内 CA はブラウザの信頼ストアと CLI の `NODE_EXTRA_CA_CERTS` に設定してください。
+付属NginxはOIDCコールバックについて、メソッド・パス・HTTPステータス・処理時間だけを記録します。元のURIを含むエラーログは、この経路だけ抑止し、認可コード・stateを保存しません。Control Planeに接続できない場合も502などの結果を確認できます。開発用Viteも、この経路のクエリをエラーログから除きます。他のAPIのエラーログは維持します。外側にIngressやロードバランサーを置く場合も、認証コールバックのクエリをログに保存しない設定にしてください。
+
+ブラウザからのAPIは同じオリジンへのCookie認証で、送信元とセッションIDを検証します。CLIはBearerトークンを使用します。権限は画面とAPIの双方で確認し、Readのみのアカウントには切り戻し・設定・削除の操作を表示しません。認証失効時は画面上のテナントデータを破棄してログイン画面へ戻ります。イントラネットでもHTTPSが必要です。開発時のloopback HTTPのみ許可します。社内CAはブラウザの信頼ストアとCLIの `NODE_EXTRA_CA_CERTS` に設定してください。
 
 ## 検証
 

@@ -1,12 +1,13 @@
 //! 認証・認可層 (M3a: API トークン + テナント解決)。
 //!
-//! `Authorization: Bearer ${secret}` の `secret` を sha256(hex) でハッシュし、
+//! CLIのBearerトークン、またはコンソールのHttpOnly Cookieから取り出した
+//! `secret` を sha256(hex) でハッシュし、
 //! `api_tokens.token_hash` と突き合わせて principal を確立する (§3.3 / §6.0)。
 //! ハッシュ照合のため、平文比較のような非定数時間比較は使わない（DB の UNIQUE
 //! インデックス照合に委ねる）。
 //!
 //! - `authenticate`: 全保護ルートに適用する middleware。`Principal` を request
-//!   extension に挿入する。`/healthz` `/auth/login` `POST /admin/tenants` には
+//!   extension に挿入する。`/healthz` `/auth/oidc/*` `POST /admin/tenants` には
 //!   適用しない（ルータ側で分離）。
 //! - `Principal`: 認証済み呼び出し主体。`FromRequestParts` で各ハンドラへ注入する。
 //! - `require_scope`: スコープ不足を 403 にする route layer。
@@ -16,7 +17,7 @@ use axum::extract::{FromRequestParts, Request, State};
 use axum::http::header::AUTHORIZATION;
 use axum::http::request::Parts;
 use axum::middleware::Next;
-use axum::response::Response;
+use axum::response::{IntoResponse, Response};
 use hibana_shared::{FaasError, Role, Scope};
 
 use crate::db;
@@ -83,42 +84,98 @@ fn hex_lower(bytes: &[u8]) -> String {
     s
 }
 
-/// 認証 middleware。Bearer secret をハッシュ照合し `Principal` を確立する。
+/// 認証 middleware。Bearer/Cookieのsecretをハッシュ照合し `Principal` を確立する。
 ///
 /// 失敗（欠損・不一致・失効・期限切れ）は一律 `401 Unauthorized`。成功時は
 /// `Principal` を request extension に挿入して次へ進む。
 ///
 /// M4d (§3.2 / §8): principal 確立後、テナントの `status` を 1 query で引き、`suspended` なら
-/// **全 API パスを 403 で短絡**する（invoke だけでなく read/admin 系も含む全保護ルートに適用される）。
+/// 自身のセッション確認・失効を除き、read/admin 系を含む保護ルートを 403 にする。
 /// invoke だけで弾くと「停止されたテナントがトークンを使い読み取り・管理操作を継続できる」状態に
 /// なるため、middleware-level でまとめて拒否する方が一貫性が高い。403 は best-effort で audit_logs に
 /// 残し、停止テナントが API キーで叩いてきた事実を運用に可視化する（停止された側がブルートフォース等
 /// 試みていないかの観測）。tenants に RLS は無いので GUC 無しで読める。
-pub async fn authenticate(
-    State(state): State<AppState>,
+pub async fn authenticate(State(state): State<AppState>, req: Request, next: Next) -> Response {
+    let clear_cookie = !req
+        .headers()
+        .contains_key(axum::http::header::AUTHORIZATION)
+        && matches!(req.uri().path(), "/auth/logout" | "/auth/logout-all");
+    let config = state.auth_config().clone();
+    let mut response = match authenticate_request(state, req, next).await {
+        Ok(response) => response,
+        Err(error) => error.into_response(),
+    };
+    if clear_cookie && response.status().is_success() {
+        response.headers_mut().insert(
+            axum::http::header::SET_COOKIE,
+            crate::oidc::session::cookie(&config, "", 0),
+        );
+    }
+    crate::oidc::no_store(response)
+}
+
+#[derive(Clone)]
+pub struct TokenMetadata {
+    pub id: String,
+    pub expires_at: chrono::DateTime<chrono::Utc>,
+}
+
+async fn authenticate_request(
+    state: AppState,
     mut req: Request,
     next: Next,
 ) -> Result<Response, AppError> {
-    let secret = extract_bearer(req.headers()).ok_or(FaasError::Unauthorized)?;
+    let browser = !req
+        .headers()
+        .contains_key(axum::http::header::AUTHORIZATION);
+    let secret = if browser {
+        let secret = crate::oidc::session::credential(state.auth_config(), req.headers())?
+            .ok_or(FaasError::Unauthorized)?;
+        crate::oidc::session::require_console(state.auth_config(), req.headers(), req.method())?;
+        secret
+    } else {
+        extract_bearer(req.headers()).ok_or(FaasError::Unauthorized)?
+    };
     let token_hash = hash_token(&secret);
 
     let row = db::find_token_by_hash(state.pool(), &token_hash)
         .await?
         .ok_or(FaasError::Unauthorized)?;
 
-    let principal = row.into_principal().ok_or(FaasError::Unauthorized)?;
+    if browser
+        && (row.auth_method != "oidc"
+            || !crate::oidc::session::matches_session(
+                req.headers(),
+                req.method(),
+                req.uri().path(),
+                &row.token_id,
+            ))
+    {
+        return Err(FaasError::Unauthorized.into());
+    }
+    req.extensions_mut().insert(TokenMetadata {
+        id: row.token_id.clone(),
+        expires_at: row.expires_at,
+    });
+
+    let principal =
+        principal_from_token(state.auth_config(), row).ok_or(FaasError::Unauthorized)?;
 
     // M4d: テナント status / quotas を 1 row で取得する（ホットパス sub-ms PK lookup）。
     // status='suspended' は 403 で短絡。`tenant_not_found` は理論上 principal 確立後には
     // 起こりえない（FK 制約 + cascade）ため 401 ではなく 500（Internal）扱い: principal の
     // 整合性が壊れているシグナル。
     match db::load_tenant_status_and_quotas(state.pool(), &principal.tenant_id).await? {
-        Some((status, _quotas)) if status == "suspended" => {
+        Some((status, _quotas))
+            if status == "suspended" && !self_session_route(req.method(), req.uri().path()) =>
+        {
             // 監査追記（best-effort: 失敗しても 403 応答は返す）。
             audit_tenant_suspended_denied(&state, &principal).await;
             return Err(FaasError::Forbidden.into());
         }
-        Some(_) => { /* active: 続行 */ }
+        Some(_) => {
+            // active、または停止中でも許可する自身のセッション操作。
+        }
         None => {
             // principal は確立済みなのに tenants に行が無い = データ整合性の異常。
             tracing::error!(
@@ -131,6 +188,30 @@ pub async fn authenticate(
 
     req.extensions_mut().insert(principal);
     Ok(next.run(req).await)
+}
+
+// Suspension forbids tenant operations, but must not trap a browser in a valid
+// HttpOnly session. These routes expose only the caller's identity or revoke it.
+fn self_session_route(method: &axum::http::Method, path: &str) -> bool {
+    match path {
+        "/auth/session" => matches!(*method, axum::http::Method::GET | axum::http::Method::HEAD),
+        "/auth/logout" | "/auth/logout-all" => *method == axum::http::Method::POST,
+        _ => false,
+    }
+}
+
+/// Apply the same authentication rules both at admission and when a locked
+/// token is rechecked inside a credential-issuing transaction.
+pub(crate) fn principal_from_token(
+    config: &crate::oidc::config::OidcConfig,
+    row: db::TokenRow,
+) -> Option<Principal> {
+    match row.auth_method.as_str() {
+        "api" => {}
+        "oidc" if row.user_oidc_issuer.as_deref() == Some(config.issuer.as_str()) => {}
+        _ => return None,
+    }
+    row.into_principal()
 }
 
 /// M4d (§3.7): tenant_suspended による拒否を audit_logs に記録する（best-effort）。
@@ -214,6 +295,25 @@ pub fn require_scope(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn suspension_exceptions_only_manage_the_callers_session() {
+        use axum::http::Method;
+        assert!(self_session_route(&Method::GET, "/auth/session"));
+        assert!(self_session_route(&Method::POST, "/auth/logout"));
+        assert!(self_session_route(&Method::POST, "/auth/logout-all"));
+        for (method, path) in [
+            (Method::POST, "/auth/session"),
+            (Method::GET, "/auth/logout"),
+            (Method::POST, "/auth/oidc/exchange"),
+            (Method::POST, "/tokens"),
+            (Method::GET, "/users"),
+            (Method::DELETE, "/users/another"),
+            (Method::GET, "/components"),
+        ] {
+            assert!(!self_session_route(&method, path));
+        }
+    }
 
     #[test]
     fn hash_token_is_lowercase_hex_sha256() {

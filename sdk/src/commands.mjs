@@ -30,8 +30,7 @@ const options = {
   profile: string("NAME", "Use a saved connection profile"),
   url: string("URL", "Hibana management API URL"),
   tenant: string("TEAM", "Tenant name"),
-  email: string("EMAIL", "Account email"),
-  "password-stdin": boolean("Read the login password from standard input"),
+  "no-browser": boolean("Print the login URL without opening a browser"),
   version: string("VERSION", "Version to use"),
   all: boolean("Select all applications in the current tenant"),
   "all-tenants": boolean("Select every tenant; requires BOOTSTRAP_ADMIN_TOKEN"),
@@ -154,14 +153,11 @@ const commands = {
   login: leaf(
     "Sign in and save a connection profile",
     "hibana login",
-    [...remote, "tenant", "email", "password-stdin"],
+    [...remote, "tenant", "no-browser"],
     {
-      examples: [
-        "hibana login --url https://api.example.com --tenant team --email dev@example.com",
-        "hibana login --url https://api.example.com --tenant team --email dev@example.com --password-stdin < password.txt",
-      ],
+      examples: ["hibana login --url https://api.example.com --tenant team"],
       notes:
-        "Reuses saved connection details when signing in again.\nPrompts for a hidden password in an interactive terminal.\nFor scripts, use --password-stdin < password.txt or HIBANA_PASSWORD.\nHIBANA_TENANT and HIBANA_EMAIL can also supply account details.",
+        "Opens your organization's login page in a browser on this computer.\nUse --no-browser to open the printed URL yourself on the same computer.\nReuses saved connection details; HIBANA_TENANT also supplies the tenant.\nCI: use a scoped HIBANA_TOKEN.",
     },
   ),
   logout: leaf(

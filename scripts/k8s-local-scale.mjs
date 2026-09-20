@@ -12,6 +12,7 @@ import { fileURLToPath } from "node:url";
 import { init } from "../sdk/src/init.mjs";
 import { build } from "../sdk/src/build.mjs";
 import { loadConfig } from "../sdk/src/config.mjs";
+import { issueFixtureToken } from "./test-api-credentials.mjs";
 import { apiClient, deploy } from "../sdk/src/api.mjs";
 
 const root = fileURLToPath(new URL("../", import.meta.url));
@@ -119,16 +120,17 @@ async function main() {
   // Explicitly distribute over both CP Pods: one Service port-forward pins one Pod.
   const urls = await Promise.all(cps.map(p => forward(p.metadata.name, 8083)));
   const slug = `scale-${randomUUID().slice(0, 8)}`;
-  const password = randomUUID() + randomUUID();
-  const created = await admin("/admin/tenants", {slug, name: "Isolated scale acceptance", admin_email: "scale@example.invalid", admin_password: password}, "POST");
+  const created = await admin("/admin/tenants", {slug, name: "Isolated scale acceptance", admin_email: "scale@example.invalid", admin_oidc_subject: `fixture-${slug}`}, "POST");
   tenantId = created.tenant_id;
   await admin(`/admin/tenants/${tenantId}/quotas`, {invoke_rate_per_sec: 500, invoke_burst: 1000, max_concurrent_executions: 200});
   await mkdir(resolve(project, ".."), {recursive: true});
   try { await access(resolve(project, "hibana.json")); } catch { await init(project, {template: "rust"}); }
   await cp("scripts/fixtures/scale-http.rs", resolve(project, "src/lib.rs"));
-  Object.assign(process.env, {HIBANA_URL: adminUrl, HIBANA_TENANT: slug, HIBANA_EMAIL: "scale@example.invalid", HIBANA_PASSWORD: password});
-  delete process.env.HIBANA_TOKEN;
-  const api = await apiClient(); await api.login();
+  const issued = await (await issueFixtureToken(query => command(["exec", "deployment/hibana-postgres", "--", "psql", "-XqAt", "-U", "hibana_admin", "-d", "hibana", "-v", "ON_ERROR_STOP=1", "-c", query]), {
+    tenant_slug: slug, email: "scale@example.invalid",
+  })).json();
+  Object.assign(process.env, { HIBANA_URL: adminUrl, HIBANA_TENANT: slug, HIBANA_TOKEN: issued.token });
+  const api = await apiClient();
   const config = await loadConfig(resolve(project, "hibana.json"));
   const artifact = await build(config);
   await deploy(api, config, artifact, `0.0.0-scale.${Date.now()}`);

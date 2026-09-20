@@ -2,10 +2,7 @@
 use std::collections::HashMap;
 use std::sync::Mutex;
 
-use super::{
-    now_unix_millis, LockoutDecision, LockoutParams, RateDecision, RateLimitParams, Store,
-    StoreError,
-};
+use super::{now_unix_millis, RateDecision, RateLimitParams, Store, StoreError};
 use async_trait::async_trait;
 
 // ============================================================================
@@ -20,7 +17,7 @@ use async_trait::async_trait;
 #[derive(Default)]
 pub struct InProcStore {
     buckets: Mutex<HashMap<String, Bucket>>,
-    failures: Mutex<HashMap<String, Failures>>,
+    auth_states: Mutex<HashMap<String, (String, u64)>>,
 }
 
 #[derive(Clone, Copy)]
@@ -28,13 +25,6 @@ struct Bucket {
     /// 残トークン数。
     tokens: f64,
     /// 最終補充時刻（ms）。
-    last_ms: u64,
-}
-
-#[derive(Clone, Copy)]
-struct Failures {
-    count: u64,
-    /// 最終失敗時刻（ms）。窓減衰判定に使う。
     last_ms: u64,
 }
 
@@ -46,6 +36,32 @@ impl InProcStore {
 
 #[async_trait]
 impl Store for InProcStore {
+    async fn put_auth_state(
+        &self,
+        key: &str,
+        value: &str,
+        ttl_secs: u64,
+    ) -> Result<(), StoreError> {
+        let now = now_unix_millis();
+        let mut states = self.auth_states.lock().unwrap();
+        states.retain(|_, (_, expires)| *expires > now);
+        if states.contains_key(key) {
+            return Err(StoreError::Backend("auth state collision".into()));
+        }
+        states.insert(key.into(), (value.into(), now + ttl_secs * 1000));
+        Ok(())
+    }
+
+    async fn take_auth_state(&self, key: &str) -> Result<Option<String>, StoreError> {
+        Ok(self
+            .auth_states
+            .lock()
+            .unwrap()
+            .remove(key)
+            .filter(|(_, expires)| *expires > now_unix_millis())
+            .map(|(value, _)| value))
+    }
+
     async fn rate_limit(
         &self,
         tenant: &str,
@@ -84,56 +100,6 @@ impl Store for InProcStore {
         }
     }
 
-    async fn record_login_failure(
-        &self,
-        key: &str,
-        params: LockoutParams,
-    ) -> Result<LockoutDecision, StoreError> {
-        let now = now_unix_millis();
-        let mut map = self.failures.lock().unwrap();
-        let f = map.entry(key.to_string()).or_insert(Failures {
-            count: 0,
-            last_ms: now,
-        });
-        // 窓を過ぎていたらリセットしてから加算（最終失敗からの減衰窓）。
-        if now.saturating_sub(f.last_ms) >= params.window_secs.saturating_mul(1000) {
-            f.count = 0;
-        }
-        f.count += 1;
-        f.last_ms = now;
-        Ok(LockoutDecision {
-            locked: f.count >= params.threshold,
-            failures: f.count,
-        })
-    }
-
-    async fn clear_login_failures(&self, key: &str) -> Result<(), StoreError> {
-        self.failures.lock().unwrap().remove(key);
-        Ok(())
-    }
-
-    async fn check_login_lockout(
-        &self,
-        key: &str,
-        params: LockoutParams,
-    ) -> Result<LockoutDecision, StoreError> {
-        let now = now_unix_millis();
-        let map = self.failures.lock().unwrap();
-        match map.get(key) {
-            Some(f) if now.saturating_sub(f.last_ms) < params.window_secs.saturating_mul(1000) => {
-                Ok(LockoutDecision {
-                    locked: f.count >= params.threshold,
-                    failures: f.count,
-                })
-            }
-            // 窓を過ぎている or 記録なし → 失敗 0 扱い。
-            _ => Ok(LockoutDecision {
-                locked: false,
-                failures: 0,
-            }),
-        }
-    }
-
     async fn ping(&self) -> Result<(), StoreError> {
         // in-proc は常に到達可能（テスト用スタブ）。
         Ok(())
@@ -161,23 +127,6 @@ impl Store for FailingStore {
         _params: RateLimitParams,
         _now_ms: u64,
     ) -> Result<RateDecision, StoreError> {
-        Self::down()
-    }
-    async fn record_login_failure(
-        &self,
-        _key: &str,
-        _params: LockoutParams,
-    ) -> Result<LockoutDecision, StoreError> {
-        Self::down()
-    }
-    async fn clear_login_failures(&self, _key: &str) -> Result<(), StoreError> {
-        Self::down()
-    }
-    async fn check_login_lockout(
-        &self,
-        _key: &str,
-        _params: LockoutParams,
-    ) -> Result<LockoutDecision, StoreError> {
         Self::down()
     }
     async fn ping(&self) -> Result<(), StoreError> {

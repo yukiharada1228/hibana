@@ -1,9 +1,10 @@
+import { issueFixtureToken } from "./test-api-credentials.mjs";
 // Run only against test-http.sh's disposable services.
 import assert from 'node:assert/strict';
 import {request} from 'node:http';
 import {setTimeout as sleep} from 'node:timers/promises';
 
-export async function testUploadCapacity({api, token, wasm, upload, url, holdStorage, releaseStorage}) {
+export async function testUploadCapacity({api, sql, token, wasm, upload, url, holdStorage, releaseStorage}) {
   const create = async token => {
     const response = await api('/components', {token, method:'POST', body:{name:'upload-capacity'}});
     assert.equal(response.status,201);
@@ -11,10 +12,10 @@ export async function testUploadCapacity({api, token, wasm, upload, url, holdSto
   };
   const id = await create(token);
   const tenant = await api('/admin/tenants', {token:'test-only',method:'POST',body:{
-    slug:'upload-capacity',name:'Upload capacity fixture',admin_email:'upload@example.invalid',admin_password:'fixture-password',
+    slug:'upload-capacity',name:'Upload capacity fixture',admin_email:'upload@example.invalid',admin_oidc_subject: 'fixture-admin',
   }});
   assert.equal(tenant.status,201); await tenant.text();
-  const login = await api('/auth/login', {method:'POST',body:{tenant_slug:'upload-capacity',email:'upload@example.invalid',password:'fixture-password'}});
+  const login = await issueFixtureToken(sql, {tenant_slug:'upload-capacity',email:'upload@example.invalid',});
   assert.equal(login.status,201);
   const {token:otherToken} = await login.json();
   const otherId = await create(otherToken);

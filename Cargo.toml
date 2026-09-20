@@ -27,10 +27,8 @@ tokio = { version = "1", features = ["full"] }
 tower-http = { version = "0.6", features = ["trace", "cors"] }
 
 # --- 認証ハッシュ（M3a, §3.3） ---
-# password_hash は argon2id（pure-Rust、当環境は cc/aws-lc 不可）。
 # api_tokens.token_hash は既存の sha2 を再利用する（ここには追加しない）。
-argon2 = "0.5"
-# opaque トークン secret と argon2 salt の生成。
+# Opaque token secret generation.
 rand = "0.8"
 # M7-0 (§5.1): 秘密値ラッパ Redacted<T> の Drop 時ゼロ化。Cargo.lock に既存（推移依存）。
 zeroize = "1"

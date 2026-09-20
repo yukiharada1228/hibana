@@ -1,3 +1,4 @@
+import { issueFixtureToken } from "./test-api-credentials.mjs";
 // Runs only inside the disposable test-http.sh platform.
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
@@ -5,6 +6,7 @@ import { withBuildMetadata } from "../sdk/src/build-metadata.mjs";
 
 export async function testBuildMetadata({
   api,
+  sql,
   token,
   wasm,
   unrecordedWasm,
@@ -41,15 +43,11 @@ export async function testBuildMetadata({
   assert.equal((await upload(id, token, "with-extensions", bytes)).status, 201);
   // Login with Read only. Build declarations never grant network access.
   const reader = await (
-    await api("/auth/login", {
-      method: "POST",
-      body: {
+    await issueFixtureToken(sql, {
         tenant_slug: "upload",
         email: "test@example.invalid",
-        password: "test-password",
         scopes: ["read"],
-      },
-    })
+      })
   ).json();
   const details = async (version) => {
     const response = await api(`${base}/versions/${version}`, {
@@ -91,21 +89,17 @@ export async function testBuildMetadata({
             slug: "metadata-other",
             name: "Other",
             admin_email: "other@example.invalid",
-            admin_password: "test-password",
+            admin_oidc_subject: 'fixture-admin',
           },
         })
       ).status,
       201,
     );
     const other = await (
-      await api("/auth/login", {
-        method: "POST",
-        body: {
+      await issueFixtureToken(sql, {
           tenant_slug: "metadata-other",
           email: "other@example.invalid",
-          password: "test-password",
-        },
-      })
+          })
     ).json();
     try {
       assert.equal(

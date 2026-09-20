@@ -22,7 +22,9 @@ npm ci --prefix sdk
 node sdk/src/cli.mjs platform install --source .
 ```
 
-以降の`hibana`は`node /path/to/checkout/sdk/src/cli.mjs`でも実行できます。ローカル基盤は`hibana platform install --source .`だけでクラスタ作成、イメージのビルド、依存サービス、DBマイグレーション、起動確認、開発用テナントの作成まで完了します。更新時も同じコマンドです。
+以降の`hibana`は`node /path/to/checkout/sdk/src/cli.mjs`でも実行できます。ローカル基盤も事前に[外部OIDCの必須設定](../../docs/authentication.md#ローカル基盤開発)を環境変数へ設定してください。`hibana platform install --source .`でクラスタ作成、イメージのビルド、依存サービス、DBマイグレーション、起動確認を行います。`HIBANA_ADMIN_OIDC_SUBJECT`を指定した場合は初期テナントも作成します。更新時も同じコマンドです。
+
+ローカルkindのIdP宛て通信許可には`HIBANA_OIDC_EGRESS_CIDRS`（実際の宛先CIDR、カンマ区切り）が必要です。TCPポートは`HIBANA_OIDC_EGRESS_PORTS`で指定し、初回の既定は443です。通信設定はクラスタ別の`oidc-egress.json`に保存され、再導入時に再利用します。
 
 | コマンド | 動作 |
 |---|---|
@@ -31,7 +33,7 @@ node sdk/src/cli.mjs platform install --source .
 | `hibana platform start --source .` | 保存した環境を再開し、公開アプリの準備後に受付を再開 |
 | `hibana platform status --source .` | ノードの停止状態、Pod・Serviceを確認 |
 | `hibana platform uninstall --source . --yes` | 専用kindクラスタとそのデータ・資格情報を削除 |
-| `hibana platform test --source .` | サンプル配備・HTTP・Secrets・rollbackの検証 |
+| `hibana platform test --source .` | `HIBANA_TOKEN`を使ってサンプル配備・HTTP・Secrets・rollbackを検証 |
 
 クラスタ名の既定値は`hibana`です。`--cluster NAME`で変更でき、状態は`.local/kubernetes-NAME/`に保存します。管理APIは`http://127.0.0.1:18080`、アプリHTTPは`http://127.0.0.1:18084`です。ホストポートは共通なので、この構成のクラスタは同時に1つだけ起動してください。専用kubeconfigを使い、普段のcontextは変更しません。
 
@@ -55,6 +57,10 @@ hibana delete --all --all-tenants --yes
 Kustomizeがリソース定義、CLI内のPython処理が「依存サービス → マイグレーション完了 → CP/Worker」の実行順序を担当します。通常のPodにはマイグレーション資格情報を渡しません。イメージと環境設定が同じ再実行ではCP/Workerを強制再起動しません。接続にはNodePortとkindのポート公開を使い、常駐スクリプトやport-forwardは不要です。
 
 ### 既存のKubernetesへ配備する
+
+本番のログインにはOIDC対応の認証基盤を使用します。既存の社内IdPへ接続するか、Keycloakを用意してください。[OIDC設定と移行手順](../../docs/authentication.md)に従い、クライアント登録・Control Planeからの通信許可・ユーザー紐付けを行います。旧パスワード方式は削除しました。ローカルkindも外部OIDC設定が必要で、Keycloakの構築・運用は導入先で行います。
+
+社内IdPがSAMLのみの場合は、[Keycloakを仲介するSAML接続手順](../../docs/saml-keycloak.md)を使います。HibanaのOIDC接続先は仲介Keycloakに設定します。
 
 `hibana platform init my-site`でサイト用Kustomize overlayを生成できます。生成されたREADMEに沿って外部PostgreSQL・Redis・S3の接続情報、DNS・TLS・IngressClass、外部依存への通信許可を設定します。署名・暗号化・bootstrap用のキーは自動生成します。秘密値の`.env`ファイルは0600で保存し、`.gitignore`に含めます。キーは安全な場所へバックアップしてください。既存の設定ディレクトリは上書きしません。
 

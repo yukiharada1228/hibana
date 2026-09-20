@@ -13,7 +13,7 @@
 #   (2) ヒューリスティック: テナントスコープの db:: 書き込み/読み取りを `state.pool()` に
 #       直接渡すコードを検出する。これらは set_tenant_guc を設定した tx（&tx）に
 #       通さねばならない（FORCE RLS 下では GUC 未設定で ERROR=fail-closed）。
-#       認証前参照 find_token_by_hash/find_user_by_email/find_tenant_id_by_slug は
+#       認証前参照 find_token_by_hash/find_tenant_id_by_slug は
 #       SECURITY DEFINER 関数経由で GUC 不要のため、意図的に対象から除外する。
 #
 # 注意: (2) は単一行の `db::fn(state.pool()` のみを捕捉するヒューリスティック（tripwire）で
@@ -108,7 +108,7 @@ fi
 #  - crates/worker/src/env.rs : worker 側の env 組み立て（M7b/M7c）
 # worker/main.rs のような巨大ファイルを allowlist に入れるとガードが実質無効になるため、
 # env 組み立ては専用モジュールへ切り出すこと（設計 §5.6）。
-expose_allow='crates/shared/src/redacted.rs|crates/control-plane/src/config.rs|crates/control-plane/src/secrets.rs|crates/control-plane/src/handlers_secrets.rs|crates/worker/src/env.rs'
+expose_allow='crates/shared/src/redacted.rs|crates/control-plane/src/config.rs|crates/control-plane/src/oidc/config.rs|crates/control-plane/src/secrets.rs|crates/control-plane/src/handlers_secrets.rs|crates/worker/src/env.rs'
 set4=$(
   grep -rnE "\.expose\(\)" --include=*.rs crates/ 2>/dev/null \
     | sed -E 's#(//).*$##' \

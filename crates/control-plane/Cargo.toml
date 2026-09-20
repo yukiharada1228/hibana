@@ -34,10 +34,10 @@ sha2 = { workspace = true }
 # 鍵は固定 seed から構築するため署名/検証に RNG は不要（OsRng 機能は使わない）。
 ed25519-dalek = { workspace = true }
 
-# 認証ハッシュ（M3a, §3.3）。password_hash は argon2id、secret/salt 生成に rand。
-# token_hash は sha2 を再利用する。
-argon2 = { workspace = true }
+# Opaque Hibana credentials; OIDC protocol and ID-token validation use openidconnect.
 rand = { workspace = true }
+openidconnect = { version = "4.0.1", default-features = false, features = ["reqwest", "rustls-tls"] }
+base64 = "0.22"
 async-trait = { workspace = true }
 
 # M7-0 / M7c (§5.1 / §4): 秘密素材（KEK / DEK / 復号済み平文）を Drop でゼロ化する。
@@ -49,7 +49,7 @@ chacha20poly1305 = { workspace = true }
 futures = "0.3"
 http-body-util = "0.1"
 
-# 共有ストア（M3d, §8）。レート制限 / login ロックアウトを全 Axum
+# 共有ストア（M3d, §8）。レート制限 / OIDC state を全 Axum
 # インスタンスで共有するカウンタ。Lua アトミック操作で TOCTOU を避ける。pure-Rust 構成。
 redis = { workspace = true }
 # Redis uses Rustls's process default; select ring explicitly when other clients
@@ -76,5 +76,6 @@ reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"
 
 # --- 統合テスト専用 dev-dependencies ---
 [dev-dependencies]
+tracing-subscriber = { workspace = true }
 tokio = { workspace = true, features = ["test-util"] }
 reqwest = { version = "0.12", default-features = false, features = ["multipart"] }

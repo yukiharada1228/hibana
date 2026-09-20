@@ -3,8 +3,8 @@ use crate::metrics;
 use crate::migrations::{run_migrate_only, run_migrations};
 use crate::routes::{build_internal_router, build_router};
 use crate::{
-    config::Config, crypto, deployment, ingress, migrations, reaper, signing, state::AppState,
-    storage, store,
+    config::Config, deployment, ingress, migrations, reaper, signing, state::AppState, storage,
+    store,
 };
 use axum::{serve::ListenerExt as _, Router};
 
@@ -71,10 +71,6 @@ pub(crate) async fn run() -> anyhow::Result<()> {
     );
     tracing::info!(endpoint = %config.s3_endpoint, bucket = %config.s3_bucket, "configured object storage");
 
-    // login の no-user パスで使う固定ダミー argon2 ハッシュを起動時に一度だけ生成する
-    // （timing oracle 防止: ユーザ不在でも常に verify を実行する）。
-    let dummy_password_hash = crypto::dummy_password_hash();
-
     let seed = signing::decode_seed(config.job_signing_key_plain())?;
     let signer = std::sync::Arc::new(signing::Signer::from_seed(
         seed,
@@ -104,7 +100,6 @@ pub(crate) async fn run() -> anyhow::Result<()> {
         config.max_wasm_upload_bytes,
         config.presign_ttl_secs,
         config.bootstrap_admin_token_plain().to_string(),
-        dummy_password_hash,
         signer,
         token_exp_offset_secs,
         store,
@@ -114,6 +109,7 @@ pub(crate) async fn run() -> anyhow::Result<()> {
         config.job_env_exchange_rate_per_min,
         config.metrics_include_tenant_label,
         config.public_apps.clone(),
+        config.auth.clone(),
     );
 
     // 完了済み入力の清掃と孤立した pending/running 行の回収。
@@ -187,9 +183,9 @@ pub(crate) async fn run() -> anyhow::Result<()> {
 
     let listener = tokio::net::TcpListener::bind(&config.bind_addr).await?;
     tracing::info!(addr = %config.bind_addr, "listening");
-    // login のロックアウト（§6.0）はクライアント IP を鍵の一方に使うため、接続元
+    // OIDC のレート制限はクライアント IP を鍵の一方に使うため、接続元
     // SocketAddr をハンドラへ届ける必要がある。`into_make_service_with_connect_info`
-    // で ConnectInfo<SocketAddr> を有効化する（これが無いと login の IP 抽出が機能しない）。
+    // で ConnectInfo<SocketAddr> を有効化する（これが無いと OIDC の IP 抽出が機能しない）。
     axum::serve(
         listener.tap_io(configure_http_socket),
         app.into_make_service_with_connect_info::<std::net::SocketAddr>(),

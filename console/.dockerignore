@@ -9,5 +9,6 @@
 !public/
 !public/**
 !nginx.conf
+!api-proxy.conf
 !default.conf.template
 !prepare-config.sh

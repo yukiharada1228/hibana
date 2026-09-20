@@ -22,6 +22,13 @@ fn map_unique_violation(e: sea_orm::DbErr, msg: &str) -> AppError {
     e.into()
 }
 
+fn map_unique_conflict(e: sea_orm::DbErr, msg: &str) -> AppError {
+    if is_unique_violation(&e) {
+        return FaasError::Conflict(msg.to_string()).into();
+    }
+    e.into()
+}
+
 fn is_unique_violation(e: &sea_orm::DbErr) -> bool {
     matches!(
         e.sql_err(),

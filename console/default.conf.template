@@ -9,23 +9,18 @@ server {
     add_header Cache-Control "no-store" always;
 
     location = /healthz { access_log off; return 200 'ok'; }
+    # Nginx error messages include the original URI, including code and state.
+    # Keep a sanitized status log instead, including when the CP is unavailable.
+    location = /api/auth/oidc/callback {
+        error_log /dev/null;
+        access_log /dev/stdout hibana_oidc;
+        proxy_pass ${HIBANA_API_UPSTREAM}/auth/oidc/callback;
+        include /etc/nginx/hibana-api-proxy.conf;
+    }
     # Fixed upstream; /api/components becomes /components. Both clients use this path.
     location /api/ {
         proxy_pass ${HIBANA_API_UPSTREAM}/;
-        proxy_http_version 1.1;
-        proxy_set_header Connection "";
-        proxy_set_header Host $proxy_host;
-        # Append the actual peer. The API walks right-to-left across only the
-        # configured TRUSTED_PROXY_CIDRS, ignoring any client-supplied prefix.
-        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
-        proxy_set_header X-Forwarded-Proto $scheme;
-        proxy_set_header Forwarded "";
-        client_max_body_size 33m;
-        proxy_read_timeout 125s;
-        proxy_send_timeout 125s;
-        proxy_request_buffering off;
-        proxy_buffering off;
-        proxy_redirect off;
+        include /etc/nginx/hibana-api-proxy.conf;
     }
     location /assets/ { try_files $uri =404; }
     location / { try_files $uri $uri/ =404; }

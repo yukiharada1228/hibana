@@ -2,14 +2,14 @@ use crate::db::TenantQuotaOverrides;
 use crate::metrics::Metrics;
 use crate::signing::{Signer, Verifier};
 use crate::storage::Storage;
-use crate::store::{LockoutParams, RateLimitParams, Store};
+use crate::store::{RateLimitParams, Store};
 use sea_orm::DatabaseConnection;
 use std::sync::Arc;
 use std::time::Duration;
 pub const QUOTA_MAX_INVOKE_RATE_PER_SEC: u64 = 500;
 pub const QUOTA_MAX_CONCURRENT_EXECUTIONS: u64 = 200;
 /// admission 制御のパラメータ束（M3d, §8）。`Config` のグローバル既定から派生し、
-/// HTTP 受付（レート制限 / DB の同時実行数）と login（ロックアウト）が参照する。
+/// HTTP 受付（レート制限 / DB の同時実行数）が参照する。
 ///
 /// M4d (§8): per-tenant 上書きは [`AdmissionConfig::resolve_for_tenant`] で解決する。
 /// グローバル既定 → テナント上書きの優先順位でフィールドごとにマージする（仕様 §8 表）。
@@ -19,8 +19,6 @@ pub struct AdmissionConfig {
     pub rate: RateLimitParams,
     /// DB の受付トランザクションで適用する同時実行数の上限。
     pub max_concurrent_executions: i64,
-    /// login 失敗ロックアウトの閾値 + 減衰窓（両キーに同値適用）。
-    pub lockout: LockoutParams,
     /// Explicitly trusted reverse proxy networks; empty means direct clients only.
     pub trusted_proxies: crate::client_ip::TrustedProxies,
 }
@@ -33,7 +31,6 @@ impl AdmissionConfig {
     /// - `invoke_burst` が Some → token-bucket の `capacity` を置き換え。
     /// - `max_concurrent_executions` が Some → 同時実行数の上限を置き換え。
     /// - None / 欠損 / null → グローバル既定を継承（変更しない）。
-    /// - login ロックアウトは per-tenant 上書きを持たない（全テナント共通の security 制御）。
     ///
     /// **上限クランプ** (§8 表「上限」): 上書きが推奨上限（[`QUOTA_MAX_INVOKE_RATE_PER_SEC`] /
     /// [`QUOTA_MAX_CONCURRENT_EXECUTIONS`]）を超えていたら頭打ちにして warn ログを残す。これは
@@ -104,6 +101,7 @@ pub struct AppState {
     inner: Arc<Inner>,
 }
 struct Inner {
+    auth: crate::oidc::config::OidcConfig,
     request_capacity: crate::request_capacity::RequestCapacity,
     upload_capacity: crate::request_capacity::RequestCapacity,
     json_request_slots: Arc<tokio::sync::Semaphore>,
@@ -115,8 +113,6 @@ struct Inner {
     max_wasm_upload_bytes: u64,
     presign_ttl: Duration,
     bootstrap_admin_token: String,
-    dummy_password_hash: String,
-    password_work_slots: Arc<tokio::sync::Semaphore>,
     signer: Arc<Signer>,
     token_exp_offset_secs: Box<dyn Fn(u64) -> i64 + Send + Sync>,
     store: Arc<dyn Store>,
@@ -135,7 +131,6 @@ impl AppState {
         max_wasm_upload_bytes: u64,
         presign_ttl_secs: u64,
         bootstrap_admin_token: String,
-        dummy_password_hash: String,
         signer: Arc<Signer>,
         token_exp_offset_secs: Box<dyn Fn(u64) -> i64 + Send + Sync>,
         store: Arc<dyn Store>,
@@ -145,9 +140,11 @@ impl AppState {
         job_env_exchange_rate_per_min: u64,
         metrics_include_tenant_label: bool,
         public_apps: crate::public_apps::PublicApps,
+        auth: crate::oidc::config::OidcConfig,
     ) -> Self {
         Self {
             inner: Arc::new(Inner {
+                auth,
                 request_capacity: crate::request_capacity::RequestCapacity::new(8),
                 upload_capacity: crate::request_capacity::RequestCapacity::new(4),
                 json_request_slots: Arc::new(tokio::sync::Semaphore::new(8)),
@@ -165,10 +162,6 @@ impl AppState {
                 max_wasm_upload_bytes,
                 presign_ttl: Duration::from_secs(presign_ttl_secs),
                 bootstrap_admin_token,
-                dummy_password_hash,
-                // Argon2 hashing and verification share one CPU/memory budget.
-                // Reject excess work immediately rather than growing a wait queue.
-                password_work_slots: Arc::new(tokio::sync::Semaphore::new(2)),
                 signer,
                 token_exp_offset_secs,
                 store,
@@ -185,20 +178,16 @@ impl AppState {
         &self.inner.pool
     }
 
+    pub fn auth_config(&self) -> &crate::oidc::config::OidcConfig {
+        &self.inner.auth
+    }
+
     pub(crate) fn upload_capacity(&self) -> &crate::request_capacity::RequestCapacity {
         &self.inner.upload_capacity
     }
 
     pub(crate) fn request_capacity(&self) -> &crate::request_capacity::RequestCapacity {
         &self.inner.request_capacity
-    }
-
-    pub(crate) fn reserve_password_work(&self) -> Option<tokio::sync::OwnedSemaphorePermit> {
-        self.inner
-            .password_work_slots
-            .clone()
-            .try_acquire_owned()
-            .ok()
     }
 
     pub(crate) fn json_request_slots(&self) -> Arc<tokio::sync::Semaphore> {
@@ -276,17 +265,12 @@ impl AppState {
         &self.inner.bootstrap_admin_token
     }
 
-    /// login の no-user パスで使う固定ダミー argon2 ハッシュ（timing 均一化）。
-    pub fn dummy_password_hash(&self) -> &str {
-        &self.inner.dummy_password_hash
-    }
-
-    /// 共有 admission ストア（M3d, §8）。invoke レート制限 / login ロックアウト。
+    /// 共有 admission ストア（M3d, §8）。invoke レート制限 / OIDC state。
     pub fn store(&self) -> &dyn Store {
         self.inner.store.as_ref()
     }
 
-    /// 受付制御のパラメータ（レート制限 / 同時実行数 / ロックアウト）。
+    /// 受付制御のパラメータ（レート制限 / 同時実行数）。
     pub fn admission(&self) -> &AdmissionConfig {
         &self.inner.admission
     }
@@ -307,10 +291,6 @@ mod tests {
                 capacity: 500.0,
             },
             max_concurrent_executions: 20,
-            lockout: LockoutParams {
-                threshold: 10,
-                window_secs: 900,
-            },
             trusted_proxies: crate::client_ip::TrustedProxies::default(),
         }
     }

@@ -1,3 +1,4 @@
+import { issueFixtureToken } from "./test-api-credentials.mjs";
 // Runs inside test-http.sh's disposable platform; never connects to a configured site.
 import assert from "node:assert/strict";
 import { mkdir, writeFile } from "node:fs/promises";
@@ -6,22 +7,18 @@ import { randomUUID } from "node:crypto";
 import { setTimeout as sleep } from "node:timers/promises";
 import { runCommand } from "./bounded-process.mjs";
 
-export async function testConsole({ api, token, url, app, wasm, folder }) {
+export async function testConsole({ api, sql, token, url, app, wasm, folder }) {
   const session = await (await api("/auth/session", { token })).json();
   assert.equal(session.tenant_slug, "upload");
   assert.equal(session.ingress_base_domain, "hibana.test");
   assert.equal((await api("/auth/session")).status, 401);
   assert.equal((await api("/auth/logout", { method: "POST" })).status, 401);
   const reader = await (
-    await api("/auth/login", {
-      method: "POST",
-      body: {
+    await issueFixtureToken(sql, {
         tenant_slug: "upload",
         email: "test@example.invalid",
-        password: "test-password",
         scopes: ["read"],
-      },
-    })
+      })
   ).json();
   assert.equal(
     (await api("/auth/session", { token: reader.token })).status,
@@ -163,11 +160,24 @@ export async function testConsole({ api, token, url, app, wasm, folder }) {
     });
     const errors = [];
     page.on("pageerror", (error) => errors.push(error.message));
-    await page.goto(consoleUrl);
-    await page.getByLabel("テナント", { exact: true }).fill("upload");
-    await page.getByLabel("メールアドレス").fill("test@example.invalid");
-    await page.getByLabel("パスワード", { exact: true }).fill("test-password");
-    await page.getByRole("button", { name: "ログイン", exact: true }).click();
+    // UI/API integration with a disposable API credential. Provider login is
+    // exercised independently by test-oidc.sh against real Keycloak.
+    const consoleToken = await (await issueFixtureToken(sql, {
+      tenant_slug: "upload", email: "test@example.invalid",
+    })).json();
+    // This fixture exercises the production proxy and data APIs. The dedicated
+    // Keycloak suite covers real browser cookies/CSRF and session restoration.
+    await page.route("**/api/**", route => {
+      if (route.request().url().endsWith("/auth/oidc/browser/exchange"))
+        return route.fulfill({ status: 201, json: { token_id: consoleToken.token_id, expires_at: consoleToken.expires_at } });
+      return route.continue({ headers: { ...route.request().headers(), authorization: `Bearer ${consoleToken.token}` } });
+    });
+    await page.addInitScript(() => {
+      if (location.hash.includes("oidc_code")) sessionStorage.setItem("hibana.oidc.pending", JSON.stringify({
+        state: "b".repeat(64), verifier: "c".repeat(64), created: Date.now(),
+      }));
+    });
+    await page.goto(`${consoleUrl}/#oidc_code=${"a".repeat(64)}&oidc_state=${"b".repeat(64)}`);
     await page.getByRole("link", { name: "console-app", exact: true }).click();
     await expect(
       page.getByRole("row").filter({ hasText: "2.0.0" }),

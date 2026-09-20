@@ -1,3 +1,4 @@
+import { issueFixtureToken } from "./test-api-credentials.mjs";
 // Real KEK rotation while a Worker has yet to redeem its accepted environment.
 // All keys and data belong to the disposable HTTP test harness.
 import assert from 'node:assert/strict';
@@ -32,9 +33,9 @@ export async function testSecretKeyRetention({api, sql, wasm, upload, url, inter
   try {
     await restart({SECRETS_MASTER_KID:oldKid,SECRETS_MASTER_KEY:oldKey,SECRETS_RETIRED_KEYS:originalKey});
     assert.equal((await api('/admin/tenants', {method:'POST',token:'test-only',body:{
-      slug:'key-retention',name:'Key retention regression',admin_email:'test@example.invalid',admin_password:'test-password',
+      slug:'key-retention',name:'Key retention regression',admin_email:'test@example.invalid',admin_oidc_subject: 'fixture-admin',
     }})).status,201);
-    const login = await api('/auth/login', {method:'POST',body:{tenant_slug:'key-retention',email:'test@example.invalid',password:'test-password'}});
+    const login = await issueFixtureToken(sql, {tenant_slug:'key-retention',email:'test@example.invalid',});
     assert.equal(login.status,201);
     const {token} = await login.json();
     const created = await api('/components', {token,method:'POST',body:{name:'key-retention'}});

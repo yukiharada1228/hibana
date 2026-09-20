@@ -10,6 +10,7 @@ Kubernetesの上にHibanaを置く構成は、Workerの複数配置・ローリ�
 - 複数の物理ノード/障害ドメイン、CNIによるNetworkPolicy強制、Ingress、DNSとTLS。管理APIとアプリ公開口を分離する。
 - PostgreSQLの永続化・レプリケーション・フェイルオーバー・バックアップ/PITR。マイグレーション専用ロールとRLS適用ランタイムロールを分離する。
 - Redisは`redis://`またはTLSの`rediss://`で接続できるHAエンドポイントを用意する（Sentinel自動検出を実装済みとはしない）。
+- OIDC対応の認証基盤（既存のEntra ID、またはKeycloakなど）、MFAの運用、Hibanaクライアント登録とユーザー紐付け。[認証設定と既存環境の移行](authentication.md)を参照。OIDC設定が不足すると起動を拒否する。
 - Wasm保存先のS3互換ストレージの冗長化・バックアップ。署名鍵・Secrets暗号鍵・DB認証情報の保管、ローテーションと復元手順。
 - Worker用ノードプール、非root・read-only rootfs・seccomp。信頼できないテナントを実行する場合は、検証済みVMベースRuntimeClassなどの追加隔離を導入する。
 - Prometheus/ログ/OTelの収集、SLO・アラート・容量上限、障害復旧・キー喪失・ノード停止・ネットワーク分断の訓練。

@@ -8,6 +8,8 @@ mod m20260916_000003_component_egress;
 mod m20260917_000004_execution_input_retention;
 mod m20260917_000005_execution_input_cleanup;
 mod m20260918_000006_secret_key_retention;
+mod m20260920_000007_oidc;
+mod m20260920_000008_oidc_only;
 
 pub struct Migrator;
 
@@ -66,6 +68,8 @@ impl MigratorTrait for Migrator {
             Box::new(m20260917_000004_execution_input_retention::Migration),
             Box::new(m20260917_000005_execution_input_cleanup::Migration),
             Box::new(m20260918_000006_secret_key_retention::Migration),
+            Box::new(m20260920_000007_oidc::Migration),
+            Box::new(m20260920_000008_oidc_only::Migration),
         ]
     }
 }

@@ -35,6 +35,8 @@ pub struct TokenRow {
     pub revoked_at: Option<DateTime<Utc>>,
     /// 紐づくユーザのロール。サービストークン（user_id NULL）は `None`。
     pub user_role: Option<String>,
+    pub auth_method: String,
+    pub user_oidc_issuer: Option<String>,
 }
 
 /// トークンが現時点で有効か（失効しておらず、かつ未期限切れ）。
@@ -84,15 +86,20 @@ impl TokenRow {
         if !is_token_valid(self.revoked_at, self.expires_at, now) {
             return None;
         }
-        let role = match self.user_role.as_deref() {
-            None => Role::Admin, // サービストークン（ユーザ無し）。
-            other => parse_role(other)?,
+        let role = match (self.user_id.as_ref(), self.user_role.as_deref()) {
+            (None, None) => Role::Admin,
+            (Some(_), Some(role)) => parse_role(Some(role))?,
+            _ => return None,
         };
+        let scopes = parse_scopes(&self.scopes)
+            .into_iter()
+            .filter(|scope| role.ceiling().contains(scope))
+            .collect();
         Some(Principal {
             tenant_id: self.tenant_id,
             user_id: self.user_id,
             token_id: self.token_id,
-            scopes: parse_scopes(&self.scopes),
+            scopes,
             role,
         })
     }
@@ -127,6 +134,8 @@ pub async fn find_token_by_hash(
             expires_at: r.try_get("", "expires_at")?,
             revoked_at: r.try_get("", "revoked_at")?,
             user_role: r.try_get("", "user_role")?,
+            auth_method: r.try_get("", "auth_method")?,
+            user_oidc_issuer: r.try_get("", "user_oidc_issuer")?,
         })
     })
     .transpose()
@@ -140,11 +149,9 @@ pub async fn find_token_by_hash(
 /// 無いため作れない。bootstrap トークンで保護されたこの経路だけが、テナントと
 /// 最初の admin ユーザを同時に作る。失敗時は両方ロールバックされる。
 ///
-/// M3b: マルチステートメント（tenants + users INSERT を 1 単位で実行）のため
-/// `impl PgExecutor` ではなく `&mut PgConnection` を受け、tx は呼び出し側が所有する
-/// （内部 begin/commit は撤去）。呼び出し側は **同一 tx 上で先に**
-/// `set_tenant_guc(&mut *tx, tenant_id)` を呼ぶこと: users は FORCE RLS 下で
-/// WITH CHECK が GUC と一致する必要がある（tenants には RLS は無い）。
+/// 呼び出し側が所有する同一トランザクションで、先に `set_tenant_guc` を呼ぶこと。
+/// users は FORCE RLS 下で WITH CHECK が GUC と一致する必要がある。
+/// 最初の管理者も、作成時から OIDC identity を持つ。
 #[allow(clippy::too_many_arguments)]
 pub async fn bootstrap_tenant(
     conn: &impl ConnectionTrait,
@@ -153,7 +160,8 @@ pub async fn bootstrap_tenant(
     name: &str,
     admin_user_id: &str,
     admin_email: &str,
-    admin_password_hash: &str,
+    issuer: &str,
+    subject: &str,
 ) -> Result<(), DbErr> {
     tenants::Entity::insert(tenants::ActiveModel {
         id: Set(tenant_id.into()),
@@ -164,74 +172,40 @@ pub async fn bootstrap_tenant(
     })
     .exec(conn)
     .await?;
-    users::Entity::insert(users::ActiveModel {
-        id: Set(admin_user_id.into()),
-        tenant_id: Set(tenant_id.into()),
-        email: Set(admin_email.into()),
-        password_hash: Set(admin_password_hash.into()),
-        role: Set("admin".into()),
-        ..Default::default()
-    })
-    .exec(conn)
-    .await?;
-    Ok(())
+    create_user(
+        conn,
+        admin_user_id,
+        tenant_id,
+        admin_email,
+        Role::Admin,
+        issuer,
+        subject,
+    )
+    .await
 }
 
-/// ユーザを作成する（POST /tenants/{id}/users）。`tenant_id` でスコープする。
+/// OIDC identity と所属を同じ INSERT で作成する。
 pub async fn create_user(
     executor: &impl ConnectionTrait,
     user_id: &str,
     tenant_id: &str,
     email: &str,
-    password_hash: &str,
     role: Role,
+    issuer: &str,
+    subject: &str,
 ) -> Result<(), DbErr> {
     users::Entity::insert(users::ActiveModel {
         id: Set(user_id.into()),
         tenant_id: Set(tenant_id.into()),
         email: Set(email.into()),
-        password_hash: Set(password_hash.into()),
         role: Set(role.as_str().into()),
+        oidc_issuer: Set(Some(issuer.into())),
+        oidc_subject: Set(Some(subject.into())),
         ..Default::default()
     })
     .exec(executor)
     .await?;
     Ok(())
-}
-
-/// login / トークン発行で参照するユーザ行。
-#[derive(Debug, Clone)]
-pub struct UserRow {
-    pub id: String,
-    pub password_hash: String,
-    pub role: String,
-}
-
-/// (tenant_id, email) でユーザを解決する（soft-delete 済みは除外）。
-///
-/// M3b: login の認証前参照（Principal 確立前。slug 解決の後だが GUC はまだ無い）。
-/// users は FORCE RLS のため GUC 無しでは読めないので、SECURITY DEFINER 関数
-/// `auth_lookup_user_by_email` を呼ぶ（migrations/src/m20260915_000001_security.sql）。
-pub async fn find_user_by_email(
-    executor: &impl ConnectionTrait,
-    tenant_id: &str,
-    email: &str,
-) -> Result<Option<UserRow>, DbErr> {
-    function_rows(
-        executor,
-        "auth_lookup_user_by_email",
-        vec![tenant_id.into(), email.into()],
-    )
-    .await?
-    .first()
-    .map(|r| {
-        Ok(UserRow {
-            id: r.try_get("", "id")?,
-            password_hash: r.try_get("", "password_hash")?,
-            role: r.try_get("", "role")?,
-        })
-    })
-    .transpose()
 }
 
 /// テナント内ユーザを id で解決し role を返す（トークン発行の対象ユーザ確認用）。
@@ -255,10 +229,8 @@ pub async fn find_user_role(
 
 /// slug からテナントを解決する（login のテナント解決, §3.3）。active のみ。
 ///
-/// M3b: login の最初の認証前参照（GUC 無し）。tenants 自体には RLS は無いが、規約として
-/// 3 つの認証前参照を SECURITY DEFINER 関数経由に統一する。`auth_lookup_tenant_id_by_slug`
-/// は `RETURNS TABLE(id text)` のため、未一致は 0 行 → `fetch_optional` で `None`（スカラ
-/// NULL 行の誤判定を避ける, migrations/src/m20260915_000001_security.sql）。
+/// OIDC 開始時の認証前参照（GUC 無し）。固定の SECURITY DEFINER 関数を呼び、
+/// 未一致の 0 行は `None` として返す。
 pub async fn find_tenant_id_by_slug(
     executor: &impl ConnectionTrait,
     slug: &str,
@@ -268,6 +240,71 @@ pub async fn find_tenant_id_by_slug(
         .first()
         .map(|r| r.try_get("", "id"))
         .transpose()
+}
+
+pub enum TokenAuthMethod {
+    Api,
+    Oidc,
+}
+
+impl TokenAuthMethod {
+    fn as_str(&self) -> &'static str {
+        match self {
+            Self::Api => "api",
+            Self::Oidc => "oidc",
+        }
+    }
+}
+
+/// Lock the caller and optional existing target in a stable order, then the
+/// calling token. Identity creation, linking and token issuance hold these locks
+/// through commit, in the same order as user-wide revocation.
+pub async fn lock_identity_actor(
+    executor: &impl ConnectionTrait,
+    principal: &Principal,
+    target_user: Option<&str>,
+) -> Result<Option<TokenRow>, DbErr> {
+    let mut user_ids: Vec<&str> = target_user.into_iter().collect();
+    if let Some(id) = principal.user_id.as_deref() {
+        user_ids.push(id);
+    }
+    let locked_users = users::Entity::find()
+        .filter(users::Column::TenantId.eq(&principal.tenant_id))
+        .filter(users::Column::Id.is_in(user_ids))
+        .filter(users::Column::DeletedAt.is_null())
+        .order_by_asc(users::Column::Id)
+        .lock_exclusive()
+        .all(executor)
+        .await?;
+    let Some(token) = api_tokens::Entity::find_by_id(&principal.token_id)
+        .filter(api_tokens::Column::TenantId.eq(&principal.tenant_id))
+        .lock_exclusive()
+        .one(executor)
+        .await?
+    else {
+        return Ok(None);
+    };
+    if token.user_id != principal.user_id {
+        return Ok(None);
+    }
+    let user = match token.user_id.as_deref() {
+        Some(id) => match locked_users.iter().find(|u| u.id == id) {
+            Some(user) if user.auth_version == token.user_auth_version => Some(user),
+            _ => return Ok(None),
+        },
+        None => None,
+    };
+    Ok(Some(TokenRow {
+        token_id: token.id,
+        tenant_id: token.tenant_id,
+        user_id: token.user_id,
+        scopes: token.scopes,
+        expires_at: token.expires_at,
+        revoked_at: token.revoked_at,
+        user_role: user.map(|u| u.role.clone()),
+        auth_method: token.auth_method,
+        user_oidc_issuer: user.and_then(|u| u.oidc_issuer.clone()),
+    }))
 }
 
 /// API トークン行を作成する。`scopes` は文字列配列で渡す（CHECK 制約に合致させる）。
@@ -281,7 +318,16 @@ pub async fn create_token(
     scopes: &[String],
     name: Option<&str>,
     expires_at: DateTime<Utc>,
+    auth_method: TokenAuthMethod,
 ) -> Result<(), DbErr> {
+    let user_auth_version = if let Some(user_id) = user_id {
+        lock_user(executor, tenant_id, user_id)
+            .await?
+            .ok_or_else(|| DbErr::Custom("token owner is not active".into()))?
+            .auth_version
+    } else {
+        0
+    };
     api_tokens::Entity::insert(api_tokens::ActiveModel {
         id: Set(token_id.into()),
         tenant_id: Set(tenant_id.into()),
@@ -290,6 +336,8 @@ pub async fn create_token(
         scopes: Set(scopes.to_vec()),
         name: Set(name.map(str::to_owned)),
         expires_at: Set(expires_at),
+        user_auth_version: Set(user_auth_version),
+        auth_method: Set(auth_method.as_str().into()),
         ..Default::default()
     })
     .exec(executor)
@@ -328,4 +376,138 @@ pub async fn token_exists(
         .count(executor)
         .await?
         > 0)
+}
+
+/// Call inside the caller's tenant transaction. Serializes issuance with revocation.
+pub async fn lock_user(
+    executor: &impl ConnectionTrait,
+    tenant_id: &str,
+    user_id: &str,
+) -> Result<Option<users::Model>, DbErr> {
+    users::Entity::find_by_id(user_id)
+        .filter(users::Column::TenantId.eq(tenant_id))
+        .filter(users::Column::DeletedAt.is_null())
+        .lock_exclusive()
+        .one(executor)
+        .await
+}
+
+pub async fn find_oidc_user(
+    executor: &impl ConnectionTrait,
+    tenant_id: &str,
+    issuer: &str,
+    subject: &str,
+) -> Result<Option<users::Model>, DbErr> {
+    users::Entity::find()
+        .filter(users::Column::TenantId.eq(tenant_id))
+        .filter(users::Column::OidcIssuer.eq(issuer))
+        .filter(users::Column::OidcSubject.eq(subject))
+        .filter(users::Column::DeletedAt.is_null())
+        .one(executor)
+        .await
+}
+
+pub async fn bind_oidc_user(
+    executor: &impl ConnectionTrait,
+    tenant: &str,
+    user: &str,
+    issuer: &str,
+    subject: &str,
+) -> Result<(), DbErr> {
+    users::Entity::update_many()
+        .col_expr(users::Column::OidcIssuer, Expr::value(issuer))
+        .col_expr(users::Column::OidcSubject, Expr::value(subject))
+        .col_expr(
+            users::Column::AuthVersion,
+            Expr::col(users::Column::AuthVersion).add(1),
+        )
+        .filter(users::Column::TenantId.eq(tenant))
+        .filter(users::Column::Id.eq(user))
+        .exec(executor)
+        .await?;
+    Ok(())
+}
+
+pub async fn revoke_user_tokens(
+    executor: &impl ConnectionTrait,
+    tenant: &str,
+    user: &str,
+    disable: bool,
+) -> Result<(), DbErr> {
+    let mut update = users::Entity::update_many()
+        .col_expr(
+            users::Column::AuthVersion,
+            Expr::col(users::Column::AuthVersion).add(1),
+        )
+        .filter(users::Column::TenantId.eq(tenant))
+        .filter(users::Column::Id.eq(user));
+    if disable {
+        update = update.col_expr(users::Column::DeletedAt, now());
+    }
+    update.exec(executor).await?;
+    // Keep explicit revocation timestamps for operators and audit tooling as well.
+    api_tokens::Entity::update_many()
+        .col_expr(api_tokens::Column::RevokedAt, now())
+        .filter(api_tokens::Column::TenantId.eq(tenant))
+        .filter(api_tokens::Column::UserId.eq(user))
+        .filter(api_tokens::Column::RevokedAt.is_null())
+        .exec(executor)
+        .await?;
+    Ok(())
+}
+
+pub async fn list_users(
+    executor: &impl ConnectionTrait,
+    tenant: &str,
+) -> Result<Vec<(String, String, String, Option<String>)>, DbErr> {
+    users::Entity::find()
+        .select_only()
+        .columns([
+            users::Column::Id,
+            users::Column::Email,
+            users::Column::Role,
+            users::Column::OidcSubject,
+        ])
+        .filter(users::Column::TenantId.eq(tenant))
+        .filter(users::Column::DeletedAt.is_null())
+        .order_by_asc(users::Column::Email)
+        .into_tuple()
+        .all(executor)
+        .await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn row(user: Option<&str>, role: Option<&str>) -> TokenRow {
+        TokenRow {
+            token_id: "token".into(),
+            tenant_id: "tenant".into(),
+            user_id: user.map(str::to_owned),
+            user_role: role.map(str::to_owned),
+            scopes: vec!["read".into(), "admin".into()],
+            expires_at: Utc::now() + chrono::Duration::hours(1),
+            revoked_at: None,
+            auth_method: "api".into(),
+            user_oidc_issuer: None,
+        }
+    }
+
+    #[test]
+    fn deleted_or_missing_user_never_becomes_service_admin() {
+        assert!(row(Some("deleted"), None).into_principal().is_none());
+        assert!(row(Some("user"), Some("unknown"))
+            .into_principal()
+            .is_none());
+        assert!(row(None, Some("admin")).into_principal().is_none());
+        assert_eq!(row(None, None).into_principal().unwrap().role, Role::Admin);
+    }
+
+    #[test]
+    fn role_downgrade_removes_stale_admin_scope() {
+        let principal = row(Some("user"), Some("member")).into_principal().unwrap();
+        assert!(!principal.has_scope(Scope::Admin));
+        assert!(principal.has_scope(Scope::Read));
+    }
 }

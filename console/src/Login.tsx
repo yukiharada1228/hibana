@@ -1,5 +1,6 @@
-import { useState, type FormEvent } from "react";
-import { Api, errorMessage } from "./api";
+import { useEffect, useState, type FormEvent } from "react";
+import { Api, errorMessage, type LoginOptions } from "./api";
+import { beginOidc, completeOidc } from "./oidc";
 import type { Session } from "./types";
 import { Button } from "./components/ui/button";
 import { Input } from "./components/ui/input";
@@ -12,28 +13,63 @@ export function Login({
   message: string;
   onLogin: (api: Api, session: Session, expires: string, email: string) => void;
 }) {
-  const [busy, setBusy] = useState(false),
+  const [busy, setBusy] = useState(true),
     [error, setError] = useState("");
+  const [options, setOptions] = useState<LoginOptions | null>(null);
   const secure =
     location.protocol === "https:" ||
     ["localhost", "127.0.0.1", "[::1]"].includes(location.hostname);
+  useEffect(() => {
+    if (!secure) return;
+    let active = true;
+    let adopted = false;
+    const api = new Api();
+    const completion =
+      completeOidc() ??
+      api.restoreSession().then((result) => (result ? { api, ...result } : null));
+    completion
+      .then((result) => {
+        if (active && result) {
+          adopted = result.api === api;
+          onLogin(
+            result.api,
+            result.session,
+            result.expires,
+            result.session.email || "ログイン中",
+          );
+        }
+      })
+      .catch((error) => {
+        if (active) setError(errorMessage(error));
+      })
+      .finally(() => {
+        if (active) setBusy(false);
+      });
+    api
+      .loginOptions()
+      .then((options) => {
+        if (active) {
+          setOptions(options);
+        }
+      })
+      .catch((error) => {
+        if (active) setError(errorMessage(error));
+      });
+    return () => {
+      active = false;
+      if (!adopted) api.close();
+    };
+  }, []);
   async function submit(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
-    if (!secure || busy) return;
+    if (!secure || busy || !options) return;
     setBusy(true);
     setError("");
     const form = event.currentTarget,
       fields = new FormData(form),
       api = new Api();
     try {
-      const email = String(fields.get("email")).trim();
-      const { session, expires } = await api.login(
-        String(fields.get("tenant")).trim(),
-        email,
-        String(fields.get("password")),
-      );
-      form.reset();
-      onLogin(api, session, expires, email);
+      await beginOidc(api, String(fields.get("tenant")).trim(), options);
     } catch (error) {
       api.close();
       setError(errorMessage(error));
@@ -48,7 +84,7 @@ export function Login({
           <Brand />
           <h1>コンソールにログイン</h1>
           <p className="muted">
-            管理者から受け取ったアカウントを入力してください。
+            テナントを入力し、組織のアカウントでログインしてください。
           </p>
           <div className="connection">
             接続先 <strong>{location.host}</strong>
@@ -66,24 +102,8 @@ export function Login({
             required
             maxLength={63}
           />
-          <label htmlFor="email">メールアドレス</label>
-          <Input
-            id="email"
-            name="email"
-            type="email"
-            autoComplete="username"
-            required
-          />
-          <label htmlFor="password">パスワード</label>
-          <Input
-            id="password"
-            name="password"
-            type="password"
-            autoComplete="current-password"
-            required
-          />
-          <Button type="submit" disabled={busy || !secure}>
-            {busy ? "接続中…" : "ログイン"}
+          <Button type="submit" disabled={busy || !secure || !options}>
+            {busy ? "接続中…" : "組織のアカウントでログイン"}
           </Button>
           <p className="muted small">
             アカウントの発行は基盤の管理者へお問い合わせください。

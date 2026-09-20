@@ -83,7 +83,7 @@ pub async fn assert_runtime_role(db: &impl ConnectionTrait) -> Result<(), DbErr>
     Ok(())
 }
 
-/// Require the schema used by this version, including additive ORM migrations.
+/// Require the schema used by this version.
 /// This check is read-only, including when automatic migrations are disabled.
 pub async fn assert_runtime_schema(db: &impl ConnectionTrait) -> Result<(), DbErr> {
     let version = db
@@ -91,7 +91,7 @@ pub async fn assert_runtime_schema(db: &impl ConnectionTrait) -> Result<(), DbEr
             &Query::select()
                 .column("version")
                 .from(("public", "seaql_migrations"))
-                .and_where(Expr::col("version").eq("m20260918_000006_secret_key_retention"))
+                .and_where(Expr::col("version").eq("m20260920_000008_oidc_only"))
                 .to_owned(),
         )
         .await;

@@ -11,6 +11,51 @@ from urllib.parse import urlsplit
 from common import MIGRATION_JOB, environment_values, management_api_prefixes, secret_values, volume_references
 
 
+OIDC_REQUIRED = ("OIDC_ISSUER_URL", "OIDC_CLIENT_ID", "OIDC_CLIENT_SECRET", "OIDC_CALLBACK_URL", "OIDC_CONSOLE_URL")
+
+
+def oidc_setting_errors(env, *, development=False):
+    """Validate without changing values or including credentials in diagnostics."""
+    errors = []
+    # Match the runtime's treatment of empty optional environment settings.
+    def value(key, default=None):
+        raw = env.get(key)
+        return default if raw is None or isinstance(raw, str) and not raw.strip() else raw
+
+    for key in OIDC_REQUIRED:
+        if not isinstance(value(key), str):
+            errors.append(f"Missing or invalid OIDC setting {key}")
+    if value("AUTH_MODE") is not None:
+        errors.append("AUTH_MODE was removed; unset it and configure OIDC")
+    insecure = value("OIDC_ALLOW_INSECURE_HTTP", "false")
+    if insecure not in ("true", "false"):
+        errors.append("OIDC_ALLOW_INSECURE_HTTP must be true or false")
+    for key in ("OIDC_ISSUER_URL", "OIDC_CALLBACK_URL", "OIDC_CONSOLE_URL"):
+        raw = value(key)
+        if not isinstance(raw, str):
+            continue
+        try:
+            uri = urlsplit(raw)
+            loopback = (development and insecure == "true" and uri.scheme == "http"
+                        and uri.hostname in ("localhost", "127.0.0.1", "::1"))
+            if (not (uri.scheme == "https" or loopback) or not uri.hostname
+                    or uri.username is not None or uri.password is not None
+                    or "?" in raw or "#" in raw or "\\" in raw
+                    or any(char.isspace() or ord(char) < 32 or ord(char) == 127 for char in raw)
+                    or uri.port is not None and not 0 < uri.port <= 65535):
+                raise ValueError("invalid URL")
+        except ValueError:
+            suffix = " (explicit development mode permits loopback HTTP)" if development else ""
+            errors.append(f"{key} must be an HTTPS URL without credentials, query or fragment{suffix}")
+    ttl = value("OIDC_SESSION_TTL_SECS", "900")
+    try:
+        if not isinstance(ttl, str) or not re.fullmatch(r"\+?[0-9]+", ttl) or not 60 <= int(ttl) <= 3600:
+            raise ValueError("invalid TTL")
+    except ValueError:
+        errors.append("OIDC_SESSION_TTL_SECS must be 60..3600")
+    return errors
+
+
 RESOURCES = {
     "Namespace": "namespaces", "ConfigMap": "configmaps", "Secret": "secrets",
     "ServiceAccount": "serviceaccounts", "Service": "services", "Deployment": "deployments.apps",
@@ -171,6 +216,7 @@ class Preflight:
                 keys = list(required["hibana-migration"] if name == "migrate" else required["hibana-runtime"])
                 if name == "control-plane":
                     keys += required["hibana-control-plane"] + ["S3_ENDPOINT", "S3_BUCKET"]
+                    errors.extend(oidc_setting_errors(env))
                     if not env.get("INGRESS_BASE_DOMAIN"):
                         keys.append("APP_PUBLIC_ORIGIN")
                     if behind_proxy:

@@ -17,6 +17,7 @@ import subprocess
 import sys
 import time
 from urllib.request import urlopen
+from unittest.mock import patch
 
 import yaml
 
@@ -24,6 +25,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path[:0] = [str(ROOT / "scripts"), str(ROOT / "sdk/platform")]
 from kubernetes import LocalCluster, LOCAL
 from k8s_resilience import Operations
+from preflight import OIDC_REQUIRED
 
 RUN_FOLDER = None
 
@@ -63,6 +65,56 @@ def command(*args, timeout=60, input=None):
 
 def write_yaml(path, value):
     path.write_text(yaml.safe_dump(value, sort_keys=False))
+
+
+def fixture_credentials(cluster):
+    # This suite checks installation/dependency access; OIDC login has its own
+    # real-provider suite. Never inherit an operator's identity-provider secrets.
+    with patch.dict(os.environ, {
+        "OIDC_ISSUER_URL": "https://fixture-idp.invalid",
+        "OIDC_CLIENT_ID": "hibana-fixture",
+        "OIDC_CLIENT_SECRET": "fixture-only",
+        "OIDC_CALLBACK_URL": "https://console.invalid/api/auth/oidc/callback",
+        "OIDC_CONSOLE_URL": "https://console.invalid/",
+    }, clear=True):
+        return cluster.credentials()["items"]
+
+
+def configure_fixture_site(site, credentials, dependency_namespace, database_ip):
+    for filename, secret_name in (("runtime.env", "hibana-runtime"), ("control-plane.env", "hibana-control-plane"), ("migration.env", "hibana-migration")):
+        values = next(d["stringData"] for d in credentials if d["metadata"]["name"] == secret_name)
+        content = "".join(f"{key}={value}\n" for key, value in values.items())
+        for dependency in ("postgres", "redis"):
+            content = content.replace("@hibana-" + dependency + ":", "@hibana-" + dependency + "." + dependency_namespace + ".svc:")
+        content = content.replace("@hibana-postgres." + dependency_namespace + ".svc:", "@" + database_ip + ":")
+        (site / filename).write_text(content)
+    configmap = yaml.safe_load((site / "site.yaml").read_text())
+    control = next(d["stringData"] for d in credentials if d["metadata"]["name"] == "hibana-control-plane")
+    configmap["data"].update({key: control[key] for key in OIDC_REQUIRED if key != "OIDC_CLIENT_SECRET"})
+    configmap["data"].update(S3_ENDPOINT=f"http://hibana-minio.{dependency_namespace}.svc:9000",
+                             S3_BUCKET="hibana-components", APP_PUBLIC_ORIGIN="http://localhost:18084", TRUSTED_PROXY_CIDRS="")
+    write_yaml(site / "site.yaml", configmap)
+    kustomization = yaml.safe_load((site / "kustomization.yaml").read_text())
+    # This fixture has no Ingress/TLS or console image. Its API is port-forwarded.
+    for resource in ("ingress.yaml", "console"):
+        kustomization["resources"].remove(resource)
+    kustomization["resources"].append("regressions.yaml")
+    kustomization["patches"].append({"path": "runtime-check.yaml"})
+    write_yaml(site / "kustomization.yaml", kustomization)
+    policies = list(yaml.safe_load_all((site / "egress.yaml").read_text()))
+    egress = next(p for p in policies if p["metadata"]["name"] == "hibana-site-dependencies")
+    egress["spec"]["egress"] = [{"to": [{"namespaceSelector": {"matchLabels": {"kubernetes.io/metadata.name": dependency_namespace}}}],
+                                 "ports": [{"protocol": "TCP", "port": port} for port in (6379, 9000)]},
+                                 {"to": [{"ipBlock": {"cidr": database_ip + "/32"}}], "ports": [{"protocol": "TCP", "port": 5432}]}]
+    # Keep the provider policy as a separate document without granting access to
+    # an external IdP. Every dependency-network mutation must retain this policy.
+    next(p for p in policies if p["metadata"]["name"] == "hibana-site-identity-provider")["spec"]["egress"] = []
+    save_fixture_egress(site, policies)
+    return policies, egress
+
+
+def save_fixture_egress(site, policies):
+    (site / "egress.yaml").write_text(yaml.safe_dump_all(policies, sort_keys=False))
 
 
 def main():
@@ -179,7 +231,7 @@ def main():
         # Dependencies precede the platform and live outside the Hibana namespace.
         dependency_namespace = "hibana-install-dependencies"
         kube("create", "namespace", dependency_namespace)
-        credentials = cluster.credentials()["items"]
+        credentials = fixture_credentials(cluster)
         dependency_secret = deepcopy(next(d for d in credentials if d["metadata"]["name"] == "hibana-local-dependencies"))
         dependency_secret["metadata"]["namespace"] = dependency_namespace
         for doc in dependencies:
@@ -215,26 +267,7 @@ def main():
 
         command("node", ROOT / "sdk/scripts/pack.mjs")
         command("node", ROOT / "sdk/src/cli.mjs", "platform", "init", site)
-        for filename, secret_name in (("runtime.env", "hibana-runtime"), ("control-plane.env", "hibana-control-plane"), ("migration.env", "hibana-migration")):
-            values = next(d["stringData"] for d in credentials if d["metadata"]["name"] == secret_name)
-            content = "".join(f"{key}={value}\n" for key, value in values.items())
-            for dependency in ("postgres", "redis"):
-                content = content.replace("@hibana-" + dependency + ":", "@hibana-" + dependency + "." + dependency_namespace + ".svc:")
-            content = content.replace("@hibana-postgres." + dependency_namespace + ".svc:", "@" + old_ip + ":")
-            (site / filename).write_text(content)
-        configmap = yaml.safe_load((site / "site.yaml").read_text())
-        configmap["data"].update(S3_ENDPOINT=f"http://hibana-minio.{dependency_namespace}.svc:9000", S3_BUCKET="hibana-components", APP_PUBLIC_ORIGIN="http://localhost:18084")
-        write_yaml(site / "site.yaml", configmap)
-        kustomization = yaml.safe_load((site / "kustomization.yaml").read_text())
-        kustomization["resources"].remove("ingress.yaml")  # Exercise dependency verification without an Ingress.
-        kustomization["resources"].append("regressions.yaml")
-        kustomization["patches"].append({"path": "runtime-check.yaml"})
-        write_yaml(site / "kustomization.yaml", kustomization)
-        egress = yaml.safe_load((site / "egress.yaml").read_text())
-        egress["spec"]["egress"] = [{"to": [{"namespaceSelector": {"matchLabels": {"kubernetes.io/metadata.name": dependency_namespace}}}],
-                                     "ports": [{"protocol": "TCP", "port": port} for port in (6379, 9000)]},
-                                     {"to": [{"ipBlock": {"cidr": old_ip + "/32"}}], "ports": [{"protocol": "TCP", "port": 5432}]}]
-        write_yaml(site / "egress.yaml", egress)
+        policies, egress = configure_fixture_site(site, credentials, dependency_namespace, old_ip)
 
         binary = b"\x00\xff\xfe"
         secret = {"apiVersion": "v1", "kind": "Secret", "metadata": {"name": "hibana-test-keystore"},
@@ -310,6 +343,7 @@ def main():
         preview = install("03-existing-preview", preview=True)
         assert "unchanged Job/hibana-setup" in preview and "recreate  Job/hibana-migrate" in preview
         assert get("job", "hibana-migrate")["metadata"]["uid"] == migration_uid
+        configmap = yaml.safe_load((site / "site.yaml").read_text())
         configmap["data"]["RUST_LOG"] = "warn"
         write_yaml(site / "site.yaml", configmap)
         install("04-update")
@@ -345,7 +379,7 @@ def main():
                 path = site / filename
                 path.write_text(path.read_text().replace("@" + before + ":", "@" + after + ":"))
             egress["spec"]["egress"][-1]["to"][0]["ipBlock"]["cidr"] = after + "/32"
-            write_yaml(site / "egress.yaml", egress)
+            save_fixture_egress(site, policies)
 
         migration_path = site / "migration/job.yaml"
         original_migration = migration_path.read_text()
@@ -387,7 +421,7 @@ def main():
         good_selector = deepcopy(egress["spec"]["podSelector"])
         egress["spec"]["podSelector"].setdefault("matchExpressions", []).append({
             "key": "app.kubernetes.io/name", "operator": "NotIn", "values": ["hibana-worker"]})
-        write_yaml(site / "egress.yaml", egress)
+        save_fixture_egress(site, policies)
         install("04c-final-policy-blocks-worker", failure="Stopped during: dependency verification")
         assert state()["status"] == "failed" and state()["phase"] == "dependency verification"
         assert temporary_policies() == []
@@ -396,7 +430,7 @@ def main():
                 assert response.status == 200 and json.load(response) == {"db": "ok", "store": "ok"}
         report["checks"].append("healthy-control-plane-does-not-mask-worker-egress-failure")
         egress["spec"]["podSelector"] = good_selector
-        write_yaml(site / "egress.yaml", egress)
+        save_fixture_egress(site, policies)
         install("04d-repair-final-policy")
         assert state()["status"] == "complete" and temporary_policies() == []
 

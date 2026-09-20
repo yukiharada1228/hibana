@@ -1,3 +1,4 @@
+import { issueFixtureToken } from "./test-api-credentials.mjs";
 // Real API/ORM regression; only run by test-http.sh in its disposable database.
 import assert from "node:assert/strict";
 
@@ -47,15 +48,11 @@ export async function testApplicationEgress({
 
   const restricted = [];
   for (const scopes of [["read"], ["read", "deploy"]]) {
-    const login = await api("/auth/login", {
-      method: "POST",
-      body: {
+    const login = await issueFixtureToken(sql, {
         tenant_slug: "upload",
         email: "test@example.invalid",
-        password: "test-password",
         scopes,
-      },
-    });
+      });
     assert.equal(login.status, 201);
     const { token: limited } = await login.json();
     restricted.push(limited);
@@ -173,21 +170,17 @@ export async function testApplicationEgress({
           slug: "egress-other",
           name: "Other",
           admin_email: "other@example.invalid",
-          admin_password: "test-password",
+          admin_oidc_subject: 'fixture-admin',
         },
       })
     ).status,
     201,
   );
   const other = await (
-    await api("/auth/login", {
-      method: "POST",
-      body: {
+    await issueFixtureToken(sql, {
         tenant_slug: "egress-other",
         email: "other@example.invalid",
-        password: "test-password",
-      },
-    })
+        })
   ).json();
   assert.equal(
     (await api(`${base}/egress`, { token: other.token })).status,

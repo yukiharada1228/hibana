@@ -13,6 +13,7 @@ RUN npm run build
 FROM ${NGINX_IMAGE}
 COPY --from=build /app/dist /usr/share/nginx/html
 COPY nginx.conf /etc/nginx/nginx.conf
+COPY api-proxy.conf /etc/nginx/hibana-api-proxy.conf
 COPY default.conf.template /etc/nginx/templates/default.conf.template
 COPY --chmod=755 prepare-config.sh /docker-entrypoint.d/05-hibana-config.sh
 ENV HIBANA_API_UPSTREAM=http://hibana-api:8080 NGINX_ENVSUBST_OUTPUT_DIR=/tmp/conf.d NGINX_ENVSUBST_FILTER=HIBANA_API_UPSTREAM

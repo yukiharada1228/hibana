@@ -29,6 +29,10 @@ jobs:
       - run: npm run build --prefix console
       - run: npx --prefix console playwright install --with-deps chromium
       - run: npm test --prefix console
+      - name: Console proxy and authentication log privacy
+        run: |
+          node scripts/test-console-dev-proxy.mjs
+          node scripts/test-console-proxy.mjs
       - uses: docker/setup-buildx-action@v3
       - uses: docker/build-push-action@v6
         with:
@@ -42,6 +46,9 @@ jobs:
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
       - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
@@ -53,8 +60,10 @@ jobs:
           python -m pip install PyYAML==6.0.3
           python scripts/check-kubernetes.py
           python sdk/platform/test_kubernetes.py
+          python scripts/test_platform_install_fixture.py
           python scripts/test_resilience.py
           python scripts/acceptance/test_results.py
+          node --test scripts/acceptance/credentials.test.mjs
       - uses: docker/setup-buildx-action@v3
       - name: Build Linux runtime image
         uses: docker/build-push-action@v6
@@ -113,6 +122,11 @@ jobs:
       - name: clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
 
+      - name: OIDC and optional SAML broker interoperability
+        env:
+          HIBANA_TEST_SAML: "1"
+        run: bash scripts/test-oidc.sh
+
       - name: rustfmt
         run: cargo fmt --all -- --check
 
@@ -134,6 +148,11 @@ jobs:
       JOB_SIGNING_KID: k1
       SECRETS_MASTER_KEY: "0011223344556677889900112233445566778899001122334455667788990011"
       SECRETS_MASTER_KID: k1
+      OIDC_ISSUER_URL: https://fixture-idp.invalid
+      OIDC_CLIENT_ID: hibana
+      OIDC_CLIENT_SECRET: fixture-only
+      OIDC_CALLBACK_URL: https://console.invalid/api/auth/oidc/callback
+      OIDC_CONSOLE_URL: https://console.invalid/
       BOOTSTRAP_ADMIN_TOKEN: dev-bootstrap-admin-token
       CONTROL_PLANE_INTERNAL_URL: http://localhost:8081
       APP_BIND_ADDR: "0.0.0.0:8083"
@@ -149,8 +168,6 @@ jobs:
       HIBANA_URL: http://localhost:8080
       GATEWAY: http://localhost:8083
       HIBANA_TENANT: smoke
-      HIBANA_EMAIL: admin@example.com
-      HIBANA_PASSWORD: dev-password
       HIBANA_INGRESS_DOMAIN: hibana.local
       REQ_TIMEOUT: "25"
       READY_TRIES: "15"
@@ -218,9 +235,10 @@ jobs:
           code=$(curl -sS -o boot.json -w '%{http_code}' -X POST http://localhost:8080/admin/tenants \
             -H "Authorization: Bearer $BOOTSTRAP_ADMIN_TOKEN" \
             -H "Content-Type: application/json" \
-            -d '{"slug":"smoke","name":"Smoke Tenant","admin_email":"admin@example.com","admin_password":"dev-password"}')
+            -d '{"slug":"smoke","name":"Smoke Tenant","admin_email":"admin@example.com","admin_oidc_subject":"fixture-smoke-admin"}')
           echo "[$code] $(cat boot.json)"
           test "$code" = "201"
+          node scripts/seed-smoke-credentials.mjs
 
       - name: Install SDK deps
         working-directory: sdk

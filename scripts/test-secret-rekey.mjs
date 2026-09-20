@@ -1,3 +1,4 @@
+import { issueFixtureToken } from "./test-api-credentials.mjs";
 // Deterministic real-DB races between KEK rewrapping and other Secret mutations.
 import assert from 'node:assert/strict';
 import {createHash} from 'node:crypto';
@@ -15,11 +16,11 @@ export async function testSecretRekey({api, sql, pg, restart}) {
   for (const [index, scenario] of scenarios.entries()) {
     const slug = `rekey-${index}`;
     const tenantResponse = await api('/admin/tenants', {method:'POST',token:'test-only',body:{
-      slug,name:'Rekey regression',admin_email:'test@example.invalid',admin_password:'test-password',
+      slug,name:'Rekey regression',admin_email:'test@example.invalid',admin_oidc_subject: 'fixture-admin',
     }});
     assert.equal(tenantResponse.status,201);
     const {tenant_id:tenant,admin_user_id:user} = await tenantResponse.json();
-    const login = await api('/auth/login', {method:'POST',body:{tenant_slug:slug,email:'test@example.invalid',password:'test-password'}});
+    const login = await issueFixtureToken(sql, {tenant_slug:slug,email:'test@example.invalid',});
     assert.equal(login.status,201);
     const {token} = await login.json();
     let rekeyToken = token, actor = user;
@@ -27,8 +28,8 @@ export async function testSecretRekey({api, sql, pg, restart}) {
       rekeyToken = `disposable-rekey-service-${index}`;
       actor = `tok_rekey_audit_${index}`;
       const hash = createHash('sha256').update(rekeyToken).digest('hex');
-      await sql(`INSERT INTO api_tokens(id,tenant_id,user_id,token_hash,scopes,expires_at) VALUES
-        ('${actor}','${tenant}',NULL,'${hash}',ARRAY['admin'],now()+interval '10 minutes')`);
+      await sql(`INSERT INTO api_tokens(id,tenant_id,user_id,token_hash,scopes,expires_at,auth_method,user_auth_version) VALUES
+        ('${actor}','${tenant}',NULL,'${hash}',ARRAY['admin'],now()+interval '10 minutes','api',0)`);
     }
     const created = await api('/components', {token,method:'POST',body:{name:'rekey'}});
     assert.equal(created.status,201);

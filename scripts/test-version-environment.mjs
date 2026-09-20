@@ -6,7 +6,7 @@ export async function testVersionEnvironment(h) {
   const {api, sql, token, id, wasm, upload, app, holdStorage, releaseStorage, url, root, artifact} = h;
   const base = `/components/${id}`;
   const tenant = (await sql(`SELECT tenant_id FROM components WHERE id='${id}'`)).trim();
-  const user = await (await api(`/tenants/${tenant}/users`, {token, method:'POST', body:{email:'deploy@example.invalid',password:'test-password',role:'member'}})).json();
+  const user = await (await api(`/tenants/${tenant}/users`, {token, method:'POST', body:{email:'deploy@example.invalid',oidc_subject:'fixture-deployer',role:'member'}})).json();
   const minted = await api('/tokens', {token,method:'POST',body:{user_id:user.user_id,scopes:['read','deploy']}});
   assert.equal(minted.status,201);
   const limited = (await minted.json()).token;

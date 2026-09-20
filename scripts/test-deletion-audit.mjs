@@ -47,7 +47,7 @@ export async function testDeletionAudit({api, sql, token, wasm, upload}) {
   const serviceId = await create('deletion-audit-service');
   const serviceToken = 'disposable-deletion-audit-service';
   const serviceHash = createHash('sha256').update(serviceToken).digest('hex');
-  await sql(`INSERT INTO api_tokens(id,tenant_id,user_id,token_hash,scopes,expires_at) VALUES ('tok_deletion_audit','${identity.tenant}',NULL,'${serviceHash}',ARRAY['read','admin'],now()+interval '10 minutes')`);
+  await sql(`INSERT INTO api_tokens(id,tenant_id,user_id,token_hash,scopes,expires_at,auth_method,user_auth_version) VALUES ('tok_deletion_audit','${identity.tenant}',NULL,'${serviceHash}',ARRAY['read','admin'],now()+interval '10 minutes','api',0)`);
   assert.equal((await api(`/components/${serviceId}`,{token:serviceToken,method:'DELETE'})).status,204);
   assert.equal((await audits('component_deleted',serviceId))[0].actor,'tok_deletion_audit');
   console.log('PASS deletion audit attribution for users, service tokens and bootstrap; denied/repeated deletion has no success audit; audit failure rolls back deletion');

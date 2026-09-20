@@ -1,14 +1,15 @@
+import { issueFixtureToken } from "./test-api-credentials.mjs";
 // Real HTTP/DB regression, run only by test-http.sh in its disposable database.
 import assert from 'node:assert/strict';
 import {createHash, generateKeyPairSync} from 'node:crypto';
 
 export async function testManagementAudit({api, sql, wasm, upload}) {
   const created = await api('/admin/tenants', {method:'POST',token:'test-only',body:{
-    slug:'management-audit',name:'Management audit',admin_email:'test@example.invalid',admin_password:'test-password',
+    slug:'management-audit',name:'Management audit',admin_email:'test@example.invalid',admin_oidc_subject: 'fixture-admin',
   }});
   assert.equal(created.status,201);
   const {tenant_id:tenant,admin_user_id:user} = await created.json();
-  const login = await api('/auth/login', {method:'POST',body:{tenant_slug:'management-audit',email:'test@example.invalid',password:'test-password'}});
+  const login = await issueFixtureToken(sql, {tenant_slug:'management-audit',email:'test@example.invalid',});
   assert.equal(login.status,201);
   const {token:userToken} = await login.json();
   const snapshot = async () => JSON.parse((await sql(`SELECT json_build_object('status',status,'quotas',quotas) FROM tenants WHERE id='${tenant}'`)).trim());
@@ -46,8 +47,8 @@ export async function testManagementAudit({api, sql, wasm, upload}) {
 
   const serviceToken = 'disposable-management-audit-service', serviceId = 'tok_management_audit';
   const hash = createHash('sha256').update(serviceToken).digest('hex');
-  await sql(`INSERT INTO api_tokens(id,tenant_id,user_id,token_hash,scopes,expires_at) VALUES
-    ('${serviceId}','${tenant}',NULL,'${hash}',ARRAY['read','admin','deploy'],now()+interval '10 minutes')`);
+  await sql(`INSERT INTO api_tokens(id,tenant_id,user_id,token_hash,scopes,expires_at,auth_method,user_auth_version) VALUES
+    ('${serviceId}','${tenant}',NULL,'${hash}',ARRAY['read','admin','deploy'],now()+interval '10 minutes','api',0)`);
   for (const [kind,token,actor] of [['user',userToken,user],['service',serviceToken,serviceId]]) {
     // Check exact attribution for each operation, including actions with NULL targets.
     const audited = async (action,target,operation,status=200) => {

@@ -45,10 +45,12 @@ class FakeCluster(ExistingCluster):
         (root / "migration").mkdir()
         super().__init__(root / "config", "test", root, "registry.test/hibana:v1")
         self.docs = [resource("Namespace", "hibana"), resource("ConfigMap", "hibana-config", data={
-            "S3_ENDPOINT": "https://objects.test", "S3_BUCKET": "bucket", "APP_PUBLIC_ORIGIN": "https://apps.test"}),
+            "S3_ENDPOINT": "https://objects.test", "S3_BUCKET": "bucket", "APP_PUBLIC_ORIGIN": "https://apps.test",
+            "OIDC_ISSUER_URL": "https://sso.test/realms/team", "OIDC_CLIENT_ID": "hibana",
+            "OIDC_CALLBACK_URL": "https://console.test/api/auth/oidc/callback", "OIDC_CONSOLE_URL": "https://console.test/"}),
             resource("Secret", "hibana-runtime", stringData={"DATABASE_URL": "postgres://private-credential@db/hibana"}),
             resource("Secret", "hibana-control-plane", stringData={key: "private-credential" for key in
-                ["REDIS_URL", "S3_ACCESS_KEY", "S3_SECRET_KEY", "BOOTSTRAP_ADMIN_TOKEN", "JOB_SIGNING_KEY", "SECRETS_MASTER_KEY"]}),
+                ["REDIS_URL", "S3_ACCESS_KEY", "S3_SECRET_KEY", "BOOTSTRAP_ADMIN_TOKEN", "JOB_SIGNING_KEY", "SECRETS_MASTER_KEY", "OIDC_CLIENT_SECRET"]}),
             resource("Secret", "hibana-migration", stringData={"MIGRATION_DATABASE_URL": "postgres://private-admin@db/hibana"})]
         self.docs[3]["stringData"]["REDIS_URL"] = "redis://private-credential@redis:6379"
         for name in ("control-plane", "worker"):
@@ -157,6 +159,47 @@ class ClusterFixture(unittest.TestCase):
 
 
 class PreflightTests(ClusterFixture):
+    def test_oidc_configuration_is_required_by_default(self):
+        settings = self.cluster.docs[1]["data"]
+        issuer = settings.pop("OIDC_ISSUER_URL")
+        with self.assertRaisesRegex(ValueError, "OIDC_ISSUER_URL"):
+            Preflight(self.cluster).settings(self.cluster.docs)
+        settings["OIDC_ISSUER_URL"] = issuer
+        secret = self.cluster.docs[3]["stringData"].pop("OIDC_CLIENT_SECRET")
+        with self.assertRaisesRegex(ValueError, "OIDC_CLIENT_SECRET"):
+            Preflight(self.cluster).settings(self.cluster.docs)
+        self.cluster.docs[3]["stringData"]["OIDC_CLIENT_SECRET"] = secret
+        Preflight(self.cluster).settings(self.cluster.docs)
+        for mode in ["oidc", "password", "migration", "typo"]:
+            settings["AUTH_MODE"] = mode
+            with self.assertRaisesRegex(ValueError, "AUTH_MODE was removed"):
+                Preflight(self.cluster).settings(self.cluster.docs)
+        self.assert_read_only()
+
+    def test_oidc_rejects_unsafe_urls_and_session_lifetimes(self):
+        settings = self.cluster.docs[1]["data"]
+        settings.update(OIDC_ISSUER_URL="https://sso.test/realms/team", OIDC_CLIENT_ID="hibana",
+                        OIDC_CALLBACK_URL="https://console.test/api/auth/oidc/callback", OIDC_CONSOLE_URL="https://console.test/")
+        self.cluster.docs[3]["stringData"]["OIDC_CLIENT_SECRET"] = "fixture-secret"
+        for key, bad in [("OIDC_ISSUER_URL", "http://sso.test/realm"),
+                         ("OIDC_ISSUER_URL", "https://sso.test:bad/realm"),
+                         ("OIDC_CALLBACK_URL", "https://console.test/callback?next=evil"),
+                         ("OIDC_CALLBACK_URL", "https://console.test/callback?"),
+                         ("OIDC_CONSOLE_URL", "https://secret@console.test/"),
+                         ("OIDC_ALLOW_INSECURE_HTTP", "yes"),
+                         ("OIDC_SESSION_TTL_SECS", "3_600"),
+                         ("OIDC_SESSION_TTL_SECS", "86400"), ("OIDC_SESSION_TTL_SECS", "oops")]:
+            with self.subTest(key=key, value=bad):
+                before = settings.get(key)
+                settings[key] = bad
+                with self.assertRaisesRegex(ValueError, key):
+                    Preflight(self.cluster).settings(self.cluster.docs)
+                if before is None:
+                    del settings[key]
+                else:
+                    settings[key] = before
+        self.assert_read_only()
+
     def test_api_and_console_ingresses_require_tls_for_their_hostname(self):
         self.cluster.docs[1]["data"]["TRUSTED_PROXY_CIDRS"] = "10.2.0.0/24"
         for service, host in [("hibana-api", "api.test"), ("hibana-console", "console.test")]:

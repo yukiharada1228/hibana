@@ -209,9 +209,5 @@ export async function connection(options = {}) {
       options.tenant ||
       process.env.HIBANA_TENANT ||
       (matches ? selected.tenant : undefined),
-    email:
-      options.email ||
-      process.env.HIBANA_EMAIL ||
-      (matches ? selected.email : undefined),
   };
 }

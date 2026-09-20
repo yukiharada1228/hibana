@@ -84,7 +84,7 @@ python3 scripts/check-architecture.py
 [専用kindの手順](../deploy/kubernetes/README.md)の`hibana platform install`で配備先とテスト用テナントを用意してから実行します。API・アプリはローカルのNodePort経由で接続します。
 
 ```bash
-# HIBANA_URL / HIBANA_TENANT / HIBANA_EMAIL / HIBANA_PASSWORDを設定
+# HIBANA_URL / HIBANA_TENANT / HIBANA_TOKENを設定
 # GATEWAYはアプリHTTP、HIBANA_INGRESS_DOMAINは公開ホストのベースドメイン
 node scripts/smoke.mjs
 HIBANA_TEST_DEPLOY=1 node scripts/test-components.mjs

@@ -9,15 +9,86 @@ const run = promisify(execFile);
 async function login(page: Page, email = "developer@example.internal") {
   await page.goto("/");
   await page.getByLabel("テナント", { exact: true }).fill("team");
-  await page.getByLabel("メールアドレス").fill(email);
-  await page.getByLabel("パスワード", { exact: true }).fill("fixture-password");
-  await page.getByRole("button", { name: "ログイン", exact: true }).click();
+  await page.request.post("/api/__test/identity", { data: { email } });
+  await page.getByRole("button", { name: "組織のアカウントでログイン", exact: true }).click();
   await expect(
     page.getByRole("heading", { name: "アプリケーション", exact: true }),
   ).toBeVisible();
 }
 test.beforeEach(async ({ request }) => {
   await request.post("/api/__test/reset", { data: {} });
+});
+
+test("reload and another tab restore the session without exposing the credential", async ({ page, context }) => {
+  await login(page);
+  await page.getByRole("link", { name: "hello-api", exact: true }).click();
+  const route = page.url();
+  const cookie = (await context.cookies()).find(cookie => cookie.name === "hibana_test_session")!;
+  expect(cookie.httpOnly).toBe(true);
+  expect(cookie.sameSite).toBe("Strict");
+  const requests: string[] = [];
+  page.on("request", request => {
+    if (request.url().includes("/api/")) requests.push(JSON.stringify(request.headers()));
+  });
+  await page.reload();
+  await expect(page.getByRole("heading", { name: "hello-api", exact: true })).toBeVisible();
+  await expect(page).toHaveURL(route);
+  expect(await page.evaluate(() => [document.cookie, localStorage.length, sessionStorage.length])).toEqual(["", 0, 0]);
+  expect(requests.every(headers => !headers.includes('"authorization"'))).toBe(true);
+  expect((await context.cookies()).find(value => value.name === cookie.name)?.expires).toBe(cookie.expires);
+  const tab = await context.newPage();
+  await tab.goto("/");
+  await expect(tab.getByRole("heading", { name: "アプリケーション", exact: true })).toBeVisible();
+  await tab.getByRole("button", { name: "ログアウト", exact: true }).click();
+  await expect(tab.getByRole("heading", { name: "コンソールにログイン" })).toBeVisible();
+  expect((await context.cookies()).some(value => value.name === cookie.name)).toBe(false);
+  await page.reload();
+  await expect(page.getByRole("heading", { name: "コンソールにログイン" })).toBeVisible();
+});
+
+test("restore rejects expired sessions and preserves a session through temporary API failure", async ({ page, context, request }) => {
+  await login(page);
+  const before = await context.cookies();
+  await page.route("**/api/auth/session", route => route.fulfill({ status: 503, json: {} }));
+  await page.reload();
+  await expect(page.getByRole("alert")).toContainText("基盤が処理を受け付けられません");
+  expect(await context.cookies()).toEqual(before);
+  await page.unroute("**/api/auth/session");
+  await page.reload();
+  await expect(page.getByRole("heading", { name: "アプリケーション", exact: true })).toBeVisible();
+  await request.post("/api/__test/expire");
+  await page.reload();
+  await expect(page.getByRole("heading", { name: "コンソールにログイン" })).toBeVisible();
+  await expect(page.getByRole("link", { name: "hello-api", exact: true })).toHaveCount(0);
+});
+
+test("session restoration tolerates a workstation clock ahead of the server", async ({ page }) => {
+  await page.clock.install({ time: new Date(Date.now() + 86_400_000) });
+  await login(page);
+  await page.reload();
+  await expect(page.getByRole("heading", { name: "アプリケーション", exact: true })).toBeVisible();
+  await page.clock.fastForward(30_000);
+  await expect(page.getByRole("button", { name: "ログアウト", exact: true })).toBeVisible();
+});
+
+test("an old tab cannot log out a different session created in another tab", async ({ page, context, browser }) => {
+  await login(page);
+  const otherContext = await browser.newContext({ baseURL: new URL(page.url()).origin });
+  try {
+    const otherPage = await otherContext.newPage();
+    await login(otherPage, "reader@example.internal");
+    const cookie = (await otherContext.cookies()).find(cookie => cookie.name === "hibana_test_session")!;
+    await context.addCookies([cookie]);
+    const rejected = page.waitForResponse(response => response.url().endsWith("/api/auth/logout") && response.status() === 401);
+    await page.getByRole("button", { name: "ログアウト", exact: true }).click();
+    await rejected;
+    await expect(page.locator(".account-menu summary")).toHaveText("reader@example.internal");
+    expect((await context.cookies()).find(value => value.name === cookie.name)?.value).toBe(cookie.value);
+    await otherPage.reload();
+    await expect(otherPage.getByRole("button", { name: "ログアウト", exact: true })).toBeVisible();
+  } finally {
+    await otherContext.close();
+  }
 });
 
 for (const tab of ["バージョン", "拡張"]) {
@@ -960,11 +1031,7 @@ test("CLI guide is available while the initial application list is pending or fa
   try {
     await page.goto("/#deploy");
     await page.getByLabel("テナント", { exact: true }).fill("team");
-    await page.getByLabel("メールアドレス").fill("developer@example.internal");
-    await page
-      .getByLabel("パスワード", { exact: true })
-      .fill("fixture-password");
-    await page.getByRole("button", { name: "ログイン", exact: true }).click();
+    await page.getByRole("button", { name: "組織のアカウントでログイン", exact: true }).click();
     const guide = page.getByRole("heading", {
       name: "CLI の接続",
       exact: true,
@@ -1016,10 +1083,10 @@ test("mobile layout, empty state, command guide and failed login", async ({
   await page.setViewportSize({ width: 390, height: 844 });
   await page.goto("/");
   await page.getByLabel("テナント", { exact: true }).fill("team");
-  await page.getByLabel("メールアドレス").fill("developer@example.internal");
-  await page.getByLabel("パスワード", { exact: true }).fill("wrong");
-  await page.getByRole("button", { name: "ログイン", exact: true }).click();
+  await page.route("**/api/auth/oidc/start", route => route.fulfill({ status: 401, json: {} }));
+  await page.getByRole("button", { name: "組織のアカウントでログイン", exact: true }).click();
   await expect(page.getByRole("alert")).toBeVisible();
+  await page.unroute("**/api/auth/oidc/start");
   await login(page);
   await expect(
     page.getByRole("link", { name: "hello-api", exact: true }),
@@ -1057,7 +1124,8 @@ test("mobile layout, empty state, command guide and failed login", async ({
   await expect(page.locator("pre").first()).not.toContainText(
     "--password-stdin",
   );
-  await expect(page.getByText(/Password: と表示されたら/)).toBeVisible();
+  await expect(page.locator("pre").first()).not.toContainText("--email");
+  await expect(page.getByText(/ブラウザが開いたら/)).toBeVisible();
   await expect(page.locator("pre").first()).not.toContainText("--profile");
   await expect(page.locator("pre").first()).not.toContainText(
     "--ingress-domain",
@@ -1172,7 +1240,7 @@ test("administrators without Deploy can delete without fetching plaintext config
   await expect(
     page.getByRole("heading", { name: "環境変数", exact: true }),
   ).toHaveCount(0);
-  expect(requests.some((url) => url.endsWith("/config"))).toBe(false);
+  expect(requests.some((url) => /\/components\/[^/]+\/config$/.test(url))).toBe(false);
 });
 
 test("version deletion protects live versions, confirms the full identifier and preserves the app", async ({

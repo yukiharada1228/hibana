@@ -5,21 +5,15 @@ import { Notice } from "./components/common";
 import { version } from "../package.json";
 const quote = (value: string) => `'${value.replaceAll("'", "'\\''")}'`;
 
-export function Deploy({
-  session,
-  email,
-}: {
-  session: Session;
-  email: string;
-}) {
+export function Deploy({ session }: { session: Session }) {
   const [copied, setCopied] = useState("");
   const cli = `npx --yes @yukiharada1228/hibana@${version}`;
-  const login = `${cli} login \\\n  --url ${quote(`${location.origin}/api`)} \\\n  --tenant ${quote(session.tenant_slug)} \\\n  --email ${quote(email)}`;
+  const login = `${cli} login \\\n  --url ${quote(`${location.origin}/api`)} \\\n  --tenant ${quote(session.tenant_slug)}`;
   const commands = [
     {
       title: "この基盤にログイン",
       description:
-        "Password: と表示されたらパスワードを入力します。入力した文字は表示されません。接続先は保存され、次回から指定を省略できます。",
+        "ブラウザが開いたら、コンソールと同じ組織のアカウントでログインします。接続先は保存されます。",
       command: login,
     },
     {

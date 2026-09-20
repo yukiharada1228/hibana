@@ -3,9 +3,7 @@ import { test, expect, type Page } from "@playwright/test";
 async function openSettings(page: Page) {
   await page.goto("/");
   await page.getByLabel("テナント", { exact: true }).fill("team");
-  await page.getByLabel("メールアドレス").fill("developer@example.internal");
-  await page.getByLabel("パスワード", { exact: true }).fill("fixture-password");
-  await page.getByRole("button", { name: "ログイン", exact: true }).click();
+  await page.getByRole("button", { name: "組織のアカウントでログイン", exact: true }).click();
   await page.getByRole("link", { name: "hello-api", exact: true }).click();
   await page.getByRole("tab", { name: "設定", exact: true }).click();
 }

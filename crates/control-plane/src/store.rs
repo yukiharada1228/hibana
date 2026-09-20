@@ -37,15 +37,6 @@ pub struct RateDecision {
     pub retry_after_secs: u64,
 }
 
-/// login ロックアウトの 1 キー分の判定結果。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct LockoutDecision {
-    /// ロックアウト中か（閾値到達 → このキーでは拒否すべき）。
-    pub locked: bool,
-    /// 現在の失敗回数（観測用）。
-    pub failures: u64,
-}
-
 /// token-bucket のパラメータ（per-tenant `invoke_rate`, §8）。
 #[derive(Debug, Clone, Copy)]
 pub struct RateLimitParams {
@@ -55,18 +46,9 @@ pub struct RateLimitParams {
     pub capacity: f64,
 }
 
-/// login ロックアウトのパラメータ（§6.0）。
-#[derive(Debug, Clone, Copy)]
-pub struct LockoutParams {
-    /// このキーの失敗閾値（到達でロックアウト）。
-    pub threshold: u64,
-    /// 失敗カウンタの減衰窓（秒）。最後の失敗から `window_secs` 無失敗で解放される。
-    pub window_secs: u64,
-}
-
 /// 共有ストア契約（M3d, §8）。
 ///
-/// invoke admission（レート制限）と login ロックアウトを集約する。RedisStore が
+/// invoke admission（レート制限）と OIDC stateを集約する。RedisStore が
 /// 本実装、`InProcStore` がテスト用スタブ、`FailingStore` が fail-mode 検証用。
 ///
 /// すべての操作は冪等／原子的であること（同一往復で read-modify-write）。
@@ -83,29 +65,27 @@ pub trait Store: Send + Sync {
         now_ms: u64,
     ) -> Result<RateDecision, StoreError>;
 
-    /// login 失敗を 1 件記録し、当該キーの現在状態を返す（§6.0）。
-    ///
-    /// `key` は呼び出し側が組み立てた識別子（例: `tenant\0email` または `ip:1.2.3.4`）。
-    /// 失敗カウンタを +1 して窓 TTL を貼り直し、閾値到達なら `locked=true`。
-    async fn record_login_failure(
-        &self,
-        key: &str,
-        params: LockoutParams,
-    ) -> Result<LockoutDecision, StoreError>;
-
-    /// login 成功でキーの失敗カウンタをリセットする（§6.0）。
-    async fn clear_login_failures(&self, key: &str) -> Result<(), StoreError>;
-
-    /// login 試行前のロックアウト判定（カウントは増やさない, §6.0）。
-    ///
-    /// 失敗カウンタが閾値以上なら `locked=true`。fail-closed の呼び出し側は `Err`（到達不能）も拒否扱い。
-    async fn check_login_lockout(
-        &self,
-        key: &str,
-        params: LockoutParams,
-    ) -> Result<LockoutDecision, StoreError>;
-
     async fn ping(&self) -> Result<(), StoreError>;
+
+    /// Short-lived login state; never overwrite a live key. Consumption is atomic
+    /// across replicas. No in-process fallback is allowed when Redis is unavailable.
+    async fn put_auth_state(
+        &self,
+        key: &str,
+        value: &str,
+        ttl_secs: u64,
+    ) -> Result<(), StoreError> {
+        let _ = (key, value, ttl_secs);
+        Err(StoreError::Unavailable(
+            "auth state store unavailable".into(),
+        ))
+    }
+    async fn take_auth_state(&self, key: &str) -> Result<Option<String>, StoreError> {
+        let _ = key;
+        Err(StoreError::Unavailable(
+            "auth state store unavailable".into(),
+        ))
+    }
 }
 
 /// 現在の壁時計（UNIX ms）。token-bucket の `now_ms` 引数に使うヘルパ。
@@ -142,12 +122,10 @@ mod redis_impl {
     ///
     /// キーレイアウト（テナント境界をキー空間で明示）:
     /// - レート: `rl:{tenant}` （HASH: tokens, last_ms）
-    /// - ロックアウト: `lockout:{key}` （INTEGER + TTL）
     #[derive(Clone)]
     pub struct RedisStore {
         conn: ConnectionManager,
         rate_script: Script,
-        lockout_incr_script: Script,
     }
 
     /// RedisError → StoreError。IO / 接続/ タイムアウト系は Unavailable（fail-mode 分岐対象）、
@@ -184,7 +162,6 @@ mod redis_impl {
             Ok(Self {
                 conn,
                 rate_script: Script::new(RATE_LUA),
-                lockout_incr_script: Script::new(LOCKOUT_INCR_LUA),
             })
         }
     }
@@ -226,27 +203,40 @@ redis.call('EXPIRE', KEYS[1], ttl)
 return {allowed, retry}
 "#;
 
-    /// login 失敗 INCR: `KEYS[1]`=counter key, `ARGV`=[threshold, window_secs]。
-    /// INCR → 窓 TTL を貼り直す。戻り値 `[locked(0/1), failures]`。
-    const LOCKOUT_INCR_LUA: &str = r#"
-local threshold = tonumber(ARGV[1])
-local window = tonumber(ARGV[2])
-local n = redis.call('INCR', KEYS[1])
-if window > 0 then redis.call('EXPIRE', KEYS[1], window) end
-local locked = 0
-if n >= threshold then locked = 1 end
-return {locked, n}
-"#;
-
     fn rate_key(tenant: &str) -> String {
         format!("rl:{tenant}")
     }
-    fn lockout_key(key: &str) -> String {
-        format!("lockout:{key}")
-    }
-
     #[async_trait]
     impl Store for RedisStore {
+        async fn put_auth_state(
+            &self,
+            key: &str,
+            value: &str,
+            ttl_secs: u64,
+        ) -> Result<(), StoreError> {
+            let result: Option<String> = redis::cmd("SET")
+                .arg(format!("auth:{key}"))
+                .arg(value)
+                .arg("EX")
+                .arg(ttl_secs)
+                .arg("NX")
+                .query_async(&mut self.conn.clone())
+                .await
+                .map_err(map_err)?;
+            match result.as_deref() {
+                Some("OK") => Ok(()),
+                _ => Err(StoreError::Backend("auth state collision".into())),
+            }
+        }
+
+        async fn take_auth_state(&self, key: &str) -> Result<Option<String>, StoreError> {
+            redis::cmd("GETDEL")
+                .arg(format!("auth:{key}"))
+                .query_async(&mut self.conn.clone())
+                .await
+                .map_err(map_err)
+        }
+
         async fn rate_limit(
             &self,
             tenant: &str,
@@ -266,55 +256,6 @@ return {locked, n}
             Ok(RateDecision {
                 allowed: res.0 == 1,
                 retry_after_secs: res.1.max(0) as u64,
-            })
-        }
-
-        async fn record_login_failure(
-            &self,
-            key: &str,
-            params: LockoutParams,
-        ) -> Result<LockoutDecision, StoreError> {
-            let mut conn = self.conn.clone();
-            let res: (i64, i64) = self
-                .lockout_incr_script
-                .key(lockout_key(key))
-                .arg(params.threshold)
-                .arg(params.window_secs)
-                .invoke_async(&mut conn)
-                .await
-                .map_err(map_err)?;
-            Ok(LockoutDecision {
-                locked: res.0 == 1,
-                failures: res.1.max(0) as u64,
-            })
-        }
-
-        async fn clear_login_failures(&self, key: &str) -> Result<(), StoreError> {
-            let mut conn = self.conn.clone();
-            let _: () = redis::cmd("DEL")
-                .arg(lockout_key(key))
-                .query_async(&mut conn)
-                .await
-                .map_err(map_err)?;
-            Ok(())
-        }
-
-        async fn check_login_lockout(
-            &self,
-            key: &str,
-            params: LockoutParams,
-        ) -> Result<LockoutDecision, StoreError> {
-            let mut conn = self.conn.clone();
-            // 窓内のキーが存在すれば値を読む。TTL で自然減衰するため GET のみで十分。
-            let n: Option<i64> = redis::cmd("GET")
-                .arg(lockout_key(key))
-                .query_async(&mut conn)
-                .await
-                .map_err(map_err)?;
-            let failures = n.unwrap_or(0).max(0) as u64;
-            Ok(LockoutDecision {
-                locked: failures >= params.threshold,
-                failures,
             })
         }
 
@@ -418,70 +359,10 @@ mod tests {
         assert!(s.rate_limit("b", p, t0).await.unwrap().allowed);
     }
 
-    /// login ロックアウト: 閾値到達で locked。それ未満は許可。
-    #[tokio::test]
-    async fn lockout_triggers_at_threshold() {
-        let s = InProcStore::new();
-        let p = LockoutParams {
-            threshold: 3,
-            window_secs: 900,
-        };
-        // 事前チェックは失敗 0 → 未ロック。
-        assert!(!s.check_login_lockout("k", p).await.unwrap().locked);
-        let d1 = s.record_login_failure("k", p).await.unwrap();
-        assert!(!d1.locked);
-        assert_eq!(d1.failures, 1);
-        let d2 = s.record_login_failure("k", p).await.unwrap();
-        assert!(!d2.locked);
-        // 3 回目で閾値到達 → locked。
-        let d3 = s.record_login_failure("k", p).await.unwrap();
-        assert!(d3.locked);
-        assert_eq!(d3.failures, 3);
-        // 以後 check も locked。
-        assert!(s.check_login_lockout("k", p).await.unwrap().locked);
-    }
-
-    /// login ロックアウト: 成功でカウンタがリセットされる。
-    #[tokio::test]
-    async fn lockout_cleared_on_success() {
-        let s = InProcStore::new();
-        let p = LockoutParams {
-            threshold: 2,
-            window_secs: 900,
-        };
-        s.record_login_failure("k", p).await.unwrap();
-        s.record_login_failure("k", p).await.unwrap();
-        assert!(s.check_login_lockout("k", p).await.unwrap().locked);
-        s.clear_login_failures("k").await.unwrap();
-        assert!(!s.check_login_lockout("k", p).await.unwrap().locked);
-    }
-
-    /// login ロックアウトは両キーで独立にカウントされる（(tenant,email) と IP）。
-    #[tokio::test]
-    async fn lockout_keys_are_independent() {
-        let s = InProcStore::new();
-        let p = LockoutParams {
-            threshold: 2,
-            window_secs: 900,
-        };
-        s.record_login_failure("tenant\u{0}user@example.com", p)
-            .await
-            .unwrap();
-        // 別キー（IP）はまだ 0。
-        assert!(!s.check_login_lockout("ip:1.2.3.4", p).await.unwrap().locked);
-    }
-
     /// fail-mode 分類: FailingStore は常に Unavailable を返し、is_unavailable で識別できる。
     #[tokio::test]
     async fn failing_store_reports_unavailable() {
         let s = FailingStore;
-        let p = LockoutParams {
-            threshold: 3,
-            window_secs: 900,
-        };
-        let err = s.check_login_lockout("k", p).await.unwrap_err();
-        assert!(err.is_unavailable());
-
         let rp = rl(50.0, 50.0);
         let err = s.rate_limit("t", rp, 0).await.unwrap_err();
         assert!(err.is_unavailable());

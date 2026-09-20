@@ -17,6 +17,15 @@ from maintenance import Maintenance
 
 class StartupTests(unittest.TestCase):
     def setUp(self):
+        env = patch.dict(k8s.os.environ, {
+            "OIDC_ISSUER_URL": "https://id.test", "OIDC_CLIENT_ID": "hibana", "OIDC_CLIENT_SECRET": " fixture-secret ",
+            "OIDC_CALLBACK_URL": "https://console.test/api/auth/oidc/callback", "OIDC_CONSOLE_URL": "https://console.test/",
+            "HIBANA_ADMIN_OIDC_SUBJECT": "fixture-admin",
+            "HIBANA_OIDC_EGRESS_CIDRS": "192.0.2.10/32",
+            "HIBANA_OIDC_EGRESS_PORTS": "443",
+        })
+        env.start()
+        self.addCleanup(env.stop)
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
         self.cluster = k8s.LocalCluster("hibana-dev")
@@ -25,6 +34,8 @@ class StartupTests(unittest.TestCase):
 
     def test_credentials_survive_repeated_startup_without_rotation(self):
         first = self.cluster.credentials()
+        control = next(item for item in first["items"] if item["metadata"]["name"] == "hibana-control-plane")
+        self.assertEqual(control["stringData"]["OIDC_CLIENT_SECRET"], " fixture-secret ")
         before = (self.cluster.state / "sdk.env").read_bytes()
         self.assertEqual(first, self.cluster.credentials())
         self.assertEqual(before, (self.cluster.state / "sdk.env").read_bytes())
@@ -41,23 +52,149 @@ class StartupTests(unittest.TestCase):
         self.assertEqual(target.read_text(), '{"items": []}')
         self.assertFalse((self.cluster.state / "sdk.env").exists())
 
-    def test_existing_tenant_accepts_session_creation_status(self):
+    def test_existing_tenant_does_not_change_identity_bindings(self):
+        self.cluster.credentials()
+        conflict = k8s.urllib.error.HTTPError("", 409, "", {}, None)
+        with patch("kubernetes.urllib.request.urlopen", side_effect=conflict) as request:
+            self.cluster.bootstrap()
+        self.assertEqual(request.call_count, 1)
+        self.assertTrue(request.call_args.args[0].full_url.endswith("/admin/tenants"))
+        body = json.loads(request.call_args.args[0].data)
+        self.assertEqual(body["admin_oidc_subject"], "fixture-admin")
+        self.assertNotIn("admin_password", body)
+
+    def test_new_tenant_uses_external_subject_without_password_login(self):
         self.cluster.credentials()
         with patch("kubernetes.urllib.request.urlopen") as request:
             request.return_value.__enter__.return_value.status = 201
             self.cluster.bootstrap()
-        self.assertEqual(request.call_count, 1, "an existing tenant must not be recreated")
-        self.assertTrue(request.call_args.args[0].full_url.endswith("/auth/login"))
+        self.assertEqual(request.call_count, 1)
+        self.assertTrue(request.call_args.args[0].full_url.endswith("/admin/tenants"))
 
-    def test_new_tenant_is_verified_after_bootstrap(self):
-        self.cluster.credentials()
-        created = MagicMock()
-        created.__enter__.return_value.status = 201
-        unauthenticated = k8s.urllib.error.HTTPError("", 401, "", {}, None)
-        with patch("kubernetes.urllib.request.urlopen", side_effect=[unauthenticated, created, created]) as request:
+    def test_invalid_admin_identity_is_rejected_before_mutation(self):
+        for key, value in [
+            ("HIBANA_ADMIN_EMAIL", " \t"),
+            ("HIBANA_ADMIN_OIDC_SUBJECT", "x" * 256),
+            ("HIBANA_ADMIN_OIDC_SUBJECT", "é" * 128),
+            ("HIBANA_ADMIN_OIDC_SUBJECT", "subject\nvalue"),
+            ("HIBANA_ADMIN_OIDC_SUBJECT", "subject\x85value"),
+        ]:
+            for action in (lambda: self.cluster.preview("install"), self.cluster.install, self.cluster.credentials):
+                with self.subTest(key=key, action=action), patch.dict(k8s.os.environ, {key: value}), \
+                        patch("kubernetes.run") as run, patch.object(self.cluster, "ensure_cluster") as ensure:
+                    with self.assertRaisesRegex(ValueError, key):
+                        action()
+                    run.assert_not_called()
+                    ensure.assert_not_called()
+                    self.assertEqual(list(self.cluster.state.iterdir()), [])
+
+    def test_subject_is_preserved_and_empty_subject_skips_bootstrap(self):
+        subject = "é" * 127 + " "
+        with patch.dict(k8s.os.environ, {"HIBANA_ADMIN_OIDC_SUBJECT": subject}):
+            self.cluster.credentials()
+        self.assertEqual(self.cluster.sdk_env()["HIBANA_ADMIN_OIDC_SUBJECT"], subject)
+        path = self.cluster.state / "sdk.env"
+        path.write_text("\n".join("HIBANA_ADMIN_OIDC_SUBJECT=''" if line.startswith("HIBANA_ADMIN_OIDC_SUBJECT=") else line
+                                  for line in path.read_text().splitlines()) + "\n")
+        self.cluster.credential_settings()
+        with patch("kubernetes.urllib.request.urlopen") as request:
             self.cluster.bootstrap()
-        self.assertEqual([call.args[0].full_url.split("18080")[-1] for call in request.call_args_list],
-                         ["/auth/login", "/admin/tenants", "/auth/login"])
+        request.assert_not_called()
+
+    def test_saved_credentials_require_current_fields_before_cluster_changes(self):
+        self.cluster.credentials()
+        path = self.cluster.state / "sdk.env"
+        original = path.read_text()
+        for key in ("HIBANA_URL", "HIBANA_TENANT", "BOOTSTRAP_ADMIN_TOKEN", "HIBANA_ADMIN_EMAIL", "HIBANA_ADMIN_OIDC_SUBJECT"):
+            path.write_text("\n".join(line for line in original.splitlines() if not line.startswith(key + "=")) + "\n")
+            path.chmod(0o400)
+            before = {p.name: (p.read_bytes(), p.stat().st_mode) for p in self.cluster.state.iterdir()}
+            for action in (lambda: self.cluster.preview("install"), self.cluster.install, self.cluster.credentials):
+                with self.subTest(key=key, action=action), patch.dict(k8s.os.environ, {key: "must-not-hide-missing-setting"}), \
+                        patch("kubernetes.run") as run, patch.object(self.cluster, "ensure_cluster") as ensure:
+                    with self.assertRaisesRegex(ValueError, "sdk.env.*" + key):
+                        action()
+                    run.assert_not_called()
+                    ensure.assert_not_called()
+                    self.assertEqual(before, {p.name: (p.read_bytes(), p.stat().st_mode) for p in self.cluster.state.iterdir()})
+            path.chmod(0o600)
+
+    def test_invalid_saved_syntax_has_a_redacted_actionable_error(self):
+        self.cluster.credentials()
+        path = self.cluster.state / "sdk.env"
+        path.write_text("BOOTSTRAP_ADMIN_TOKEN='private-fixture-secret")
+        with self.assertRaisesRegex(ValueError, "KEY=value.*sdk.env") as error:
+            self.cluster.credential_settings()
+        self.assertNotIn("private-fixture-secret", str(error.exception))
+
+    def test_missing_oidc_does_not_create_local_credentials(self):
+        with patch.dict(k8s.os.environ, {"OIDC_ISSUER_URL": ""}):
+            with self.assertRaisesRegex(ValueError, "OIDC_ISSUER_URL"):
+                self.cluster.credentials()
+        self.assertFalse((self.cluster.state / "secrets.json").exists())
+
+    def test_invalid_oidc_is_rejected_before_preview_install_or_saving(self):
+        cases = [
+            ("OIDC_CLIENT_SECRET", " "),
+            ("OIDC_ISSUER_URL", "http://id.test"),
+            ("OIDC_CALLBACK_URL", "https://console.test:invalid/callback"),
+            ("OIDC_CONSOLE_URL", "https://user:private-secret@console.test/"),
+            ("OIDC_CONSOLE_URL", "https://console.test/?"),
+            ("OIDC_CONSOLE_URL", "https://console.test/#"),
+            ("OIDC_ISSUER_URL", "https://id.test\n/realm"),
+            ("OIDC_ALLOW_INSECURE_HTTP", "yes"),
+            ("OIDC_SESSION_TTL_SECS", "not-a-number"),
+            ("OIDC_SESSION_TTL_SECS", "3_600"),
+            ("OIDC_SESSION_TTL_SECS", "59"),
+            ("OIDC_SESSION_TTL_SECS", "3601"),
+        ]
+        for key, value in cases:
+            for action in (lambda: self.cluster.preview("install"), self.cluster.install, self.cluster.credentials):
+                with self.subTest(key=key, action=action), patch.dict(k8s.os.environ, {key: value}), \
+                        patch("kubernetes.run") as run, patch.object(self.cluster, "ensure_cluster") as ensure:
+                    with self.assertRaisesRegex(ValueError, key) as error:
+                        action()
+                    self.assertNotIn("private-secret", str(error.exception))
+                    run.assert_not_called()
+                    ensure.assert_not_called()
+                    self.assertEqual(list(self.cluster.state.iterdir()), [])
+
+    def test_loopback_http_requires_explicit_development_setting(self):
+        for url in ("http://localhost:8180/realm", "http://127.0.0.1:8180/realm", "http://[::1]:8180/realm"):
+            with self.subTest(url=url), patch.dict(k8s.os.environ, {"OIDC_ISSUER_URL": url, "OIDC_ALLOW_INSECURE_HTTP": "false"}):
+                with self.assertRaisesRegex(ValueError, "OIDC_ISSUER_URL"):
+                    self.cluster.credential_settings()
+                with patch.dict(k8s.os.environ, {"OIDC_ALLOW_INSECURE_HTTP": "true"}):
+                    self.cluster.credential_settings()
+        with patch.dict(k8s.os.environ, {"OIDC_ISSUER_URL": "http://id.test", "OIDC_ALLOW_INSECURE_HTTP": "true"}):
+            with self.assertRaisesRegex(ValueError, "OIDC_ISSUER_URL"):
+                self.cluster.credentials()
+
+    def test_saved_oidc_is_validated_without_overwrite_or_permission_changes(self):
+        stored = self.cluster.credentials()
+        control = next(item["stringData"] for item in stored["items"] if item["metadata"]["name"] == "hibana-control-plane")
+        control["OIDC_SESSION_TTL_SECS"] = "invalid"
+        path = self.cluster.state / "secrets.json"
+        path.write_text(json.dumps(stored))
+        path.chmod(0o400)
+        before = {p.name: (p.read_bytes(), p.stat().st_mode) for p in self.cluster.state.iterdir()}
+        for action in (lambda: self.cluster.preview("install"), self.cluster.install, self.cluster.credentials):
+            with patch.object(self.cluster, "ensure_cluster") as ensure:
+                with self.assertRaisesRegex(ValueError, "Correct OIDC settings.*secrets.json"):
+                    action()
+                ensure.assert_not_called()
+                self.assertEqual(before, {p.name: (p.read_bytes(), p.stat().st_mode) for p in self.cluster.state.iterdir()})
+
+    def test_preview_uses_saved_oidc_and_does_not_chmod_credentials(self):
+        self.cluster.credentials()
+        for path in self.cluster.state.iterdir():
+            path.chmod(0o400)
+        before = {p.name: (p.read_bytes(), p.stat().st_mode) for p in self.cluster.state.iterdir()}
+        with patch.dict(k8s.os.environ, {"OIDC_ISSUER_URL": ""}), \
+                patch("kubernetes.shutil.which", return_value="tool"), patch.object(self.cluster, "render", return_value=[]), \
+                patch("kubernetes.run", return_value=""):
+            self.cluster.preview("install")
+        self.assertEqual(before, {p.name: (p.read_bytes(), p.stat().st_mode) for p in self.cluster.state.iterdir()})
 
     def test_old_cluster_is_rejected_without_mutation(self):
         self.cluster.kubeconfig.touch()
@@ -65,6 +202,65 @@ class StartupTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "left unchanged"):
                 self.cluster.ensure_cluster()
         self.assertEqual([call.args[1] for call in command.call_args_list], ["get", "inspect"])
+
+    def test_invalid_oidc_egress_is_rejected_before_cluster_or_credentials(self):
+        for key, value in [("HIBANA_OIDC_EGRESS_CIDRS", cidr) for cidr in
+                           ("", "192.0.2.10", "192.0.2.10/24", "0.0.0.0/0", "::/0", "id.example/32")] + [
+                           ("HIBANA_OIDC_EGRESS_PORTS", port) for port in ("", "0", "65536", "https", "443,")]:
+            for action in (lambda: self.cluster.preview("install"), self.cluster.install):
+                with self.subTest(key=key, value=value), patch.dict(k8s.os.environ, {key: value}), \
+                        patch.object(self.cluster, "ensure_cluster") as ensure, patch("kubernetes.run") as run:
+                    with self.assertRaisesRegex(ValueError, "HIBANA_OIDC_EGRESS"):
+                        action()
+                    ensure.assert_not_called()
+                    run.assert_not_called()
+                    self.assertEqual(list(self.cluster.state.iterdir()), [])
+
+    def test_saved_egress_is_reused_and_preview_does_not_write_overrides(self):
+        self.cluster.credentials()
+        path = self.cluster.state / "oidc-egress.json"
+        path.write_text(json.dumps({"cidrs": ["192.0.2.20/32", "2001:db8::20/128"], "ports": [8443]}))
+        path.chmod(0o400)
+        before = path.read_bytes(), path.stat().st_mode
+        with patch.dict(k8s.os.environ, {}, clear=True), patch("kubernetes.shutil.which", return_value="tool"), \
+                patch.object(self.cluster, "render", return_value=[]), patch("kubernetes.run", return_value=""):
+            settings, _ = self.cluster.oidc_egress()
+            self.assertEqual(settings["ports"], [8443])
+            self.assertEqual(settings["cidrs"], ["192.0.2.20/32", "2001:db8::20/128"])
+            self.cluster.preview("install")
+            with patch.dict(k8s.os.environ, {"HIBANA_OIDC_EGRESS_CIDRS": "192.0.2.30/32"}):
+                self.cluster.preview("install")
+                self.assertEqual(self.cluster.oidc_egress()[0], {"cidrs": ["192.0.2.30/32"], "ports": [8443]})
+        self.assertEqual(before, (path.read_bytes(), path.stat().st_mode))
+
+    def test_invalid_saved_egress_is_rejected_without_replacement(self):
+        path = self.cluster.state / "oidc-egress.json"
+        for invalid in ("{", "[]", '{"cidrs":["192.0.2.10/32"],"ports":[true]}'):
+            path.write_text(invalid)
+            with patch.dict(k8s.os.environ, {}, clear=True):
+                with self.assertRaisesRegex(ValueError, "oidc-egress.json"):
+                    self.cluster.oidc_egress()
+            self.assertEqual(path.read_text(), invalid)
+
+    def test_install_applies_and_saves_control_plane_egress(self):
+        from common import KubernetesTarget
+        docs = KubernetesTarget().render(k8s.LOCAL, "hibana-platform:fixture")
+        with patch.object(self.cluster, "preflight"), patch.object(self.cluster, "ensure_cluster"), \
+                patch("kubernetes.run", return_value="sha256:" + "a" * 64), \
+                patch.object(self.cluster, "render", return_value=docs), patch.object(self.cluster, "kube"), \
+                patch.object(self.cluster, "apply") as apply, patch.object(self.cluster, "migrate"), \
+                patch.object(self.cluster, "dependency_path", return_value=k8s.LOCAL / "dependencies"), \
+                patch.object(self.cluster, "resume_admission"), patch("kubernetes.wait_http"), \
+                patch.object(self.cluster, "bootstrap"):
+            self.cluster.install()
+        policies = [doc for call in apply.call_args_list for doc in call.args[0] if doc["kind"] == "NetworkPolicy"]
+        policy = next(p for p in policies if p["metadata"]["name"] == "hibana-local-identity-provider")
+        self.assertEqual(policy["spec"]["podSelector"], {"matchLabels": {"app.kubernetes.io/name": "hibana-control-plane"}})
+        self.assertEqual(policy["spec"]["egress"], [{"to": [{"ipBlock": {"cidr": "192.0.2.10/32"}}], "ports": [{"protocol": "TCP", "port": 443}]}])
+        self.assertIn("default-deny", {p["metadata"]["name"] for p in policies})
+        path = self.cluster.state / "oidc-egress.json"
+        self.assertEqual(json.loads(path.read_text()), {"cidrs": ["192.0.2.10/32"], "ports": [443]})
+        self.assertEqual(path.stat().st_mode & 0o777, 0o600)
 
     def test_unowned_cluster_is_rejected_before_access(self):
         with patch("kubernetes.shutil.which", return_value="tool"), patch("kubernetes.run", return_value="hibana-dev\n") as command:

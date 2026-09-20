@@ -89,9 +89,10 @@ where
         // allowed to finish rather than being canceled mid-transaction.
         match tokio::time::timeout(RECEIVE_TIMEOUT, Json::<T>::from_request(req, state)).await {
             Ok(Ok(Json(value))) => Ok(JsonBody(value)),
-            // 詳細（オフセット・ボディ断片）はログにのみ残し、クライアントへは汎用文言。
+            // Serde errors can quote a submitted Secret or credential. Record
+            // only the category/status, including when debug logging is enabled.
             Ok(Err(rejection)) => {
-                tracing::debug!(error = %rejection, "rejected request body");
+                tracing::debug!(source_status = %rejection.status(), "rejected request body");
                 Err(AppError::from(FaasError::InvalidRequest("invalid request body".into())).into_response())
             }
             Err(_) => Err((StatusCode::REQUEST_TIMEOUT, Json(serde_json::json!({"error": {
@@ -113,6 +114,41 @@ mod tests {
     struct Dummy {
         #[allow(dead_code)]
         a: i32,
+    }
+
+    #[tokio::test]
+    async fn invalid_json_values_are_never_logged_even_at_debug_level() {
+        use std::sync::{Arc, Mutex};
+        struct Capture(Arc<Mutex<Vec<u8>>>);
+        impl std::io::Write for Capture {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let output = Arc::new(Mutex::new(Vec::new()));
+        let writer = output.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::DEBUG)
+            .with_ansi(false)
+            .without_time()
+            .with_writer(move || Capture(writer.clone()))
+            .finish();
+        let _guard = tracing::subscriber::set_default(subscriber);
+        let request = Request::builder()
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(axum::body::Body::from(r#"{"a":"fixture-private-secret"}"#))
+            .unwrap();
+        let rejected = JsonBody::<Dummy>::from_request(request, &())
+            .await
+            .unwrap_err();
+        assert_eq!(rejected.status(), StatusCode::BAD_REQUEST);
+        let logs = String::from_utf8(output.lock().unwrap().clone()).unwrap();
+        assert!(logs.contains("rejected request body"));
+        assert!(!logs.contains("fixture-private-secret"));
     }
 
     #[tokio::test]

@@ -86,12 +86,12 @@ JS/TSのビルドには同梱のoptionalDependenciesを使います。ビルド�
 
 以下の `hibana ...` は、グローバル導入済みならそのまま実行できます。CLIを導入済みのプロジェクト内では `npm exec -- hibana ...`、作成前は `npx --yes @yukiharada1228/hibana@0.2.0-rc.2 ...` として実行します。コンソールの「CLI の接続」から、自分の接続先とバージョンを含む初回コマンドと、作成後の`npm run deploy`をコピーできます。
 
-管理者から管理API URL・テナント名・アカウントを受け取ります。公開 URL は基盤から自動取得します。通常のログインでは `Password:` に続けてパスワードを入力します。文字は表示されません。スクリプトでは `--password-stdin < /secure/login-password.txt` または `HIBANA_PASSWORD` を使えます。
+管理者から管理API URL・テナント名・組織のアカウントを受け取ります。公開 URL は基盤から自動取得します。ログイン時はブラウザで組織の認証基盤に接続します。CIでは専用APIトークンを`HIBANA_TOKEN`へ設定してください。ログインは開発環境もOIDCに統一しています。[認証と移行の詳細](authentication.md)を参照してください。
 
 ```bash
 hibana login \
   --url https://api.example.internal \
-  --tenant team --email developer@example.internal
+  --tenant team
 
 hibana init hello
 cd hello

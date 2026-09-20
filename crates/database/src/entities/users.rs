@@ -7,10 +7,12 @@ pub struct Model {
     pub id: String,
     pub tenant_id: String,
     pub email: String,
-    pub password_hash: String,
     pub role: String,
     pub created_at: DateTimeUtc,
     pub deleted_at: Option<DateTimeUtc>,
+    pub oidc_issuer: Option<String>,
+    pub oidc_subject: Option<String>,
+    pub auth_version: i64,
 }
 
 #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]

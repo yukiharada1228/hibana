@@ -49,7 +49,7 @@ export async function apiClient(options = {}) {
       if (response.status === 401)
         error.hint = auth
           ? `Authentication failed or expired (HTTP 401). Run ${login} to sign in again. If using HIBANA_TOKEN, replace the expired token.`
-          : "Login failed (HTTP 401). Check the tenant, email and password.";
+          : "Login failed (HTTP 401). Check the tenant and your organization account.";
       else if (response.status === 403)
         error.hint =
           "Permission denied (HTTP 403). Sign in with an account authorized for this operation.";
@@ -60,28 +60,23 @@ export async function apiClient(options = {}) {
     }
     return result;
   }
+  async function acceptLogin(result, save) {
+    token = result.token;
+    if (typeof token !== "string" || !token)
+      throw new Error("Login returned no access token");
+    if (save) {
+      const { profile, ...value } = selected;
+      await saveProfile(profile, { ...value, token });
+      return profile;
+    }
+  }
   return {
     ...selected,
     request,
-    async login({ password = process.env.HIBANA_PASSWORD, save = false } = {}) {
-      const { tenant, email } = selected;
-      if (!tenant || !email || !password)
-        throw new Error(
-          "Specify --tenant and --email, then enter the password (scripts can use --password-stdin or HIBANA_PASSWORD)",
-        );
-      const result = await request("/auth/login", {
-        method: "POST",
-        auth: false,
-        body: { tenant_slug: tenant, email, password },
-      });
-      token = result.token;
-      if (typeof token !== "string" || !token)
-        throw new Error("Login returned no access token");
-      if (save) {
-        const { profile, ...value } = selected;
-        await saveProfile(profile, { ...value, token });
-        return profile;
-      }
+    async loginOidc(options = {}) {
+      const { browserLogin } = await import("./oidc.mjs");
+      const result = await browserLogin({ ...selected, request }, options);
+      return acceptLogin(result, true);
     },
   };
 }

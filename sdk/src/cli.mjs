@@ -4,7 +4,6 @@ import { loadConfig } from "./config.mjs";
 import { build } from "./build.mjs";
 import { init } from "./init.mjs";
 import { readStdin } from "./process.mjs";
-import { promptPassword } from "./password.mjs";
 import { parseCommand } from "./commands.mjs";
 import { validateVersionName } from "./version-name.mjs";
 import { applications, secrets, text, versionLabel } from "./output.mjs";
@@ -53,10 +52,7 @@ async function main() {
   }
   if (command === "login") {
     const api = await apiClient({ ...values, login: true });
-    const password = values["password-stdin"]
-      ? await readStdin("Password")
-      : process.env.HIBANA_PASSWORD || (await promptPassword());
-    const name = await api.login({ password, save: true });
+    const name = await api.loginOidc({ noBrowser: values["no-browser"] });
     console.log(
       `Connected to ${api.url}\nTenant: ${text(api.tenant)}\nSaved connection: ${text(name)} (used by subsequent commands)`,
     );

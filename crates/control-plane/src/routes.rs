@@ -1,8 +1,6 @@
 //! Management and internal HTTP routing; authentication stays at the route boundary.
 use crate::ingress;
-use crate::{
-    auth, auth::require_scope, direct_http, handlers, handlers_secrets, login, state::AppState,
-};
+use crate::{auth, auth::require_scope, direct_http, handlers, handlers_secrets, state::AppState};
 use axum::{
     routing::{delete, get, patch, post, put},
     Router,
@@ -129,6 +127,13 @@ pub(crate) fn build_router(state: AppState) -> Router {
             post(handlers::identity::create_user),
         )
         .route("/tokens", post(handlers::identity::create_token))
+        .route("/users", get(handlers::identity::list_users))
+        .route("/users/{user_id}/oidc", put(handlers::identity::bind_oidc))
+        .route(
+            "/users/{user_id}/revoke-tokens",
+            post(handlers::identity::revoke_user_tokens),
+        )
+        .route("/users/{user_id}", delete(handlers::identity::disable_user))
         .route(
             "/tokens/{token_id}",
             delete(handlers::identity::revoke_token),
@@ -192,6 +197,7 @@ pub(crate) fn build_router(state: AppState) -> Router {
         // Authenticated clients can inspect and revoke only their own session.
         .route("/auth/session", get(handlers::identity::get_session))
         .route("/auth/logout", post(handlers::identity::logout))
+        .route("/auth/logout-all", post(handlers::identity::logout_all))
         .route_layer(axum::middleware::from_fn_with_state(
             state.clone(),
             auth::authenticate,
@@ -201,7 +207,11 @@ pub(crate) fn build_router(state: AppState) -> Router {
         .route("/healthz", get(handlers::health::healthz))
         .route("/readyz", get(handlers::health::readyz))
         .route("/metrics", get(handlers::health::metrics))
-        .route("/auth/login", post(login::login))
+        .route("/auth/config", get(crate::oidc::configuration))
+        .route("/auth/oidc/start", post(crate::oidc::start))
+        .route("/auth/oidc/callback", get(crate::oidc::callback))
+        .route("/auth/oidc/exchange", post(crate::oidc::exchange))
+        .route("/auth/oidc/browser/exchange", post(crate::oidc::browser_exchange))
         .route("/admin/tenants", post(handlers::tenants::create_tenant))
         .route(
             "/admin/components",
@@ -247,7 +257,10 @@ pub(crate) fn build_router(state: AppState) -> Router {
             state.clone(),
             http_metrics_middleware,
         ))
-        .layer(TraceLayer::new_for_http())
+        .layer(TraceLayer::new_for_http().make_span_with(|request: &axum::http::Request<axum::body::Body>| {
+            // OIDC callback query strings contain authorization codes and state.
+            tracing::info_span!("http_request", method = %request.method(), path = request.uri().path())
+        }))
         .layer(axum::middleware::from_fn_with_state(
             state.clone(),
             crate::maintenance::public_gate,

@@ -51,6 +51,11 @@ data:
   S3_BUCKET: CHANGE_ME
   APP_PUBLIC_ORIGIN: https://CHANGE_ME
   TRUSTED_PROXY_CIDRS: CHANGE_ME_TRUSTED_PROXY_CIDRS
+  OIDC_ISSUER_URL: https://CHANGE_ME/realms/hibana
+  OIDC_CLIENT_ID: hibana
+  OIDC_CALLBACK_URL: https://CHANGE_ME/api/auth/oidc/callback
+  OIDC_CONSOLE_URL: https://CHANGE_ME/
+  OIDC_SESSION_TTL_SECS: "900"
 `,
     "egress.yaml": `# Use the address ranges and ports of your external dependencies.
 apiVersion: networking.k8s.io/v1
@@ -73,11 +78,25 @@ spec:
       ports: [{protocol: TCP, port: 6379}]
     - to: [{ipBlock: {cidr: CHANGE_ME_S3_CIDR}}]
       ports: [{protocol: TCP, port: 443}]
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: hibana-site-identity-provider
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: hibana-control-plane
+  policyTypes: [Egress]
+  egress:
+    - to: [{ipBlock: {cidr: CHANGE_ME_OIDC_CIDR}}]
+      ports: [{protocol: TCP, port: 443}]
 `,
     "runtime.env": "DATABASE_URL=postgres://CHANGE_ME\n",
     "control-plane.env": `REDIS_URL=redis://CHANGE_ME
 S3_ACCESS_KEY=CHANGE_ME
 S3_SECRET_KEY=CHANGE_ME
+OIDC_CLIENT_SECRET=CHANGE_ME
 BOOTSTRAP_ADMIN_TOKEN=${randomBytes(32).toString("hex")}
 JOB_SIGNING_KEY=${randomBytes(32).toString("hex")}
 SECRETS_MASTER_KEY=${randomBytes(32).toString("hex")}
@@ -90,7 +109,8 @@ SECRETS_MASTER_KEY=${randomBytes(32).toString("hex")}
 2. Update site.yaml with your S3 endpoint, bucket and application domain. Set TRUSTED_PROXY_CIDRS to the comma-separated source IP CIDRs of your console and Ingress proxies (single IPs use /32 or /128). Include each trusted hop; do not include ordinary clients or untrusted workloads. The outside Ingress must overwrite X-Forwarded-For with the actual client address, or securely append its peer and trust only known upstream proxies.
 3. Update ingress.yaml with your management hostname, per-tenant app hostname, IngressClass and TLS Secret names. Provision the TLS Secrets in namespace hibana or include them as resources in this overlay. Label the Ingress controller namespace as described in ingress.yaml.
    Update console/ingress.yaml with the intranet console hostname and TLS Secret. Set a released console image (prefer a digest) in console/kustomization.yaml. Browser users open https://CONSOLE_HOST/; the CLI can use https://CONSOLE_HOST/api. The platform --image option only selects the Control Plane/Worker image.
-4. Set your dependency address ranges and ports in egress.yaml. Provision the external databases and bucket before installation.
+4. Set your dependency and identity-provider address ranges and ports in egress.yaml. Provision the external databases and bucket before installation.
+   Register a confidential OIDC client with your existing provider (Keycloak is the reference setup). Enable Authorization Code with S256 PKCE, register exactly OIDC_CALLBACK_URL, configure OIDC_CLIENT_SECRET in control-plane.env, and set the issuer and console URLs in site.yaml. See docs/authentication.md in the Hibana repository. The identity provider must be reachable from both users' browsers and the Control Plane.
 5. Run the preview, resolve every reported issue, then install:
 
 \`\`\`sh

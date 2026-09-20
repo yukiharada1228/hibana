@@ -111,6 +111,10 @@ def main():
         report['image'] = image
         report['image_id'] = identity
         command(cluster.kind, 'load', 'docker-image', image, '--name', CLUSTER, timeout=180)
+        # This suite tests the runtime with API credentials, not an external IdP.
+        os.environ.update(OIDC_ISSUER_URL='https://fixture-idp.invalid', OIDC_CLIENT_ID='hibana',
+                          OIDC_CLIENT_SECRET='fixture-only', OIDC_CALLBACK_URL='https://console.invalid/api/auth/oidc/callback',
+                          OIDC_CONSOLE_URL='https://console.invalid/')
         credentials = cluster.credentials()
         cluster.apply([d for d in cluster.render(LOCAL, image) if d['kind'] == 'Namespace'])
         cluster.apply(credentials['items'])
@@ -151,7 +155,7 @@ def main():
             api = stack.enter_context(operations.forward('control-plane', 8080))
             apps = stack.enter_context(operations.forward('control-plane', 8083))
             client_env = cluster.sdk_env()
-            client_env.update(HIBANA_URL=api, GATEWAY=apps, HIBANA_UPSTREAM_TOKEN=upstream_token,
+            client_env.update(HIBANA_ACCEPTANCE_KUBECONFIG=str(cluster.kubeconfig), HIBANA_ACCEPTANCE_CONTEXT=f'kind-{CLUSTER}', HIBANA_ADMIN_EMAIL='acceptance@example.invalid', HIBANA_ADMIN_OIDC_SUBJECT='fixture-acceptance-admin', HIBANA_URL=api, GATEWAY=apps, HIBANA_UPSTREAM_TOKEN=upstream_token,
                               HIBANA_UPSTREAM_URL='http://11.203.42.10:8080', HIBANA_ACCEPTANCE_FOLDER=str(folder),
                               HIBANA_ACCEPTANCE_SECONDS=str(args.seconds), HIBANA_CLI_ENTRY=str(args.cli_entry),
                               HIBANA_CONFIG_HOME=str(folder / 'cli-settings'), HIBANA_PROFILE='')

@@ -2,6 +2,7 @@
 """Manage the checkout-owned kind environment. Kubernetes resources live in Kustomize."""
 import argparse
 from datetime import datetime, timezone
+import ipaddress
 import json
 import os
 from pathlib import Path
@@ -22,6 +23,7 @@ from common import KubernetesTarget, stamp_runtime_settings
 from maintenance import Maintenance, NoControlPlane
 from local_operation import LocalOperationLock
 from operation import exclusive
+from preflight import OIDC_REQUIRED, oidc_setting_errors
 
 ROOT = Path(__file__).resolve().parents[2]
 LOCAL = ROOT / "deploy/kubernetes/local"
@@ -203,26 +205,51 @@ class LocalCluster(KubernetesTarget):
         remaining = run("docker", "ps", "-aq", "--filter", f"label=io.x-k8s.kind.cluster={self.name}", capture=True).strip()
         if remaining:
             raise ValueError("Cluster deletion is incomplete; local state was retained.")
-        for name in ("kubeconfig", "sdk.env", "secrets.json", "maintenance.json"):
+        for name in ("kubeconfig", "sdk.env", "secrets.json", "maintenance.json", "oidc-egress.json"):
             (self.state / name).unlink(missing_ok=True)
         print(f"Uninstalled local cluster {self.name}.")
 
-    def credentials(self):
-        self.state.mkdir(parents=True, exist_ok=True, mode=0o700)
-        self.state.chmod(0o700)
+    def credential_settings(self):
+        """Read and validate the effective settings, including during dry runs."""
         target = self.state / "secrets.json"
         sdk = self.state / "sdk.env"
         if target.exists() or sdk.exists():
             if not target.is_file() or not sdk.is_file():
                 raise ValueError(f"Incomplete credentials in {self.state}; restore the missing file. Keys were not rotated.")
+            stored = json.loads(target.read_text())
+            control = next((item.get("stringData", {}) for item in stored.get("items", [])
+                            if item.get("metadata", {}).get("name") == "hibana-control-plane"), {})
+            errors = oidc_setting_errors(control, development=True)
+            if errors:
+                raise ValueError(f"Correct OIDC settings in the hibana-control-plane Secret in {target}; existing credentials were preserved (docs/authentication.md):\n  " + "\n  ".join(errors))
+            self.sdk_env()
+            return stored, control
+
+        oidc = {key: os.environ.get(key, "") for key in OIDC_REQUIRED}
+        for key in ("AUTH_MODE", "OIDC_ALLOW_INSECURE_HTTP", "OIDC_SESSION_TTL_SECS"):
+            if os.environ.get(key):
+                oidc[key] = os.environ[key]
+        errors = oidc_setting_errors(oidc, development=True)
+        if errors:
+            raise ValueError("Configure an external OIDC provider before installing:\n  " + "\n  ".join(errors))
+        admin_identity()
+        return None, oidc
+
+    def credentials(self):
+        stored, oidc = self.credential_settings()
+        self.state.mkdir(parents=True, exist_ok=True, mode=0o700)
+        self.state.chmod(0o700)
+        target = self.state / "secrets.json"
+        sdk = self.state / "sdk.env"
+        if stored is not None:
             target.chmod(0o600)
             sdk.chmod(0o600)
-            return json.loads(target.read_text())
-
-        admin, app, redis, s3, bootstrap, login = [secrets.token_hex(24) for _ in range(6)]
+            return stored
+        admin, app, redis, s3, bootstrap = [secrets.token_hex(24) for _ in range(5)]
         data = {
             "hibana-runtime": {"DATABASE_URL": f"postgres://faas_app:{app}@hibana-postgres:5432/hibana"},
             "hibana-control-plane": {
+                **oidc,
                 "REDIS_URL": f"redis://:{redis}@hibana-redis:6379", "S3_ACCESS_KEY": "hibana-local",
                 "S3_SECRET_KEY": s3, "BOOTSTRAP_ADMIN_TOKEN": bootstrap,
                 "JOB_SIGNING_KEY": secrets.token_hex(32), "SECRETS_MASTER_KEY": secrets.token_hex(32),
@@ -240,7 +267,7 @@ class LocalCluster(KubernetesTarget):
         write_private(target, json.dumps(result))
         write_private(sdk, "".join(f"{key}={shlex.quote(value)}\n" for key, value in {
             "HIBANA_URL": "http://127.0.0.1:18080", "HIBANA_TENANT": "smoke",
-            "HIBANA_EMAIL": "admin@example.com", "HIBANA_PASSWORD": login,
+            **admin_identity(),
             "BOOTSTRAP_ADMIN_TOKEN": bootstrap,
         }.items()))
         return result
@@ -249,12 +276,19 @@ class LocalCluster(KubernetesTarget):
         path = self.state / "sdk.env"
         if not path.is_file():
             raise ValueError("Development credentials are missing. Run hibana platform install first.")
-        env = os.environ.copy()
         # Read the generated shell-compatible file without executing it.
-        for entry in shlex.split(path.read_text(), comments=True):
-            key, value = entry.split("=", 1)
-            env[key] = value
-        env.pop("HIBANA_TOKEN", None)
+        try:
+            saved = dict(entry.split("=", 1) for entry in shlex.split(path.read_text(), comments=True))
+        except ValueError as error:
+            raise ValueError(f"Correct the KEY=value entries in {path}; settings were preserved.") from error
+        try:
+            for key in ("HIBANA_URL", "HIBANA_TENANT", "BOOTSTRAP_ADMIN_TOKEN"):
+                if not saved.get(key, "").strip():
+                    raise ValueError(f"{key} is required")
+            admin_identity(saved)
+        except ValueError as error:
+            raise ValueError(f"Correct the current OIDC settings in {path}: {error}; settings were preserved.") from error
+        env = {**os.environ, **saved}
         env["GATEWAY"] = "http://127.0.0.1:18084"
         return env
 
@@ -281,18 +315,18 @@ class LocalCluster(KubernetesTarget):
             except urllib.error.HTTPError as error:
                 return error.code
 
-        login = {"tenant_slug": env["HIBANA_TENANT"], "email": env["HIBANA_EMAIL"], "password": env["HIBANA_PASSWORD"]}
-        status = post("/auth/login", login)
-        if status in (200, 201):
+        subject = env.get("HIBANA_ADMIN_OIDC_SUBJECT", "")
+        if not subject:
+            print("Create the first tenant with POST /admin/tenants and a verified admin_oidc_subject (docs/authentication.md).")
             return
-        if status != 401:
-            raise ValueError(f"Development tenant login failed: HTTP {status}")
         status = post("/admin/tenants", {
             "slug": env["HIBANA_TENANT"], "name": "Kubernetes Smoke Tenant",
-            "admin_email": env["HIBANA_EMAIL"], "admin_password": env["HIBANA_PASSWORD"],
+            "admin_email": env["HIBANA_ADMIN_EMAIL"], "admin_oidc_subject": subject,
         }, env["BOOTSTRAP_ADMIN_TOKEN"])
-        if status not in (201, 409) or post("/auth/login", login) not in (200, 201):
-            raise ValueError(f"Development tenant bootstrap failed (HTTP {status}); check existing credentials.")
+        if status == 409:
+            print("Tenant already exists; its identity bindings were preserved. Verify access with hibana login.")
+        elif status != 201:
+            raise ValueError(f"Development tenant bootstrap failed (HTTP {status}).")
 
     def dependency_path(self):
         current = self.kube("-n", "hibana", "get", "deployment", "hibana-postgres", "hibana-minio",
@@ -306,14 +340,62 @@ class LocalCluster(KubernetesTarget):
             return LOCAL / "dependencies"
         return LOCAL.parent / "persistent-dependencies"
 
+    def oidc_egress(self):
+        """Read a local operator's allowlist; never resolve or broaden it implicitly."""
+        path = self.state / "oidc-egress.json"
+        try:
+            settings = json.loads(path.read_text()) if path.exists() else {}
+            if not isinstance(settings, dict):
+                raise ValueError("expected object")
+            cidrs = settings.get("cidrs", [])
+            ports = settings.get("ports", [443])
+            if "HIBANA_OIDC_EGRESS_CIDRS" in os.environ:
+                cidrs = os.environ["HIBANA_OIDC_EGRESS_CIDRS"].split(",")
+            if "HIBANA_OIDC_EGRESS_PORTS" in os.environ:
+                ports = os.environ["HIBANA_OIDC_EGRESS_PORTS"].split(",")
+            if not isinstance(cidrs, list) or not cidrs or not isinstance(ports, list) or not ports:
+                raise ValueError("empty allowlist")
+            networks = []
+            for cidr in cidrs:
+                if not isinstance(cidr, str) or "/" not in cidr:
+                    raise ValueError("explicit CIDR required")
+                network = ipaddress.ip_network(cidr.strip())
+                if network.prefixlen == 0:
+                    raise ValueError("unrestricted CIDR")
+                networks.append(str(network))
+            tcp_ports = []
+            for port in ports:
+                if isinstance(port, str) and re.fullmatch(r"[0-9]+", port.strip()):
+                    port = int(port.strip())
+                if type(port) is not int or not 1 <= port <= 65535:
+                    raise ValueError("invalid TCP port")
+                tcp_ports.append(port)
+        except (ValueError, TypeError) as error:
+            raise ValueError(
+                "Configure HIBANA_OIDC_EGRESS_CIDRS (comma-separated IPv4/IPv6 CIDRs, no /0) "
+                "and HIBANA_OIDC_EGRESS_PORTS (TCP ports; default 443), or correct "
+                f"{path}. Include the provider's discovery, JWKS and token endpoints "
+                "(docs/authentication.md)."
+            ) from error
+        settings = {"cidrs": sorted(set(networks)), "ports": sorted(set(tcp_ports))}
+        policy = {"apiVersion": "networking.k8s.io/v1", "kind": "NetworkPolicy",
+                  "metadata": {"name": "hibana-local-identity-provider", "namespace": "hibana"},
+                  "spec": {"podSelector": {"matchLabels": {"app.kubernetes.io/name": "hibana-control-plane"}},
+                           "policyTypes": ["Egress"], "egress": [{
+                               "to": [{"ipBlock": {"cidr": cidr}} for cidr in settings["cidrs"]],
+                               "ports": [{"protocol": "TCP", "port": port} for port in settings["ports"]]}]}}
+        return settings, policy
+
     def preflight(self):
+        self.credential_settings()
+        self.oidc_egress()
         for tool in ["docker", "kubectl", self.kind]:
             if not shutil.which(tool):
                 raise ValueError(f"Required tool not found: {tool}. Install it and ensure it is on PATH.")
         run("docker", "info", "--format", "{{.ServerVersion}}", capture=True, timeout=20)
         self.render(LOCAL, "hibana-platform:preflight")
         self.render(LOCAL / "migration", "hibana-platform:preflight")
-        print("Local checks passed: Docker, kind, kubectl and Kubernetes manifests.")
+        print("Local checks passed: OIDC settings/egress, Docker, kind, kubectl and Kubernetes manifests.")
 
     def preview(self, action):
         if action == "install":
@@ -323,7 +405,9 @@ class LocalCluster(KubernetesTarget):
                 self.owned_nodes()
             print(f"  {'reuse' if self.name in clusters else 'create'} kind cluster {self.name}")
             print("  build and load the platform image; prepare credentials and persistent dependencies")
-            print("  run the database migration; deploy Control Plane and Worker; verify HTTP and tenant login")
+            settings, _ = self.oidc_egress()
+            print(f"  allow Control Plane OIDC egress to {', '.join(settings['cidrs'])} on TCP {', '.join(map(str, settings['ports']))}")
+            print("  run the database migration; deploy Control Plane and Worker; verify HTTP and provision the OIDC tenant")
             print("Image and generated-credential diffs require the build and are not computed in this preview.")
         else:
             nodes = self.owned_nodes()
@@ -337,9 +421,16 @@ class LocalCluster(KubernetesTarget):
     def install(self):
         self.install_phase = "local preflight"
         self.preflight()
+        egress_settings, egress_policy = self.oidc_egress()
         self.install_phase = "cluster creation"
         self.ensure_cluster()
         credentials = self.credentials()
+        # Publish validated network settings atomically; dry runs never write them.
+        pending = self.state / "oidc-egress.next.json"
+        with pending.open("w", encoding="utf-8") as stream:
+            os.chmod(pending, 0o600)
+            json.dump(egress_settings, stream)
+        pending.replace(self.state / "oidc-egress.json")
         self.install_phase = "image build"
         print("Installing: image build")
         # A fresh provenance attestation would change the image index even for a cached build.
@@ -351,6 +442,7 @@ class LocalCluster(KubernetesTarget):
         run("docker", "tag", "hibana-platform:dev", image)
         run(self.kind, "load", "docker-image", image, "--name", self.name)
         docs = self.render(LOCAL, image)
+        docs.append(egress_policy)
         stamp_runtime_settings(docs, credentials["items"])
         self.apply([doc for doc in docs if doc["kind"] == "Namespace"])
         self.apply(credentials["items"])
@@ -402,6 +494,23 @@ def workloads_ready(pods, expected, resumed_at, restarted_nodes=None):
             continue
         ready[name] += 1
     return bool(expected) and all(ready[name] >= replicas for name, replicas in expected.items())
+
+
+def admin_identity(values=None):
+    """Validate the current bootstrap contract without guessing an OIDC subject."""
+    if values is None:
+        values = {
+            "HIBANA_ADMIN_EMAIL": os.environ.get("HIBANA_ADMIN_EMAIL", "admin@example.com"),
+            "HIBANA_ADMIN_OIDC_SUBJECT": os.environ.get("HIBANA_ADMIN_OIDC_SUBJECT", ""),
+        }
+    email = values.get("HIBANA_ADMIN_EMAIL")
+    if not isinstance(email, str) or not email.strip():
+        raise ValueError("HIBANA_ADMIN_EMAIL must be nonempty")
+    subject = values.get("HIBANA_ADMIN_OIDC_SUBJECT")
+    if (not isinstance(subject, str) or len(subject.encode("utf-8")) > 255
+            or any(ord(char) < 32 or 127 <= ord(char) <= 159 for char in subject)):
+        raise ValueError("HIBANA_ADMIN_OIDC_SUBJECT must be present (empty skips bootstrap), at most 255 UTF-8 bytes, without control characters")
+    return {"HIBANA_ADMIN_EMAIL": email, "HIBANA_ADMIN_OIDC_SUBJECT": subject}
 
 
 def write_private(path, contents):

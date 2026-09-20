@@ -8,8 +8,6 @@ const DEFAULT_REDIS_URL: &str = "redis://127.0.0.1:6379";
 const DEFAULT_INVOKE_RATE_PER_SEC: u64 = 50;
 const DEFAULT_INVOKE_BURST: u64 = 500;
 const DEFAULT_MAX_CONCURRENT: u64 = 20;
-const DEFAULT_LOGIN_LOCKOUT_THRESHOLD: u64 = 10;
-const DEFAULT_LOGIN_LOCKOUT_WINDOW_SECS: u64 = 900;
 const DEFAULT_REAPER_INTERVAL_SECS: u64 = 30;
 const DEFAULT_STUCK_EXECUTION_DEADLINE_SECS: u64 = 900;
 
@@ -27,6 +25,7 @@ const SECRETS_MASTER_KEY_PLACEHOLDER: &str = "CHANGE_ME_REPLACE_WITH_32_BYTE_KEY
 
 #[derive(Clone)]
 pub struct Config {
+    pub auth: crate::oidc::config::OidcConfig,
     pub database_url: String,
     pub migration_database_url: String,
     pub bootstrap_admin_token: Redacted<String>,
@@ -49,8 +48,6 @@ pub struct Config {
     pub invoke_rate_per_sec: u64,
     pub invoke_burst: u64,
     pub max_concurrent_executions: u64,
-    pub login_lockout_threshold: u64,
-    pub login_lockout_window_secs: u64,
     pub reaper_interval_secs: u64,
     pub stuck_execution_deadline_secs: u64,
     pub trusted_proxies: crate::client_ip::TrustedProxies,
@@ -142,6 +139,7 @@ impl Config {
             "TRUST_PROXY_HEADERS=true is no longer supported; configure TRUSTED_PROXY_CIDRS"
         );
         let cfg = Self {
+            auth: crate::oidc::config::OidcConfig::from_env()?,
             database_url,
             migration_database_url,
             bootstrap_admin_token: Redacted::new(env_required("BOOTSTRAP_ADMIN_TOKEN")?),
@@ -166,14 +164,6 @@ impl Config {
             max_concurrent_executions: env_u64(
                 "QUOTA_MAX_CONCURRENT_EXECUTIONS",
                 DEFAULT_MAX_CONCURRENT,
-            )?,
-            login_lockout_threshold: env_u64(
-                "LOGIN_LOCKOUT_THRESHOLD",
-                DEFAULT_LOGIN_LOCKOUT_THRESHOLD,
-            )?,
-            login_lockout_window_secs: env_u64(
-                "LOGIN_LOCKOUT_WINDOW_SECS",
-                DEFAULT_LOGIN_LOCKOUT_WINDOW_SECS,
             )?,
             reaper_interval_secs: env_u64("REAPER_INTERVAL_SECS", DEFAULT_REAPER_INTERVAL_SECS)?,
             stuck_execution_deadline_secs: env_u64(
@@ -221,17 +211,13 @@ impl Config {
     }
 
     pub fn admission(&self) -> crate::state::AdmissionConfig {
-        use crate::store::{LockoutParams, RateLimitParams};
+        use crate::store::RateLimitParams;
         crate::state::AdmissionConfig {
             rate: RateLimitParams {
                 refill_per_sec: self.invoke_rate_per_sec as f64,
                 capacity: self.invoke_burst as f64,
             },
             max_concurrent_executions: self.max_concurrent_executions as i64,
-            lockout: LockoutParams {
-                threshold: self.login_lockout_threshold,
-                window_secs: self.login_lockout_window_secs,
-            },
             trusted_proxies: self.trusted_proxies.clone(),
         }
     }

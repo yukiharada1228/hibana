@@ -1,0 +1,25 @@
+{
+  "alias": "corporate-saml",
+  "displayName": "社内アカウント",
+  "providerId": "saml",
+  "enabled": true,
+  "trustEmail": false,
+  "storeToken": false,
+  "firstBrokerLoginFlowAlias": "first broker login",
+  "config": {
+    "entityId": "https://sso.example.com/realms/hibana/broker/corporate-saml",
+    "idpEntityId": "CHANGE_ME_IDP_ENTITY_ID",
+    "singleSignOnServiceUrl": "https://CHANGE_ME_IDP_HOST/saml",
+    "validateSignature": "true",
+    "signingCertificate": "CHANGE_ME_IDP_SIGNING_CERTIFICATE_BASE64",
+    "wantAssertionsSigned": "true",
+    "wantAuthnRequestsSigned": "true",
+    "signatureAlgorithm": "RSA_SHA256",
+    "postBindingAuthnRequest": "true",
+    "postBindingResponse": "true",
+    "principalType": "ATTRIBUTE",
+    "principalAttribute": "employee_id",
+    "nameIDPolicyFormat": "urn:oasis:names:tc:SAML:2.0:nameid-format:persistent",
+    "syncMode": "IMPORT"
+  }
+}

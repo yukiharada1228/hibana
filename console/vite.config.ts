@@ -1,9 +1,19 @@
-import { defineConfig } from "vite";
+import { createLogger, defineConfig } from "vite";
 import react from "@vitejs/plugin-react";
 import tailwind from "@tailwindcss/vite";
 import { fileURLToPath } from "node:url";
 
+const logger = createLogger();
+const logError = logger.error;
+// Vite's proxy includes the request URL in upstream errors. Preserve the error
+// and route without recording OIDC authorization codes or state in terminals.
+logger.error = (message, options) => logError(
+  message.replace(/(\/auth\/oidc\/callback)\?[^\s\u001b]*/g, "$1?[redacted]"),
+  options,
+);
+
 export default defineConfig({
+  customLogger: logger,
   plugins: [react(), tailwind()],
   resolve: { alias: { "@": fileURLToPath(new URL("./src", import.meta.url)) } },
   server: {

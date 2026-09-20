@@ -1,3 +1,4 @@
+import { issueFixtureToken } from "./test-api-credentials.mjs";
 // Uses only the disposable HTTP harness and its fixture credentials.
 import assert from 'node:assert/strict';
 import {request} from 'node:http';
@@ -7,7 +8,7 @@ export async function testPublicNames({api, token, sql}) {
   const before = await counts();
   for (const name of ['', 'TeamA', 'under_score', 'two.labels', '-app', 'app-', '日本語', 'a'.repeat(64)]) {
     const tenant = await api('/admin/tenants', {method:'POST', token:'test-only', body:{
-      slug:name, name:'Invalid DNS label fixture', admin_email:'invalid-name@example.invalid', admin_password:'fixture-password',
+      slug:name, name:'Invalid DNS label fixture', admin_email:'invalid-name@example.invalid', admin_oidc_subject: 'fixture-admin',
     }});
     assert.equal(tenant.status,400, `invalid tenant slug: ${name}`);
     await tenant.json();
@@ -51,9 +52,9 @@ export async function testHttpBoundaries({api, sql, token, wasm, upload, url}) {
   assert.equal(created.status,201);
   const id = (await created.json()).component_id;
   assert.equal((await upload(id,token,'1',wasm,0,{ingress:true})).status,201);
-  const readerResponse = await api('/auth/login', {method:'POST',body:{
-    tenant_slug:'upload',email:'test@example.invalid',password:'test-password',scopes:['read'],
-  }});
+  const readerResponse = await issueFixtureToken(sql, {
+    tenant_slug:'upload',email:'test@example.invalid',scopes:['read'],
+  });
   assert.equal(readerResponse.status,201);
   const reader = await readerResponse.json();
   assert.deepEqual(reader.scopes,['read']);

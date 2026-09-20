@@ -1,5 +1,9 @@
 // Browser contract fixtures only; excluded from the production image and bundle.
 import { createServer } from "node:http";
+import { createHash, randomBytes } from "node:crypto";
+let identity = "developer@example.internal";
+const grants = new Map();
+const sessions = new Map();
 let components, versions, egress, tokens, expired, unavailable, invocationCount;
 function reset(empty = false) {
   components = empty
@@ -32,6 +36,9 @@ function reset(empty = false) {
   egress = {};
   tokens = new Map([["cli-fixture-token", ["read", "deploy", "admin"]]]);
   invocationCount = 12408;
+  identity = "developer@example.internal";
+  grants.clear();
+  sessions.clear();
   expired = false;
   unavailable = false;
 }
@@ -102,36 +109,68 @@ createServer(async (req, res) => {
     unavailable = true;
     return send(200, {});
   }
-  if (url.pathname === "/auth/login") {
-    if (body.password !== "fixture-password") return send(401, {});
+  if (url.pathname === "/__test/identity") {
+    identity = body.email;
+    return send(200, {});
+  }
+  if (url.pathname === "/auth/config") return send(200, { console_url: "http://127.0.0.1:4173/" });
+  if (url.pathname === "/auth/oidc/start") {
+    const code = randomBytes(32).toString("hex");
+    grants.set(code, { ...body, email: identity });
+    return send(200, { authorization_url: `http://127.0.0.1:4173/api/__test/authorize?code=${code}` });
+  }
+  if (url.pathname === "/__test/authorize") {
+    const code = url.searchParams.get("code"), grant = grants.get(code);
+    if (!grant) return send(400, {});
+    const target = new URL(grant.redirect_uri);
+    target.hash = new URLSearchParams({ oidc_code: code, oidc_state: grant.state });
+    res.writeHead(302, { location: target.href }).end();
+    return;
+  }
+  if (url.pathname === "/auth/oidc/browser/exchange") {
+    const grant = grants.get(body.code);
+    grants.delete(body.code);
+    if (!grant || createHash("sha256").update(body.code_verifier).digest("base64url") !== grant.code_challenge) return send(401, {});
     const scopes =
-      body.email === "reader@example.internal"
+      grant.email === "reader@example.internal"
         ? ["read"]
-        : body.email === "admin-only@example.internal"
+        : grant.email === "admin-only@example.internal"
           ? ["read", "admin"]
-          : body.email === "deployer@example.internal"
+          : grant.email === "deployer@example.internal"
             ? ["read", "deploy"]
             : ["read", "deploy", "admin"];
-    const token = `browser-fixture-token-${tokens.size}`;
+    const token = randomBytes(32).toString("hex");
+    const token_id = randomBytes(16).toString("hex");
+    const expires_at = new Date(Date.now() + 3600000).toISOString();
     tokens.set(token, scopes);
+    sessions.set(token, { token_id, expires_at, email: grant.email });
+    res.setHeader("Set-Cookie", `hibana_test_session=${token}; Path=/; HttpOnly; SameSite=Strict; Max-Age=3600`);
     return send(201, {
-      token,
-      expires_at: new Date(Date.now() + 3600000).toISOString(),
+      token_id, expires_at,
     });
   }
-  const token = req.headers.authorization?.slice(7),
+  const token = req.headers.authorization?.slice(7) || req.headers.cookie?.split(';').map(s => s.trim()).find(s => s.startsWith('hibana_test_session='))?.split('=')[1],
     scopes = tokens.get(token);
   if (!scopes || expired) return send(401, {});
+  const session = sessions.get(token);
+  if (!req.headers.authorization && (req.headers['x-hibana-console'] !== '1'
+      || (req.headers['x-hibana-session'] !== session?.token_id
+        && !(url.pathname === '/auth/session' && !req.headers['x-hibana-session'])))) return send(401, {});
   if (url.pathname === "/auth/session")
     return send(200, {
+      token_id: session?.token_id || token,
+      expires_at: session?.expires_at || new Date(Date.now() + 3600000).toISOString(),
+      expires_in_ms: session ? Math.max(0, Date.parse(session.expires_at) - Date.now()) : 3600000,
       tenant_id: "t_team",
       tenant_slug: "team",
       tenant_name: "Development",
+      email: session?.email || identity,
       scopes,
       ingress_base_domain: "apps.example.internal",
     });
   if (url.pathname === "/auth/logout") {
     tokens.delete(token);
+    res.setHeader("Set-Cookie", "hibana_test_session=; Path=/; HttpOnly; SameSite=Strict; Max-Age=0");
     return send(204);
   }
   if (unavailable) return send(503, {});

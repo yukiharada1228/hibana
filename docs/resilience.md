@@ -63,7 +63,7 @@ format 2のバックアップでは`key-config.json`に`SECRETS_MASTER_KID`と`J
 
 復元時はS3へ書き戻したオブジェクトを再取得してSHA-256を確認し、DBの主要テーブル・Secrets履歴・版ごとのvars/Secret参照の行数を照合します。旧バックアップの6テーブルの行数一覧も読み取り可能ですが、新規取得では設定の2テーブルを加えます。さらに、生存するSecretの現行世代をすべて実際に復号します。検証にはCPと同じ暗号実装を持つイメージをローカルDockerで起動し、ネットワークを無効化、鍵・暗号文は標準入力だけで渡し、平文は出力しません。このイメージには`--verify-backup-secrets`モードが必要です。旧世代はダンプに保持しますが、計画的なrekey後に鍵を廃棄済みの履歴まで復号可能とはしません。
 
-再開後にはCLIのlogin・既存API・Secrets・rollbackも確認します。Redisのレート制限/ログイン失敗カウンタはこのバックアップに含みません。Redisの再作成はロックアウト状態も失うため、公開環境ではHA・永続化・障害中の認証制御を別途設計します。
+再開後にはCLIのlogin・既存API・Secrets・rollbackも確認します。Redisのレート制限/OIDCログイン状態はこのバックアップに含みません。Redisの再作成は未完了のOIDCログイン状態も失うため、公開環境ではHA・永続化・障害中の認証制御を別途設計します。
 
 PVCはHAではありません。kindのlocal-pathボリュームは特定の論理ノードに依存し、kindクラスタ削除時には失われます。本番には複数ノードで利用できる耐障害ストレージ、DBのWAL保管/PITR、別環境への復元訓練が必要です。
 
@@ -105,7 +105,7 @@ python3 scripts/k8s_resilience.py fault --target hibana-worker --seconds 60 --pr
 | 依存先 | Hibana側の対応 | 本番環境で必要な試験 |
 | --- | --- | --- |
 | PostgreSQL | SQLx再接続、SQL10秒/ロック3秒/idle transaction15秒、TCP keepalive/user timeout | 同じ書込み先名でprimary昇格、接続の再確立、RLS・署名・実行記録・Secrets・rollbackの確認 |
-| Redis | 接続/応答2秒、再接続2回・待機最大500ms、到達不能時は受付/ログインを拒否 | HAのprimary切替、レート制限・ロックアウト・一回限りのトークンの保持。同時実行数はDBだけで管理。Sentinel直接検出は未実装 |
+| Redis | 接続/応答2秒、再接続2回・待機最大500ms、到達不能時は受付/ログインを拒否 | HAのprimary切替、レート制限・OIDC state・一回限りのトークンの保持。同時実行数はDBだけで管理。Sentinel直接検出は未実装 |
 | S3 | SDK接続3秒/1試行10秒/全体30秒・最大2試行。Worker取得は30秒 | 冗長ストレージの障害・復旧、未キャッシュWasm取得、アップロード、ハッシュ一致 |
 
 SQLのstatement timeoutはDBサーバー側です。ネットワーク全体の応答時間を単独で保証しません。ゲストを開始した可能性があるHTTP呼出しは自動再実行せず、結果不明の書込みはアプリ側の冪等性で扱います。Worker喪失後の孤立実行は既存reaper（既定1800秒）で回収します。

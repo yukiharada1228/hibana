@@ -1,4 +1,9 @@
 export type Session = {
+  token_id: string;
+  expires_at: string;
+  expires_in_ms: number;
+  user_id?: string | null;
+  email?: string | null;
   tenant_id: string;
   tenant_slug: string;
   tenant_name: string;

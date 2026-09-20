@@ -28,7 +28,7 @@ const config = {
   limits: { memory_mb: 256, timeout_ms: 15000 },
 };
 await writeFile(configFile, JSON.stringify({ ...config, secrets: [] }));
-hibana(["login"]);
+assert.ok(process.env.HIBANA_TOKEN, "Set a scoped HIBANA_TOKEN for non-interactive smoke tests; OIDC login is tested separately");
 hibana(["deploy"]);
 hibana(["secret", "put", "TEST_SECRET"], "hibana-test-secret");
 hibana(["secret", "allow-deploy", "TEST_SECRET"]);

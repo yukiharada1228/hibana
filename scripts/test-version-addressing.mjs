@@ -1,3 +1,4 @@
+import { issueFixtureToken } from "./test-api-credentials.mjs";
 // Only called by test-http.sh against its disposable database.
 import assert from 'node:assert/strict';
 
@@ -31,9 +32,9 @@ export async function testVersionAddressing({api, sql, token, wasm, upload}) {
 
   const other = await api('/components',{token,method:'POST',body:{name:'version-other'}});
   const otherId = (await other.json()).component_id;
-  const tenant = await api('/admin/tenants',{token:'test-only',method:'POST',body:{slug:'version-outsider',name:'Fixture',admin_email:'fixture@example.invalid',admin_password:'fixture-password'}});
+  const tenant = await api('/admin/tenants',{token:'test-only',method:'POST',body:{slug:'version-outsider',name:'Fixture',admin_email:'fixture@example.invalid',admin_oidc_subject: 'fixture-admin'}});
   assert.equal(tenant.status,201);
-  const login = await api('/auth/login',{method:'POST',body:{tenant_slug:'version-outsider',email:'fixture@example.invalid',password:'fixture-password'}});
+  const login = await issueFixtureToken(sql, {tenant_slug:'version-outsider',email:'fixture@example.invalid',});
   assert.equal(login.status,201);
   const outsider = (await login.json()).token;
   for (const method of ['GET','DELETE']) {
@@ -41,7 +42,7 @@ export async function testVersionAddressing({api, sql, token, wasm, upload}) {
     assert.equal((await api(`${base}/by-id/${ids[0]}`,{token:outsider,method})).status,404);
     assert.equal((await api(`${base}/by-id/${ids[0]}`,{method})).status,401);
   }
-  const reader = await api('/auth/login',{method:'POST',body:{tenant_slug:'upload',email:'test@example.invalid',password:'test-password',scopes:['read']}});
+  const reader = await issueFixtureToken(sql, {tenant_slug:'upload',email:'test@example.invalid',scopes:['read']});
   const readToken = (await reader.json()).token;
   assert.equal((await api(`${base}/by-id/${ids[0]}`,{token:readToken})).status,200);
   assert.equal((await api(`${base}/by-id/${ids[0]}`,{token:readToken,method:'DELETE'})).status,403);

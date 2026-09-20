@@ -29,7 +29,6 @@ fn state(pool: DatabaseConnection, store: Arc<dyn crate::store::Store>) -> AppSt
         cfg.max_wasm_upload_bytes,
         cfg.presign_ttl_secs,
         "test-only".into(),
-        String::new(),
         Arc::new(crate::signing::Signer::from_seed(
             crate::signing::decode_seed(cfg.job_signing_key_plain()).unwrap(),
             cfg.job_signing_kid.clone(),
@@ -42,6 +41,7 @@ fn state(pool: DatabaseConnection, store: Arc<dyn crate::store::Store>) -> AppSt
         cfg.job_env_exchange_rate_per_min,
         false,
         cfg.public_apps.clone(),
+        cfg.auth.clone(),
     )
 }
 
@@ -95,13 +95,7 @@ async fn http_mvp_regression() {
         "refusing a nonempty database"
     );
     assert_legacy_database_rejected(&owner).await;
-    let (first, second) = tokio::join!(
-        crate::migrations::run_migrations(&owner),
-        crate::migrations::run_migrations(&owner)
-    );
-    first.unwrap();
-    second.unwrap();
-    assert_fresh_schema(&owner).await;
+    migrate_before_oidc_cutover(&owner).await;
     fixture_execute(&owner, r#"
         INSERT INTO tenants (id,slug,name,status,quotas) VALUES ('http','http','HTTP','active','{"max_concurrent_executions":1}'),('other','other','Other','active','{}');
         INSERT INTO components (id,tenant_id,name,ingress_enabled) VALUES ('source','http','source',true),('target','http','target',true);
@@ -111,10 +105,12 @@ async fn http_mvp_regression() {
                    ('target-v1','http','target','1','target/1.wasm','abcd','active');
         UPDATE components SET active_version_id=id||'-v1';
     "#, vec![]).await.unwrap();
-    assert_compound_identities(&owner).await;
     assert_build_metadata_upgrade(&owner).await;
     assert_execution_input_upgrade(&owner).await;
     assert_secret_key_retention_upgrade(&owner).await;
+    assert_oidc_cutover(&owner).await;
+    assert_fresh_schema(&owner).await;
+    assert_compound_identities(&owner).await;
     let pool = hibana_database::postgres::connect(&std::env::var("DATABASE_URL").unwrap(), 10, 0)
         .await
         .unwrap();
@@ -127,89 +123,6 @@ async fn http_mvp_regression() {
     assert_tenant_context_is_transaction_local().await;
     let store = Arc::new(crate::store::InProcStore::new());
     let state = state(pool.clone(), store.clone());
-
-    // Capacity is shared across router clones and rejects before identity/store work.
-    let first_check = state.reserve_password_work().unwrap();
-    let second_check = state.clone().reserve_password_work().unwrap();
-    let overloaded = crate::login::login(
-        State(state.clone()),
-        axum::extract::ConnectInfo("127.0.0.1:12345".parse().unwrap()),
-        HeaderMap::new(),
-        crate::extract::JsonBody(crate::login::LoginRequest {
-            tenant_slug: "absent".into(),
-            email: "none@example.invalid".into(),
-            password: "fixture-password".into(),
-            scopes: vec![],
-        }),
-    )
-    .await
-    .unwrap()
-    .into_response();
-    assert_eq!(overloaded.status(), StatusCode::TOO_MANY_REQUESTS);
-    assert_eq!(overloaded.headers()["retry-after"], "1");
-    let user = crate::handlers::identity::create_user(
-        State(state.clone()),
-        crate::auth::Principal {
-            tenant_id: "http".into(),
-            user_id: None,
-            token_id: "test".into(),
-            scopes: vec![hibana_shared::Scope::Admin],
-            role: hibana_shared::Role::Admin,
-        },
-        axum::extract::Path("http".into()),
-        crate::extract::JsonBody(crate::handlers::identity::CreateUserRequest {
-            email: "capacity@example.invalid".into(),
-            password: "fixture-password".into(),
-            role: hibana_shared::Role::Member,
-        }),
-    )
-    .await
-    .unwrap()
-    .into_response();
-    let mut admin_headers = HeaderMap::new();
-    admin_headers.insert("authorization", "Bearer test-only".parse().unwrap());
-    let tenant = crate::handlers::tenants::create_tenant(
-        State(state.clone()),
-        admin_headers,
-        crate::extract::JsonBody(crate::handlers::tenants::CreateTenantRequest {
-            slug: "capacity-blocked".into(),
-            name: "Capacity".into(),
-            admin_email: "capacity@example.invalid".into(),
-            admin_password: "fixture-password".into(),
-        }),
-    )
-    .await
-    .unwrap()
-    .into_response();
-    for response in [user, tenant] {
-        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
-        assert_eq!(response.headers()["retry-after"], "1");
-        let bytes = axum::body::to_bytes(response.into_body(), 4096)
-            .await
-            .unwrap();
-        assert_eq!(
-            serde_json::from_slice::<serde_json::Value>(&bytes).unwrap()["error"]["code"],
-            "password_capacity"
-        );
-    }
-    assert_eq!(
-        scalar(
-            &owner,
-            "SELECT count(*) FROM users WHERE email='capacity@example.invalid'"
-        )
-        .await,
-        0
-    );
-    assert_eq!(
-        scalar(
-            &owner,
-            "SELECT count(*) FROM tenants WHERE slug='capacity-blocked'"
-        )
-        .await,
-        0
-    );
-    drop((first_check, second_check));
-    assert!(state.reserve_password_work().is_some());
 
     let unavailable = self::state(pool.clone(), Arc::new(crate::store::FailingStore));
     assert_eq!(
@@ -1454,23 +1367,181 @@ async fn assert_fresh_schema(owner: &DatabaseConnection) {
     assert_eq!(scalar(owner,"SELECT count(*) FROM information_schema.tables WHERE table_schema='public' AND table_type='BASE TABLE'").await,16);
     assert_eq!(
         scalar(owner, "SELECT count(*) FROM seaql_migrations").await,
-        6
+        8
     );
     assert_eq!(scalar(owner,"SELECT count(*) FROM pg_class c JOIN pg_namespace n ON c.relnamespace=n.oid WHERE n.nspname='public' AND c.relkind='r' AND c.relrowsecurity AND c.relforcerowsecurity").await,13);
     assert_eq!(scalar(owner,"SELECT count(*) FROM information_schema.columns WHERE table_schema='public' AND column_name IN ('canary_weight','canary_version_id','chain_depth','routing_reason','idempotency_key')").await,0);
     println!("PASS fresh ORM schema: 15 platform tables, RLS, no removed feature tables, idempotent migration");
 }
 
+// Exercise historical data migrations before the irreversible OIDC cutover.
+async fn migrate_before_oidc_cutover(owner: &DatabaseConnection) {
+    use hibana_migration::MigratorTrait as _;
+    let applied = if fixture_scalar::<bool>(
+        owner,
+        "SELECT to_regclass('public.seaql_migrations') IS NOT NULL",
+        vec![],
+    )
+    .await
+    .unwrap()
+    {
+        scalar(owner, "SELECT count(*) FROM seaql_migrations").await
+    } else {
+        0
+    };
+    assert!(applied <= 7);
+    if applied < 7 {
+        hibana_migration::Migrator::up(owner, Some((7 - applied) as u32))
+            .await
+            .unwrap();
+    }
+}
+
+async fn assert_oidc_cutover(owner: &DatabaseConnection) {
+    use hibana_migration::MigratorTrait as _;
+    assert!(hibana_database::postgres::assert_runtime_schema(owner)
+        .await
+        .is_err());
+    fixture_execute(owner, r#"
+        INSERT INTO users(id,tenant_id,email,password_hash,role,oidc_issuer,oidc_subject,auth_version)
+        VALUES ('cutover-user','http','cutover@example.invalid','unused','admin','https://fixture-idp.invalid','cutover-subject',4);
+        INSERT INTO api_tokens(id,tenant_id,user_id,token_hash,scopes,expires_at,auth_method,user_auth_version)
+        SELECT 'cutover-'||method,'http','cutover-user','cutover-'||method,ARRAY['read'],now()+interval '1 hour',method,4
+        FROM unnest(ARRAY['api','oidc','password']) AS method;
+        INSERT INTO api_tokens(id,tenant_id,token_hash,scopes,expires_at,auth_method,user_auth_version,revoked_at)
+        VALUES ('cutover-service','http','cutover-service',ARRAY['read'],now()+interval '1 hour','api',0,NULL),
+               ('cutover-revoked','http','cutover-revoked',ARRAY['read'],now()+interval '1 hour','api',0,'2026-01-01T00:00:00Z');
+    "#, vec![]).await.unwrap();
+    let (first, second) = tokio::join!(
+        crate::migrations::run_migrations(owner),
+        crate::migrations::run_migrations(owner)
+    );
+    first.unwrap();
+    second.unwrap();
+    hibana_database::postgres::assert_runtime_schema(owner)
+        .await
+        .unwrap();
+    assert_eq!(
+        scalar(
+            owner,
+            "SELECT count(*) FROM api_tokens WHERE id LIKE 'cutover-%'"
+        )
+        .await,
+        5
+    );
+    assert_eq!(
+        scalar(
+            owner,
+            "SELECT count(*) FROM api_tokens WHERE id LIKE 'cutover-%' AND revoked_at IS NULL"
+        )
+        .await,
+        0
+    );
+    assert_eq!(
+        scalar(
+            owner,
+            "SELECT auth_version FROM users WHERE id='cutover-user'"
+        )
+        .await,
+        5
+    );
+    assert!(fixture_scalar::<bool>(owner, "SELECT revoked_at='2026-01-01T00:00:00Z'::timestamptz FROM api_tokens WHERE id='cutover-revoked'", vec![]).await.unwrap());
+    assert_eq!(scalar(owner, "SELECT count(*) FROM information_schema.columns WHERE table_schema='public' AND table_name='users' AND column_name='password_hash'").await, 0);
+    for function in [
+        "auth_lookup_user_by_email(text,text)",
+        "auth_lookup_token_by_hash_v2(text)",
+        "legacy_token_auth_method(text,text,text)",
+        "classify_legacy_token_auth()",
+        "snapshot_legacy_token_generation()",
+    ] {
+        assert!(
+            fixture_scalar::<bool>(
+                owner,
+                "SELECT to_regprocedure($1) IS NULL",
+                vec![format!("public.{function}").into()]
+            )
+            .await
+            .unwrap(),
+            "{function}"
+        );
+    }
+    assert_eq!(scalar(owner, "SELECT count(*) FROM pg_trigger WHERE tgname IN ('classify_legacy_token_auth','snapshot_legacy_token_generation')").await, 0);
+    assert_eq!(scalar(owner, "SELECT count(*) FROM pg_proc p, LATERAL aclexplode(p.proacl) a WHERE p.oid='public.auth_lookup_token_by_hash(text)'::regprocedure AND a.grantee=0 AND a.privilege_type='EXECUTE'").await, 0);
+    // Current issuance and authentication still operate with the restricted DB role.
+    let runtime = hibana_database::postgres::connect(&std::env::var("DATABASE_URL").unwrap(), 1, 0)
+        .await
+        .unwrap();
+    assert!(db::find_token_by_hash(&runtime, "cutover-api")
+        .await
+        .unwrap()
+        .is_none());
+    assert!(db::find_token_by_hash(&runtime, "cutover-service")
+        .await
+        .unwrap()
+        .unwrap()
+        .revoked_at
+        .is_some());
+    for columns in [
+        "",
+        ",auth_method",
+        ",user_auth_version",
+        ",auth_method,user_auth_version",
+    ] {
+        let extra = match columns {
+            "" => "",
+            ",auth_method" => ",'api'",
+            ",user_auth_version" => ",5",
+            _ => ",'password',5",
+        };
+        let tx = runtime.begin().await.unwrap();
+        db::set_tenant_guc(&tx, "http").await.unwrap();
+        let query = format!("INSERT INTO api_tokens(id,tenant_id,user_id,token_hash,scopes,expires_at{columns}) VALUES ('cutover-invalid','http','cutover-user','cutover-invalid',ARRAY['read'],now()+interval '1 hour'{extra})");
+        assert!(
+            fixture_execute(&tx, &query, vec![]).await.is_err(),
+            "{columns}"
+        );
+        tx.rollback().await.unwrap();
+    }
+    fixture_execute(owner, "INSERT INTO api_tokens(id,tenant_id,user_id,token_hash,scopes,expires_at,auth_method,user_auth_version) VALUES ('cutover-new','http','cutover-user','cutover-new',ARRAY['read'],now()+interval '1 hour','api',5)", vec![]).await.unwrap();
+    assert!(db::find_token_by_hash(&runtime, "cutover-new")
+        .await
+        .unwrap()
+        .unwrap()
+        .into_principal()
+        .is_some());
+    crate::migrations::run_migrations(owner).await.unwrap();
+    assert!(
+        db::find_token_by_hash(&runtime, "cutover-new")
+            .await
+            .unwrap()
+            .unwrap()
+            .into_principal()
+            .is_some(),
+        "repeated migration must not revoke newly issued credentials"
+    );
+    assert!(hibana_migration::Migrator::down(owner, Some(1))
+        .await
+        .unwrap_err()
+        .to_string()
+        .contains("cannot be rolled back"));
+    hibana_database::postgres::assert_runtime_schema(owner)
+        .await
+        .unwrap();
+    runtime.close().await.unwrap();
+    fixture_execute(owner, "DELETE FROM api_tokens WHERE id LIKE 'cutover-%'; DELETE FROM users WHERE id='cutover-user'", vec![]).await.unwrap();
+    println!("PASS OIDC cutover removes password storage and legacy writers, revokes existing credentials, preserves rows, and permits current token issuance");
+}
+
 async fn assert_build_metadata_upgrade(owner: &DatabaseConnection) {
     use hibana_migration::MigratorTrait as _;
     // Exercise an existing baseline with real versions; never recreate the DB.
-    hibana_migration::Migrator::down(owner, Some(5))
+    hibana_migration::Migrator::down(owner, Some(6))
         .await
         .unwrap();
     assert!(hibana_database::postgres::assert_runtime_schema(owner)
         .await
         .is_err());
-    crate::migrations::run_migrations(owner).await.unwrap();
+    migrate_before_oidc_cutover(owner).await;
     assert_eq!(
         scalar(
             owner,
@@ -1508,7 +1579,7 @@ async fn assert_build_metadata_upgrade(owner: &DatabaseConnection) {
 
 async fn assert_execution_input_upgrade(owner: &DatabaseConnection) {
     use hibana_migration::MigratorTrait as _;
-    hibana_migration::Migrator::down(owner, Some(3))
+    hibana_migration::Migrator::down(owner, Some(4))
         .await
         .unwrap();
     fixture_execute(owner, r#"
@@ -1523,7 +1594,7 @@ async fn assert_execution_input_upgrade(owner: &DatabaseConnection) {
             CROSS JOIN (VALUES ('pending'),('running'),('succeeded'),('failed'),('timeout')) AS s(status)
             WHERE v.id IN ('source-v1','retention-other-v1');
     "#, vec![]).await.unwrap();
-    crate::migrations::run_migrations(owner).await.unwrap();
+    migrate_before_oidc_cutover(owner).await;
     assert_eq!(scalar(owner, "SELECT count(*) FROM executions WHERE id LIKE 'retention-upgrade-%' AND status IN ('pending','running') AND input IS NOT NULL AND input_ref IS NOT NULL").await, 4);
     assert_eq!(scalar(owner, "SELECT count(*) FROM executions WHERE id LIKE 'retention-upgrade-%' AND status NOT IN ('pending','running') AND input IS NULL AND input_ref IS NULL").await, 6);
 
@@ -1561,7 +1632,7 @@ async fn assert_execution_input_upgrade(owner: &DatabaseConnection) {
     tx.commit().await.unwrap();
     // Simulate an older Pod finishing after migration, including a suspended tenant.
     fixture_execute(owner, "UPDATE executions SET status='succeeded',input='{\"headers\":{\"authorization\":\"legacy-fixture\"}}',input_ref='legacy-ref' WHERE id IN ('retention-upgrade-http-running','retention-upgrade-other-running')", vec![]).await.unwrap();
-    crate::migrations::run_migrations(owner).await.unwrap();
+    migrate_before_oidc_cutover(owner).await;
     assert_eq!(scalar(owner, "SELECT count(*) FROM executions WHERE id LIKE 'retention-upgrade-%' AND status='succeeded' AND input IS NOT NULL").await, 2);
     let runtime = hibana_database::postgres::connect(&std::env::var("DATABASE_URL").unwrap(), 2, 0)
         .await
@@ -1616,7 +1687,7 @@ async fn assert_execution_input_upgrade(owner: &DatabaseConnection) {
 
 async fn assert_secret_key_retention_upgrade(owner: &DatabaseConnection) {
     use hibana_migration::MigratorTrait as _;
-    hibana_migration::Migrator::down(owner, Some(1))
+    hibana_migration::Migrator::down(owner, Some(2))
         .await
         .unwrap();
     assert!(hibana_database::postgres::assert_runtime_schema(owner)
@@ -1653,10 +1724,10 @@ async fn assert_secret_key_retention_upgrade(owner: &DatabaseConnection) {
     "#, vec![]).await.unwrap();
     // Prove the old function misses generations required by accepted jobs.
     assert_eq!(scalar(owner, "SELECT COALESCE(sum(n),0)::bigint FROM secrets_kek_kid_counts_all() WHERE kek_kid='key-required'").await, 0);
-    crate::migrations::run_migrations(owner).await.unwrap();
-    hibana_database::postgres::assert_runtime_schema(owner)
+    migrate_before_oidc_cutover(owner).await;
+    assert!(hibana_database::postgres::assert_runtime_schema(owner)
         .await
-        .unwrap();
+        .is_err());
     let runtime = hibana_database::postgres::connect(&std::env::var("DATABASE_URL").unwrap(), 1, 0)
         .await
         .unwrap();
@@ -1810,12 +1881,12 @@ async fn assert_tenant_context_is_transaction_local() {
 }
 
 async fn assert_compound_identities(owner: &DatabaseConnection) {
-    fixture_execute(owner, "INSERT INTO users(id,tenant_id,email,password_hash,role) VALUES ('foreign-user','other','foreign@example.invalid','fixture','member')", vec![]).await.unwrap();
+    fixture_execute(owner, "INSERT INTO users(id,tenant_id,email,role) VALUES ('foreign-user','other','foreign@example.invalid','member')", vec![]).await.unwrap();
     for query in [
         "INSERT INTO component_versions(id,tenant_id,component_id,version,storage_uri,wasm_sha256) VALUES ('foreign-version','other','source','foreign','unused','unused')",
         "INSERT INTO executions(id,tenant_id,component_id,version_id) VALUES ('foreign-execution','other','source','source-v1')",
         "INSERT INTO usage_rollups(tenant_id,period_start,component_id) VALUES ('other',CURRENT_DATE,'source')",
-        "INSERT INTO api_tokens(id,tenant_id,user_id,token_hash,scopes,expires_at) VALUES ('foreign-token','http','foreign-user','fixture',ARRAY['read'],now()+interval '1 hour')",
+        "INSERT INTO api_tokens(id,tenant_id,user_id,token_hash,scopes,expires_at,auth_method,user_auth_version) VALUES ('foreign-token','http','foreign-user','fixture',ARRAY['read'],now()+interval '1 hour','api',0)",
         "UPDATE components SET active_version_id='target-v1' WHERE id='source'",
         "UPDATE components SET previous_active_version_id='target-v1' WHERE id='source'",
     ] {

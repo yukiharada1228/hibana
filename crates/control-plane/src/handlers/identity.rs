@@ -1,8 +1,8 @@
 //! Identity management HTTP handlers.
-use super::map_unique_violation;
+use super::map_unique_conflict;
 use crate::auth::{hash_token, Principal};
 use crate::authz::{require_admin_role, resolve_token_scopes};
-use crate::crypto::{generate_secret, hash_password_async};
+use crate::crypto::generate_secret;
 use crate::db;
 use crate::error::AppError;
 use crate::extract::JsonBody;
@@ -12,7 +12,7 @@ use axum::http::StatusCode;
 use axum::response::IntoResponse;
 use axum::Json;
 use hibana_shared::{new_token_id, new_user_id, FaasError, Role, Scope};
-use sea_orm::TransactionTrait as _;
+use sea_orm::{DatabaseTransaction, TransactionTrait as _};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 
@@ -21,9 +21,10 @@ use serde_json::json;
 // ---------------------------------------------------------------------------
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct CreateUserRequest {
     pub email: String,
-    pub password: String,
+    pub oidc_subject: String,
     pub role: Role,
 }
 
@@ -54,28 +55,23 @@ pub async fn create_user(
     if req.email.trim().is_empty() {
         return Err(FaasError::InvalidRequest("email must not be empty".into()).into());
     }
-    if req.password.is_empty() {
-        return Err(FaasError::InvalidRequest("password must not be empty".into()).into());
-    }
-
-    let Some(permit) = state.reserve_password_work() else {
-        return Ok(crate::admission::RateLimited::password_capacity().into_response());
-    };
-    let password_hash = hash_password_async(permit, req.password).await?;
+    validate_subject(&req.oidc_subject)?;
     let user_id = new_user_id();
 
     let tx = state.pool().begin().await?;
     db::set_tenant_guc(&tx, &principal.tenant_id).await?;
+    let principal = lock_identity_admin(&state, &tx, &principal, None).await?;
     db::create_user(
         &tx,
         &user_id,
         &principal.tenant_id,
         req.email.trim(),
-        &password_hash,
         req.role,
+        &state.auth_config().issuer,
+        &req.oidc_subject,
     )
     .await
-    .map_err(|e| map_unique_violation(e, "email already exists in this tenant"))?;
+    .map_err(|e| map_unique_conflict(e, "email or identity already exists in this tenant"))?;
     // §3.7: identity プロビジョニングを記録する（GUC 設定済み → user 行と同一 tx で commit）。
     // パスワード/ハッシュは載せない。target は新 user_id、detail に role のみ。
     db::insert_audit_log(
@@ -155,6 +151,10 @@ pub async fn create_token(
     let tx = state.pool().begin().await?;
     db::set_tenant_guc(&tx, &principal.tenant_id).await?;
 
+    // Middleware authorization precedes body reception. Revalidate after it,
+    // under the same locks used for issuance and revocation, through commit.
+    let principal = lock_identity_admin(&state, &tx, &principal, Some(&req.user_id)).await?;
+
     // 対象ユーザは同一テナント内に存在しなければならない（不在/外部は 404）。
     let target_role_str = db::find_user_role(&tx, &principal.tenant_id, &req.user_id)
         .await?
@@ -186,6 +186,7 @@ pub async fn create_token(
         &scope_strs,
         req.name.as_deref(),
         expires_at,
+        db::TokenAuthMethod::Api,
     )
     .await?;
 
@@ -267,6 +268,7 @@ pub async fn revoke_token(
 pub async fn get_session(
     State(state): State<AppState>,
     principal: Principal,
+    axum::Extension(token): axum::Extension<crate::auth::TokenMetadata>,
 ) -> Result<impl IntoResponse, AppError> {
     let tenant = db::session_tenant(state.pool(), &principal.tenant_id)
         .await?
@@ -277,7 +279,198 @@ pub async fn get_session(
         "tenant_name": tenant.1,
         "scopes": principal.scopes,
         "ingress_base_domain": state.ingress_base_domain(),
+        "user_id": principal.user_id,
+        "email": session_email(&state, &principal).await?,
+        "token_id": token.id,
+        "expires_at": token.expires_at.to_rfc3339(),
+        "expires_in_ms": (token.expires_at - chrono::Utc::now()).num_milliseconds().max(0),
     })))
+}
+
+async fn session_email(
+    state: &AppState,
+    principal: &Principal,
+) -> Result<Option<String>, AppError> {
+    let Some(user) = principal.user_id.as_deref() else {
+        return Ok(None);
+    };
+    let tx = state.pool().begin().await?;
+    db::set_tenant_guc(&tx, &principal.tenant_id).await?;
+    let email = db::lock_user(&tx, &principal.tenant_id, user)
+        .await?
+        .map(|u| u.email);
+    tx.commit().await?;
+    Ok(email)
+}
+
+pub(super) fn validate_subject(subject: &str) -> Result<(), AppError> {
+    if subject.is_empty() || subject.len() > 255 || subject.chars().any(char::is_control) {
+        return Err(FaasError::InvalidRequest("a valid oidc_subject is required".into()).into());
+    }
+    Ok(())
+}
+
+pub async fn list_users(
+    State(state): State<AppState>,
+    principal: Principal,
+) -> Result<impl IntoResponse, AppError> {
+    require_admin_role(principal.role)?;
+    let tx = state.pool().begin().await?;
+    db::set_tenant_guc(&tx, &principal.tenant_id).await?;
+    let users = db::list_users(&tx, &principal.tenant_id).await?;
+    tx.commit().await?;
+    Ok(Json(
+        users
+            .into_iter()
+            .map(|(id, email, role, subject)| {
+                json!({
+                    "user_id": id, "email": email, "role": role, "oidc_subject": subject,
+                })
+            })
+            .collect::<Vec<_>>(),
+    ))
+}
+
+#[derive(Deserialize)]
+pub struct BindOidcRequest {
+    oidc_subject: String,
+}
+
+/// Middleware authentication can become stale during body reception or a DB
+/// lock wait. Hold the current actor's identity and token locks through commit.
+async fn lock_identity_principal(
+    state: &AppState,
+    tx: &DatabaseTransaction,
+    principal: &Principal,
+    target: Option<&str>,
+) -> Result<Principal, AppError> {
+    let caller = db::lock_identity_actor(tx, principal, target)
+        .await?
+        .ok_or(FaasError::Unauthorized)?;
+    crate::auth::principal_from_token(state.auth_config(), caller)
+        .ok_or_else(|| FaasError::Unauthorized.into())
+}
+
+async fn lock_identity_admin(
+    state: &AppState,
+    tx: &DatabaseTransaction,
+    principal: &Principal,
+    target: Option<&str>,
+) -> Result<Principal, AppError> {
+    let principal = lock_identity_principal(state, tx, principal, target).await?;
+    require_admin_role(principal.role)?;
+    if !principal.has_scope(Scope::Admin) {
+        return Err(FaasError::Forbidden.into());
+    }
+    Ok(principal)
+}
+
+pub async fn bind_oidc(
+    State(state): State<AppState>,
+    principal: Principal,
+    Path(user): Path<String>,
+    JsonBody(req): JsonBody<BindOidcRequest>,
+) -> Result<impl IntoResponse, AppError> {
+    require_admin_role(principal.role)?;
+    validate_subject(&req.oidc_subject)?;
+    let tx = state.pool().begin().await?;
+    db::set_tenant_guc(&tx, &principal.tenant_id).await?;
+    let principal = lock_identity_admin(&state, &tx, &principal, Some(&user)).await?;
+    db::lock_user(&tx, &principal.tenant_id, &user)
+        .await?
+        .ok_or_else(|| FaasError::NotFound("user".into()))?;
+    db::bind_oidc_user(
+        &tx,
+        &principal.tenant_id,
+        &user,
+        &state.auth_config().issuer,
+        &req.oidc_subject,
+    )
+    .await
+    .map_err(|e| map_unique_conflict(e, "identity already belongs to a user in this tenant"))?;
+    db::insert_audit_log(
+        &tx,
+        &principal.tenant_id,
+        principal.actor(),
+        "user_oidc_linked",
+        Some(&user),
+        None,
+    )
+    .await?;
+    tx.commit().await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+enum UserRevocation {
+    Tokens,
+    Disable,
+    LogoutAll,
+}
+
+async fn revoke_user(
+    state: &AppState,
+    principal: &Principal,
+    user: &str,
+    action: UserRevocation,
+) -> Result<StatusCode, AppError> {
+    let tx = state.pool().begin().await?;
+    db::set_tenant_guc(&tx, &principal.tenant_id).await?;
+    let principal = match action {
+        UserRevocation::LogoutAll => {
+            let actor = lock_identity_principal(state, &tx, principal, Some(user)).await?;
+            if actor.user_id.as_deref() != Some(user) {
+                return Err(FaasError::Forbidden.into());
+            }
+            actor
+        }
+        _ => lock_identity_admin(state, &tx, principal, Some(user)).await?,
+    };
+    db::lock_user(&tx, &principal.tenant_id, user)
+        .await?
+        .ok_or_else(|| FaasError::NotFound("user".into()))?;
+    let disable = matches!(action, UserRevocation::Disable);
+    db::revoke_user_tokens(&tx, &principal.tenant_id, user, disable).await?;
+    db::insert_audit_log(
+        &tx,
+        &principal.tenant_id,
+        principal.actor(),
+        if disable {
+            "user_disabled"
+        } else {
+            "user_tokens_revoked"
+        },
+        Some(user),
+        None,
+    )
+    .await?;
+    tx.commit().await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+pub async fn revoke_user_tokens(
+    State(state): State<AppState>,
+    principal: Principal,
+    Path(user): Path<String>,
+) -> Result<StatusCode, AppError> {
+    require_admin_role(principal.role)?;
+    revoke_user(&state, &principal, &user, UserRevocation::Tokens).await
+}
+
+pub async fn disable_user(
+    State(state): State<AppState>,
+    principal: Principal,
+    Path(user): Path<String>,
+) -> Result<StatusCode, AppError> {
+    require_admin_role(principal.role)?;
+    revoke_user(&state, &principal, &user, UserRevocation::Disable).await
+}
+
+pub async fn logout_all(
+    State(state): State<AppState>,
+    principal: Principal,
+) -> Result<StatusCode, AppError> {
+    let user = principal.user_id.as_deref().ok_or(FaasError::Forbidden)?;
+    revoke_user(&state, &principal, user, UserRevocation::LogoutAll).await
 }
 
 /// Revoke the presented token. This deliberately needs no Admin scope and accepts no target ID.

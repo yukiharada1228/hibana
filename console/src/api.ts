@@ -27,14 +27,18 @@ const messages: Record<number, string> = {
   503: "基盤が処理を受け付けられません。しばらく待ってから状態を確認してください。",
 };
 
-/** One page session. Credentials never enter URLs, browser storage or cookies. */
+export type LoginOptions = {
+  console_url: string;
+};
+
+/** The server owns the HttpOnly credential; this page holds only its public ID. */
 export class Api {
-  private token = "";
+  private sessionId = "";
   private lifetime = new AbortController();
   onExpired = () => {};
 
   close() {
-    this.token = "";
+    this.sessionId = "";
     this.lifetime.abort();
   }
 
@@ -47,7 +51,7 @@ export class Api {
     try {
       response = await fetch(`/api${path}`, {
         method,
-        credentials: "omit",
+        credentials: "same-origin",
         redirect: "error",
         cache: "no-store",
         signal: AbortSignal.any([
@@ -55,7 +59,8 @@ export class Api {
           AbortSignal.timeout(120_000),
         ]),
         headers: {
-          ...(this.token ? { Authorization: `Bearer ${this.token}` } : {}),
+          "X-Hibana-Console": "1",
+          ...(this.sessionId ? { "X-Hibana-Session": this.sessionId } : {}),
           ...(body !== undefined ? { "Content-Type": "application/json" } : {}),
         },
         body: body === undefined ? undefined : JSON.stringify(body),
@@ -67,7 +72,7 @@ export class Api {
       );
     }
     if (!response.ok) {
-      if (response.status === 401 && this.token) {
+      if (response.status === 401 && this.sessionId) {
         this.close();
         this.onExpired();
       }
@@ -80,34 +85,67 @@ export class Api {
     return response.status === 204 ? (undefined as T) : response.json();
   }
 
-  async login(
-    tenant: string,
-    email: string,
-    password: string,
-  ): Promise<{ session: Session; expires: string }> {
-    const result = await this.request<{ token: string; expires_at: string }>(
-      "/auth/login",
+  loginOptions() {
+    return this.request<LoginOptions>("/auth/config");
+  }
+
+  beginOidc(body: {
+    tenant_slug: string;
+    redirect_uri: string;
+    state: string;
+    code_challenge: string;
+  }) {
+    return this.request<{ authorization_url: string }>(
+      "/auth/oidc/start",
       "POST",
-      {
-        tenant_slug: tenant,
-        email,
-        password,
-      },
+      body,
     );
-    this.token = result.token;
+  }
+
+  async finishOidc(code: string, verifier: string) {
+    const result = await this.request<{ token_id: string; expires_at: string }>(
+      "/auth/oidc/browser/exchange",
+      "POST",
+      { code, code_verifier: verifier },
+    );
+    // Bind the first metadata request as well: a different tab may sign in.
+    this.sessionId = result.token_id;
+    return this.loadSession();
+  }
+
+  async restoreSession() {
     try {
-      const session = await this.request<Session>("/auth/session");
-      if (!session.scopes.includes("read"))
-        throw new Error("コンソールの利用には Read 権限が必要です。");
-      return { session, expires: result.expires_at };
+      return await this.loadSession();
     } catch (error) {
-      await this.request("/auth/logout", "POST").catch(() => {});
-      this.close();
+      if (error instanceof ApiError && error.status === 401) return null;
       throw error;
     }
   }
+
+  private async loadSession() {
+    const session = await this.request<Session>("/auth/session");
+    if (
+      !session.token_id ||
+      !Number.isFinite(Date.parse(session.expires_at)) ||
+      !Number.isFinite(session.expires_in_ms) ||
+      session.expires_in_ms < 0
+    )
+      throw new Error("ログイン応答が不正です。");
+    if (!session.scopes.includes("read"))
+      throw new Error("コンソールの利用には Read 権限が必要です。");
+    this.sessionId = session.token_id;
+    // Only the server decides expiry. A workstation's clock may be incorrect.
+    return {
+      session,
+      expires: new Date(Date.now() + session.expires_in_ms).toISOString(),
+    };
+  }
   async logout() {
     await this.request("/auth/logout", "POST");
+    this.close();
+  }
+  async logoutAll() {
+    await this.request("/auth/logout-all", "POST");
     this.close();
   }
   components() {
