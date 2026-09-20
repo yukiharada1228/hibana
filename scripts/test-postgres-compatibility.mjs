@@ -50,6 +50,7 @@ const report = {
   wasmDatabaseQuery: "not tested",
 };
 let started = false;
+let failure;
 let runtime,
   runtimeLog = "";
 const application = join(folder, "application");
@@ -798,7 +799,6 @@ async function checkDatabase() {
   );
   await run("docker", [
     "run",
-    "--rm",
     "-d",
     "--name",
     container,
@@ -815,7 +815,9 @@ async function checkDatabase() {
     report.postgresImage,
     "/bin/bash",
     "-c",
-    "install -o postgres -g postgres -m 600 /fixtures/server.key /run/pg-cert/server.key && exec docker-entrypoint.sh postgres -c ssl=on -c ssl_cert_file=/fixtures/server.crt -c ssl_key_file=/run/pg-cert/server.key",
+    // The host mkdtemp directory is 0700. On native Linux postgres cannot
+    // traverse it; copy both files before the entrypoint drops root privileges.
+    "install -o postgres -g postgres -m 600 /fixtures/server.key /fixtures/server.crt /run/pg-cert/ && exec docker-entrypoint.sh postgres -c ssl=on -c ssl_cert_file=/run/pg-cert/server.crt -c ssl_key_file=/run/pg-cert/server.key",
   ]);
   started = true;
   const address = await run("docker", ["port", container, "5432/tcp"]);
@@ -963,16 +965,40 @@ try {
   await buildApplication();
   await checkDatabase();
 } catch (error) {
+  failure = error;
   console.error(runtimeLog);
   console.error("Failed request:", report.requests?.at(-1));
+  // Keep an exited container until cleanup so startup errors remain diagnosable.
+  if (started) {
+    try {
+      const { stdout, stderr } = await execute(
+        "docker",
+        ["logs", "--tail", "80", container],
+        { timeout: 10000, maxBuffer: 65536 },
+      );
+      console.error(stdout + stderr);
+    } catch (diagnosticError) {
+      console.error(
+        "Could not read PostgreSQL fixture logs:",
+        diagnosticError.message,
+      );
+    }
+  }
   throw error;
 } finally {
   try {
     await stopRuntime();
     if (started) {
-      await run("docker", ["stop", container]);
-      report.temporaryDatabase =
-        "stopped and removed (--rm, tmpfs, no persistent volume)";
+      try {
+        await run("docker", ["rm", "--force", container]);
+        report.temporaryDatabase = "removed (tmpfs, no persistent volume)";
+      } catch (cleanupError) {
+        if (!failure) throw cleanupError;
+        console.error(
+          "Could not remove PostgreSQL fixture:",
+          cleanupError.message,
+        );
+      }
     }
   } finally {
     await rm(folder, { recursive: true, force: true });
