@@ -9,19 +9,31 @@ export function requireReleaseChecks(runs, sha) {
     ".github/workflows/ci.yml",
     ".github/workflows/security.yml",
   ]) {
-    const latest = runs
-      .filter(
-        (run) =>
-          run.head_sha === sha &&
-          run.path === path &&
-          ["push", "workflow_dispatch", "schedule"].includes(run.event),
-      )
-      .sort((a, b) => b.id - a.id)[0];
+    const matching = runs.filter(
+      (run) =>
+        run.head_sha === sha &&
+        run.path === path &&
+        ["push", "workflow_dispatch", "schedule"].includes(run.event),
+    );
+    assert.ok(matching.length, `${path} must run for ${sha}`);
+    // A rerun keeps its original ID. Compare result updates, and never publish
+    // while another applicable check is still running (including an old rerun).
+    for (const run of matching) {
+      assert.equal(run.status, "completed", `${path} is still ${run.status}`);
+      assert.ok(
+        Number.isFinite(Date.parse(run.updated_at)),
+        `${path} has no result timestamp`,
+      );
+    }
+    const latestTime = Math.max(
+      ...matching.map((run) => Date.parse(run.updated_at)),
+    );
+    const latest = matching.filter(
+      (run) => Date.parse(run.updated_at) === latestTime,
+    );
     assert.ok(
-      latest &&
-        latest.status === "completed" &&
-        latest.conclusion === "success",
-      `${path} must succeed for ${sha}; latest result: ${latest?.conclusion || latest?.status || "missing"}`,
+      latest.every((run) => run.conclusion === "success"),
+      `${path} must succeed for ${sha}; latest result: ${latest.map((run) => run.conclusion).join(", ")}`,
     );
   }
 }

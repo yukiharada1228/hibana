@@ -31,3 +31,16 @@ for (const cancellation of ['timeout', 'abort']) {
 test('unbounded output is canceled', async () => {
   await assert.rejects(runCommand(process.execPath, ['-e', 'setInterval(()=>process.stdout.write("x".repeat(65536)),1)'], {maxBytes: 1024}), /output limit/);
 });
+
+test('failure diagnostics are opt-in, bounded and include stderr', async () => {
+  const args = ['-e', 'process.stderr.write("x".repeat(32768) + "diagnostic"); process.exitCode = 1;'];
+  await assert.rejects(runCommand(process.execPath, args), error => {
+    assert.doesNotMatch(error.message, /diagnostic/);
+    return true;
+  });
+  await assert.rejects(runCommand(process.execPath, args, {diagnostics: true}), error => {
+    assert.match(error.message, /diagnostic/);
+    assert.ok(error.message.length < 17000);
+    return true;
+  });
+});

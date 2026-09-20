@@ -10,6 +10,7 @@ const successful = ["ci", "security"].map((name, index) => ({
   event: "push",
   status: "completed",
   conclusion: "success",
+  updated_at: "2026-09-20T10:00:00Z",
 }));
 
 test("exact release commit requires both successful branch checks", () => {
@@ -22,6 +23,51 @@ test("exact release commit requires both successful branch checks", () => {
       sha,
     ),
   );
+});
+
+test("a rerun of an older run is ordered by its latest result, not its ID", () => {
+  for (const run of successful) {
+    const olderRerun = {
+      ...run,
+      id: 0,
+      updated_at: "2026-09-20T11:00:00Z",
+      conclusion: "failure",
+    };
+    assert.throws(() => requireReleaseChecks([...successful, olderRerun], sha));
+    requireReleaseChecks(
+      [...successful, { ...olderRerun, conclusion: "success" }],
+      sha,
+    );
+    assert.throws(() =>
+      requireReleaseChecks(
+        [...successful, { ...olderRerun, updated_at: run.updated_at }],
+        sha,
+      ),
+    );
+    assert.throws(() =>
+      requireReleaseChecks(
+        [
+          ...successful,
+          {
+            ...olderRerun,
+            updated_at: "2026-09-20T09:00:00Z",
+            status: "queued",
+          },
+        ],
+        sha,
+      ),
+    );
+    requireReleaseChecks(
+      [...successful, { ...olderRerun, updated_at: "2026-09-20T09:00:00Z" }],
+      sha,
+    );
+    assert.throws(() =>
+      requireReleaseChecks(
+        [...successful, { ...olderRerun, updated_at: undefined }],
+        sha,
+      ),
+    );
+  }
 });
 
 test("older success cannot mask a failed, canceled or pending rerun", () => {

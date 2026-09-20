@@ -1,5 +1,6 @@
-// Real consumer installs, with empty npm caches and no registry access. Each
-// preset must work from hibana.json alone, without application npm dependencies.
+// The publisher starts with an empty npm cache and may resolve public packages.
+// Consumer installs have empty caches and no registry access. Each preset must
+// work from hibana.json alone, without application npm dependencies.
 import assert from "node:assert/strict";
 import { createRequire } from "node:module";
 import { cp, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
@@ -17,6 +18,8 @@ const temporary = await mkdtemp(
   join(tmpdir(), "hibana-extension-bundles-test-"),
 );
 const readJson = async (path) => JSON.parse(await readFile(path, "utf8"));
+const publisherCache = process.env.npm_config_cache;
+process.env.npm_config_cache = join(temporary, "publisher-cache");
 
 try {
   await assert.rejects(
@@ -159,5 +162,7 @@ try {
     );
   }
 } finally {
+  if (publisherCache === undefined) delete process.env.npm_config_cache;
+  else process.env.npm_config_cache = publisherCache;
   await rm(temporary, { recursive: true, force: true });
 }

@@ -39,13 +39,13 @@ export async function packExtensionBundle(destination, name) {
     ]);
 
     // Explicit local tarballs satisfy all unpublished @hibana dependencies.
-    // npm ci in the publisher workspace has already cached the public packages.
+    // npm ci caches tarballs, but may not cache the registry metadata needed
+    // to resolve this fresh staging project. Only consumer installs are offline.
     // --no-save keeps the preset's direct dependencies unchanged.
     await runCommand(
       "npm",
       [
         "install",
-        "--offline",
         "--ignore-scripts",
         "--no-audit",
         "--no-fund",
@@ -53,7 +53,7 @@ export async function packExtensionBundle(destination, name) {
         "--package-lock=false",
         ...packages.filter((pkg) => pkg !== preset).map((pkg) => pkg.tarball),
       ],
-      { cwd: staging, timeoutMs: 120000 },
+      { cwd: staging, timeoutMs: 120000, diagnostics: true },
     );
     const file = join(staging, "package.json");
     const metadata = JSON.parse(await readFile(file, "utf8"));
