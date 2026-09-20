@@ -160,7 +160,14 @@ def main():
         command(cluster.kind, "create", "cluster", "--name", name, "--config", config,
                 "--kubeconfig", cluster.kubeconfig, "--wait", "120s", *node_image, timeout=240)
         report["kubernetes"] = json.loads(kube("get", "--raw", "/version"))["gitVersion"]
-        images = [args.image, "postgres:16", "redis:7-alpine", "minio/minio:latest", "minio/mc:latest", "node:24-bookworm-slim"]
+        dependencies = list(yaml.safe_load_all(command("kubectl", "kustomize", LOCAL / "dependencies")))
+        # Docker save/load preserves tags, not registry digests. Keep the release
+        # tags from the manifests so the offline fixture uses the same versions.
+        images = [args.image, "node:24-bookworm-slim", *sorted({
+            container["image"].split("@")[0]
+            for doc in dependencies
+            for container in doc.get("spec", {}).get("template", {}).get("spec", {}).get("containers", [])
+        })]
         print("Loading cached platform and dependency images", flush=True)
         architecture = json.loads(kube("get", "nodes", "-o", "json"))["items"][0]["status"]["nodeInfo"]["architecture"]
         # Docker Desktop may cache only one architecture of a multi-platform index.
@@ -175,7 +182,6 @@ def main():
         credentials = cluster.credentials()["items"]
         dependency_secret = deepcopy(next(d for d in credentials if d["metadata"]["name"] == "hibana-local-dependencies"))
         dependency_secret["metadata"]["namespace"] = dependency_namespace
-        dependencies = list(yaml.safe_load_all(command("kubectl", "kustomize", LOCAL / "dependencies")))
         for doc in dependencies:
             doc["metadata"]["namespace"] = dependency_namespace
             if doc["kind"] == "NetworkPolicy":
@@ -184,8 +190,7 @@ def main():
                         "namespaceSelector": {"matchLabels": {"kubernetes.io/metadata.name": "hibana"}},
                         "podSelector": {"matchLabels": {"app.kubernetes.io/part-of": "hibana"}}})
             for container in doc.get("spec", {}).get("template", {}).get("spec", {}).get("containers", []):
-                if container["image"].startswith("minio/"):
-                    container["image"] = container["image"].split("@")[0] + ":latest"
+                container["image"] = container["image"].split("@")[0]
                 container["imagePullPolicy"] = "IfNotPresent"
         kube("apply", "-f", "-", input=json.dumps({"apiVersion": "v1", "kind": "List", "items": [dependency_secret, *dependencies]}).encode())
         for dependency in ("postgres", "redis", "minio"):

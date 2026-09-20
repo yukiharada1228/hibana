@@ -201,6 +201,8 @@ CLIはComponentのヘッダーを確認します。WITの一致や全体の検�
 
 完成した成果物は `.hibana/build/artifacts/<SHA-256>.wasm` に保存し、`build` がそのパスを返します。`deploy` と `dev` も同じ固定ファイルを使うため、並行ビルドで別のコードに置き換わりません。`.hibana/build/app.wasm` は最新ビルドのコピーです。同じ内容は再利用し、過去の成果物は保持します。実行中の `build`・`deploy`・`dev` がないときに `.hibana/build/` を削除するとキャッシュを整理できます。
 
+macOS・Linuxでは、Ctrl+CやSIGTERMを実行中のビルドコマンド・拡張機能のnpm処理とその子孫へ伝えます。終了しなければ5秒後に強制終了します。`platform`のPython処理は操作ロックの解放を待つため35秒まで待ちます。`dev`はビルドとランタイム取得を中断し、起動済みランタイムの終了を待って停止します。
+
 ## 開発・配備・Secrets
 
 `dev`は完成したComponentを`hibana-worker --dev-component`で動かします。`--runtime`、`HIBANA_RUNTIME_BIN`、CLIと同じバージョンの管理済みランタイム、PATHの順に選択します。見つからなければ、CLIと同じバージョンの対応OS/CPU版をGitHub Releasesから自動取得し、SHA-256を検証して保存します。次回以降は保存済みのランタイムを再利用します。

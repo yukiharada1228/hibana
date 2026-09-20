@@ -50,6 +50,14 @@ impl RateLimited {
         }
     }
 
+    pub fn json_capacity() -> Self {
+        Self {
+            code: "json_capacity",
+            message: "management JSON requests are busy; retry later",
+            ..Self::password_capacity()
+        }
+    }
+
     pub fn password_capacity() -> Self {
         Self {
             retry_after_secs: 1,
@@ -203,6 +211,7 @@ mod tests {
             RateLimited::rate(7),
             RateLimited::concurrency(),
             RateLimited::login_capacity(),
+            RateLimited::json_capacity(),
             RateLimited::password_capacity(),
             RateLimited::upload_capacity(true),
         ] {

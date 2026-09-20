@@ -72,6 +72,8 @@ hibana platform uninstall --kubeconfig /path/config --context staging --yes
 
 対象は`hibana` namespace内のHibanaリソースです。`install`が管理対象を記録し、`stop`はCP/Workerを0 Podにして元のreplica数と管理対象HPAを保存、`start`で復元します。外部管理のHPAがある場合は停止前に拒否します。GitOpsなど別のコントローラーと同時に同じDeploymentを管理しないでください。
 
+`--image`は、overlayに指定済みのタグやdigestに優先して、`hibana-control-plane`の`control-plane`、`hibana-worker`の`worker`、`hibana-migrate`の`migrate`コンテナへ適用します。これらのリソース名・コンテナ名を維持してください。Console・sidecar・initContainer・依存サービスには、それぞれのマニフェストで指定したイメージを使います。
+
 既存Kubernetesの`uninstall`は記録されたリソースだけを撤去し、クラスタ・namespace・PVC・外部依存を残します。ローカルkindの`uninstall`はクラスタ内のデータも削除します。
 
 既存Kubernetesへの`install`・`start`・`stop`・`uninstall`は、namespace内の予約済みConfigMap `hibana-platform-operation`で排他制御します。別PCから同時に実行しても、後から来た操作は停止情報やDeploymentを変更する前にエラーになります。ロックの作成と取得・解放にはKubernetesの作成競合と`resourceVersion`による更新競合検出を使います。必要な権限はConfigMapの`get`・`create`・`update`です。`status`と`--dry-run`はロックを取得しません。空のロック用ConfigMapは`uninstall`後も保持します。
@@ -93,6 +95,8 @@ kubectl --kubeconfig /path/config --context staging -n hibana delete configmap h
 自動で再作成するJobは、成功済みの`hibana-migrate`だけです。追加したJobは通常の更新として検証し、イメージなど変更できないフィールドの差分は適用前にエラーにします。環境変数の`optional: true`は参照先やキーを省略できますが、Hibanaの必須設定は必要です。ボリューム用Secretはバイナリも利用できます。Secret全体ではなく、環境変数やTLSで必要なキーを文字列として検証します。
 
 Deploymentの環境変数は`envFrom`と個別のSecret・ConfigMapキー参照を合わせて変更検知します。`data`と`stringData`はKubernetesと同じ優先順位で読み取り、initContainerも対象にします。参照値の変更でPodを更新し、個別参照で使っていないキーやBase64の改行だけの変更では更新しません。
+
+Secret・ConfigMapのボリュームも、`install`時にマウント対象のファイル内容を比較してPodを更新します。バイナリ値、projected volume、`items`のキー選択、`subPath`、initContainerのマウント、クラスタ側で管理する参照先も対象です。`subPathExpr`ではボリューム全体の変更を検知します。外部でSecretを更新した場合は、同じ`install`を再実行してPodへ反映してください。
 
 新規namespaceでは、namespace自体をdry-runで検証し、namespacedリソースのサーバー側検証は実導入時のnamespace作成後に行います。`--dry-run`ではこの未検証範囲を表示し、namespaceを作成しません。Admissionで参照する別リソースなど、実際に存在してからでなければ検証できない条件もあります。DBの疎通はマイグレーション時と最終NetworkPolicyの適用後に確認します。後者では全Control Plane・Workerから新規接続でDB、ストア、相手のServiceと各Podへの通信を確認し、Control PlaneからはRedisも確認します。S3はHTTP/TLSの到達性を確認するため、読み書き権限や実アプリの配備は導入後にアプリを配備して確認してください。この検査には`pods/exec`の`get`・`create`権限と、`--maintenance check`に対応したHibanaプラットフォームイメージが必要です。接続検査はPod内の環境変数を使い、診断結果には接続先URLや資格情報を含めません。
 
@@ -128,7 +132,7 @@ npm test --prefix sdk
 python3 scripts/test-platform-install.py --image hibana-platform:review-recovery
 ```
 
-実機テストにはDocker・NetworkPolicyを強制するkind（v0.24以降）・kubectl・PyYAMLと、ローカルに保存済みのHibanaイメージ、`postgres:16`、`redis:7-alpine`、`minio/minio:latest`、`minio/mc:latest`、`node:24-bookworm-slim`が必要です。`--node-image IMAGE`でキャッシュ済みkindノードイメージも指定できます。
+実機テストにはDocker・NetworkPolicyを強制するkind（v0.24以降）・kubectl・PyYAMLと、ローカルに保存済みのHibanaイメージ、`postgres:16`、`redis:7-alpine`、`quay.io/minio/minio:RELEASE.2025-09-07T16-13-09Z`、`quay.io/minio/mc:RELEASE.2025-08-13T08-35-41Z`、`node:24-bookworm-slim`が必要です。依存イメージは`local/dependencies`のマニフェストと同じタグを使います。`--node-image IMAGE`でキャッシュ済みkindノードイメージも指定できます。
 
 テストは専用の単一ノードクラスタとkubeconfigを作成し、`platform init`で生成した設定から初回導入・更新・変更できないJobの拒否・rollout失敗後の再実行を確認します。任意の環境変数参照、バイナリSecretの実マウント、管理APIのreadinessも検証し、終了時に専用クラスタを削除します。結果は`.local/platform-install/`配下の`report.json`に記録します。外部依存は別namespaceのPostgreSQL・Redis・MinIOで再現し、オンプレ環境固有のDNS・TLS・Ingressや複数ノードの可用性はこのテストの対象外です。
 

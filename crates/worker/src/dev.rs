@@ -2,7 +2,7 @@
 use crate::{env, metrics, runtime::Runtime};
 use anyhow::{Context, Result};
 use axum::{
-    body::{to_bytes, Body},
+    body::{to_bytes, Body, Bytes, HttpBody},
     extract::State,
     http::{Request, StatusCode},
     response::{IntoResponse, Response},
@@ -11,10 +11,13 @@ use axum::{
 };
 use hibana_shared::{egress::EgressEndpoint, ResourceLimits};
 use serde::Deserialize;
-use std::{collections::BTreeMap, net::SocketAddr, sync::Arc, time::Duration};
+use std::{collections::BTreeMap, future::Future, net::SocketAddr, sync::Arc, time::Duration};
 use tokio::sync::Semaphore;
-use tokio::time::{timeout_at, Instant};
+use tokio::time::{timeout, timeout_at, Instant};
+use tokio_util::{sync::CancellationToken, task::TaskTracker};
 use wasmtime::component::Component;
+
+const RECEIVE_TIMEOUT: Duration = Duration::from_secs(10);
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -31,6 +34,8 @@ struct DevState {
     settings: Settings,
     outbound: Vec<EgressEndpoint>,
     slots: Arc<Semaphore>,
+    shutdown: CancellationToken,
+    executions: TaskTracker,
 }
 
 pub async fn run(args: &[String]) -> Result<()> {
@@ -71,6 +76,8 @@ pub async fn run(args: &[String]) -> Result<()> {
         settings,
         outbound,
         slots: Arc::new(Semaphore::new(8)),
+        shutdown: CancellationToken::new(),
+        executions: TaskTracker::new(),
     });
     let listener = tokio::net::TcpListener::bind(bind).await?;
     println!("Hibana (Wasmtime): http://{}", listener.local_addr()?);
@@ -79,36 +86,78 @@ pub async fn run(args: &[String]) -> Result<()> {
             tracing::warn!(%error, "cannot enable TCP_NODELAY for HTTP connection");
         }
     });
-    axum::serve(listener, Router::new().fallback(invoke).with_state(state))
-        .with_graceful_shutdown(async {
-            #[cfg(unix)]
-            {
-                let mut terminate =
-                    tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
-                        .expect("signal handler");
-                tokio::select! { _ = tokio::signal::ctrl_c() => {}, _ = terminate.recv() => {} }
-            }
-            #[cfg(not(unix))]
-            {
-                let _ = tokio::signal::ctrl_c().await;
-            }
-        })
-        .await?;
+    let shutdown = state.shutdown.clone();
+    let signal_shutdown = shutdown.clone();
+    let executions = state.executions.clone();
+    // Let admitted handlers finish, with one second to flush the response. The
+    // validated execution limit is at most 60s, below the CLI's 65s kill timer.
+    let drain_timeout = state.settings.resources.max_execution_time() + Duration::from_secs(1);
+    let server = async move {
+        axum::serve(listener, Router::new().fallback(invoke).with_state(state))
+            .with_graceful_shutdown(async move {
+                #[cfg(unix)]
+                {
+                    let mut terminate =
+                        tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+                            .expect("signal handler");
+                    tokio::select! { _ = tokio::signal::ctrl_c() => {}, _ = terminate.recv() => {} }
+                }
+                #[cfg(not(unix))]
+                {
+                    let _ = tokio::signal::ctrl_c().await;
+                }
+                signal_shutdown.cancel();
+            })
+            .await?;
+        // HEAD/204/304 may finish sending before the guest's waitUntil work.
+        executions.close();
+        executions.wait().await;
+        Ok(())
+    };
+    drain_on_shutdown(server, shutdown, drain_timeout).await?;
     Ok(())
 }
 
+async fn drain_on_shutdown(
+    server: impl Future<Output = std::io::Result<()>>,
+    shutdown: CancellationToken,
+    drain_timeout: Duration,
+) -> std::io::Result<()> {
+    tokio::pin!(server);
+    tokio::select! {
+        result = &mut server => result,
+        _ = shutdown.cancelled() => {
+            match timeout(drain_timeout, server).await {
+                Ok(result) => result,
+                Err(_) => {
+                    tracing::warn!("development server drain deadline exceeded");
+                    Ok(())
+                }
+            }
+        }
+    }
+}
+
 async fn invoke(State(state): State<Arc<DevState>>, request: Request<Body>) -> Response {
+    if state.shutdown.is_cancelled() {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    }
     let Ok(slot) = state.slots.clone().try_acquire_owned() else {
         return StatusCode::SERVICE_UNAVAILABLE.into_response();
     };
     let (parts, body) = request.into_parts();
-    let Ok(body) = to_bytes(body, hibana_shared::http::MAX_REQUEST_BYTES).await else {
-        return StatusCode::PAYLOAD_TOO_LARGE.into_response();
+    let body = tokio::select! {
+        biased;
+        _ = state.shutdown.cancelled() => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
+        result = read_body(body) => match result {
+            Ok(body) => body,
+            Err(status) => return status.into_response(),
+        },
     };
     let request = hibana_shared::http::HttpRequest::from_parts(&parts, &body);
     let is_head = request.method == "HEAD";
     let (stream, response, completed) = crate::runtime::response_channel();
-    tokio::spawn(async move {
+    state.executions.clone().spawn(async move {
         let _slot = slot;
         let env = match env::build_env(
             &state.settings.vars,
@@ -149,6 +198,28 @@ async fn invoke(State(state): State<Arc<DevState>>, request: Request<Body>) -> R
             "Wasm handler did not return an HTTP response",
         )
             .into_response(),
+    }
+}
+
+async fn read_body(body: Body) -> std::result::Result<Bytes, StatusCode> {
+    let limit = hibana_shared::http::MAX_REQUEST_BYTES;
+    if body.size_hint().lower() > limit as u64 {
+        return Err(StatusCode::PAYLOAD_TOO_LARGE);
+    }
+    match timeout(RECEIVE_TIMEOUT, to_bytes(body, limit)).await {
+        Ok(Ok(bytes)) => Ok(bytes),
+        Ok(Err(error)) => {
+            use std::error::Error as _;
+            if error
+                .source()
+                .is_some_and(|source| source.is::<http_body_util::LengthLimitError>())
+            {
+                Err(StatusCode::PAYLOAD_TOO_LARGE)
+            } else {
+                Err(StatusCode::BAD_REQUEST)
+            }
+        }
+        Err(_) => Err(StatusCode::REQUEST_TIMEOUT),
     }
 }
 
@@ -228,6 +299,125 @@ async fn resolve_outbound(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn state() -> Arc<DevState> {
+        let engine = crate::runtime::build_engine().unwrap();
+        let component = Component::new(&engine, "(component)").unwrap();
+        Arc::new(DevState {
+            runtime: Runtime::new(engine, metrics::Metrics::init()).unwrap(),
+            component: Arc::new(crate::runtime::PreparedComponent::new(component).unwrap()),
+            settings: Settings {
+                vars: BTreeMap::new(),
+                resources: ResourceLimits::default(),
+                net_allow_outbound: Vec::new(),
+            },
+            outbound: Vec::new(),
+            slots: Arc::new(Semaphore::new(8)),
+            shutdown: CancellationToken::new(),
+            executions: TaskTracker::new(),
+        })
+    }
+
+    fn pending_request() -> Request<Body> {
+        Request::new(Body::from_stream(futures::stream::pending::<
+            Result<Bytes, std::io::Error>,
+        >()))
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn incomplete_requests_timeout_and_release_all_slots() {
+        let state = state();
+        let requests = futures::future::join_all(
+            (0..8).map(|_| invoke(State(state.clone()), pending_request())),
+        );
+        tokio::pin!(requests);
+        assert!(futures::poll!(&mut requests).is_pending());
+        assert_eq!(state.slots.available_permits(), 0);
+        assert_eq!(
+            invoke(State(state.clone()), Request::new(Body::empty()))
+                .await
+                .status(),
+            StatusCode::SERVICE_UNAVAILABLE
+        );
+        tokio::time::advance(RECEIVE_TIMEOUT).await;
+        for response in requests.await {
+            assert_eq!(response.status(), StatusCode::REQUEST_TIMEOUT);
+        }
+        assert_eq!(state.slots.available_permits(), 8);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn shutdown_cancels_incomplete_requests_and_rejects_new_ones() {
+        let state = state();
+        let request = invoke(State(state.clone()), pending_request());
+        tokio::pin!(request);
+        assert!(futures::poll!(&mut request).is_pending());
+        let started = Instant::now();
+        state.shutdown.cancel();
+        assert_eq!(request.await.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(state.slots.available_permits(), 8);
+        assert_eq!(
+            invoke(State(state), Request::new(Body::empty()))
+                .await
+                .status(),
+            StatusCode::SERVICE_UNAVAILABLE
+        );
+        assert_eq!(started.elapsed(), Duration::ZERO);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn body_deadline_is_absolute_and_size_errors_are_distinct() {
+        let trickle = Body::from_stream(futures::stream::unfold((), |()| async {
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            Some((Ok::<_, std::io::Error>(Bytes::from_static(b"x")), ()))
+        }));
+        let started = Instant::now();
+        assert_eq!(read_body(trickle).await, Err(StatusCode::REQUEST_TIMEOUT));
+        assert_eq!(started.elapsed(), RECEIVE_TIMEOUT);
+        let limit = hibana_shared::http::MAX_REQUEST_BYTES;
+        assert_eq!(
+            read_body(Body::from(vec![0; limit + 1])).await,
+            Err(StatusCode::PAYLOAD_TOO_LARGE)
+        );
+        let streamed = Body::from_stream(futures::stream::iter([
+            Ok::<_, std::io::Error>(Bytes::from(vec![0; limit])),
+            Ok(Bytes::from_static(b"x")),
+        ]));
+        assert_eq!(
+            read_body(streamed).await,
+            Err(StatusCode::PAYLOAD_TOO_LARGE)
+        );
+        let broken = Body::from_stream(futures::stream::iter([Err::<Bytes, _>(
+            std::io::Error::other("fixture"),
+        )]));
+        assert_eq!(read_body(broken).await, Err(StatusCode::BAD_REQUEST));
+        assert_eq!(read_body(Body::from("ok")).await.unwrap(), "ok");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn drain_deadline_starts_at_shutdown_and_bounds_stalled_connections() {
+        let shutdown = CancellationToken::new();
+        let signal = shutdown.clone();
+        let server = async move {
+            tokio::time::sleep(Duration::from_secs(10)).await;
+            signal.cancel();
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            Ok(())
+        };
+        let started = Instant::now();
+        drain_on_shutdown(server, shutdown, Duration::from_secs(2))
+            .await
+            .unwrap();
+        assert_eq!(started.elapsed(), Duration::from_secs(11));
+
+        let shutdown = CancellationToken::new();
+        shutdown.cancel();
+        let started = Instant::now();
+        drain_on_shutdown(futures::future::pending(), shutdown, Duration::from_secs(2))
+            .await
+            .unwrap();
+        assert_eq!(started.elapsed(), Duration::from_secs(2));
+    }
 
     #[test]
     fn development_settings_default_to_no_destinations_and_reject_invalid_entries() {

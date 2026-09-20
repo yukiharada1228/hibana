@@ -8,7 +8,7 @@ import shutil
 import subprocess
 from urllib.parse import urlsplit
 
-from common import MIGRATION_JOB, environment_values, management_api_prefixes, secret_values
+from common import MIGRATION_JOB, environment_values, management_api_prefixes, secret_values, volume_references
 
 
 RESOURCES = {
@@ -108,6 +108,8 @@ class Preflight:
             values = source.get("data", {})
             if kind == "Secret":
                 values = secret_values(source, key) if text else {**values, **source.get("stringData", {})}
+            elif kind == "ConfigMap" and not text:
+                values = {**source.get("binaryData", {}), **values}
             if key is not None and key not in values and not optional:
                 errors.append(f"Missing {kind}/{name} key {key}")
             return values
@@ -131,10 +133,10 @@ class Preflight:
             for volume in pod.get("volumes", []):
                 if volume.get("persistentVolumeClaim"):
                     require("PersistentVolumeClaim", volume["persistentVolumeClaim"]["claimName"])
-                for key, kind, name in (("secret", "Secret", "secretName"), ("configMap", "ConfigMap", "name")):
-                    ref = volume.get(key)
-                    if ref:
-                        require(kind, ref[name], optional=ref.get("optional", False))
+                for kind, name, ref in volume_references(volume):
+                    require(kind, name, optional=ref.get("optional", False))
+                    for item in ref.get("items", []):
+                        require(kind, name, item["key"], ref.get("optional", False))
             if doc["kind"] == "Ingress":
                 spec = doc.get("spec", {})
                 if spec.get("ingressClassName"):

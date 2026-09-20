@@ -84,5 +84,6 @@ export async function platform(args, options) {
     console.log("Cancelled.");
     return;
   }
-  await run("python3", command);
+  // OperationLock release may need a full 30-second Kubernetes request.
+  await run("python3", command, { stopTimeoutMs: 35000 });
 }

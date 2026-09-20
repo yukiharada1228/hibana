@@ -104,18 +104,33 @@ class StartupTests(unittest.TestCase):
         self.assertFalse(any(action in call.args for call in run.call_args_list for action in ["create", "build", "apply", "delete"]))
 
     def test_image_replacement_only_changes_platform_container(self):
-        rendered = """kind: Deployment
-spec:
-  template:
-    spec:
-      containers:
-        - {name: platform, image: 'hibana-platform:dev'}
-        - {name: dependency, image: 'postgres:17'}
-"""
-        with patch("kubernetes.run", return_value=rendered):
-            docs = self.cluster.render("local", "hibana-platform:local-content")
-        self.assertEqual([c["image"] for c in docs[0]["spec"]["template"]["spec"]["containers"]],
-                         ["hibana-platform:local-content", "postgres:17"])
+        for old in ("hibana-platform:dev", "registry.example.com/hibana/platform:replace-with-release",
+                    "registry.test/hibana:v1", "registry.test/hibana@sha256:" + "a" * 64):
+            with self.subTest(old=old):
+                docs = []
+                for kind, name in (("Deployment", "control-plane"), ("Deployment", "worker"),
+                                   ("Job", "migrate"), ("Deployment", "console"), ("Job", "setup")):
+                    docs.append({"kind": kind, "metadata": {"name": "hibana-" + name}, "spec": {"template": {"spec": {
+                        "containers": [{"name": name, "image": old}, {"name": "dependency", "image": old}],
+                        "initContainers": [{"name": "init", "image": old}]}}}})
+                rendered = "\n---\n".join(json.dumps(doc) for doc in docs)
+                with patch("kubernetes.run", return_value=rendered):
+                    updated = self.cluster.render("local", "hibana-platform:local-content")
+                for index, doc in enumerate(updated):
+                    pod = doc["spec"]["template"]["spec"]
+                    self.assertEqual([c["image"] for c in pod["containers"]],
+                                     ["hibana-platform:local-content" if index < 3 else old, old])
+                    self.assertEqual(pod["initContainers"][0]["image"], old)
+
+    def test_missing_or_duplicate_platform_container_is_rejected(self):
+        for containers in ([], [{"name": "renamed", "image": "old"}],
+                           [{"name": "worker", "image": "old"}] * 2):
+            with self.subTest(containers=containers):
+                doc = {"kind": "Deployment", "metadata": {"name": "hibana-worker"},
+                       "spec": {"template": {"spec": {"containers": containers}}}}
+                with patch("kubernetes.run", return_value=json.dumps(doc)):
+                    with self.assertRaisesRegex(ValueError, "hibana-worker must contain exactly one worker container"):
+                        self.cluster.render("local", "hibana-platform:new")
 
     def test_config_changes_trigger_rollout_but_unused_credentials_do_not(self):
         config = {"kind": "ConfigMap", "metadata": {"name": "config"}, "data": {"limit": "1"}}

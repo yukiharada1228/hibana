@@ -240,6 +240,10 @@ pub(crate) fn build_router(state: AppState) -> Router {
         // 拾える。**path はルートテンプレート**（`/components/{id}/versions`）を使い、生 URI の
         // ID でカーディナリティを爆発させない。
         .layer(axum::middleware::from_fn_with_state(
+            state.json_request_slots(),
+            crate::extract::limit_json_requests,
+        ))
+        .layer(axum::middleware::from_fn_with_state(
             state.clone(),
             http_metrics_middleware,
         ))

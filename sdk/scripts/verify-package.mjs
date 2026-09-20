@@ -2,7 +2,8 @@
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import { mkdtemp, mkdir, readFile, rm, writeFile } from "node:fs/promises";
-import { createServer } from "node:net";
+import { connect, createServer } from "node:net";
+import { once } from "node:events";
 import { createServer as createRegistry } from "node:http";
 import { tmpdir } from "node:os";
 import { join, resolve, delimiter } from "node:path";
@@ -22,6 +23,25 @@ async function run(command, args, cwd = temporary, overrides = {}) {
     child.once("error", reject);
     child.once("exit", code => code === 0 ? resolve(output) : reject(new Error(`${command} ${args.join(" ")}: ${code}\n${output}\n${errors}`)));
   });
+}
+
+async function incompleteRequest(port, sockets) {
+  const socket = connect(port, "127.0.0.1");
+  sockets.push(socket);
+  const status = new Promise(resolve => {
+    let response = "";
+    socket.on("data", data => {
+      response += data;
+      const match = /^HTTP\/1\.1 (\d{3}) /.exec(response);
+      if (match) resolve(Number(match[1]));
+    });
+    socket.once("error", () => resolve(0));
+    socket.once("close", () => resolve(0));
+    socket.setTimeout(15000, () => socket.destroy());
+  });
+  await once(socket, "connect");
+  socket.write("POST / HTTP/1.1\r\nHost: localhost\r\nContent-Length: 2\r\nConnection: close\r\n\r\nx");
+  return { socket, status };
 }
 
 try {
@@ -115,6 +135,8 @@ try {
     let output = ""; child.stdout.on("data", b => output += b); child.stderr.on("data", b => output += b);
     const exited = new Promise(resolve => child.once("exit", (code, signal) => resolve({ code, signal })));
     child.once("error", error => { output += error.message; });
+    const sockets = [];
+    let shutdownStarted;
     try {
       const deadline = Date.now() + (github ? 300000 : 120000);
       let response;
@@ -127,14 +149,36 @@ try {
       assert.equal((await run(managedRuntime, ["--version"])).trim(), `hibana-worker ${packed.version}`);
       if (github) assert.match(output, /Downloading the runtime matching this CLI version/);
       console.log("Hono response verified on the checksum-installed Wasmtime runtime, discovered without --runtime or PATH changes.");
+      const pending = await Promise.all(Array.from({ length: 8 }, () => incompleteRequest(port, sockets)));
+      // Wait for all eight uploads to reach admission; their body bytes never finish.
+      let status;
+      const admissionDeadline = Date.now() + 3000;
+      do {
+        const probe = await fetch(`http://127.0.0.1:${port}/`, { signal: AbortSignal.timeout(2000) });
+        status = probe.status;
+        await probe.arrayBuffer();
+        if (status !== 503) await new Promise(resolve => setTimeout(resolve, 50));
+      } while (status !== 503 && Date.now() < admissionDeadline);
+      assert.equal(status, 503, "incomplete uploads should occupy all execution slots");
+      assert.deepEqual(await Promise.all(pending.map(request => request.status)), Array(8).fill(408));
+      for (const request of pending) request.socket.destroy();
+      const recovered = await fetch(`http://127.0.0.1:${port}/`, { signal: AbortSignal.timeout(2000) });
+      assert.equal(recovered.status, 200);
+      assert.match(await recovered.text(), /Hello from Hono on Hibana/);
+      console.log("Eight incomplete uploads received 408 and normal requests recovered.");
+      await incompleteRequest(port, sockets);
+      await new Promise(resolve => setTimeout(resolve, 100));
+      shutdownStarted = Date.now();
     } finally {
       child.kill("SIGINT");
       const timer = setTimeout(() => child.kill("SIGKILL"), 70000);
       const result = await exited; clearTimeout(timer);
+      for (const socket of sockets) socket.destroy();
       assert.equal(result.code, 0, output);
     }
+    assert.ok(Date.now() - shutdownStarted < 5000, "Ctrl+C must cancel incomplete uploads without waiting for their receive deadline");
     await assert.rejects(fetch(`http://127.0.0.1:${port}/`, { signal: AbortSignal.timeout(2000) }));
-    console.log("Ctrl+C stopped the runtime and closed its HTTP listener.");
+    console.log("Ctrl+C promptly stopped the runtime with an incomplete upload and closed its HTTP listener.");
   } else console.log("Runtime execution skipped: set HIBANA_RUNTIME_BIN to verify Wasmtime execution and shutdown.");
   console.log("Standalone package verification passed.");
 } finally {

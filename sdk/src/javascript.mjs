@@ -59,17 +59,21 @@ addEventListener("fetch", event => {
     plugins: [extensionImports(extensions.packages)],
   });
   const wit = extensions.wit || join(SDK_ROOT, "wit");
-  await run(process.execPath, [
-    fileURLToPath(
-      new URL("./jco.js", import.meta.resolve("@bytecodealliance/jco")),
-    ),
-    "componentize",
-    bundle,
-    "--wit",
-    wit,
-    "--world-name",
-    "http",
-    "--out",
-    out,
-  ]);
+  await run(
+    process.execPath,
+    [
+      fileURLToPath(
+        new URL("./jco.js", import.meta.resolve("@bytecodealliance/jco")),
+      ),
+      "componentize",
+      bundle,
+      "--wit",
+      wit,
+      "--world-name",
+      "http",
+      "--out",
+      out,
+    ],
+    { signal: extensions.signal },
+  );
 }

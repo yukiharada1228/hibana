@@ -33,6 +33,7 @@ import {testRequestCapacity} from './test-request-capacity.mjs';
 import {testUploadCapacity} from './test-upload-capacity.mjs';
 import {testExecutionShutdown} from './test-execution-shutdown.mjs';
 import {testIngressReadiness} from './test-ingress-readiness.mjs';
+import {testJsonReception} from './test-json-reception.mjs';
 
 const pg = process.env.HTTP_TEST_PG_CONTAINER;
 assert.match(pg || '', /^hibana-http-pg-[0-9]+$/);
@@ -199,6 +200,7 @@ try {
   // bootstrap::run treats presence of APP_BIND_ADDR as enabled; remove it entirely.
   delete process.env.APP_BIND_ADDR;
   await start();
+  await testJsonReception({url, operator});
   await testHttpMetrics({api});
   await startWorker();
   const created = await api('/admin/tenants', {method:'POST', token:'test-only', body:{slug:' upload ',name:'Upload regression',admin_email:'test@example.invalid',admin_password:'test-password'}});

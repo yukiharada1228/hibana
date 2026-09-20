@@ -29,9 +29,16 @@ async function fixture(t) {
   // runtime discovery, checksum validation, installation, build and process startup.
   await writeFile(preload, `
     import { appendFile } from "node:fs/promises";
-    globalThis.fetch = async url => {
+    globalThis.fetch = async (url, {signal}) => {
       await appendFile(${JSON.stringify(calls)}, JSON.stringify(String(url)) + "\\n");
       const mode = process.env.HIBANA_TEST_DOWNLOAD;
+      if (mode === "pending") {
+        console.log("DOWNLOAD_PENDING");
+        return new Promise((_, reject) => {
+          const timer = setInterval(() => {}, 1000);
+          signal.addEventListener("abort", () => { clearInterval(timer); reject(signal.reason); }, {once: true});
+        });
+      }
       if (mode === "network") throw new Error("fixture network unavailable");
       if (mode === "http") return new Response("missing", { status: 404 });
       if (String(url) === ${JSON.stringify(releaseBase(version) + "SHA256SUMS")})
@@ -60,7 +67,7 @@ async function fixture(t) {
       child.stderr.on("data", b => output += b);
       child.stdout.on("data", b => {
         output += b;
-        if (!stopping && output.includes("Runtime fixture:")) { stopping = true; child.kill("SIGINT"); }
+        if (!stopping && (output.includes("Runtime fixture:") || output.includes("DOWNLOAD_PENDING"))) { stopping = true; child.kill("SIGINT"); }
       });
     });
   }
@@ -84,6 +91,15 @@ test("dev installs the matching runtime on first use and reuses it on subsequent
   assert.match(cached.output, /Runtime fixture: downloaded/);
   assert.doesNotMatch(cached.output, /Downloading/);
   assert.equal((await f.downloads()).length, 2);
+});
+
+test("dev interrupts a pending runtime download before starting a build or watcher", async t => {
+  const f = await fixture(t);
+  const result = await f.invoke(["dev"], { HIBANA_TEST_DOWNLOAD: "pending" });
+  assert.deepEqual({code: result.code, signal: result.signal}, {code: 0, signal: null}, result.output);
+  assert.match(result.output, /DOWNLOAD_PENDING/);
+  assert.doesNotMatch(result.output, /Watching|Runtime fixture:/);
+  await assert.rejects(stat(f.managed), {code: "ENOENT"});
 });
 
 test("dev preserves explicit, environment, managed and PATH runtime precedence without downloading", async t => {

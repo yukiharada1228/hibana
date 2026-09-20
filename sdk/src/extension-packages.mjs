@@ -2,8 +2,8 @@
 // are never installed or rewritten here; only .hibana/ and hibana-lock.json are used.
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
-import { execFile } from "node:child_process";
-import { promisify, isDeepStrictEqual } from "node:util";
+import { run } from "./process.mjs";
+import { isDeepStrictEqual } from "node:util";
 import { setTimeout as delay } from "node:timers/promises";
 import {
   mkdir,
@@ -26,7 +26,6 @@ import {
   publishInstallation,
 } from "./extension-cache.mjs";
 
-const execute = promisify(execFile);
 const hash = (bytes) => createHash("sha256").update(bytes).digest("hex");
 const json = (value) => JSON.stringify(value, null, 2) + "\n";
 const manifest = (dependencies) => ({
@@ -138,9 +137,9 @@ function validateLock(lock, dependencies) {
   }
 }
 
-async function npm(command, directory) {
+async function npm(command, directory, signal) {
   try {
-    await execute(
+    await run(
       "npm",
       [
         command,
@@ -153,6 +152,8 @@ async function npm(command, directory) {
       ],
       {
         cwd: directory,
+        capture: true,
+        signal,
         timeout: 120000,
         maxBuffer: 2 * 1024 * 1024,
       },
@@ -167,7 +168,7 @@ async function npm(command, directory) {
 
 export async function installExtensionPackages(
   config,
-  { frozenLockfile = false } = {},
+  { frozenLockfile = false, signal } = {},
 ) {
   const sources = Object.fromEntries(
     Object.entries(config.extensions || {}).sort(([a], [b]) =>
@@ -273,7 +274,7 @@ export async function installExtensionPackages(
         ? "Restoring locked Hibana extensions..."
         : "Preparing Hibana extensions from hibana.json...",
     );
-    await npm(matches ? "ci" : "install", staging);
+    await npm(matches ? "ci" : "install", staging, signal);
     for (const name of Object.keys(sources)) {
       const pkg = JSON.parse(
         await readFile(

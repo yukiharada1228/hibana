@@ -106,6 +106,7 @@ pub struct AppState {
 struct Inner {
     request_capacity: crate::request_capacity::RequestCapacity,
     upload_capacity: crate::request_capacity::RequestCapacity,
+    json_request_slots: Arc<tokio::sync::Semaphore>,
     public_requests: Arc<crate::maintenance::Requests>,
     worker_http: reqwest::Client,
     preparation_http: reqwest::Client,
@@ -149,6 +150,7 @@ impl AppState {
             inner: Arc::new(Inner {
                 request_capacity: crate::request_capacity::RequestCapacity::new(8),
                 upload_capacity: crate::request_capacity::RequestCapacity::new(4),
+                json_request_slots: Arc::new(tokio::sync::Semaphore::new(8)),
                 public_requests: Arc::default(),
                 worker_http: reqwest::Client::builder()
                     .no_proxy()
@@ -197,6 +199,10 @@ impl AppState {
             .clone()
             .try_acquire_owned()
             .ok()
+    }
+
+    pub(crate) fn json_request_slots(&self) -> Arc<tokio::sync::Semaphore> {
+        self.inner.json_request_slots.clone()
     }
 
     pub(crate) fn public_requests(&self) -> &Arc<crate::maintenance::Requests> {

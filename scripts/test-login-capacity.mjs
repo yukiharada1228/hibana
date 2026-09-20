@@ -20,7 +20,7 @@ export async function testIdentityCapacity({api, token}) {
       assert.ok([201,429].includes(response.status), JSON.stringify(result));
       if (response.status === 429) {
         assert.equal(response.headers.get('retry-after'),'1');
-        assert.equal(result.error.code,'password_capacity');
+        assert.ok(['password_capacity', 'json_capacity'].includes(result.error.code));
         assert.equal(result.error.retryable,true);
       }
       return response.status;
@@ -52,7 +52,7 @@ export async function testLoginCapacity({api}) {
     assert.ok([401,429].includes(response.status), JSON.stringify(result));
     if (response.status === 429) {
       assert.equal(response.headers.get('retry-after'),'1');
-      assert.equal(result.error.code,'login_capacity');
+      assert.ok(['login_capacity', 'json_capacity'].includes(result.error.code));
       assert.equal(result.error.retryable,true);
     }
     return response.status;

@@ -13,7 +13,7 @@ import uuid
 from unittest.mock import patch, MagicMock
 
 from existing import ExistingCluster, LABEL, MARKER
-from common import stamp_runtime_settings
+from common import KubernetesTarget, stamp_runtime_settings
 from network import NetworkTransition, PREFIX as NETWORK_PREFIX
 from operation import NAME as OPERATION_LOCK
 from readiness import Readiness
@@ -266,6 +266,121 @@ class PreflightTests(ClusterFixture):
         self.assertNotEqual(before, after)
         self.assert_read_only()
 
+    def test_subpath_binary_rotation_restarts_only_the_consumer(self):
+        pod = self.cluster.docs[-1]["spec"]["template"]["spec"]
+        for kind, field, ref in (("Secret", "data", {"secret": {"secretName": "files"}}),
+                                 ("ConfigMap", "binaryData", {"configMap": {"name": "files"}})):
+            with self.subTest(kind=kind):
+                source = resource(kind, "files", **{field: {"selected": "//4=", "unused": "b2xk"}})
+                docs = self.cluster.docs + [source]
+                pod["volumes"] = [{"name": "files", **ref}]
+                pod["containers"][0]["volumeMounts"] = [{"name": "files", "mountPath": "/run/config", "subPath": "./selected"}]
+                stamp_runtime_settings(docs, [])
+                cp_before = deepcopy(docs[-3]["spec"]["template"])
+                before = self.settings_hash(docs)
+                source[field]["unused"] = "bmV3"
+                self.assertEqual(before, self.settings_hash(docs))
+                source[field]["selected"] = "AP8="
+                self.assertNotEqual(before, self.settings_hash(docs))
+                stamp_runtime_settings(docs, [])
+                self.assertEqual(cp_before, docs[-3]["spec"]["template"])
+        self.assert_read_only()
+
+    def test_mounted_text_representation_and_overrides_preserve_hash(self):
+        pod = self.cluster.docs[-1]["spec"]["template"]["spec"]
+        source = resource("Secret", "files", stringData={"config": "text"})
+        docs = self.cluster.docs + [source]
+        pod["volumes"] = [{"name": "files", "secret": {"secretName": "files"}}]
+        pod["containers"][0]["volumeMounts"] = [{"name": "files", "mountPath": "/run/config"}]
+        before = self.settings_hash(docs)
+        source["data"] = {"config": "invalid but overridden"}
+        self.assertEqual(before, self.settings_hash(docs))
+        source.pop("stringData")
+        source["data"]["config"] = "dG\r\nV4dA==\n"
+        self.assertEqual(before, self.settings_hash(docs))
+        source["kind"] = "ConfigMap"
+        pod["volumes"][0] = {"name": "files", "configMap": {"name": "files"}}
+        source["data"] = {"config": "text"}
+        self.assertEqual(before, self.settings_hash(docs))
+        source["data"]["config"] = "updated"
+        self.assertNotEqual(before, self.settings_hash(docs))
+
+    def test_projected_selected_keys_and_init_mounts_detect_effective_files(self):
+        pod = self.cluster.docs[-1]["spec"]["template"]["spec"]
+        secret = resource("Secret", "files", stringData={"selected": "old", "unused": "old"})
+        config = resource("ConfigMap", "files", data={"override": "constant"})
+        docs = self.cluster.docs + [secret, config]
+        pod["volumes"] = [{"name": "files", "projected": {"sources": [
+            {"secret": {"name": "files", "items": [{"key": "selected", "path": "nested/config"}]}},
+            {"configMap": {"name": "files", "items": [{"key": "override", "path": "nested/config"}]}},
+        ]}}]
+        pod["initContainers"] = [{"name": "init", "volumeMounts": [{"name": "files", "mountPath": "/run/config", "subPath": "nested"}]}]
+        before = self.settings_hash(docs)
+        secret["stringData"].update(selected="overridden", unused="unused-change")
+        self.assertEqual(before, self.settings_hash(docs))
+        config["data"]["override"] = "changed"
+        self.assertNotEqual(before, self.settings_hash(docs))
+        self.output(lambda: Preflight(self.cluster).settings(docs))
+        self.assert_read_only()
+
+    def test_unmounted_volume_and_unselected_items_do_not_restart(self):
+        pod = self.cluster.docs[-1]["spec"]["template"]["spec"]
+        source = resource("Secret", "files", stringData={"selected": "old", "unused": "old"})
+        docs = self.cluster.docs + [source]
+        volume = {"name": "files", "secret": {"secretName": "files", "items": [{"key": "selected", "path": "config"}]}}
+        pod["volumes"] = [volume]
+        before = self.settings_hash(docs)
+        source["stringData"]["selected"] = "new"
+        self.assertEqual(before, self.settings_hash(docs))
+        for mount in ({"subPath": "."}, {"subPathExpr": "$(CONFIG_FILE)"}, {}):
+            with self.subTest(mount=mount):
+                pod["containers"][0]["volumeMounts"] = [{"name": "files", "mountPath": "/run/config", **mount}]
+                before = self.settings_hash(docs)
+                source["stringData"]["unused"] += "changed"
+                self.assertEqual(before, self.settings_hash(docs))
+                source["stringData"]["selected"] += "changed"
+                self.assertNotEqual(before, self.settings_hash(docs))
+
+    def test_optional_projected_file_appearance_and_removal_change_hash(self):
+        pod = self.cluster.docs[-1]["spec"]["template"]["spec"]
+        pod["volumes"] = [{"name": "files", "projected": {"sources": [{"secret": {
+            "name": "files", "optional": True, "items": [{"key": "config", "path": "config"}]}}]}}]
+        pod["containers"][0]["volumeMounts"] = [{"name": "files", "mountPath": "/run/config"}]
+        absent = self.settings_hash()
+        source = resource("Secret", "files", stringData={"unused": "value"})
+        docs = self.cluster.docs + [source]
+        self.assertEqual(absent, self.settings_hash(docs))
+        source["stringData"]["config"] = "present"
+        self.assertNotEqual(absent, self.settings_hash(docs))
+        del source["stringData"]["config"]
+        self.assertEqual(absent, self.settings_hash(docs))
+        self.output(lambda: Preflight(self.cluster).settings(docs))
+        self.assert_read_only()
+
+    def test_external_mounted_rotation_and_required_keys_are_preflighted(self):
+        pod = self.cluster.docs[-1]["spec"]["template"]["spec"]
+        for kind, field, ref in (("Secret", "data", {"secret": {"secretName": "files"}}),
+                                 ("ConfigMap", "binaryData", {"projected": {"sources": [{"configMap": {"name": "files"}}]}})):
+            with self.subTest(kind=kind):
+                source = resource(kind, "files", **{field: {"config": "//4="}})
+                self.cluster.live[resource_id(source)] = source
+                pod["volumes"] = [{"name": "files", **ref}]
+                reference = ref["secret"] if kind == "Secret" else ref["projected"]["sources"][0]["configMap"]
+                reference["items"] = [{"key": "config", "path": "config"}]
+                pod["containers"][0]["volumeMounts"] = [{"name": "files", "mountPath": "/run/config", "subPath": "config"}]
+                with contextlib.redirect_stdout(io.StringIO()):
+                    before = self.cluster.prepare_install()[0][-1]["spec"]["template"]
+                    source[field]["config"] = "AP8="
+                    after = self.cluster.prepare_install()[0][-1]["spec"]["template"]
+                    self.assertNotEqual(before, after)
+                    del source[field]["config"]
+                    with self.assertRaisesRegex(ValueError, f"Missing {kind}/files key config"):
+                        self.cluster.prepare_install()
+                    del self.cluster.live[resource_id(source)]
+                    with self.assertRaisesRegex(ValueError, f"Missing {kind}/files"):
+                        self.cluster.prepare_install()
+        self.assert_read_only()
+
     def test_optional_key_references_preserve_existing_environment_values(self):
         worker = self.cluster.docs[-1]["spec"]["template"]["spec"]["containers"][0]
         for kind, ref_key in (("Secret", "secretKeyRef"), ("ConfigMap", "configMapKeyRef")):
@@ -464,6 +579,22 @@ class PreflightTests(ClusterFixture):
 
 
 class RemoteInstallTests(ClusterFixture):
+    def test_image_argument_updates_concrete_overlay_images_and_install_record(self):
+        def render_output(*args, **kwargs):
+            docs = self.cluster.migration if Path(args[2]).name == "migration" else self.cluster.docs
+            return "\n---\n".join(json.dumps(doc) for doc in docs)
+        self.cluster.migration[0]["spec"]["template"]["spec"]["containers"][0]["image"] = "hibana-platform:dev"
+        with patch.object(self.cluster, "run", side_effect=render_output), \
+                patch.object(self.cluster, "render", side_effect=lambda path, image: KubernetesTarget.render(self.cluster, path, image)):
+            for image in ("registry.test/hibana:v2", "registry.test/hibana@sha256:" + "b" * 64):
+                with self.subTest(image=image):
+                    self.cluster.image = image
+                    self.output(self.cluster.install)
+                    for identity in (("Deployment", "hibana-control-plane"), ("Deployment", "hibana-worker"), ("Job", "hibana-migrate")):
+                        self.assertEqual(self.cluster.live[identity]["spec"]["template"]["spec"]["containers"][0]["image"], image)
+                    record = self.cluster.record()["install"]
+                    self.assertEqual((record["image"], record["status"]), (image, "complete"))
+
     def test_normal_update_checks_applications_and_records_failed_preparation(self):
         self.output(self.cluster.install)
         self.cluster.image = "registry.test/hibana:v2"

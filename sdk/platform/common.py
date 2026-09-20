@@ -2,12 +2,18 @@
 import base64
 import hashlib
 import json
+import posixpath
 import re
 import subprocess
 
 import yaml
 
 MIGRATION_JOB = "hibana-migrate"
+PLATFORM_CONTAINERS = {
+    ("Deployment", "hibana-control-plane"): "control-plane",
+    ("Deployment", "hibana-worker"): "worker",
+    ("Job", MIGRATION_JOB): "migrate",
+}
 
 
 def management_api_prefixes(rule):
@@ -38,10 +44,14 @@ class KubernetesTarget:
             raise ValueError(f"Could not render overlay {path}. Check kustomization.yaml, referenced files and env-file syntax.") from error
         docs = [doc for doc in yaml.safe_load_all(rendered) if doc is not None]
         for doc in docs:
+            name = PLATFORM_CONTAINERS.get((doc.get("kind"), doc.get("metadata", {}).get("name")))
+            if name is None:
+                continue
             pod = doc.get("spec", {}).get("template", {}).get("spec", {})
-            for container in pod.get("containers", []):
-                if container.get("image") in ("hibana-platform:dev", "registry.example.com/hibana/platform:replace-with-release"):
-                    container["image"] = image
+            containers = [container for container in pod.get("containers", []) if container.get("name") == name]
+            if len(containers) != 1:
+                raise ValueError(f"{doc['kind']}/{doc['metadata']['name']} must contain exactly one {name} container")
+            containers[0]["image"] = image
         return docs
 
     def apply(self, docs):
@@ -93,8 +103,68 @@ def environment_values(container, require):
     return env
 
 
+def volume_references(volume):
+    """Secret/ConfigMap references in direct and projected volumes."""
+    for field, kind, name in (("secret", "Secret", "secretName"), ("configMap", "ConfigMap", "name")):
+        if field in volume:
+            ref = volume[field]
+            yield kind, ref[name], ref
+    for source in volume.get("projected", {}).get("sources", []):
+        for field, kind in (("secret", "Secret"), ("configMap", "ConfigMap")):
+            if field in source:
+                ref = source[field]
+                yield kind, ref["name"], ref
+
+
+def file_values(source, key=None):
+    """Canonical base64 file bytes, including binary data and stringData overrides."""
+    secret = source["kind"] == "Secret"
+    encoded = source.get("data" if secret else "binaryData", {})
+    strings = source.get("stringData" if secret else "data", {})
+    keys = encoded.keys() | strings.keys() if key is None else [key]
+    try:
+        return {key: base64.b64encode(strings[key].encode() if key in strings else base64.b64decode(
+                    encoded[key].replace("\r", "").replace("\n", ""), validate=True)).decode()
+                for key in keys if key in strings or key in encoded}
+    except (ValueError, UnicodeError) as error:
+        raise ValueError(f"{source['kind']}/{source['metadata']['name']} has invalid file data") from error
+
+
+def mounted_settings(pod, require):
+    mounts = {}
+    for container in pod.get("containers", []) + pod.get("initContainers", []):
+        for mount in container.get("volumeMounts", []):
+            mounts.setdefault(mount["name"], []).append(mount)
+    settings = {}
+    for volume in pod.get("volumes", []):
+        if volume["name"] not in mounts:
+            continue
+        references = list(volume_references(volume))
+        if not references:
+            continue
+        files = {}
+        for kind, name, ref in references:
+            optional = ref.get("optional", False)
+            if ref.get("items"):
+                for item in ref["items"]:
+                    values = require(kind, name, item["key"], optional) or {}
+                    if item["key"] in values:
+                        files[posixpath.normpath(item["path"])] = values[item["key"]]
+            else:
+                files.update(require(kind, name, optional=optional) or {})
+        selected = {}
+        for mount in mounts[volume["name"]]:
+            # subPathExpr can depend on Pod-specific downward API values. Keep
+            # all projected files in that case; the expression is in the template.
+            subpath = posixpath.normpath("" if mount.get("subPathExpr") else mount.get("subPath", ""))
+            selected.update({path: value for path, value in files.items()
+                             if subpath == "." or path == subpath or path.startswith(subpath + "/")})
+        settings[volume["name"]] = selected
+    return settings
+
+
 def stamp_runtime_settings(docs, credentials):
-    """Restart Deployments when the environment of a container or init container changes."""
+    """Restart consumers when their environment or mounted configuration changes."""
     sources = {(doc["kind"], doc["metadata"]["name"]): doc
                for doc in docs + credentials if doc["kind"] in ("ConfigMap", "Secret")}
 
@@ -104,7 +174,10 @@ def stamp_runtime_settings(docs, credentials):
             if optional:
                 return {}
             raise ValueError(f"Missing {kind}/{name} for runtime settings")
-        values = secret_values(source, key) if kind == "Secret" else source.get("data", {})
+        if text:
+            values = secret_values(source, key) if kind == "Secret" else source.get("data", {})
+        else:
+            values = file_values(source, key)
         if key is not None and key not in values and not optional:
             raise ValueError(f"Missing {kind}/{name} key {key}")
         return values
@@ -116,5 +189,8 @@ def stamp_runtime_settings(docs, credentials):
         pod = template["spec"]
         settings = [environment_values(container, require)
                     for container in pod.get("containers", []) + pod.get("initContainers", [])]
+        mounted = mounted_settings(pod, require)
+        if mounted:
+            settings.append({"volumes": mounted})
         digest = hashlib.sha256(json.dumps(settings, sort_keys=True).encode()).hexdigest()
         template.setdefault("metadata", {}).setdefault("annotations", {})["hibana.local/settings-hash"] = digest

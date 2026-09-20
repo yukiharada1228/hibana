@@ -35,7 +35,9 @@ async function checkComponent(path) {
 }
 
 export async function build(config, options = {}) {
+  options.signal?.throwIfAborted();
   const extensions = await resolveExtensions(config, options);
+  options.signal?.throwIfAborted();
   if (
     extensions.permissions.includes("outbound-network") &&
     options.mode !== "dev"
@@ -63,13 +65,18 @@ export async function build(config, options = {}) {
           );
         throw error;
       }
-      await compileJavaScript(config, candidate, { ...extensions, wit });
+      await compileJavaScript(config, candidate, {
+        ...extensions,
+        wit,
+        signal: options.signal,
+      });
     } else {
       for (const [command, ...args] of config.build?.commands || []) {
-        await run(command, args, { cwd: config.root });
+        await run(command, args, { cwd: config.root, signal: options.signal });
       }
       await copyFile(resolve(config.root, config.component), candidate);
     }
+    options.signal?.throwIfAborted();
     await checkComponent(candidate);
     let output = candidate;
     if (extensions.components.length) {
@@ -86,7 +93,7 @@ export async function build(config, options = {}) {
             "-o",
             composed,
           ],
-          { cwd: config.root },
+          { cwd: config.root, signal: options.signal },
         );
       } catch (error) {
         throw new Error(

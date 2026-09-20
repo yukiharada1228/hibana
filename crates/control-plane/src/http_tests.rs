@@ -768,6 +768,15 @@ async fn http_mvp_regression() {
     console_information_regression(&state).await;
     direct_http_dispatch_regression(&owner, &pool).await;
     completion_diagnostic_regression(&owner, &state).await;
+    // Keep identities used by the subsequent cross-tenant RLS checks, but do
+    // not ask the real fleet to prepare these fake, unstored Wasm versions.
+    fixture_execute(
+        &owner,
+        "UPDATE components SET active_version_id = NULL",
+        vec![],
+    )
+    .await
+    .unwrap();
     println!("PASS admin deletion: authentication / RLS / active execution guard / suspended tenant inventory / name reuse / retained history");
 }
 

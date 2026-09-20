@@ -60,3 +60,19 @@ test("offline runtime installation requires an exact checksum and a supported ve
   assert.throws(() => runtimeTarget("linux", "arm"), /remote deployment/);
   assert.throws(() => releaseChecksum(`${f.checksum}  ${f.filename}\n${f.checksum}  ${f.filename}`, f.filename), /duplicated/);
 });
+
+test("runtime download cancellation interrupts reception and preserves the installed executable", async t => {
+  const f = await fixture(t), source = join(f.home, "source");
+  await writeFile(source, f.bytes);
+  const path = await installRuntime({ version: f.version, from: source, sha256: f.checksum }, f);
+  const cancellation = new AbortController();
+  const fetcher = async (url, {signal}) => {
+    if (String(url).endsWith("SHA256SUMS")) return new Response(`${f.checksum}  ${f.filename}\n`);
+    return new Response(new ReadableStream({ start(controller) {
+      signal.addEventListener("abort", () => controller.error(signal.reason), {once: true});
+      cancellation.abort();
+    } }));
+  };
+  await assert.rejects(installRuntime({ version: f.version }, {...f, fetcher, signal: cancellation.signal}), {name: "AbortError"});
+  assert.deepEqual(await readFile(path), f.bytes);
+});

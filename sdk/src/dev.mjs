@@ -79,38 +79,13 @@ export async function dev(config, options, build) {
   const port = Number(options.port || 8787);
   if (!Number.isInteger(port) || port < 1 || port > 65535)
     throw new Error("port must be 1..65535");
+  const builds = new AbortController();
   const extensionOptions = {
+    signal: builds.signal,
     mode: "dev",
     frozenLockfile: Boolean(options["frozen-lockfile"]),
   };
-  await resolveExtensions(config, extensionOptions);
-  let runtime = options.runtime || process.env.HIBANA_RUNTIME_BIN;
-  if (!runtime) runtime = await installedRuntime();
-  if (!runtime) {
-    for (const directory of (process.env.PATH || "")
-      .split(delimiter)
-      .filter(Boolean)) {
-      const candidate = join(directory, "hibana-worker");
-      try {
-        await access(candidate, constants.X_OK);
-        runtime = candidate;
-        break;
-      } catch {}
-    }
-  }
-  if (!runtime) {
-    console.log(
-      "Local Hibana runtime not found. Downloading the runtime matching this CLI version...",
-    );
-    try {
-      runtime = await installRuntime();
-    } catch (error) {
-      throw new Error(
-        `Could not prepare the local runtime: ${error.message}\nCheck your connection and run hibana dev again.\nFor offline setup, run hibana runtime install --from FILE --sha256 HASH, or use --runtime PATH.`,
-        { cause: error },
-      );
-    }
-  }
+  let runtime;
   const settings = join(config.root, ".hibana/dev-settings.json");
   let child, watcher, timer, childStopping, stopPromise, rebuildingTask;
   let stopping = false,
@@ -135,6 +110,7 @@ export async function dev(config, options, build) {
     return childStopping;
   }
   async function start() {
+    builds.signal.throwIfAborted();
     const localNetwork = devConfig(config.dev);
     const artifact = await build(config, extensionOptions);
     let local = {};
@@ -196,7 +172,7 @@ export async function dev(config, options, build) {
       config = await loadConfig(config.path);
       await start();
     } catch (error) {
-      console.error(`Build failed: ${error.message}`);
+      if (!stopping) console.error(`Build failed: ${error.message}`);
     } finally {
       rebuilding = false;
       if (dirty) {
@@ -212,6 +188,7 @@ export async function dev(config, options, build) {
   function stop() {
     if (stopPromise) return stopPromise;
     stopping = true;
+    builds.abort();
     clearTimeout(timer);
     watcher?.close();
     stopPromise = (async () => {
@@ -221,10 +198,39 @@ export async function dev(config, options, build) {
     })();
     return stopPromise;
   }
-  process.once("SIGINT", stop);
-  process.once("SIGTERM", stop);
+  process.on("SIGINT", stop);
+  process.on("SIGTERM", stop);
   try {
-    await start();
+    await resolveExtensions(config, extensionOptions);
+    builds.signal.throwIfAborted();
+    runtime = options.runtime || process.env.HIBANA_RUNTIME_BIN;
+    if (!runtime) runtime = await installedRuntime();
+    if (!runtime) {
+      for (const directory of (process.env.PATH || "")
+        .split(delimiter)
+        .filter(Boolean)) {
+        const candidate = join(directory, "hibana-worker");
+        try {
+          await access(candidate, constants.X_OK);
+          runtime = candidate;
+          break;
+        } catch {}
+      }
+    }
+    if (!runtime) {
+      console.log(
+        "Local Hibana runtime not found. Downloading the runtime matching this CLI version...",
+      );
+      try {
+        runtime = await installRuntime({}, { signal: builds.signal });
+      } catch (error) {
+        throw new Error(
+          `Could not prepare the local runtime: ${error.message}\nCheck your connection and run hibana dev again.\nFor offline setup, run hibana runtime install --from FILE --sha256 HASH, or use --runtime PATH.`,
+          { cause: error },
+        );
+      }
+    }
+    if (!stopping) await start();
     if (!stopping && !options["no-watch"]) {
       watcher = watch(config.root, { recursive: true }, (_, file) => {
         if (!file || !shouldRebuild(config, file)) return;
@@ -244,6 +250,8 @@ export async function dev(config, options, build) {
       );
     }
     await completion;
+  } catch (error) {
+    if (!stopping) throw error;
   } finally {
     await stop();
     process.removeListener("SIGINT", stop);

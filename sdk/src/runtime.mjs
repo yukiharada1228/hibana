@@ -106,8 +106,14 @@ async function download(url, limit, signal, fetcher) {
 
 export async function installRuntime(
   options = {},
-  { fetcher = fetch, home, target = runtimeTarget() } = {},
+  {
+    fetcher = fetch,
+    home,
+    target = runtimeTarget(),
+    signal: cancellation,
+  } = {},
 ) {
+  cancellation?.throwIfAborted();
   const version = checkedVersion(
     options.version || (await packageInfo()).version,
   );
@@ -128,7 +134,10 @@ export async function installRuntime(
       throw new Error("Runtime file exceeds size limit");
     bytes = await readFile(options.from);
   } else {
-    const signal = AbortSignal.timeout(180000);
+    const deadline = AbortSignal.timeout(180000);
+    const signal = cancellation
+      ? AbortSignal.any([deadline, cancellation])
+      : deadline;
     const base = releaseBase(version);
     expected = releaseChecksum(
       (
@@ -146,6 +155,7 @@ export async function installRuntime(
     throw new Error(
       "Runtime checksum mismatch; existing installation was preserved",
     );
+  cancellation?.throwIfAborted();
   const destination = runtimePath(version, { home, target });
   const directory = resolve(destination, "..");
   await mkdir(directory, { recursive: true, mode: 0o700 });

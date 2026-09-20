@@ -200,6 +200,32 @@ mod tests {
         assert_eq!(requests.active(), 0);
     }
 
+    #[tokio::test(start_paused = true)]
+    async fn unfinished_json_releases_its_admission_guard() {
+        use axum::{
+            body::{Body, Bytes},
+            extract::FromRequest,
+        };
+        let requests = Arc::new(Requests::default());
+        let body = Body::from_stream(futures::stream::pending::<Result<Bytes, std::io::Error>>());
+        let request = Request::builder()
+            .header("content-type", "application/json")
+            .body(body)
+            .unwrap();
+        let admitted = async {
+            let _guard = requests.enter();
+            crate::extract::JsonBody::<serde_json::Value>::from_request(request, &()).await
+        };
+        tokio::pin!(admitted);
+        assert!(futures::poll!(&mut admitted).is_pending());
+        assert_eq!(requests.active(), 1);
+        let result = tokio::time::timeout(std::time::Duration::from_secs(11), admitted)
+            .await
+            .expect("JSON reception must not hold the drain open indefinitely");
+        assert_eq!(result.unwrap_err().status(), StatusCode::REQUEST_TIMEOUT);
+        assert_eq!(requests.active(), 0);
+    }
+
     #[tokio::test]
     async fn drain_waits_for_preclose_admission_and_fences_new_checks() {
         let requests = Arc::new(Requests::default());
