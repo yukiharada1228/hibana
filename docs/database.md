@@ -17,7 +17,7 @@ SQLiteへの集約は、既存の複数CP/Worker構成に別の共有・調停�
 | テーブル | 内容 |
 |---|---|
 | `tenants` | テナント、状態、クォータ、署名必須ポリシー |
-| `users` | テナント内ユーザーと認証用ハッシュ |
+| `users` | テナント内ユーザー、OIDC issuer・subject、認証世代 |
 | `api_tokens` | トークンハッシュ、スコープ、有効期限 |
 | `audit_logs` | 追記専用の監査記録 |
 | `components` | アプリ、公開設定、active・previous版の参照、管理者承認済み外部通信先 |

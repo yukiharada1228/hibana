@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { createServer } from "node:http";
-import { randomBytes, createHash } from "node:crypto";
+import { createServer as createHttpsServer } from "node:https";
+import { randomBytes, createHash, X509Certificate } from "node:crypto";
 import { spawn } from "node:child_process";
 import { once } from "node:events";
 import { mkdir, readFile, open } from "node:fs/promises";
@@ -37,7 +38,13 @@ async function port(container, internal) {
 const postgres = `postgres://postgres@127.0.0.1:${await port(pg, 5432)}/hibana_oidc`;
 const runtimeDb = postgres.replace("postgres@", "faas_app:faas_app@");
 const redisUrl = `redis://127.0.0.1:${await port(redis, 6379)}`;
-const idp = `http://127.0.0.1:${await port(keycloak, 8080)}`;
+const https = process.env.HIBANA_TEST_HTTPS === "1";
+const scheme = https ? "https" : "http";
+const idp = `${scheme}://127.0.0.1:${await port(keycloak, https ? 8443 : 8080)}`;
+const tlsOptions = https ? {
+  cert: await readFile(process.env.OIDC_TEST_TLS_CERT),
+  key: await readFile(process.env.OIDC_TEST_TLS_KEY),
+} : undefined;
 const listen = async (server) => {
   await new Promise((ok, fail) => {
     server.once("error", fail);
@@ -56,7 +63,7 @@ const cpPort = await vacantPort(),
 const base = `http://127.0.0.1:${cpPort}`,
   secondary = `http://127.0.0.1:${secondPort}`;
 const consoleRoot = resolve("console/dist");
-const site = createServer(async (req, res) => {
+const serve = async (req, res) => {
   try {
     if (req.url.startsWith("/api/")) {
       const chunks = [];
@@ -96,8 +103,11 @@ const site = createServer(async (req, res) => {
   } catch {
     res.writeHead(404).end();
   }
-});
-const consoleUrl = `http://127.0.0.1:${await listen(site)}/`;
+};
+const site = https ? createHttpsServer(tlsOptions, serve) : createServer(serve);
+const consoleUrl = `${scheme}://127.0.0.1:${await listen(site)}/`;
+const callbackUrl = https ? `${consoleUrl}api/auth/oidc/callback` : `${base}/auth/oidc/callback`;
+const cliBase = https ? `${consoleUrl}api` : base;
 const folder = resolve(".local/verification/oidc");
 await mkdir(folder, { recursive: true });
 const log = await open(join(folder, "control-plane.log"), "w");
@@ -110,9 +120,10 @@ const env = {
   OIDC_ISSUER_URL: `${idp}/realms/hibana`,
   OIDC_CLIENT_ID: "hibana",
   OIDC_CLIENT_SECRET: "fixture-client-secret",
-  OIDC_CALLBACK_URL: `${base}/auth/oidc/callback`,
+  OIDC_CALLBACK_URL: callbackUrl,
   OIDC_CONSOLE_URL: consoleUrl,
-  OIDC_ALLOW_INSECURE_HTTP: "true",
+  OIDC_ALLOW_INSECURE_HTTP: https ? "false" : "true",
+  ...(https ? { OIDC_CA_CERT_FILE: process.env.OIDC_TEST_CA } : {}),
   OIDC_SESSION_TTL_SECS: "900",
   // The rate-limit fixture forwards distinct client IPs through loopback only.
   TRUSTED_PROXY_CIDRS: "127.0.0.1/32",
@@ -144,10 +155,11 @@ async function eventually(check, message) {
   }
   throw new Error(message);
 }
-async function launch(port) {
+async function launch(port, overrides = {}) {
   const cp = spawn(binary, [], {
     env: {
       ...env,
+      ...overrides,
       BIND_ADDR: `127.0.0.1:${port}`,
       INTERNAL_BIND_ADDR: `127.0.0.1:${await vacantPort()}`,
     },
@@ -227,7 +239,7 @@ async function grant(tenant = "team", username = "alice", mutations = {}) {
     page = await ctx.newPage();
   let callback;
   page.on("request", (req) => {
-    if (req.url().startsWith(`${base}/auth/oidc/callback?`))
+    if (req.url().startsWith(`${callbackUrl}?`))
       callback = req.url();
   });
   await page.goto(start.data.authorization_url);
@@ -333,7 +345,13 @@ try {
   assert.equal(realm.status, 201, await realm.text());
   await launch(cpPort);
   await launch(secondPort);
-  browser = await chromium.launch({ headless: true });
+  // Trust only this fixture's browser certificate key, without changing the
+  // workstation trust store. CP and CLI verify the chain using the private CA.
+  const spki = https ? createHash("sha256").update(new X509Certificate(tlsOptions.cert)
+    .publicKey.export({ type: "spki", format: "der" })).digest("base64") : undefined;
+  browser = await chromium.launch({ headless: true,
+    args: spki ? [`--ignore-certificate-errors-spki-list=${spki}`] : [],
+  });
   // Capture one-time handoffs before the real console strips them.
   const newContext = browser.newContext.bind(browser);
   browser.newContext = async (...args) => {
@@ -355,6 +373,22 @@ try {
   });
   assert.equal(created.status, 201, JSON.stringify(created.data));
   const { tenant_id: tenant, admin_user_id: user } = created.data;
+  if (https) {
+    const untrustedPort = await vacantPort();
+    const untrusted = await launch(untrustedPort, { OIDC_CA_CERT_FILE: "" });
+    const rejected = await api("/auth/oidc/start", {
+      endpoint: `http://127.0.0.1:${untrustedPort}`, method: "POST", body: {
+        tenant_slug: "team", redirect_uri: consoleUrl,
+        state: randomBytes(32).toString("base64url"),
+        code_challenge: randomBytes(32).toString("base64url"),
+      },
+    });
+    assert.equal(rejected.status, 503, "an untrusted IdP certificate must fail closed");
+    const exited = once(untrusted, "exit");
+    untrusted.kill("SIGTERM");
+    await exited;
+    console.log("PASS HTTPS IdP trust: configured private CA accepted; untrusted CA rejected");
+  }
   assert.equal((await api("/admin/tenants", {
     method: "POST", token: env.BOOTSTRAP_ADMIN_TOKEN,
     body: { slug: "team", name: "Replacement", admin_email: "replacement@example.invalid", admin_oidc_subject: bob },
@@ -504,7 +538,7 @@ try {
     {
       tenant: "team",
       request: async (path, options) => {
-        const result = await api(path, options);
+        const result = await api(path, { ...options, endpoint: cliBase });
         assert.ok(result.status < 300, JSON.stringify(result.data));
         return result.data;
       },
@@ -623,7 +657,7 @@ try {
   );
   if (process.env.HIBANA_TEST_SAML === "1") {
     const { testSamlBroker } = await import("./test-saml-broker.mjs");
-    await testSamlBroker({ idp, api, base, secondary, consoleUrl, browser, folder, clearRate,
+    await testSamlBroker({ idp, api, base, secondary, consoleUrl, callbackUrl, cliBase, browser, folder, clearRate,
       bootstrapToken: env.BOOTSTRAP_ADMIN_TOKEN });
   }
 } finally {

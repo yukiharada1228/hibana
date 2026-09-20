@@ -1,11 +1,14 @@
-# Hibana 0.2.0-rc.2
+# Hibana 0.2.0-rc.3
 
-このソースの基盤DBは空DB用の新しい初期スキーマです。旧DBへの自動更新は拒否します。[DBの作成と切替](database.md)を確認し、既存の稼働DBとは別の検証先を指定してください。
+新規導入は空DBで行います。0.2.0-rc.2のDBを更新する場合は、Control Planeを停止・バックアップして[OIDC専用版への切り替え](authentication.md#oidc専用版への切り替え)を実施します。v0.1.0の旧スキーマへの上書き更新は拒否するため、[DBの作成と切替](database.md)に従って別の検証先を指定してください。
 
-CLI・PC用Wasmtimeランタイム・Control Plane・Workerを`0.2.0-rc.2`に揃えた候補版です。npm 公開前はGitHub Actionsで作成した候補を取得し、検証環境へ導入します。公開後は `npx --yes @yukiharada1228/hibana@0.2.0-rc.2` を使用できます。正式なReleaseを公開するまで、候補版のGitHub Release URLによる自動取得は使えません。
+CLI・PC用Wasmtimeランタイム・Control Plane・Workerを`0.2.0-rc.3`に揃えた候補版です。npm 公開前はGitHub Actionsで作成した候補を取得し、検証環境へ導入します。公開後は `npx --yes @yukiharada1228/hibana@0.2.0-rc.3` を使用できます。正式なReleaseを公開するまで、候補版のGitHub Release URLによる自動取得は使えません。
 
 ## 含まれる変更
 
+- OIDCへの認証一本化。Hibanaのパスワード認証を削除し、IdPのissuer・subjectでユーザーを識別。Keycloak経由のSAML仲介も結合試験で確認。
+- コンソールのHttpOnlyセッション、再読み込み・別タブ復元、停止テナントのログアウト、権限変更・失効の再検証。
+- 認証コールバックとJSONエラーのログから秘密値を除去。依存監査の適用条件を明記し、拡張の空キャッシュ・シンボリックリンク経由ビルドを修正。
 - Hono・JavaScriptプロジェクトで作成時のCLIバージョンを固定し、`npm run dev`・`build`・`deploy`からプロジェクト内のCLIを実行。
 - `dev.allow_outbound`でローカル開発時の接続先を明示。接続先の検証・DNSの固定・内部IPの拒否を適用し、配備先の通信許可とは独立して管理。
 - 単独CLIによるサイト設定生成、実際のKubernetes dry-run、導入段階の記録と修復。
@@ -18,12 +21,12 @@ CLI・PC用Wasmtimeランタイム・Control Plane・Workerを`0.2.0-rc.2`に揃
 
 ## 配布物を取得する
 
-`release/v0.2.0-rc.2`ブランチの同じコミットに対して、CI、Security dependencies、Hibana releaseの全ジョブが成功した候補を選びます。`RUN_ID`はそのGitHub release実行のIDです。Actionsの成果物は14日間保持されます。
+`develop`上の手動実行、または`release/v0.2.0-rc.3`ブランチの同じコミットに対して、CI、Security dependencies、Hibana releaseの全ジョブが成功した候補を選びます。`RUN_ID`はそのGitHub release実行のIDです。Actionsの成果物は14日間保持されます。
 
 ```bash
 gh run download RUN_ID --repo yukiharada1228/hibana \
-  --name hibana-release-candidate --dir .local/release/0.2.0-rc.2
-cd .local/release/0.2.0-rc.2
+  --name hibana-release-candidate --dir .local/release/0.2.0-rc.3
+cd .local/release/0.2.0-rc.3
 shasum -a 256 -c SHA256SUMS
 ```
 
@@ -31,11 +34,11 @@ shasum -a 256 -c SHA256SUMS
 
 | 配布物 | ファイル |
 | --- | --- |
-| CLI | `hibana-cli-0.2.0-rc.2.tgz` |
-| Kubernetesマニフェスト | `hibana-kubernetes-0.2.0-rc.2.tar.gz` |
-| PC用ランタイム | `hibana-worker-0.2.0-rc.2-{darwin,linux}-{x64,arm64}`の4ファイル |
-| 基盤イメージ | `hibana-platform-0.2.0-rc.2-linux-{amd64,arm64}.tar`の2ファイル |
-| コンソールイメージ | `hibana-console-0.2.0-rc.2-linux-{amd64,arm64}.tar`の2ファイル |
+| CLI | `hibana-cli-0.2.0-rc.3.tgz` |
+| Kubernetesマニフェスト | `hibana-kubernetes-0.2.0-rc.3.tar.gz` |
+| PC用ランタイム | `hibana-worker-0.2.0-rc.3-{darwin,linux}-{x64,arm64}`の4ファイル |
+| 基盤イメージ | `hibana-platform-0.2.0-rc.3-linux-{amd64,arm64}.tar`の2ファイル |
+| コンソールイメージ | `hibana-console-0.2.0-rc.3-linux-{amd64,arm64}.tar`の2ファイル |
 
 候補の作成元はActions実行のcommit SHAで確認できます。異なる実行・バージョンのファイルを混在させず、ハッシュ確認後に社内へ搬入してください。
 
@@ -45,9 +48,9 @@ shasum -a 256 -c SHA256SUMS
 
 ```bash
 # 取得したファイルがあるディレクトリで実行
-npx --yes --package=./hibana-cli-0.2.0-rc.2.tgz hibana --version
-npx --yes --package=./hibana-cli-0.2.0-rc.2.tgz hibana runtime install --from ./hibana-worker-0.2.0-rc.2-darwin-arm64 --sha256 HASH
-npx --yes --package=./hibana-cli-0.2.0-rc.2.tgz hibana init hello --cli-package ./hibana-cli-0.2.0-rc.2.tgz
+npx --yes --package=./hibana-cli-0.2.0-rc.3.tgz hibana --version
+npx --yes --package=./hibana-cli-0.2.0-rc.3.tgz hibana runtime install --from ./hibana-worker-0.2.0-rc.3-darwin-arm64 --sha256 HASH
+npx --yes --package=./hibana-cli-0.2.0-rc.3.tgz hibana init hello --cli-package ./hibana-cli-0.2.0-rc.3.tgz
 cd hello
 npm run dev
 # 別ターミナルで curl http://127.0.0.1:8787/
@@ -61,9 +64,9 @@ npm run dev
 CPUに合うDocker archiveを読み込み、社内レジストリへ搬入します。`registry.example.internal`とkubeconfig/contextを実サイトのものへ変更してください。
 
 ```bash
-docker load --input hibana-platform-0.2.0-rc.2-linux-amd64.tar
-docker tag hibana-platform:0.2.0-rc.2-linux-amd64 registry.example.internal/hibana/platform:0.2.0-rc.2-amd64
-docker push registry.example.internal/hibana/platform:0.2.0-rc.2-amd64
+docker load --input hibana-platform-0.2.0-rc.3-linux-amd64.tar
+docker tag hibana-platform:0.2.0-rc.3-linux-amd64 registry.example.internal/hibana/platform:0.2.0-rc.3-amd64
+docker push registry.example.internal/hibana/platform:0.2.0-rc.3-amd64
 hibana platform init my-site
 # my-site/README.mdに沿ってDB・Redis・S3・DNS・TLSを設定
 hibana platform install --kubeconfig /secure/config --context staging \
@@ -72,7 +75,7 @@ hibana platform install --kubeconfig /secure/config --context staging \
   --overlay my-site --image registry.example.internal/hibana/platform@sha256:DIGEST
 ```
 
-この候補は既存DBへの上書き移行を行いません。既存overlayと鍵を保管し、別の空DB・検証用依存サービスを指定してCLIと基盤を確認します。稼働DBの切替は後日の保守作業とし、[基盤DBの切替方針](database.md)・[バックアップと復元](resilience.md)に従います。
+初回の試用は、既存overlayと鍵を保管し、別の空DB・検証用依存サービスを指定してCLIと基盤を確認します。OIDCの5つの必須設定と、IdP側のクライアント登録・管理者subjectの紐付けが必要です。既存の0.2.0系DBの更新は[認証の切り替え手順](authentication.md#oidc専用版への切り替え)に従い、旧Control Planeと混在させません。[基盤DBの切替方針](database.md)・[バックアップと復元](resilience.md)も確認してください。
 
 基盤操作には予約済みConfigMap `hibana-platform-operation`の`get`・`create`・`update`権限が必要です。CLI強制終了後にロックが残った場合の解除条件と手順は[基盤管理ガイド](../deploy/kubernetes/README.md)に記載しています。
 

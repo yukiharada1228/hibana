@@ -4,6 +4,7 @@ import {
   copyFile,
   mkdir,
   access,
+  realpath,
   readdir,
   writeFile,
   rm,
@@ -11,6 +12,8 @@ import {
 import path from "node:path";
 
 export async function buildComponent({ root, artifact, output }) {
+  // Cargo canonicalizes manifest paths, including symlinked workspaces and /tmp.
+  root = await realpath(root);
   const env = { ...process.env };
   if (env.WASI_SDK_PATH) {
     env.CC_wasm32_wasip2 = path.join(env.WASI_SDK_PATH, "bin/clang");
@@ -40,12 +43,13 @@ export async function buildComponent({ root, artifact, output }) {
 
   // Preserve notices for Rust code statically linked into the shipped Component.
   // Including build dependencies as well avoids omitting generated-code notices.
+  // Metadata resolves the whole workspace; a selected build may not have fetched
+  // the other members' crates yet. Keep the lockfile, but allow those downloads.
   const metadata = spawnSync(
     "cargo",
     [
       "metadata",
       "--locked",
-      "--offline",
       "--filter-platform",
       "wasm32-wasip2",
       "--format-version",

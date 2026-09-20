@@ -26,6 +26,8 @@ jobs:
           cache-dependency-path: sdk/package-lock.json
       - name: Install RustSec auditor
         run: cargo install cargo-audit --version 0.22.2 --locked
+      - name: Test dependency assessment boundaries
+        run: python3 scripts/test_oidc_rsa.py
       - name: Audit Rust dependencies and validate scoped exception
         run: bash scripts/check-security.sh
       - name: Audit CLI and JavaScript compiler dependencies

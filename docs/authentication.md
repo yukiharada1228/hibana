@@ -162,3 +162,5 @@ bash scripts/test-oidc.sh
 ```
 
 ループバック限定の一時PostgreSQL・Redis・Keycloak 26.7.4を使います。二つのControl Planeをまたぐコード交換、コンソール・CLI、PKCEとコード再利用拒否、同一メールの別主体の拒否、テナント境界、全トークン失効、権限降格、論理削除、旧パスワード経路とトークンの拒否を検証します。任意の[SAML仲介の互換性試験](saml-keycloak.md#自動検証)は`HIBANA_TEST_SAML=1 bash scripts/test-oidc.sh`で追加実行します。既存環境へは接続しません。
+
+CIでは`HIBANA_TEST_HTTPS=1 HIBANA_TEST_SAML=1 bash scripts/test-oidc.sh`を使用します。一時CAでIdPとコンソールのHTTPSを構成し、CPは`OIDC_CA_CERT_FILE`、CLIは`NODE_EXTRA_CA_CERTS`で証明書を検証します。CA未設定のCPが接続を拒否することと、ブラウザのSecure・`__Host-` Cookieによる復元・失効を確認します。ブラウザだけは一時証明書の公開鍵を明示して許可し、ホストの信頼ストアを変更しません。これは隔離された自動試験であり、導入先のPKIや別の利用者による試用は別途確認します。

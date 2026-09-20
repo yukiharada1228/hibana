@@ -25,7 +25,7 @@ Hibana の MVP は、組織が管理するオンプレ Kubernetes 上で、Hono�
 | 共有制限 | Redis を確認できなければ受付を 503 で拒否。DB の受付記録でもテナント同時実行上限を保証する |
 | Kubernetes | 非 root、read-only rootfs、権限昇格禁止、capabilities 全削除、seccomp、ServiceAccount トークン自動マウント禁止。管理者が CNI・TLS・ノード構成を検証する |
 
-ログインを含む公開管理APIのJSONリクエストは、CPごとに同時8件までです。本文を読む前に枠を確保し、管理操作が終わるまで保持します。超過時は本文を読まずHTTP 429・`json_capacity`と`Retry-After: 1`を返します。JSON本文は既定の2 MiB以内で、受信開始から10秒以内に完了する必要があります。少量ずつ送信を続けても期限は延長せず、超過するとHTTP 408・`request_timeout`を返して枠と保守停止の待機対象を解放します。この期限は本文の抽出に適用し、その後の管理操作を途中で打ち切るものではありません。アプリ呼び出し・multipartアップロード・パスワード検証にはそれぞれ別の容量制限があります。
+ログインを含む公開管理APIのJSONリクエストは、CPごとに同時8件までです。本文を読む前に枠を確保し、管理操作が終わるまで保持します。超過時は本文を読まずHTTP 429・`json_capacity`と`Retry-After: 1`を返します。JSON本文は既定の2 MiB以内で、受信開始から10秒以内に完了する必要があります。少量ずつ送信を続けても期限は延長せず、超過するとHTTP 408・`request_timeout`を返して枠と保守停止の待機対象を解放します。この期限は本文の抽出に適用し、その後の管理操作を途中で打ち切るものではありません。アプリ呼び出し・multipartアップロードにはそれぞれ別の容量制限があります。OIDC処理も全体・接続元・テナントの頻度を制限します。
 
 `memory_mb` は実行内の線形メモリ合計です。ホストの HTTP バッファ、コンパイル、コードキャッシュ、JIT 管理領域を含む Pod の RSS 全体の上限ではありません。Pod の cgroup 制限と同時実行数も必要です。割当失敗時のメモリ計量は保守的な上限値となる場合があります。
 
@@ -43,9 +43,19 @@ bash scripts/check-security.sh
 npm audit --prefix sdk --package-lock-only --audit-level=low
 ```
 
-SeaORMへの移行で旧SQLx経由の未使用RSA依存もlockfileから外れたため、`RUSTSEC-2023-0071`の除外を削除しています。検査はadvisoryの除外なしで実行します。
+### OIDCのRSA依存に対する適用判定
+
+2026-09-21に`RUSTSEC-2023-0071`を再評価しました。現在の依存経路は`hibana-control-plane → openidconnect 4.0.1 → rsa 0.9.10`だけです。以前のSQLx経由の未使用依存とは別の評価です。
+
+[RustSecの指摘](https://rustsec.org/advisories/RUSTSEC-2023-0071.html)はRSA秘密鍵の演算時間から秘密鍵を推測する攻撃です。修正版はまだありません。HibanaのOIDC処理はIdPの公開鍵でIDトークンの署名を検証し、RSA秘密鍵の生成・保持・署名・復号を行いません。`openidconnect`の[`verify_rsa_signature`](https://docs.rs/openidconnect/4.0.1/src/openidconnect/core/crypto.rs.html)は公開パラメータ`n`・`e`から`RsaPublicKey`を作って`verify`を呼びます。Hibanaの内部ジョブ署名は別のEd25519実装です。このため、現在の利用経路には当該秘密鍵漏えいの条件がなく、非該当と判断しています。RSAクレート全体の問題が修正済みという意味ではありません。
+
+`scripts/check-security.sh`は、監査前に全ターゲットのRSA依存元・バージョンとHibanaのOIDC API使用箇所を検査します。新しい依存元、バージョン、RSA秘密鍵API、未評価のOIDC API・import、または**2026-12-20**の再評価期限に到達した場合は失敗します。この静的チェックは変更を見落とさないための補助で、Rustの意味解析やセキュリティ証明ではありません。依存更新・OIDC変更時は実装を再評価してください。
+
+条件を満たした場合だけ当該advisoryを監査対象から除き、判定理由と期限をCIへ表示します。他の脆弱性・unsound警告や情報取得の失敗は従来どおり失敗にします。`python3 scripts/test_oidc_rsa.py`で例外の範囲と期限の回帰検証を行います。
 
 2026-09-15の検査では、`spin` 0.9.8 / 0.10.0 に yanked 警告も残ります。multer / crc-fast の推移依存です。既知脆弱性・unsoundとは区別して表示を維持し、上流更新時に再確認します。警告を削除するための独自の依存パッチは導入していません。
+
+2026-09-21の検査では、Redisクライアント経由の`rustls-pemfile` 2.2.0にも保守終了の警告があります。これも現在の脆弱性・unsound指摘とは区別し、表示を維持しています。Redisクライアント更新時は社内CA・ホスト名検証・TCP/TLSの回帰試験を必須とします。
 
 2026-09-15の依存更新で、rustlsを0.23.45、rustls-webpkiを0.103.15へ更新しました。TLSハンドシェイクの[RUSTSEC-2026-0285](https://rustsec.org/advisories/RUSTSEC-2026-0285.html)の修正を含みます。
 

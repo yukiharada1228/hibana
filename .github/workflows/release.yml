@@ -163,6 +163,7 @@ jobs:
     timeout-minutes: 20
     permissions:
       contents: write
+      actions: read
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -173,6 +174,10 @@ jobs:
           name: hibana-release-candidate
           path: dist
       - run: node scripts/release.mjs version
+      - name: Require successful CI and security audit for this commit
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: node scripts/check-release-ci.mjs
       - name: Publish versioned assets
         env:
           GH_TOKEN: ${{ github.token }}

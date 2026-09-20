@@ -92,6 +92,9 @@ jobs:
       - name: Architecture boundaries
         run: python3 scripts/check-architecture.py
 
+      - name: Release eligibility checks
+        run: node --test scripts/test-release-ci.mjs
+
       # rust-toolchain.toml（stable + wasm32-wasip2）が channel を固定する。
       # clippy / rustfmt コンポーネントを固定 toolchain に追加する。
       - name: Install toolchain components
@@ -125,6 +128,7 @@ jobs:
       - name: OIDC and optional SAML broker interoperability
         env:
           HIBANA_TEST_SAML: "1"
+          HIBANA_TEST_HTTPS: "1"
         run: bash scripts/test-oidc.sh
 
       - name: rustfmt
@@ -261,6 +265,7 @@ jobs:
       - name: Build optional packages and test separate TCP / TLS
         # No Worker/CLI dependencies. Official tool archives are checksum-pinned.
         run: |
+          node scripts/test-extension-cold-build.mjs
           curl --fail --location --retry 3 https://github.com/WebAssembly/wasi-sdk/releases/download/wasi-sdk-34/wasi-sdk-34.0-x86_64-linux.tar.gz -o "$RUNNER_TEMP/wasi-sdk.tar.gz"
           printf '%s  %s\n' b761e3a0721dbae9c09a0059e5fdb2bf917d1b4a8a7b430fb3b5aafb0984b2c4 "$RUNNER_TEMP/wasi-sdk.tar.gz" | sha256sum --check
           tar -xzf "$RUNNER_TEMP/wasi-sdk.tar.gz" -C "$RUNNER_TEMP"

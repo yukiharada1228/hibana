@@ -6,10 +6,13 @@ export async function testConsoleSession({ page, context, consoleUrl, secondary,
   const session = await page.evaluate(async () => (await fetch("/api/auth/session", {
     headers: { "x-hibana-console": "1" },
   })).json());
-  const cookie = (await context.cookies()).find(cookie => cookie.name.startsWith("hibana_session_"));
+  const secure = new URL(consoleUrl).protocol === "https:";
+  const cookie = (await context.cookies()).find(cookie => /^(?:__Host-)?hibana_session_/.test(cookie.name));
   assert.ok(session.expires_in_ms > 0);
   assert.ok(cookie?.httpOnly);
   assert.equal(cookie.sameSite, "Strict");
+  assert.equal(cookie.secure, secure);
+  assert.equal(cookie.name.startsWith("__Host-"), secure);
   assert.equal(cookie.domain, "127.0.0.1");
   assert.equal(cookie.path, "/");
   assert.equal(await page.evaluate(() => document.cookie), "");
@@ -76,7 +79,7 @@ export async function testConsoleSession({ page, context, consoleUrl, secondary,
   assert.match(setCookie, /SameSite=Strict/);
   const pair = setCookie.split(";", 1)[0];
   const [name, value] = pair.split("=");
-  await context.addCookies([{ name, value, url: consoleUrl, httpOnly: true, sameSite: "Strict" }]);
+  await context.addCookies([{ name, value, url: consoleUrl, httpOnly: true, secure, sameSite: "Strict" }]);
   await page.reload();
   await page.getByRole("button", { name: "ログアウト", exact: true }).waitFor();
   assert.match(metadata.token_id, /^tok_[a-f0-9]+$/);

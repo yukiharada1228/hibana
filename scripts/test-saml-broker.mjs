@@ -4,7 +4,7 @@ import { join } from "node:path";
 import { browserLogin } from "../sdk/src/oidc.mjs";
 import { createSamlBrokerFixture } from "./saml-broker-fixture.mjs";
 
-export async function testSamlBroker({ idp, api, base, secondary, consoleUrl, browser, folder, clearRate, bootstrapToken }) {
+export async function testSamlBroker({ idp, api, base, secondary, consoleUrl, callbackUrl, cliBase, browser, folder, clearRate, bootstrapToken }) {
   for (const endpoint of [base, secondary]) {
     const config = await api("/auth/config", { endpoint });
     assert.equal(config.data.console_url, consoleUrl);
@@ -115,7 +115,7 @@ export async function testSamlBroker({ idp, api, base, secondary, consoleUrl, br
   await clearRate();
   await withPage(async (page, saml) => {
     const cli = await browserLogin({ tenant: "saml-team", request: async (path, options) => {
-      const result = await api(path, { ...options, endpoint: secondary });
+      const result = await api(path, { ...options, endpoint: cliBase });
       assert.ok(result.status < 300, `CLI ${path}: ${result.status}`);
       return result.data;
     } }, { log: () => {}, timeoutMs: 30_000, open: async (url) => {
@@ -141,7 +141,7 @@ export async function testSamlBroker({ idp, api, base, secondary, consoleUrl, br
     let changed = false;
     let hibanaCallback = false;
     page.on("request", (request) => {
-      if (request.url().startsWith(`${base}/auth/oidc/callback?`)) hibanaCallback = true;
+      if (request.url().startsWith(`${callbackUrl}?`)) hibanaCallback = true;
     });
     await page.route(fixture.endpoint, async (route) => {
       const form = new URLSearchParams(route.request().postData());
