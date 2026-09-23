@@ -277,10 +277,22 @@ jobs:
           GITHUB_REF_TYPE=tag GITHUB_REF_NAME="$RELEASE_TAG" node scripts/release.mjs version
           GITHUB_SHA="$(git rev-parse HEAD)" node scripts/check-release-ci.mjs
       - name: Download and verify every published asset
-        env:
-          GH_TOKEN: ${{ github.token }}
         run: |
-          gh release download "$RELEASE_TAG" --dir dist
+          version=$(node scripts/release.mjs version)
+          mkdir dist
+          assets=(SHA256SUMS "hibana-cli-$version.tgz" "hibana-kubernetes-$version.tar.gz")
+          for target in linux-x64 linux-arm64 darwin-x64 darwin-arm64; do
+            assets+=("hibana-worker-$version-$target")
+          done
+          for image in platform console; do
+            for arch in amd64 arm64; do
+              assets+=("hibana-$image-$version-linux-$arch.tar")
+            done
+          done
+          for asset in "${assets[@]}"; do
+            curl --fail --location --retry 3 --output "dist/$asset" \
+              "https://github.com/$GITHUB_REPOSITORY/releases/download/$RELEASE_TAG/$asset"
+          done
           cp dist/SHA256SUMS original-SHA256SUMS
           (cd dist && sha256sum --check SHA256SUMS)
           node scripts/release.mjs checksums dist --complete
