@@ -24,6 +24,7 @@ AccessTokenHash AuthType AuthorizationCode ClientId ClientSecret CsrfToken Issue
 Nonce OAuth2TokenResponse PkceCodeChallenge PkceCodeVerifier RedirectUrl TokenResponse
 EndpointSet EndpointNotSet EndpointMaybeSet AsyncHttpClient HttpRequest HttpResponse
 http Response builder
+Scope new
 """.split())
 
 

@@ -53,7 +53,9 @@ npm audit --prefix sdk --package-lock-only --audit-level=low
 
 `scripts/check-security.sh`は、監査前に全ターゲットのRSA依存元・バージョンとHibanaのOIDC API使用箇所を検査します。新しい依存元、バージョン、RSA秘密鍵API、未評価のOIDC API・import、または**2026-12-20**の再評価期限に到達した場合は失敗します。この静的チェックは変更を見落とさないための補助で、Rustの意味解析やセキュリティ証明ではありません。依存更新・OIDC変更時は実装を再評価してください。
 
-条件を満たした場合だけ当該advisoryを監査対象から除き、判定理由と期限をCIへ表示します。他の脆弱性・unsound警告や情報取得の失敗は従来どおり失敗にします。`python3 scripts/test_oidc_rsa.py`で例外の範囲と期限の回帰検証を行います。
+2026-09-23にメール表示同期で追加した`openidconnect::Scope::new`を確認しました。[`Scope`](https://docs.rs/openidconnect/4.0.1/openidconnect/struct.Scope.html)は認可要求のスコープ文字列を保持する型です。Hibanaは`email`の要求に使用し、RSA秘密鍵の生成・署名・復号は追加していません。確認済みAPIにこの型とコンストラクタを追加し、未知のAPIや秘密鍵APIを拒否する検査と再評価期限は維持します。
+
+条件を満たした場合だけ当該advisoryを監査対象から除き、判定理由と期限をCIへ表示します。他の脆弱性・unsound警告や情報取得の失敗は従来どおり失敗にします。`python3 scripts/test_oidc_rsa.py`で例外の範囲と期限、および実際のOIDC利用箇所の回帰検証を行います。
 
 2026-09-15の検査では、`spin` 0.9.8 / 0.10.0 に yanked 警告も残ります。multer / crc-fast の推移依存です。既知脆弱性・unsoundとは区別して表示を維持し、上流更新時に再確認します。警告を削除するための独自の依存パッチは導入していません。
 

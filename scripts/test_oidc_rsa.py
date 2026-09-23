@@ -17,6 +17,18 @@ class RsaAssessmentTests(unittest.TestCase):
         validate(self.tree, self.sources, self.today)
         validate(self.tree.replace("0.2.0-rc.2", "0.2.0-rc.3"), self.sources, self.today)
 
+    def test_reviewed_email_scope_and_current_consumers(self):
+        self.sources["crates/control-plane/src/oidc/mod.rs"] += (
+            '\nlet scope = openidconnect::Scope::new("email".into());'
+        )
+        validate(self.tree, self.sources, self.today)
+        sources = {
+            str(path.relative_to(ROOT)): path.read_text()
+            for directory in ("crates", "migrations")
+            for path in (ROOT / directory).rglob("*.rs")
+        }
+        validate(self.tree, sources, self.today)
+
     def test_new_versions_consumers_and_patched_crates_require_review(self):
         for tree in (
             "", self.tree + "another-consumer v1.0.0\n",
@@ -38,6 +50,7 @@ class RsaAssessmentTests(unittest.TestCase):
             "use openidconnect::{core::CoreClient as Client};",
             "let key = openidconnect::core::CoreRsaPrivateSigningKey::from_pem(pem);",
             "let key = rsa::RsaPrivateKey::new(rng, 2048);",
+            'let key = openidconnect::UnknownApi::new("value");',
         ):
             with self.subTest(code=code), self.assertRaises(ValueError):
                 validate(self.tree, {"crates/worker/src/extra.rs": code}, self.today)

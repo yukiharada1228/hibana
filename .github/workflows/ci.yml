@@ -26,6 +26,8 @@ jobs:
           cache: npm
           cache-dependency-path: console/package-lock.json
       - run: npm ci --prefix console --ignore-scripts
+      # Browser tests also invoke the CLI with a prebuilt Wasm fixture.
+      - run: npm ci --prefix sdk --omit=dev --omit=optional --ignore-scripts
       - run: npm run build --prefix console
       - run: npx --prefix console playwright install --with-deps chromium
       - run: npm test --prefix console
@@ -82,6 +84,9 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: '24'
+
+      # HTTP/OIDC fixtures import the SDK and build native templates only.
+      - run: npm ci --prefix sdk --omit=dev --omit=optional --ignore-scripts
 
       # M3b (§3.2): テナント分離の静的ガード。toolchain 不要で安価なため最初に走らせる。
       # SET app.tenant_id ハザード（LOCAL 欠落・文字列結合）と、tenant-scoped db:: 呼び出しを
@@ -166,7 +171,7 @@ jobs:
       # localhost also resolves to ::1 on Linux runners, where nothing listens.
       WORKER_HTTP_URL: http://127.0.0.1:8084
       WORKER_HTTP_BIND_ADDR: "0.0.0.0:8084"
-      INGRESS_BASE_DOMAIN: hibana.local
+      APP_PUBLIC_ORIGIN: http://localhost:8083
       COMPONENTS_DIR: ./components
       WASM_CACHE_DIR: ./worker-cache
       RUST_LOG: info
@@ -174,7 +179,6 @@ jobs:
       HIBANA_URL: http://localhost:8080
       GATEWAY: http://localhost:8083
       HIBANA_TENANT: smoke
-      HIBANA_INGRESS_DOMAIN: hibana.local
       REQ_TIMEOUT: "25"
       READY_TRIES: "15"
     steps:
