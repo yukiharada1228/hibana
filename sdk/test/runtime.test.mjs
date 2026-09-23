@@ -1,0 +1,97 @@
+import test from "node:test";
+import assert from "node:assert/strict";
+import { mkdtemp, readFile, readdir, rm, stat, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { createHash } from "node:crypto";
+import { installRuntime, runtimePath, runtimeTarget, releaseChecksum } from "../src/runtime.mjs";
+import { releaseBase } from "../src/package.mjs";
+
+test("online and offline runtime selection require the same canonical release version", async t => {
+  const f = await fixture(t), from = join(f.home, "source");
+  await writeFile(from, f.bytes);
+  for (const version of ["1.2.3", "1.2.3-rc.1", "1.2.3-0.alpha"]) {
+    assert.ok(releaseBase(version).endsWith(`/v${version}/`));
+    assert.equal(runtimePath(version, f), join(f.home, version, f.target, "hibana-worker"));
+  }
+  for (const version of ["01.2.3", "1.2.3-01", "1.2.3-..", "9007199254740992.0.0", "1.2.3\n", "v1.2.3", "1.2.3+build.1", "^1.2.3", "../outside", null, undefined, 123]) {
+    assert.throws(() => releaseBase(version), /release version/);
+    assert.throws(() => runtimePath(version, f), /release version/);
+    // An omitted version selects the CLI's own version; explicit invalid strings must fail before I/O.
+    if (version == null) continue;
+    for (const options of [{version}, {version, from, sha256: f.checksum}])
+      await assert.rejects(installRuntime(options, {...f, fetcher() { assert.fail("invalid versions must not download"); }}), /release version/);
+  }
+  assert.deepEqual(await readdir(f.home), ["source"], "invalid offline versions must not create installations");
+});
+
+async function fixture(t) {
+  const home = await mkdtemp(join(tmpdir(), "hibana-runtime-"));
+  t.after(() => rm(home, { recursive: true, force: true }));
+  const bytes = Buffer.from("test-runtime-bytes");
+  const checksum = createHash("sha256").update(bytes).digest("hex");
+  const target = "linux-x64", version = "0.1.0";
+  const filename = `hibana-worker-${version}-${target}`;
+  return { home, bytes, checksum, target, version, filename };
+}
+
+test("runtime release selection verifies checksums and follows HTTPS asset redirects", async t => {
+  const f = await fixture(t), seen = [];
+  const fetcher = async (url, options) => {
+    seen.push(String(url)); assert.equal(options.redirect, "manual");
+    if (String(url).endsWith("SHA256SUMS")) return new Response(`${f.checksum}  ${f.filename}\n`);
+    if (url.hostname === "github.com") return new Response(null, { status: 302, headers: { location: "https://release-assets.githubusercontent.com/runtime?download=1" } });
+    return new Response(f.bytes);
+  };
+  const path = await installRuntime({ version: f.version }, { ...f, fetcher });
+  assert.deepEqual(await readFile(path), f.bytes);
+  assert.equal((await stat(path)).mode & 0o777, 0o700);
+  assert.equal(seen.length, 3);
+  assert.ok(seen[1].endsWith(`/v${f.version}/${f.filename}`));
+});
+
+test("corrupt, incomplete and failed runtime downloads preserve the existing executable", async t => {
+  const f = await fixture(t), source = join(f.home, "source");
+  await writeFile(source, f.bytes);
+  const path = await installRuntime({ version: f.version, from: source, sha256: f.checksum }, f);
+  for (const mode of ["wrong-hash", "missing", "http", "oversized", "truncated", "unpublished"]) {
+    const fetcher = async url => {
+      if (String(url).endsWith("SHA256SUMS")) return new Response(mode === "missing" ? "" : `${f.checksum}  ${f.filename}\n`);
+      if (mode === "http") return new Response(null, { status: 302, headers: { location: "http://insecure.example/runtime" } });
+      if (mode === "oversized") return new Response("x", { headers: { "content-length": String(200 * 1024 * 1024) } });
+      if (mode === "truncated") return new Response(new ReadableStream({ start(c) { c.error(new Error("connection lost")); } }));
+      if (mode === "unpublished") return new Response(null, { status: 404 });
+      return new Response("corrupt");
+    };
+    await assert.rejects(installRuntime({ version: f.version }, { ...f, fetcher }), undefined, mode);
+    assert.deepEqual(await readFile(path), f.bytes, mode);
+  }
+});
+
+test("offline runtime installation requires an exact checksum and a supported version/target", async t => {
+  const f = await fixture(t), from = join(f.home, "source");
+  await writeFile(from, f.bytes);
+  await assert.rejects(installRuntime({ version: f.version, from }, f), /both/);
+  await assert.rejects(installRuntime({ version: f.version, from, sha256: "0".repeat(64) }, f), /checksum mismatch/);
+  await assert.rejects(stat(runtimePath(f.version, f)), { code: "ENOENT" });
+  assert.throws(() => runtimePath("../outside", f), /release version/);
+  assert.throws(() => runtimeTarget("win32", "x64"), /remote deployment/);
+  assert.throws(() => runtimeTarget("linux", "arm"), /remote deployment/);
+  assert.throws(() => releaseChecksum(`${f.checksum}  ${f.filename}\n${f.checksum}  ${f.filename}`, f.filename), /duplicated/);
+});
+
+test("runtime download cancellation interrupts reception and preserves the installed executable", async t => {
+  const f = await fixture(t), source = join(f.home, "source");
+  await writeFile(source, f.bytes);
+  const path = await installRuntime({ version: f.version, from: source, sha256: f.checksum }, f);
+  const cancellation = new AbortController();
+  const fetcher = async (url, {signal}) => {
+    if (String(url).endsWith("SHA256SUMS")) return new Response(`${f.checksum}  ${f.filename}\n`);
+    return new Response(new ReadableStream({ start(controller) {
+      signal.addEventListener("abort", () => controller.error(signal.reason), {once: true});
+      cancellation.abort();
+    } }));
+  };
+  await assert.rejects(installRuntime({ version: f.version }, {...f, fetcher, signal: cancellation.signal}), {name: "AbortError"});
+  assert.deepEqual(await readFile(path), f.bytes);
+});

@@ -1,0 +1,9 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+namespace: hibana
+resources:
+  - job.yaml
+images:
+  - name: hibana-platform
+    newName: registry.example.com/hibana/platform
+    newTag: replace-with-release

@@ -1,0 +1,154 @@
+import { isApplicationName } from "./application-name.mjs";
+import { cp, mkdir, readdir, writeFile } from "node:fs/promises";
+import { resolve, join, dirname, basename } from "node:path";
+import { fileURLToPath } from "node:url";
+import { run } from "./process.mjs";
+import { packageInfo } from "./package.mjs";
+
+const sdk = resolve(dirname(fileURLToPath(import.meta.url)), "..");
+export const templates = ["hono", "javascript", "rust", "go"];
+function shellPath(path) {
+  return /^[a-zA-Z0-9_./-]+$/.test(path)
+    ? path
+    : `'${path.replaceAll("'", "'\\''")}'`;
+}
+
+export async function init(
+  directory = ".",
+  { template = "hono", install = true, cliPackage } = {},
+) {
+  if (!templates.includes(template))
+    throw new Error(`Supported templates: ${templates.join(", ")}`);
+  const root = resolve(directory);
+  const name = basename(root)
+    .toLowerCase()
+    .replace(/[^a-z0-9-]/g, "-")
+    .replace(/^-+|-+$/g, "")
+    .slice(0, 63)
+    .replace(/-+$/, "");
+  if (!isApplicationName(name))
+    throw new Error(
+      "Choose a project directory containing ASCII letters or digits",
+    );
+  await mkdir(root, { recursive: true });
+  if ((await readdir(root)).some((name) => name !== ".git"))
+    throw new Error(
+      `Directory is not empty: ${root}\nChoose a new directory, for example hibana init my-api.`,
+    );
+  await cp(join(sdk, "templates", template), root, { recursive: true });
+  const config = {
+    name,
+    secrets: [],
+    vars: template === "hono" ? {} : { GREETING: "Hello Hibana" },
+    limits: { memory_mb: 256, timeout_ms: 15000 },
+  };
+  const javascript = template === "hono" || template === "javascript";
+  const { name: cliName, version } = await packageInfo();
+  if (javascript) {
+    config.main = "src/index.ts";
+    await writeFile(
+      join(root, "package.json"),
+      JSON.stringify(
+        {
+          name,
+          private: true,
+          type: "module",
+          scripts: {
+            dev: "hibana dev",
+            build: "hibana build",
+            deploy: "hibana deploy",
+          },
+          ...(template === "hono" ? { dependencies: { hono: "^4.6.0" } } : {}),
+          devDependencies: {
+            [cliName]: cliPackage ? `file:${resolve(cliPackage)}` : version,
+          },
+          engines: { node: ">=24" },
+        },
+        null,
+        2,
+      ) + "\n",
+    );
+  } else {
+    // A generated project owns its WIT, and can also be built without the Hibana CLI.
+    await cp(join(sdk, "wit"), join(root, "wit"), { recursive: true });
+    if (template === "rust") {
+      config.component = "target/wasm32-wasip2/release/hibana_http_app.wasm";
+      config.build = {
+        commands: [
+          ["cargo", "build", "--release", "--target", "wasm32-wasip2"],
+        ],
+        watch: ["src", "Cargo.toml", "Cargo.lock", "wit"],
+      };
+    } else {
+      config.component = "main.wasm";
+      const tool = [
+        "go",
+        "tool",
+        "componentize-go",
+        "--ignore-toml-files",
+        "--wit-path",
+        "wit",
+        "--world",
+        "http",
+      ];
+      config.build = {
+        commands: [
+          [
+            ...tool,
+            "bindings",
+            "--format",
+            "--pkg-name",
+            "example.com/hibana-app/bindings",
+            "--export-pkg-name",
+            "example.com/hibana-app",
+            "--output",
+            "bindings",
+          ],
+          [...tool, "build"],
+        ],
+        watch: [
+          "main.go",
+          "export_wasi_http_incoming_handler",
+          "go.mod",
+          "go.sum",
+          "wit",
+        ],
+      };
+    }
+  }
+  await writeFile(
+    join(root, "hibana.json"),
+    JSON.stringify(config, null, 2) + "\n",
+  );
+  await writeFile(
+    join(root, ".gitignore"),
+    "node_modules/\n.hibana/\n.dev.vars\ntarget/\n*.wasm\n" +
+      (template === "go" ? "# Generated WIT bindings\nbindings/\n" : ""),
+  );
+  console.log(`Created ${root}`);
+  const changeDirectory =
+    root === process.cwd() ? [] : [`cd ${shellPath(root)}`];
+  if (javascript && install) {
+    console.log("Installing project dependencies...");
+    try {
+      await run("npm", ["install"], { cwd: root });
+    } catch (error) {
+      throw new Error(
+        `Project files are ready, but dependency installation failed: ${error.message}\nRetry from the project directory:\n${[...changeDirectory, "npm install", "npm run dev"].map((command) => `  ${command}`).join("\n")}`,
+        { cause: error },
+      );
+    }
+  }
+  const next = [
+    ...changeDirectory,
+    ...(javascript && !install ? ["npm install"] : []),
+    javascript ? "npm run dev" : `npx --yes ${cliName}@${version} dev`,
+  ];
+  console.log(`\nNext:\n${next.map((command) => `  ${command}`).join("\n")}`);
+  if (!javascript)
+    console.log(
+      template === "rust"
+        ? "\nRequires Rust and the wasm32-wasip2 target (rustup target add wasm32-wasip2)."
+        : "\nRequires Go; the project's componentize-go tool is installed by go tool on first use.",
+    );
+}

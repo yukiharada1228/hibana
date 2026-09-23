@@ -1,24 +1,27 @@
 [package]
-name = "faas-control-plane"
+name = "hibana-control-plane"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 
 [[bin]]
-name = "control-plane"
+name = "hibana-control-plane"
 path = "src/main.rs"
 
 [dependencies]
-faas-shared = { workspace = true }
+hex = { workspace = true }
+hibana-shared = { workspace = true }
+hibana-database = { workspace = true }
+sea-orm = { workspace = true }
+hibana-migration = { workspace = true }
 
 # Web / 非同期（multipart: POST /components/{id}/versions のアップロード受信）
 axum = { workspace = true, features = ["multipart"] }
 tokio = { workspace = true }
-tower = { workspace = true }
 tower-http = { workspace = true }
+ipnet = { workspace = true }
 
 # Object Storage（MinIO/S3 互換。本体保存 + presigned GET URL。§3.4）
-aws-config = { workspace = true }
 aws-sdk-s3 = { workspace = true }
 aws-credential-types = { workspace = true }
 # HTTP クライアントを rustls-ring で明示構築（aws-lc-sys / cc 依存を回避。§3.4）
@@ -32,23 +35,28 @@ sha2 = { workspace = true }
 # 鍵は固定 seed から構築するため署名/検証に RNG は不要（OsRng 機能は使わない）。
 ed25519-dalek = { workspace = true }
 
-# 認証ハッシュ（M3a, §3.3）。password_hash は argon2id、secret/salt 生成に rand。
-# token_hash は sha2 を再利用する。
-argon2 = { workspace = true }
+# Opaque Hibana credentials; OIDC protocol and ID-token validation use openidconnect.
 rand = { workspace = true }
+openidconnect = { version = "4.0.1", default-features = false, features = ["reqwest", "rustls-tls"] }
+base64 = { workspace = true }
+cookie = "0.18.2"
 async-trait = { workspace = true }
 
-# DB（query! マクロは使わずランタイム API のみ）
-sqlx = { workspace = true }
+# M7-0 / M7c (§5.1 / §4): 秘密素材（KEK / DEK / 復号済み平文）を Drop でゼロ化する。
+zeroize = { workspace = true }
+# M7c (§4.1): secret の封筒暗号（XChaCha20-Poly1305）。
+chacha20poly1305 = { workspace = true }
 
-# メッセージング
-async-nats = { workspace = true }
-# Stream トレイト (Subscriber は futures::Stream を実装)。async-nats と整合。
+# Async utilities.
 futures = "0.3"
+http-body-util = "0.1"
 
-# 共有ストア（M3d, §8）。レート制限 / in-flight / login ロックアウトを全 Axum
+# 共有ストア（M3d, §8）。レート制限 / OIDC state を全 Axum
 # インスタンスで共有するカウンタ。Lua アトミック操作で TOCTOU を避ける。pure-Rust 構成。
 redis = { workspace = true }
+# Redis uses Rustls's process default; select ring explicitly when other clients
+# enable a second provider through Cargo feature unification.
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
 
 # シリアライズ / 時刻
 serde = { workspace = true }
@@ -57,20 +65,19 @@ chrono = { workspace = true }
 
 # エラー / ログ
 anyhow = { workspace = true }
+# M9b (§6.2): 検証子プロセスで setrlimit(RLIMIT_AS) を呼ぶ（Linux）。
+libc = "0.2"
 thiserror = { workspace = true }
 tracing = { workspace = true }
-tracing-subscriber = { workspace = true }
 
 # 観測（M4a, §3.8）。Prometheus /metrics で使う TextEncoder + Registry。
 prometheus = { workspace = true }
 
+# Direct HTTP dispatch and native integration tests.
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "stream"] }
+
 # --- 統合テスト専用 dev-dependencies ---
 [dev-dependencies]
-# M4 chaos tests（tests/chaos_m4.rs）の HTTP クライアント。プロダクションコードでは使わない。
-# worker と同じ rustls-tls バックエンドで OpenSSL/aws-lc-sys を回避。`json` feature は
-# テスト中のリクエスト/レスポンスの serde 統合のため必要。
-reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
-# chaos_b の Idempotency-Key 生成にユニーク nanos を埋める用途。
-chrono = { workspace = true }
-# chaos テストの async ランタイム（既存の workspace tokio を re-import するだけ）。
-tokio = { workspace = true }
+tracing-subscriber = { workspace = true }
+tokio = { workspace = true, features = ["test-util"] }
+reqwest = { version = "0.12", default-features = false, features = ["multipart"] }

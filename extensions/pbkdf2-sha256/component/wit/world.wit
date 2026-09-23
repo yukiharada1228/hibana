@@ -1,0 +1,5 @@
+package hibana:pbkdf2-sha256@0.5.0;
+interface api {
+  derive: func(password: list<u8>, salt: list<u8>, iterations: u32) -> result<list<u8>, string>;
+}
+world primitive { export api; }

@@ -1,0 +1,13 @@
+[package]
+name = "hibana-unicode-nfkc"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+unicode-normalization = "=0.1.25"
+wit-bindgen.workspace = true

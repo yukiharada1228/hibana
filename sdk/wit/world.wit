@@ -1,0 +1,6 @@
+package hibana:app;
+
+// The runtime provides WASI HTTP 0.2.3, with outgoing requests subject to host grants.
+world http {
+  export wasi:http/incoming-handler@0.2.3;
+}

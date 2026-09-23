@@ -1,0 +1,144 @@
+//! Usage management HTTP handlers.
+use crate::auth::Principal;
+use crate::db::{self, UsageRollupRow, UsageTotals};
+use crate::error::AppError;
+use crate::state::AppState;
+use axum::extract::{Query, State};
+use axum::response::IntoResponse;
+use axum::Json;
+use chrono::Datelike;
+use hibana_shared::FaasError;
+use sea_orm::TransactionTrait as _;
+use serde::{Deserialize, Serialize};
+
+// ---------------------------------------------------------------------------
+// GET /usage — テナント利用量参照 (M5, §15 / §6.0, read スコープ)
+// ---------------------------------------------------------------------------
+
+/// `GET /usage` のクエリパラメータ。
+///
+/// `from`/`to` は `YYYY-MM-DD`（0001〜9999 年、UTC 日境界）。`usage_rollups` は UTC 日次粒度で集計されるため
+/// レスポンスも UTC 日次（period の両端含む）になる。既定は `to`=今日(UTC) / `from`=`to`-30 日。
+/// `component_id` 指定時はその component のみに絞り込む（未指定なら全 component）。
+#[derive(Debug, Deserialize)]
+pub struct UsageQuery {
+    #[serde(default)]
+    pub from: Option<String>,
+    #[serde(default)]
+    pub to: Option<String>,
+    #[serde(default)]
+    pub component_id: Option<String>,
+}
+
+/// `GET /usage` 応答。`totals` は `by_component` を畳んだ全体集計（SUM 列は和、peak は max）。
+#[derive(Debug, Serialize)]
+pub struct UsageResponse {
+    pub tenant_id: String,
+    /// 集計対象期間の開始（UTC 日, 含む）。`YYYY-MM-DD`。
+    pub from: String,
+    /// 集計対象期間の終了（UTC 日, 含む）。`YYYY-MM-DD`。
+    pub to: String,
+    pub totals: UsageTotals,
+    pub by_component: Vec<UsageRollupRow>,
+}
+
+/// `from`/`to` クエリ文字列を `NaiveDate` に解決する（純関数・時計を引数化してテスト可能）。
+///
+/// 既定: `to`=`today` / `from`=`to`-30 日。指定時は `YYYY-MM-DD` をパースし、不正は
+/// [`FaasError::InvalidRequest`]（→ 400）。`from > to` も 400 で弾く（空でない範囲を保証）。
+pub(super) fn resolve_usage_range(
+    from: Option<&str>,
+    to: Option<&str>,
+    today: chrono::NaiveDate,
+) -> Result<(chrono::NaiveDate, chrono::NaiveDate), FaasError> {
+    let parse = |label: &str, s: &str| {
+        let invalid = || FaasError::InvalidRequest(format!("{label} must be YYYY-MM-DD"));
+        if s.len() != 10 {
+            return Err(invalid());
+        }
+        let date = chrono::NaiveDate::parse_from_str(s, "%Y-%m-%d").map_err(|_| invalid())?;
+        if date.format("%Y-%m-%d").to_string() != s {
+            return Err(invalid());
+        }
+        Ok(date)
+    };
+
+    let to = match to {
+        Some(s) => parse("to", s)?,
+        None => today,
+    };
+    let from = match from {
+        Some(s) => parse("from", s)?,
+        None => to
+            .checked_sub_signed(chrono::Duration::days(30))
+            .ok_or_else(|| {
+                FaasError::InvalidRequest("default usage range is outside supported dates".into())
+            })?,
+    };
+
+    if [from, to]
+        .iter()
+        .any(|date| !(1..=9999).contains(&date.year()))
+    {
+        return Err(FaasError::InvalidRequest(
+            "from and to must be between 0001-01-01 and 9999-12-31".into(),
+        ));
+    }
+
+    if from > to {
+        return Err(FaasError::InvalidRequest(
+            "from must not be after to".into(),
+        ));
+    }
+    Ok((from, to))
+}
+
+/// `by_component` を期間全体の `totals` へ畳む（純関数）。SUM 列は和、peak は max を取る。
+pub(super) fn fold_usage_totals(by_component: &[UsageRollupRow]) -> UsageTotals {
+    by_component
+        .iter()
+        .fold(UsageTotals::default(), |mut acc, c| {
+            let c = &c.usage;
+            acc.invocation_count = acc.invocation_count.saturating_add(c.invocation_count);
+            acc.cpu_fuel_used = acc.cpu_fuel_used.saturating_add(c.cpu_fuel_used);
+            acc.wall_time_ms = acc.wall_time_ms.saturating_add(c.wall_time_ms);
+            acc.peak_memory_bytes_max = acc.peak_memory_bytes_max.max(c.peak_memory_bytes_max);
+            acc.output_bytes = acc.output_bytes.saturating_add(c.output_bytes);
+            acc.succeeded_count = acc.succeeded_count.saturating_add(c.succeeded_count);
+            acc.failed_count = acc.failed_count.saturating_add(c.failed_count);
+            acc.timeout_count = acc.timeout_count.saturating_add(c.timeout_count);
+            acc
+        })
+}
+
+/// GET /usage — テナント利用量参照 (M5, §15 / §6.0, read スコープ)。
+///
+/// `principal.tenant_id` を唯一の権威値として使う（cross-tenant path を持たず IDOR 面を増やさない）。
+/// RLS 下では SELECT 実行接続に `app.tenant_id` をセットする必要があるため tx を張って GUC を設定する
+/// （GUC 未設定の bare 接続は fail-closed で ERROR）。WHERE にも tenant_id をバインドして二重防御する。
+pub async fn get_usage(
+    State(state): State<AppState>,
+    principal: Principal,
+    Query(q): Query<UsageQuery>,
+) -> Result<impl IntoResponse, AppError> {
+    let tenant = &principal.tenant_id;
+
+    let today = chrono::Utc::now().date_naive();
+    let (from, to) = resolve_usage_range(q.from.as_deref(), q.to.as_deref(), today)?;
+
+    let tx = state.pool().begin().await?;
+    db::set_tenant_guc(&tx, tenant).await?;
+    let by_component =
+        db::get_usage_rollups(&tx, tenant, from, to, q.component_id.as_deref()).await?;
+    tx.commit().await?;
+
+    let totals = fold_usage_totals(&by_component);
+
+    Ok(Json(UsageResponse {
+        tenant_id: tenant.clone(),
+        from: from.format("%Y-%m-%d").to_string(),
+        to: to.format("%Y-%m-%d").to_string(),
+        totals,
+        by_component,
+    }))
+}

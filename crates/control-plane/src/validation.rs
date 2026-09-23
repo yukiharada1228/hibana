@@ -1,30 +1,12 @@
-//! wasm 検証パイプライン + capability 強制 (M2/M3d: §6.2 / §4.4)。
+//! Validate uploaded WASI HTTP components in a resource-limited subprocess.
 //!
-//! アップロードされた本体を「デプロイ前に」検証する。M2 はインプロセス検証:
-//! 1. Component Model 妥当性検証（`wasmparser::Validator`）
-//! 2. host import の capability 照合（§4.4 strict matching: handler-world import を
-//!    **admin 承認済み capability 集合** と厳密照合し、未承認 import は **422** で拒否する。
-//!    型のみの import は capability を伴わないため対象外）。
-//! 3. sha256 算出・サイズ確定
+//! The child checks the Component Model, the HTTP export and supported host
+//! imports, then returns the digest, size and resolved imports to persist.
+//! Custom application interfaces must be composed into the uploaded component.
+//! Environment bindings and outbound grants are enforced separately at runtime.
 //!
-//! capability モデル (§4.4 M3d):
-//! - 既定は **deny-all** (MUST)。クライアント宣言値（multipart `capabilities`）は **信用しない**。
-//!   承認は `admin` スコープを要する管理操作であり、本スライスでは「標準 handler world 契約 +
-//!   標準 WASI Preview2」を **baseline 承認集合** として固定する（[`approved_baseline`]）。これより
-//!   広い ambient capability（任意ホスト・net・fs 等）は承認集合に含まれないため 422 で拒否される。
-//! - 検証通過後に **承認済みとして解決した import 集合** を返し（[`Validated::approved_imports`]）、
-//!   呼び出し側はこれ（クライアント宣言値ではなく）を `component_versions.capabilities` に保存する。
-//!
-//! TODO(§4.4): admin の capability 承認 API（per-version の承認集合を DB に持ち、ここへ渡す）。
-//!             本スライスは baseline 固定 + strict matching までを実装する（net/fs/env/stdio の
-//!             host 配線・WIT world 拡張は本スライス対象外）。
-//!
-//! DoS 緩和: 同時検証数を static `Semaphore` で制限し、CPU バウンドな検証は
-//! `spawn_blocking` で実行する。
-//!
-//! TODO(§6.2): 別プロセスサンドボックスでの隔離検証（再帰深さ・メモリ・時間の
-//!             OS レベル隔離）。M2 はインプロセスのため、悪意ある巨大/深い入力に
-//!             対する保護はサイズ上限 + 同時実行制限 + Validator の内部上限のみ。
+//! A semaphore bounds concurrent children; a wall-clock timeout and Linux
+//! `RLIMIT_AS` bound each validation process.
 
 use std::collections::BTreeSet;
 use std::sync::OnceLock;
@@ -33,71 +15,29 @@ use sha2::{Digest, Sha256};
 use tokio::sync::Semaphore;
 use wasmparser::{ComponentTypeRef, Parser, Payload, Validator, WasmFeatures};
 
-use faas_shared::FaasError;
+use hibana_shared::{subprocess, FaasError};
 
 /// 同時に走る検証の上限（DoS 緩和, §6.2）。
 const MAX_CONCURRENT_VALIDATIONS: usize = 4;
 
-/// admin 承認済み capability 集合の baseline 接頭辞（§4.4）。
-///
-/// baseline は「§4.2 標準 handler world 契約 + 標準 WASI Preview2 のうち **ambient な権限を
-/// 与えない** stdio/clocks/random だけ」を承認する。bare `wasi:` namespace を承認すると
-/// `wasi:sockets/*`（network egress）や `wasi:filesystem/*`（fs アクセス）まで一括承認され、
-/// §4.4 の deny-all が約束する「net/fs は本スライス対象外」を policy 層で破る（worker の
-/// 空 `WasiCtx` が runtime で塞いでいても、capability 層は承認済みと記録してしまい
-/// defense-in-depth が崩れる）。よって net/fs を含む広い namespace 接頭辞は **承認しない**:
-/// - `wasi:io/` … streams / poll（stdio 配線の土台。net/fs リソースを単体では開けない）。
-/// - `wasi:cli/` … stdin/stdout/stderr / environment / exit（標準 handler world の stdio 契約）。
-/// - `wasi:clocks/` … monotonic / wall-clock（時刻参照のみ。ambient な副作用なし）。
-/// - `wasi:random/` … 乱数（ambient な副作用なし）。
-/// - `faas:component/` … §4.2 の標準 handler world を定義する自パッケージ（world の「契約」）。
-///
-/// **明示的に baseline から除外**（承認集合に入れない → 422）:
-/// - `wasi:sockets/`（tcp/udp/ip-name-lookup = network egress）
-/// - `wasi:filesystem/`（fs アクセス）
-///
-/// 将来これらを許す場合は admin 承認 API で per-version の `exact`/`prefixes` に明示追加する。
-///
-/// **型のみの import**（`ComponentTypeRef::Type`）は capability を与えないため接頭辞に
-/// 関わらず承認対象外（[`collect_component_imports`] で区別し、照合をスキップする）。
-const BASELINE_APPROVED_PREFIXES: &[&str] = &[
+/// Supported WASI host imports. Socket/HTTP access still requires an outbound
+/// grant; filesystem imports receive no preopened directories. Type-only
+/// imports do not grant capabilities and are skipped by `match_capabilities`.
+const SUPPORTED_IMPORT_PREFIXES: &[&str] = &[
     "wasi:io/",
     "wasi:cli/",
     "wasi:clocks/",
     "wasi:random/",
-    "faas:component/",
+    "wasi:sockets/",
+    "wasi:filesystem/",
+    "wasi:http/types",
+    "wasi:http/outgoing-handler",
 ];
 
-/// admin が承認した capability 集合 (§4.4)。WIT import を strict matching する際の権威。
-///
-/// 既定は [`ApprovedCapabilities::baseline`]（= 標準 handler world 契約 + 標準 WASI）。空の承認集合
-/// （`prefixes` も `exact` も baseline のみ）は **deny-all** を意味する（baseline を超える ambient
-/// capability を一切認めない）。本スライスでは baseline 固定だが、将来 admin 承認 API が per-version の
-/// 承認値をここへ流し込めるよう、接頭辞集合 + 完全一致集合の 2 段で構成する。
-#[derive(Debug, Clone)]
-pub struct ApprovedCapabilities {
-    /// 承認済み接頭辞（`wasi:` / `faas:component/` 等）。
-    prefixes: BTreeSet<String>,
-    /// 承認済み完全一致 import 名（接頭辞では表せない個別承認用; 本スライスでは空）。
-    exact: BTreeSet<String>,
-}
-
-impl ApprovedCapabilities {
-    /// baseline 承認集合（標準 handler world 契約 + 標準 WASI Preview2）。deny-all 既定。
-    pub fn baseline() -> Self {
-        Self {
-            prefixes: BASELINE_APPROVED_PREFIXES
-                .iter()
-                .map(|s| s.to_string())
-                .collect(),
-            exact: BTreeSet::new(),
-        }
-    }
-
-    /// import 名が承認集合に含まれるか（接頭辞一致 **or** 完全一致）。
-    fn approves(&self, name: &str) -> bool {
-        self.exact.contains(name) || self.prefixes.iter().any(|p| name.starts_with(p.as_str()))
-    }
+fn is_supported_import(name: &str) -> bool {
+    SUPPORTED_IMPORT_PREFIXES
+        .iter()
+        .any(|prefix| name.starts_with(prefix))
 }
 
 /// プロセス全体で共有する検証用セマフォ。
@@ -107,10 +47,11 @@ fn validation_semaphore() -> &'static Semaphore {
 }
 
 /// 検証通過後の確定情報。
-#[derive(Debug, Clone)]
+///
+/// M9b (§6.2): 検証は別プロセスで走るため、この型は子プロセス → 親プロセスの
+/// **ワイヤ形式**でもある（子が JSON で stdout に書き、親が読む）。
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct Validated {
-    /// コンポーネントが要求する host import 名（`namespace:package/interface`）。観測用。
-    pub imports: Vec<String>,
     /// §4.4: 承認集合との strict matching を通過した capability import 集合（型のみは除く）。
     /// 呼び出し側はこれ（クライアント宣言値ではなく）を `component_versions.capabilities` に保存する。
     pub approved_imports: Vec<String>,
@@ -118,37 +59,145 @@ pub struct Validated {
     pub sha256: String,
     /// 本体サイズ（bytes）。
     pub size_bytes: u64,
+    pub build_metadata: Option<crate::build_metadata::BuildMetadata>,
 }
 
-/// 本体を検証し capability を強制する（§6.2 / §4.4）。
-///
-/// CPU バウンドな解析を `spawn_blocking` に逃がし、同時実行は static セマフォで
-/// 制限する。妥当性違反・未承認 import は `InvalidRequest`（→ 422 相当）にする。
-///
-/// `approved` は admin 承認済み capability 集合（本スライスは [`ApprovedCapabilities::baseline`]）。
-/// クライアント宣言値ではなくこの承認集合と WIT import を厳密照合する。
-pub async fn validate_wasm(
-    bytes: Vec<u8>,
-    approved: ApprovedCapabilities,
-) -> Result<Validated, FaasError> {
+/// 検証子プロセスの wall-clock timeout（秒）。超過で SIGKILL する。
+const DEFAULT_VALIDATION_TIMEOUT_SECS: u64 = 5;
+/// 検証子プロセスのメモリ上限（MiB, Linux の `RLIMIT_AS`）。
+/// macOS では `RLIMIT_AS` を張らず、時間・出力上限で縛る。
+const DEFAULT_VALIDATION_MEM_LIMIT_MB: u64 = 256;
+/// 子プロセスが返してよい JSON の最大バイト数（想定外に巨大な出力を読み込まない保険）。
+const VALIDATION_MAX_OUTPUT_BYTES: usize = 64 * 1024;
+
+/// 子プロセス起動モードを表す引数。main.rs のサブコマンド分岐がこれを見て
+/// [`run_validate_stdin`] へ入る。
+pub const VALIDATE_STDIN_FLAG: &str = "--validate-stdin";
+
+/// 親 → 子 → 親のワイヤ形式（stdout に 1 つだけ書く）。
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+enum ValidationOutcome {
+    /// 検証通過。
+    Ok(Validated),
+    /// wasm 自体が不正 / 未承認。子は exit 0 でこれを返す。
+    Rejected { message: String },
+}
+
+/// Validate in a bounded, credential-free subprocess. Keep the concurrency
+/// permit until the child is reaped, including cancelled or timed-out uploads.
+pub async fn validate_wasm(bytes: &[u8]) -> Result<Validated, FaasError> {
     let permit = validation_semaphore()
-        .acquire()
-        .await
-        .map_err(|e| FaasError::Internal(format!("validation semaphore closed: {e}")))?;
+        .try_acquire()
+        .map_err(|_| FaasError::Unavailable)?;
 
-    let result = tokio::task::spawn_blocking(move || validate_blocking(&bytes, &approved))
-        .await
-        .map_err(|e| FaasError::Internal(format!("validation task panicked: {e}")))?;
+    let exe = std::env::current_exe()
+        .map_err(|e| FaasError::Internal(format!("cannot resolve own exe for validation: {e}")))?;
+    let mut command = subprocess::isolated_command(exe);
+    command.arg(VALIDATE_STDIN_FLAG).env(
+        "VALIDATION_MEM_LIMIT_MB",
+        env_u64("VALIDATION_MEM_LIMIT_MB", DEFAULT_VALIDATION_MEM_LIMIT_MB)
+            .max(16)
+            .to_string(),
+    );
+    let output = subprocess::output(
+        command,
+        bytes,
+        std::time::Duration::from_secs(
+            env_u64("VALIDATION_TIMEOUT_SECS", DEFAULT_VALIDATION_TIMEOUT_SECS).max(1),
+        ),
+        VALIDATION_MAX_OUTPUT_BYTES,
+        permit,
+    )
+    .await
+    .map_err(|error| match error {
+        subprocess::Error::Spawn(_) | subprocess::Error::Io(_) | subprocess::Error::Stopped => {
+            FaasError::Internal(format!("validation {error}"))
+        }
+        _ => FaasError::InvalidRequest(format!("wasm validation failed: {error}")),
+    })?;
 
-    drop(permit);
-    result
+    match serde_json::from_slice::<ValidationOutcome>(&output) {
+        Ok(ValidationOutcome::Ok(v)) => Ok(v),
+        Ok(ValidationOutcome::Rejected { message }) => Err(FaasError::InvalidRequest(message)),
+        Err(e) => Err(FaasError::Internal(format!(
+            "could not parse validation subprocess output: {e}"
+        ))),
+    }
 }
 
-/// 同期検証本体（`spawn_blocking` 内で実行）。
-fn validate_blocking(
-    bytes: &[u8],
-    approved: &ApprovedCapabilities,
-) -> Result<Validated, FaasError> {
+/// 子プロセス側の入口（`--validate-stdin`）。main.rs のサブコマンド分岐から呼ぶ。
+///
+/// stdin から wasm を読み、[`validate_blocking`] を走らせ、[`ValidationOutcome`] を stdout へ
+/// 1 つ書いて exit 0 で終わる（「wasm が不正」も検証結果として返す）。
+/// メモリ制限の設定失敗やstdin/stdoutのI/O失敗では異常終了する。
+///
+/// **プロセスの先頭でメモリ上限を張る**（Linux の `RLIMIT_AS`）。これが本スライスの主目的で、
+/// wasmparser が悪性 wasm でメモリを食い潰しても、この子プロセスが OOM で死ぬだけで
+/// control-plane 本体には波及しない。
+pub fn run_validate_stdin() -> anyhow::Result<()> {
+    use std::io::Read as _;
+
+    set_memory_limit()?;
+
+    let mut bytes = Vec::new();
+    std::io::stdin()
+        .read_to_end(&mut bytes)
+        .map_err(|e| anyhow::anyhow!("validation child: cannot read stdin: {e}"))?;
+
+    let outcome = match validate_blocking(&bytes) {
+        Ok(v) => ValidationOutcome::Ok(v),
+        Err(FaasError::InvalidRequest(m)) => ValidationOutcome::Rejected { message: m },
+        // 未知の検証エラーも成功として扱わない。
+        Err(other) => ValidationOutcome::Rejected {
+            message: format!("validation failed: {other}"),
+        },
+    };
+
+    let json = serde_json::to_vec(&outcome)
+        .map_err(|e| anyhow::anyhow!("validation child: serialize: {e}"))?;
+    use std::io::Write as _;
+    std::io::stdout()
+        .write_all(&json)
+        .map_err(|e| anyhow::anyhow!("validation child: write stdout: {e}"))?;
+    Ok(())
+}
+
+/// 子プロセスの仮想メモリ上限を `RLIMIT_AS` で張る（Linux）。
+///
+/// macOS は `RLIMIT_AS` を実質無視するので、**macOS ではメモリ上限に頼らず**親側の
+/// wall-clock timeout + 出力サイズ上限だけで縛る（macOS はローカル開発専用という前提, §4.2）。
+/// 本番 Linux ではこの rlimit が「1 検証あたりのメモリ」を hard に縛る本体である。
+#[cfg(target_os = "linux")]
+fn set_memory_limit() -> anyhow::Result<()> {
+    let mb = env_u64("VALIDATION_MEM_LIMIT_MB", DEFAULT_VALIDATION_MEM_LIMIT_MB).max(16);
+    let bytes = mb.saturating_mul(1024 * 1024);
+    let limit = libc::rlimit {
+        rlim_cur: bytes,
+        rlim_max: bytes,
+    };
+    // SAFETY: setrlimit は resource と rlimit ポインタを取る単純な syscall。
+    if unsafe { libc::setrlimit(libc::RLIMIT_AS, &limit) } != 0 {
+        return Err(std::io::Error::last_os_error().into());
+    }
+    Ok(())
+}
+
+#[cfg(not(target_os = "linux"))]
+fn set_memory_limit() -> anyhow::Result<()> {
+    // macOS 等は RLIMIT_AS が効かない。timeout + 出力上限で縛る（上のコメント参照）。
+    Ok(())
+}
+
+/// u64 の任意 env。欠損 / 不正は default（子プロセスでも使うので独立実装）。
+fn env_u64(key: &str, default: u64) -> u64 {
+    std::env::var(key)
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .unwrap_or(default)
+}
+
+/// 検証子プロセスで実行する同期検証本体。
+fn validate_blocking(bytes: &[u8]) -> Result<Validated, FaasError> {
     // (1) Component Model 妥当性検証。
     //     component_model を有効化した features で完全検証する。
     let features = WasmFeatures::default() | WasmFeatures::COMPONENT_MODEL;
@@ -159,19 +208,20 @@ fn validate_blocking(
 
     // (2) §4.4 strict matching: capability を伴う import を **承認集合** と厳密照合する。
     //     型のみの import は capability を伴わないため照合対象外。未承認は 422（deny-all 既定）。
+    require_http_export(bytes)?;
     let imports = collect_component_imports(bytes)?;
-    let approved_imports = match_capabilities(&imports, approved)?;
+    let approved_imports = match_capabilities(&imports)?;
 
     // (4) sha256 算出・サイズ確定。
     let mut hasher = Sha256::new();
     hasher.update(bytes);
-    let sha256 = hex_lower(&hasher.finalize());
+    let sha256 = hex::encode(hasher.finalize());
 
     Ok(Validated {
-        imports: imports.into_iter().map(|i| i.name).collect(),
         approved_imports,
         sha256,
         size_bytes: bytes.len() as u64,
+        build_metadata: crate::build_metadata::extract(bytes)?,
     })
 }
 
@@ -188,20 +238,16 @@ struct ComponentImport {
 /// 未承認があれば 422 相当の [`FaasError::InvalidRequest`] を返す。型のみの import
 /// （`ComponentTypeRef::Type`）は capability を伴わないため照合対象外（承認結果にも含めない）。
 /// deny-all 既定（空 = baseline のみ）では ambient capability は一切通過しない。
-fn match_capabilities(
-    imports: &[ComponentImport],
-    approved: &ApprovedCapabilities,
-) -> Result<Vec<String>, FaasError> {
+fn match_capabilities(imports: &[ComponentImport]) -> Result<Vec<String>, FaasError> {
     let mut approved_imports = Vec::new();
     for import in imports {
         if import.type_only {
             continue;
         }
-        if !approved.approves(&import.name) {
+        if !is_supported_import(&import.name) {
             return Err(FaasError::InvalidRequest(format!(
                 "unapproved host import '{}': capabilities default to deny-all (§4.4); only the \
-                 admin-approved set (standard handler world faas:component/* and WASI Preview2 \
-                 wasi:* in this slice) is permitted",
+                 supported WASI imports are permitted",
                 import.name
             )));
         }
@@ -218,92 +264,168 @@ fn match_capabilities(
 fn collect_component_imports(bytes: &[u8]) -> Result<Vec<ComponentImport>, FaasError> {
     let mut imports = Vec::new();
 
+    // **最外殻コンポーネントの import だけ**を集める（= host 境界）。`parse_all` は
+    // ネストしたモジュール/コンポーネントのセクションも平坦に流すため、内部コンポーネントの
+    // **内部 import**（親の instantiation で満たされ host からは配線されない）まで拾ってしまう。
+    // それらは host capability ではないので許可リスト照合の対象にしてはならない。
+    // 例: componentize-js 0.19.3（wasi:http proxy 経路）が生む component は、内部コンポーネントに
+    // `handle` 関数 import を持つ —— これは incoming-handler の内部配線であって host import ではない。
+    // nest 深さを ModuleSection/ComponentSection(+1) と End(-1) で数え、depth==0 のときだけ集める。
+    let mut depth: i32 = 0;
+
     for payload in Parser::new(0).parse_all(bytes) {
         let payload =
             payload.map_err(|e| FaasError::InvalidRequest(format!("parse error: {e}")))?;
-        if let Payload::ComponentImportSection(section) = payload {
-            for import in section {
-                let import =
-                    import.map_err(|e| FaasError::InvalidRequest(format!("parse error: {e}")))?;
-                imports.push(ComponentImport {
-                    name: import.name.0.to_string(),
-                    type_only: matches!(import.ty, ComponentTypeRef::Type(_)),
-                });
+        match payload {
+            // ネスト単位に入る（後続ペイロードは内部のもの）。
+            Payload::ModuleSection { .. } | Payload::ComponentSection { .. } => {
+                depth += 1;
             }
+            // 現在の単位の終わり。最外殻の End で depth は負になりうるが害はない。
+            Payload::End(_) => {
+                depth -= 1;
+            }
+            // host 境界（最外殻）の import section のみ照合対象にする。
+            Payload::ComponentImportSection(section) if depth == 0 => {
+                for import in section {
+                    let import = import
+                        .map_err(|e| FaasError::InvalidRequest(format!("parse error: {e}")))?;
+                    imports.push(ComponentImport {
+                        name: import.name.0.to_string(),
+                        type_only: matches!(import.ty, ComponentTypeRef::Type(_)),
+                    });
+                }
+            }
+            _ => {}
         }
     }
 
     Ok(imports)
 }
 
-/// バイト列を小文字 16 進へ。
-fn hex_lower(bytes: &[u8]) -> String {
-    use std::fmt::Write as _;
-    let mut s = String::with_capacity(bytes.len() * 2);
-    for b in bytes {
-        let _ = write!(s, "{b:02x}");
+/// バージョンへ注入する環境変数名の形式と件数を検証する純関数。
+///
+/// 重複は集合化で吸収する。名前の形式・件数の上限は `hibana_shared` の定数を使う
+/// （CP と worker で同じ定数を参照する二重防御）。
+pub fn validate_env_allowlist(names: &[String]) -> Result<BTreeSet<String>, FaasError> {
+    if names.len() > hibana_shared::MAX_FUNCTION_ENV_KEYS {
+        return Err(FaasError::InvalidRequest(format!(
+            "at most {} env names may be approved per version",
+            hibana_shared::MAX_FUNCTION_ENV_KEYS
+        )));
     }
-    s
+    let mut out = BTreeSet::new();
+    for name in names {
+        if !hibana_shared::is_valid_env_key(name) {
+            return Err(FaasError::InvalidRequest(format!(
+                "invalid env name '{name}': must match ^[A-Z_][A-Z0-9_]{{0,{}}}$",
+                hibana_shared::MAX_ENV_KEY_LEN - 1
+            )));
+        }
+        out.insert(name.clone());
+    }
+    Ok(out)
+}
+
+fn require_http_export(bytes: &[u8]) -> Result<(), FaasError> {
+    let mut depth = 0i32;
+    for payload in Parser::new(0).parse_all(bytes) {
+        match payload.map_err(|e| FaasError::InvalidRequest(format!("parse error: {e}")))? {
+            Payload::ModuleSection { .. } | Payload::ComponentSection { .. } => depth += 1,
+            Payload::End(_) => depth -= 1,
+            Payload::ComponentExportSection(section) if depth == 0 => {
+                for export in section {
+                    let export = export
+                        .map_err(|e| FaasError::InvalidRequest(format!("parse error: {e}")))?;
+                    if export.name.0 == "wasi:http/incoming-handler@0.2.3"
+                        && export.kind == wasmparser::ComponentExternalKind::Instance
+                    {
+                        return Ok(());
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    Err(FaasError::InvalidRequest("Hibana requires a WASI HTTP Component exporting wasi:http/incoming-handler@0.2.3; bytes handlers and CLI modules are not supported".into()))
 }
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn deployment_rejects_components_without_http_export_and_core_modules() {
+        for bytes in [
+            b"\0asm\x0d\0\x01\0".as_slice(),
+            b"\0asm\x01\0\0\0".as_slice(),
+        ] {
+            let err = super::validate_blocking(bytes).unwrap_err();
+            assert!(err.to_string().contains("WASI HTTP Component"));
+        }
+    }
+
     use super::*;
+
+    #[tokio::test]
+    async fn full_validation_capacity_rejects_without_a_payload_wait_queue() {
+        let permits = validation_semaphore().try_acquire_many(4).unwrap();
+        assert!(matches!(
+            validate_wasm(b"fixture").await,
+            Err(FaasError::Unavailable)
+        ));
+        drop(permits);
+        assert_eq!(validation_semaphore().available_permits(), 4);
+    }
 
     /// §4.4: baseline 承認集合は標準 WASI と標準 handler world 契約を承認する。
     #[test]
-    fn baseline_approves_wasi_and_standard_world() {
-        let approved = ApprovedCapabilities::baseline();
+    fn baseline_approves_wasi_http_contract() {
         // 標準 WASI Preview2。
-        assert!(approved.approves("wasi:io/streams@0.2.6"));
-        assert!(approved.approves("wasi:cli/environment@0.2.0"));
+        assert!(is_supported_import("wasi:io/streams@0.2.6"));
+        assert!(is_supported_import("wasi:cli/environment@0.2.0"));
         // §4.2 標準 handler world の自パッケージ型 interface（echo が import する）。
-        assert!(approved.approves("faas:component/types@1.0.0"));
+        assert!(is_supported_import("wasi:http/types@0.2.3"));
     }
 
     /// §4.4: deny-all 既定。baseline を超える ambient capability は未承認 → 422 対象。
     #[test]
     fn baseline_rejects_unapproved_host_import() {
-        let approved = ApprovedCapabilities::baseline();
         // 任意の ambient capability は未承認（net/fs 等）。
-        assert!(!approved.approves("evil:net/socket@0.1.0"));
-        assert!(!approved.approves("host:fs/open"));
+        assert!(!is_supported_import("evil:net/socket@0.1.0"));
+        assert!(!is_supported_import("host:fs/open"));
         // 名前空間を偽装した接頭辞も未承認。
-        assert!(!approved.approves("notwasi:io/streams"));
-        assert!(!approved.approves("faas:secrets/store"));
+        assert!(!is_supported_import("notwasi:io/streams"));
+        assert!(!is_supported_import("faas:secrets/store"));
     }
 
     /// §4.4 defense-in-depth: bare `wasi:` namespace を承認しないため、network egress
-    /// （`wasi:sockets/*`）と fs（`wasi:filesystem/*`）は baseline で **未承認**（→ 422）。
-    /// これらは本スライスの deny-all が対象外と宣言する capability であり、policy 層で塞ぐ。
+    /// M9c: `wasi:filesystem/*` の **import は baseline で許可**する。Rust std は net-only の
+    /// component でも filesystem import を推移的に焼き込むため、拒否すると std ベースの egress
+    /// component が一切アップロードできない。**実際の fs アクセスはランタイムが塞ぐ**
+    /// （WasiCtx が preopen を 1 つも与えない → どのパスも開けない）。この deny-by-default は
+    /// chaos_v1 が実行時に固定する（「アップロードは通るが実行時に fs は全拒否」）。
     #[test]
-    fn baseline_excludes_sockets_and_filesystem() {
-        let approved = ApprovedCapabilities::baseline();
-        assert!(!approved.approves("wasi:sockets/tcp@0.2.6"));
-        assert!(!approved.approves("wasi:sockets/udp@0.2.6"));
-        assert!(!approved.approves("wasi:sockets/ip-name-lookup@0.2.6"));
-        assert!(!approved.approves("wasi:filesystem/types@0.2.6"));
-        assert!(!approved.approves("wasi:filesystem/preopens@0.2.6"));
+    fn baseline_allows_filesystem_import_but_runtime_denies_access() {
+        assert!(is_supported_import("wasi:filesystem/types@0.2.6"));
+        assert!(is_supported_import("wasi:filesystem/preopens@0.2.6"));
+    }
+
+    /// M9c: `wasi:sockets/*` の **import は baseline で許可**する（env モデルと同じく「import できる」
+    /// ことと「実際に到達できる」ことを分ける）。実際の egress は admin 承認した allowlist が
+    /// 非空のときだけ worker の `socket_addr_check` が通し、空なら全拒否する（deny-by-default は
+    /// ランタイムが担保する）。したがって import 許可だけでは 1 バイトも外へ出られない。
+    #[test]
+    fn baseline_allows_sockets_import_but_runtime_gates_egress() {
+        assert!(is_supported_import("wasi:sockets/tcp@0.2.6"));
+        assert!(is_supported_import("wasi:sockets/ip-name-lookup@0.2.6"));
     }
 
     /// §4.4: baseline が承認する WASI Preview2 サブインターフェース（stdio/clocks/random）。
     #[test]
     fn baseline_approves_ambient_free_wasi_subinterfaces() {
-        let approved = ApprovedCapabilities::baseline();
-        assert!(approved.approves("wasi:io/poll@0.2.6"));
-        assert!(approved.approves("wasi:cli/stdout@0.2.0"));
-        assert!(approved.approves("wasi:clocks/monotonic-clock@0.2.0"));
-        assert!(approved.approves("wasi:random/random@0.2.0"));
-    }
-
-    /// 完全一致の個別承認（接頭辞では表せない承認）も照合される。
-    #[test]
-    fn exact_grant_is_matched() {
-        let mut approved = ApprovedCapabilities::baseline();
-        approved.exact.insert("acme:custom/iface@1.0.0".to_string());
-        assert!(approved.approves("acme:custom/iface@1.0.0"));
-        // 別バージョンは完全一致しない（接頭辞承認ではないため）。
-        assert!(!approved.approves("acme:custom/iface@2.0.0"));
+        assert!(is_supported_import("wasi:io/poll@0.2.6"));
+        assert!(is_supported_import("wasi:cli/stdout@0.2.0"));
+        assert!(is_supported_import("wasi:clocks/monotonic-clock@0.2.0"));
+        assert!(is_supported_import("wasi:random/random@0.2.0"));
     }
 
     fn cap(name: &str) -> ComponentImport {
@@ -323,20 +445,19 @@ mod tests {
     /// §4.4: 承認集合の部分集合となる import 群は通過し、解決した承認 import が返る。
     #[test]
     fn match_accepts_approved_subset() {
-        let approved = ApprovedCapabilities::baseline();
         let imports = vec![
             cap("wasi:io/streams@0.2.6"),
             cap("wasi:cli/environment@0.2.0"),
-            cap("faas:component/types@1.0.0"),
+            cap("wasi:http/types@0.2.3"),
         ];
-        let resolved = match_capabilities(&imports, &approved).expect("approved subset accepts");
+        let resolved = match_capabilities(&imports).expect("approved subset accepts");
         // 承認集合に含まれる capability import がそのまま解決される。
         assert_eq!(
             resolved,
             vec![
                 "wasi:io/streams@0.2.6".to_string(),
                 "wasi:cli/environment@0.2.0".to_string(),
-                "faas:component/types@1.0.0".to_string(),
+                "wasi:http/types@0.2.3".to_string(),
             ]
         );
     }
@@ -344,9 +465,8 @@ mod tests {
     /// §4.4: 未承認の ambient capability import は 422 (`InvalidRequest`) で拒否される。
     #[test]
     fn match_rejects_unapproved_import_as_422() {
-        let approved = ApprovedCapabilities::baseline();
         let imports = vec![cap("wasi:io/streams@0.2.6"), cap("evil:net/socket@0.1.0")];
-        let err = match_capabilities(&imports, &approved).expect_err("unapproved must reject");
+        let err = match_capabilities(&imports).expect_err("unapproved must reject");
         // InvalidRequest は HTTP 422 相当（error.rs envelope）。メッセージは import 名のみ言及。
         match err {
             FaasError::InvalidRequest(msg) => {
@@ -357,41 +477,48 @@ mod tests {
         }
     }
 
-    /// §4.4: deny-all 既定。承認集合に baseline 以外が無ければ、baseline 外 import は通らない。
-    /// 完全な deny-all（baseline すら無い空集合）では capability import は一切通過しない。
     #[test]
-    fn match_deny_all_default_blocks_any_ambient() {
-        let empty = ApprovedCapabilities {
-            prefixes: BTreeSet::new(),
-            exact: BTreeSet::new(),
-        };
-        // baseline の wasi: ですら、空の承認集合では通らない（完全 deny-all）。
-        let imports = vec![cap("wasi:io/streams@0.2.6")];
-        assert!(matches!(
-            match_capabilities(&imports, &empty),
-            Err(FaasError::InvalidRequest(_))
-        ));
-        // import が無ければ deny-all でも当然通過する（要求 capability ゼロ）。
-        assert_eq!(
-            match_capabilities(&[], &empty).unwrap(),
-            Vec::<String>::new()
-        );
+    fn match_accepts_no_imports() {
+        assert_eq!(match_capabilities(&[]).unwrap(), Vec::<String>::new());
     }
 
     /// §4.4 / M2 gotcha: 型のみ import は capability を伴わないため照合対象外。
     /// baseline 外の名前空間でも型のみなら拒否されず、承認結果にも含まれない。
     #[test]
     fn match_type_only_import_is_not_a_capability() {
-        let approved = ApprovedCapabilities::baseline();
         let imports = vec![
             // 型のみ: baseline 外の名前空間でも capability ではないので通過する。
             type_only("some:pkg/iface@1.0.0"),
             // capability を伴う baseline import は通常どおり解決される。
-            cap("faas:component/types@1.0.0"),
+            cap("wasi:http/types@0.2.3"),
         ];
-        let resolved =
-            match_capabilities(&imports, &approved).expect("type-only must not be rejected");
+        let resolved = match_capabilities(&imports).expect("type-only must not be rejected");
         // 型のみは承認結果に含めない。capability import のみが解決される。
-        assert_eq!(resolved, vec!["faas:component/types@1.0.0".to_string()]);
+        assert_eq!(resolved, vec!["wasi:http/types@0.2.3".to_string()]);
+    }
+
+    /// admin 承認リストのバリデーション（形式・件数の境界）。
+    #[test]
+    fn env_allowlist_validation() {
+        let ok = validate_env_allowlist(&["API_KEY".into(), "LOG_LEVEL".into(), "API_KEY".into()])
+            .expect("valid names");
+        assert_eq!(ok.len(), 2, "duplicates collapse");
+
+        for bad in ["lower", "with-dash", "1LEADING", "HAS=EQ", "", "A\u{0}B"] {
+            assert!(
+                validate_env_allowlist(&[bad.to_string()]).is_err(),
+                "must reject {bad:?}"
+            );
+        }
+        // 境界: 64 文字は可、65 文字は不可。
+        let max = "A".repeat(hibana_shared::MAX_ENV_KEY_LEN);
+        assert!(validate_env_allowlist(&[max]).is_ok());
+        let over = "A".repeat(hibana_shared::MAX_ENV_KEY_LEN + 1);
+        assert!(validate_env_allowlist(&[over]).is_err());
+        // 件数上限。
+        let many: Vec<String> = (0..=hibana_shared::MAX_FUNCTION_ENV_KEYS)
+            .map(|i| format!("K{i}"))
+            .collect();
+        assert!(validate_env_allowlist(&many).is_err());
     }
 }

@@ -1,40 +1,26 @@
-//! 共有アプリケーション状態。
-//!
-//! axum ハンドラ / バックグラウンド task / 認証層が共有する。
-
-use std::sync::Arc;
-use std::time::Duration;
-
-use sqlx::PgPool;
-
 use crate::db::TenantQuotaOverrides;
 use crate::metrics::Metrics;
-use crate::signing::{Signer, Verifier};
+use crate::signing::Signer;
 use crate::storage::Storage;
-use crate::store::{InflightParams, LockoutParams, RateLimitParams, Store};
-
-/// M4d (§8): 仕様 §8 表「上限（推奨）」。テナント上書き値が **上回ったら** ここで頭打ちにする
-/// （クランプ + 警告ログ）。仕様 §8 で MUST レベルではない（運用 default + 推奨上限）が、
-/// 過大な上書きで他テナント・JetStream MaxAckPending を巻き込まないよう **必ずクランプ**する。
+use crate::store::{RateLimitParams, Store};
+use sea_orm::DatabaseConnection;
+use std::sync::Arc;
+use std::time::Duration;
 pub const QUOTA_MAX_INVOKE_RATE_PER_SEC: u64 = 500;
-/// 同上: 同時実行（pending+running）の運用上限。
 pub const QUOTA_MAX_CONCURRENT_EXECUTIONS: u64 = 200;
-
 /// admission 制御のパラメータ束（M3d, §8）。`Config` のグローバル既定から派生し、
-/// invoke handler（レート制限 / in-flight）と login（ロックアウト）が参照する。
+/// HTTP 受付（レート制限 / DB の同時実行数）が参照する。
 ///
 /// M4d (§8): per-tenant 上書きは [`AdmissionConfig::resolve_for_tenant`] で解決する。
 /// グローバル既定 → テナント上書きの優先順位でフィールドごとにマージする（仕様 §8 表）。
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub struct AdmissionConfig {
     /// invoke レート制限の token-bucket パラメータ（refill = invoke_rate, capacity = burst）。
     pub rate: RateLimitParams,
-    /// in-flight 同時実行の上限 + カウンタ TTL。
-    pub inflight: InflightParams,
-    /// login 失敗ロックアウトの閾値 + 減衰窓（両キーに同値適用）。
-    pub lockout: LockoutParams,
-    /// X-Forwarded-For を信頼してクライアント IP を取り出すか（§6.0; 既定 false）。
-    pub trust_proxy_headers: bool,
+    /// DB の受付トランザクションで適用する同時実行数の上限。
+    pub max_concurrent_executions: i64,
+    /// Explicitly trusted reverse proxy networks; empty means direct clients only.
+    pub trusted_proxies: crate::client_ip::TrustedProxies,
 }
 
 impl AdmissionConfig {
@@ -43,13 +29,12 @@ impl AdmissionConfig {
     /// マージ規則:
     /// - `invoke_rate_per_sec` が Some → token-bucket の `refill_per_sec` を置き換え。
     /// - `invoke_burst` が Some → token-bucket の `capacity` を置き換え。
-    /// - `max_concurrent_executions` が Some → in-flight の `max` を置き換え。
+    /// - `max_concurrent_executions` が Some → 同時実行数の上限を置き換え。
     /// - None / 欠損 / null → グローバル既定を継承（変更しない）。
-    /// - login ロックアウトは per-tenant 上書きを持たない（全テナント共通の security 制御）。
     ///
     /// **上限クランプ** (§8 表「上限」): 上書きが推奨上限（[`QUOTA_MAX_INVOKE_RATE_PER_SEC`] /
     /// [`QUOTA_MAX_CONCURRENT_EXECUTIONS`]）を超えていたら頭打ちにして warn ログを残す。これは
-    /// 過大設定で MaxAckPending や他テナントを巻き込まないための防御層（admin API 側でも検証する
+    /// 過大設定で他テナントの実行資源を圧迫しないための防御層（admin API 側でも検証する
     /// 想定だが、ここでも独立に強制することで両方が間違っても安全側に倒れる）。
     pub fn resolve_for_tenant(
         &self,
@@ -57,7 +42,7 @@ impl AdmissionConfig {
         overrides: &TenantQuotaOverrides,
     ) -> ResolvedAdmissionParams {
         let mut rate = self.rate;
-        let mut inflight = self.inflight;
+        let mut max_concurrent_executions = self.max_concurrent_executions;
 
         if let Some(rps) = overrides.invoke_rate_per_sec {
             let clamped = clamp_quota_u64(
@@ -80,13 +65,15 @@ impl AdmissionConfig {
                 max,
                 QUOTA_MAX_CONCURRENT_EXECUTIONS,
             );
-            inflight.max = clamped as i64;
+            max_concurrent_executions = clamped as i64;
         }
 
-        ResolvedAdmissionParams { rate, inflight }
+        ResolvedAdmissionParams {
+            rate,
+            max_concurrent_executions,
+        }
     }
 }
-
 /// 与えられた `value` が `max` を超えていたらクランプし warn ログを残す（M4d）。
 /// 純関数（テスト用）。
 fn clamp_quota_u64(tenant: &str, field: &str, value: u64, max: u64) -> u64 {
@@ -104,117 +91,158 @@ fn clamp_quota_u64(tenant: &str, field: &str, value: u64, max: u64) -> u64 {
     }
 }
 
-/// M4d (§8): per-tenant に解決した admission パラメータ。invoke handler で 1 度だけ
-/// 計算し、レート制限 / in-flight reserve の両ゲートに渡す。
 #[derive(Debug, Clone, Copy)]
 pub struct ResolvedAdmissionParams {
     pub rate: RateLimitParams,
-    pub inflight: InflightParams,
+    pub max_concurrent_executions: i64,
 }
-
-/// ハンドラへ注入する共有状態。`Clone` は内部 `Arc` により安価。
 #[derive(Clone)]
 pub struct AppState {
     inner: Arc<Inner>,
 }
-
 struct Inner {
-    pool: PgPool,
-    nats: async_nats::Client,
-    /// invoke を Nats-Msg-Id=execution_id 付きで publish するための JetStream context
-    /// （冪等性 layer 3, §6.6）。
-    jetstream: async_nats::jetstream::Context,
+    auth: crate::oidc::config::OidcConfig,
+    request_capacity: crate::request_capacity::RequestCapacity,
+    upload_capacity: crate::request_capacity::RequestCapacity,
+    json_request_slots: Arc<tokio::sync::Semaphore>,
+    public_requests: Arc<crate::maintenance::Requests>,
+    worker_http: reqwest::Client,
+    preparation_http: reqwest::Client,
+    pool: DatabaseConnection,
     storage: Storage,
     max_wasm_upload_bytes: u64,
     presign_ttl: Duration,
-    /// /uploads の presigned PUT URL の TTL（§3.4 / §5.2）。worker への wasm presign GET とは
-    /// 別管理（用途・寿命が異なる）。
-    upload_presign_ttl: Duration,
-    /// bootstrap system-admin トークン（POST /admin/tenants を gate）。
     bootstrap_admin_token: String,
-    /// login の no-user/no-tenant パスで使う固定ダミー argon2 ハッシュ
-    /// （timing oracle 防止のため常に verify する）。
-    dummy_password_hash: String,
-    /// 共有 admission ストア（M3d, §8）。invoke レート制限 / in-flight / login ロックアウトを
-    /// 全 Axum インスタンスで共有して集計する。invoke handler / login / reaper が参照する。
-    store: Arc<dyn Store>,
-    /// admission 制御パラメータ（rate / inflight / lockout, §8）。
-    admission: AdmissionConfig,
-    /// ジョブ署名トークンの署名器（M3c, §3.3）。invoke が mint、subscriber が verify する。
     signer: Arc<Signer>,
-    /// invoke が壁時計上限から token exp を計算するためのオフセット計算器。
-    /// `Config::token_exp_offset_secs` をクロージャ化して持つ（Config 全体を抱えない）。
-    token_exp_offset_secs: Box<dyn Fn(u64) -> i64 + Send + Sync>,
-    /// 観測メトリクス（M4a, §3.8）。`/metrics` ハンドラ + 計装点（invoke / finalize / reaper）から
-    /// 参照する。Registry はプロセスで 1 つ。Arc で共有して clone コストをゼロに抑える。
+    token_margin_secs: u64,
+    store: Arc<dyn Store>,
+    admission: AdmissionConfig,
     metrics: Arc<Metrics>,
+    secret_keyring: Arc<crate::secrets::SecretKeyring>,
+    job_env_exchange_rate_per_min: u64,
+    metrics_include_tenant_label: bool,
+    public_apps: crate::public_apps::PublicApps,
 }
-
 impl AppState {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
-        pool: PgPool,
-        nats: async_nats::Client,
+        pool: DatabaseConnection,
         storage: Storage,
         max_wasm_upload_bytes: u64,
         presign_ttl_secs: u64,
-        upload_presign_ttl_secs: u64,
         bootstrap_admin_token: String,
-        dummy_password_hash: String,
         signer: Arc<Signer>,
-        token_exp_offset_secs: Box<dyn Fn(u64) -> i64 + Send + Sync>,
+        token_margin_secs: u64,
         store: Arc<dyn Store>,
         admission: AdmissionConfig,
         metrics: Arc<Metrics>,
+        secret_keyring: Arc<crate::secrets::SecretKeyring>,
+        job_env_exchange_rate_per_min: u64,
+        metrics_include_tenant_label: bool,
+        public_apps: crate::public_apps::PublicApps,
+        auth: crate::oidc::config::OidcConfig,
     ) -> Self {
-        // invoke の JetStream publish 用 context は NATS クライアントから構築する。
-        let jetstream = async_nats::jetstream::new(nats.clone());
         Self {
             inner: Arc::new(Inner {
+                auth,
+                request_capacity: crate::request_capacity::RequestCapacity::new(8),
+                upload_capacity: crate::request_capacity::RequestCapacity::new(4),
+                json_request_slots: Arc::new(tokio::sync::Semaphore::new(8)),
+                public_requests: Arc::default(),
+                worker_http: reqwest::Client::builder()
+                    .no_proxy()
+                    .redirect(reqwest::redirect::Policy::none())
+                    .connect_timeout(Duration::from_secs(3))
+                    .read_timeout(Duration::from_secs(60))
+                    .build()
+                    .expect("internal HTTP client"),
+                preparation_http: crate::preparation::http_client(),
                 pool,
-                nats,
-                jetstream,
                 storage,
                 max_wasm_upload_bytes,
                 presign_ttl: Duration::from_secs(presign_ttl_secs),
-                upload_presign_ttl: Duration::from_secs(upload_presign_ttl_secs),
                 bootstrap_admin_token,
-                dummy_password_hash,
                 signer,
-                token_exp_offset_secs,
+                token_margin_secs,
                 store,
                 admission,
                 metrics,
+                secret_keyring,
+                job_env_exchange_rate_per_min,
+                metrics_include_tenant_label,
+                public_apps,
             }),
         }
     }
-
-    pub fn pool(&self) -> &PgPool {
+    pub fn pool(&self) -> &DatabaseConnection {
         &self.inner.pool
     }
 
-    pub fn nats(&self) -> &async_nats::Client {
-        &self.inner.nats
+    pub fn auth_config(&self) -> &crate::oidc::config::OidcConfig {
+        &self.inner.auth
     }
 
-    /// invoke を publish する JetStream context（Nats-Msg-Id 冪等, §6.6）。
-    pub fn jetstream(&self) -> &async_nats::jetstream::Context {
-        &self.inner.jetstream
+    pub(crate) fn upload_capacity(&self) -> &crate::request_capacity::RequestCapacity {
+        &self.inner.upload_capacity
     }
 
-    /// ジョブ署名器（invoke が sign、subscriber が verify に使う）。
+    pub(crate) fn request_capacity(&self) -> &crate::request_capacity::RequestCapacity {
+        &self.inner.request_capacity
+    }
+
+    pub(crate) fn json_request_slots(&self) -> Arc<tokio::sync::Semaphore> {
+        self.inner.json_request_slots.clone()
+    }
+
+    pub(crate) fn public_requests(&self) -> &Arc<crate::maintenance::Requests> {
+        &self.inner.public_requests
+    }
+
+    pub fn worker_http(&self) -> &reqwest::Client {
+        &self.inner.worker_http
+    }
+
+    pub(crate) fn preparation_http(&self) -> &reqwest::Client {
+        &self.inner.preparation_http
+    }
+
+    /// `faas_tenant_invoke_total` に `tenant_id` ラベルを付けるか（M10 follow-up）。
+    /// false のときは `"aggregate"` に畳んで系列爆発を防ぐ。
+    pub fn metrics_include_tenant_label(&self) -> bool {
+        self.inner.metrics_include_tenant_label
+    }
+
+    /// M11 (§4.2): 公開 ingress gateway のベースドメイン。None なら gateway 無効。
+    pub fn app_url(&self, app: &str, tenant: &str) -> Option<String> {
+        self.inner.public_apps.url(app, tenant)
+    }
+
+    pub fn ingress_base_domain(&self) -> Option<&str> {
+        self.inner.public_apps.domain()
+    }
+
+    /// `/internal/job-env` のレート上限（req/分）。
+    pub fn job_env_exchange_rate_per_min(&self) -> u64 {
+        self.inner.job_env_exchange_rate_per_min
+    }
+
+    /// secret の KEK キーリング (M7c)。**平文の鍵素材はここから外へ出さない**
+    /// （`secrets::encrypt` / `decrypt` / `rewrap` が参照するだけ）。
+    pub fn secret_keyring(&self) -> &crate::secrets::SecretKeyring {
+        &self.inner.secret_keyring
+    }
+
     pub fn signer(&self) -> &Signer {
         &self.inner.signer
     }
 
-    /// 署名トークンの検証器（subscriber が使う）。
-    pub fn verifier(&self) -> &Verifier {
-        self.inner.signer.verifier()
-    }
-
-    /// 壁時計上限（ms）から token exp オフセット秒数を計算する (§3.3)。
+    /// Wall-clock execution limit plus time for cold compilation and result persistence.
     pub fn token_exp_offset_secs(&self, wall_time_ms: u64) -> i64 {
-        (self.inner.token_exp_offset_secs)(wall_time_ms)
+        wall_time_ms
+            .div_ceil(1000)
+            .saturating_add(self.inner.token_margin_secs)
+            .saturating_add(120)
+            .min(i64::MAX as u64) as i64
     }
 
     /// Object Storage クライアント（本体保存 / presign, §3.4）。
@@ -232,27 +260,17 @@ impl AppState {
         self.inner.presign_ttl
     }
 
-    /// /uploads の presigned PUT URL の TTL（§3.4 / §5.2 / §6.4）。
-    pub fn upload_presign_ttl(&self) -> Duration {
-        self.inner.upload_presign_ttl
-    }
-
     /// bootstrap system-admin トークン（POST /admin/tenants の gate, §3.3）。
     pub fn bootstrap_admin_token(&self) -> &str {
         &self.inner.bootstrap_admin_token
     }
 
-    /// login の no-user パスで使う固定ダミー argon2 ハッシュ（timing 均一化）。
-    pub fn dummy_password_hash(&self) -> &str {
-        &self.inner.dummy_password_hash
-    }
-
-    /// 共有 admission ストア（M3d, §8）。invoke レート制限 / in-flight / login ロックアウト。
+    /// 共有 admission ストア（M3d, §8）。invoke レート制限 / OIDC state。
     pub fn store(&self) -> &dyn Store {
         self.inner.store.as_ref()
     }
 
-    /// admission 制御パラメータ（rate / inflight / lockout, §8）。
+    /// 受付制御のパラメータ（レート制限 / 同時実行数）。
     pub fn admission(&self) -> &AdmissionConfig {
         &self.inner.admission
     }
@@ -262,7 +280,6 @@ impl AppState {
         self.inner.metrics.as_ref()
     }
 }
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -273,15 +290,8 @@ mod tests {
                 refill_per_sec: 50.0,
                 capacity: 500.0,
             },
-            inflight: InflightParams {
-                max: 20,
-                ttl_secs: 3600,
-            },
-            lockout: LockoutParams {
-                threshold: 10,
-                window_secs: 900,
-            },
-            trust_proxy_headers: false,
+            max_concurrent_executions: 20,
+            trusted_proxies: crate::client_ip::TrustedProxies::default(),
         }
     }
 
@@ -293,7 +303,7 @@ mod tests {
         let r = c.resolve_for_tenant("ten_a", &overrides);
         assert_eq!(r.rate.refill_per_sec, 50.0);
         assert_eq!(r.rate.capacity, 500.0);
-        assert_eq!(r.inflight.max, 20);
+        assert_eq!(r.max_concurrent_executions, 20);
     }
 
     /// 各フィールドが独立に上書きされる（部分上書き）。
@@ -309,9 +319,7 @@ mod tests {
         assert_eq!(r.rate.refill_per_sec, 100.0);
         // burst は継承（既定）。
         assert_eq!(r.rate.capacity, 500.0);
-        assert_eq!(r.inflight.max, 50);
-        // TTL も継承（上書きキーが無いため）。
-        assert_eq!(r.inflight.ttl_secs, 3600);
+        assert_eq!(r.max_concurrent_executions, 50);
     }
 
     /// §8 表の上限を超えたらクランプする（防御）。
@@ -325,7 +333,10 @@ mod tests {
         };
         let r = c.resolve_for_tenant("ten_a", &overrides);
         assert_eq!(r.rate.refill_per_sec, QUOTA_MAX_INVOKE_RATE_PER_SEC as f64);
-        assert_eq!(r.inflight.max, QUOTA_MAX_CONCURRENT_EXECUTIONS as i64);
+        assert_eq!(
+            r.max_concurrent_executions,
+            QUOTA_MAX_CONCURRENT_EXECUTIONS as i64
+        );
     }
 
     /// 上限ちょうど（境界）はクランプされない。
@@ -339,7 +350,10 @@ mod tests {
         };
         let r = c.resolve_for_tenant("ten_a", &overrides);
         assert_eq!(r.rate.refill_per_sec, QUOTA_MAX_INVOKE_RATE_PER_SEC as f64);
-        assert_eq!(r.inflight.max, QUOTA_MAX_CONCURRENT_EXECUTIONS as i64);
+        assert_eq!(
+            r.max_concurrent_executions,
+            QUOTA_MAX_CONCURRENT_EXECUTIONS as i64
+        );
     }
 
     /// M4d (§8): per-tenant 上書き値はグローバル既定を「下回る」ケースでも正しく勝ち、
@@ -363,20 +377,13 @@ mod tests {
         assert!(resolved.rate.capacity < c.rate.capacity);
 
         let store = InProcStore::new();
-        let now_ms = 1_000_000u64;
         // 1 度目は burst 内で許可。
-        let d1 = store
-            .rate_limit("ten_a", resolved.rate, now_ms)
-            .await
-            .unwrap();
+        let d1 = store.rate_limit("ten_a", resolved.rate).await.unwrap();
         assert!(d1.allowed);
         // 2 度目は burst (1) 越え → 上書き値が効いていれば拒否（Retry-After > 0）。
         // グローバル既定（50rps / burst 500）が効いていたら 2 度目も通ってしまうため、
         // ここが本テストの核心アサート。
-        let d2 = store
-            .rate_limit("ten_a", resolved.rate, now_ms)
-            .await
-            .unwrap();
+        let d2 = store.rate_limit("ten_a", resolved.rate).await.unwrap();
         assert!(
             !d2.allowed,
             "tenant override (burst=1) must clamp below the global default (burst=500)"
@@ -397,9 +404,15 @@ mod tests {
         let r_strict = c.resolve_for_tenant("ten_a", &strict);
         let r_loose = c.resolve_for_tenant("ten_b", &loose);
         assert_ne!(r_strict.rate.refill_per_sec, r_loose.rate.refill_per_sec);
-        assert_ne!(r_strict.inflight.max, r_loose.inflight.max);
+        assert_ne!(
+            r_strict.max_concurrent_executions,
+            r_loose.max_concurrent_executions
+        );
         // 別テナントへ上書き値が「漏れない」ことの最低限の保証。
         assert_eq!(r_loose.rate.refill_per_sec, c.rate.refill_per_sec);
-        assert_eq!(r_loose.inflight.max, c.inflight.max);
+        assert_eq!(
+            r_loose.max_concurrent_executions,
+            c.max_concurrent_executions
+        );
     }
 }

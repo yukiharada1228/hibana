@@ -1,0 +1,13 @@
+{
+  "schemaVersion": 2,
+  "runtime": "wasi:http/incoming-handler@0.2.3",
+  "dependencies": [
+    "@hibana/node-net",
+    "@hibana/node-buffer",
+    "@hibana/tls"
+  ],
+  "aliases": {
+    "tls": "./src/index.mjs",
+    "node:tls": "./src/index.mjs"
+  }
+}

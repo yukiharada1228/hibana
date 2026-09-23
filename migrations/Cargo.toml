@@ -1,0 +1,8 @@
+[package]
+name = "hibana-migration"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+sea-orm-migration = { workspace = true }

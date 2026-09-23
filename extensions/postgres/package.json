@@ -1,0 +1,34 @@
+{
+  "name": "@hibana/postgres",
+  "version": "0.7.5",
+  "private": true,
+  "type": "module",
+  "license": "MIT",
+  "exports": {
+    ".": "./dist/index.mjs",
+    "./hibana.extension.json": "./hibana.extension.json"
+  },
+  "files": [
+    "hibana.extension.json",
+    "README.md",
+    "LICENSE",
+    "dist/"
+  ],
+  "dependencies": {
+    "@hibana/postgres-core": "0.7.0",
+    "@hibana/postgres-transport-tls": "0.7.4",
+    "@hibana/postgres-auth-md5": "0.6.0",
+    "@hibana/postgres-auth-scram": "0.6.0",
+    "@hibana/sha224": "0.5.0",
+    "@hibana/sha256": "0.5.0",
+    "@hibana/sha384": "0.5.0",
+    "@hibana/sha512": "0.5.0",
+    "@hibana/sha512-224": "0.5.0",
+    "@hibana/sha512-256": "0.5.0",
+    "@hibana/postgres-pool": "0.7.0"
+  },
+  "scripts": {
+    "build": "node build.mjs",
+    "prepack": "npm run build"
+  }
+}

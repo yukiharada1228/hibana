@@ -1,0 +1,62 @@
+{
+  "name": "@yukiharada1228/hibana",
+  "version": "0.2.0-rc.4",
+  "publishConfig": {
+    "access": "public",
+    "registry": "https://registry.npmjs.org"
+  },
+  "type": "module",
+  "description": "Independent CLI for local WebAssembly development and remote Hibana deployments",
+  "scripts": {
+    "test": "node --test test/*.test.mjs",
+    "pretest": "node scripts/pack.mjs",
+    "prepack": "node scripts/pack.mjs",
+    "test:package": "node scripts/verify-package.mjs",
+    "format": "prettier --write \"src/**/*.mjs\" \"../extensions/*/src/*.mjs\" \"../extensions/*/build.mjs\" \"../extensions/build-*.mjs\" \"../scripts/fixtures/network/*.mjs\" \"../scripts/fixtures/postgres/*.mjs\" \"../scripts/test-application-extensions.mjs\" \"../scripts/test-tcp-tls-extension.mjs\" \"../scripts/test-postgres-compatibility.mjs\" \"../scripts/postgres-auth-fixture.mjs\" \"../scripts/postgres-selection.mjs\" \"../scripts/test-postgres-selection.mjs\" \"../scripts/pack-extensions.mjs\" \"../scripts/pack-extension-bundle.mjs\" \"../scripts/test-extension-bundles.mjs\" \"../scripts/test-extension-boundaries.mjs\"",
+    "format:check": "prettier --check \"src/**/*.mjs\" \"../extensions/*/src/*.mjs\" \"../extensions/*/build.mjs\" \"../extensions/build-*.mjs\" \"../scripts/fixtures/network/*.mjs\" \"../scripts/fixtures/postgres/*.mjs\" \"../scripts/test-application-extensions.mjs\" \"../scripts/test-tcp-tls-extension.mjs\" \"../scripts/test-postgres-compatibility.mjs\" \"../scripts/postgres-auth-fixture.mjs\" \"../scripts/postgres-selection.mjs\" \"../scripts/test-postgres-selection.mjs\" \"../scripts/pack-extensions.mjs\" \"../scripts/pack-extension-bundle.mjs\" \"../scripts/test-extension-bundles.mjs\" \"../scripts/test-extension-boundaries.mjs\""
+  },
+  "bin": {
+    "hibana": "src/cli.mjs"
+  },
+  "engines": {
+    "node": ">=24"
+  },
+  "devDependencies": {
+    "hono": "^4.6.0",
+    "prettier": "3.6.2"
+  },
+  "optionalDependencies": {
+    "@bytecodealliance/componentize-js": "^0.19.3",
+    "@bytecodealliance/jco": "^1.17.9",
+    "esbuild": "^0.28.2"
+  },
+  "files": [
+    "src/",
+    "templates/",
+    "wit/",
+    "platform/remote.py",
+    "platform/existing.py",
+    "platform/preflight.py",
+    "platform/common.py",
+    "platform/maintenance.py",
+    "platform/network.py",
+    "platform/operation.py",
+    "platform/readiness.py",
+    "platform/manifests/",
+    "scripts/pack.mjs",
+    "LICENSE"
+  ],
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/yukiharada1228/hibana.git",
+    "directory": "sdk"
+  },
+  "homepage": "https://github.com/yukiharada1228/hibana/tree/main/sdk",
+  "bugs": {
+    "url": "https://github.com/yukiharada1228/hibana/issues"
+  },
+  "dependencies": {
+    "semver": "7.8.5"
+  }
+}

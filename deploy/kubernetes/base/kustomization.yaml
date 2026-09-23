@@ -1,0 +1,13 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+namespace: hibana
+resources:
+  - namespace.yaml
+  - config.yaml
+  - control-plane.yaml
+  - worker.yaml
+  - network-policy.yaml
+images:
+  - name: hibana-platform
+    newName: registry.example.com/hibana/platform
+    newTag: replace-with-release

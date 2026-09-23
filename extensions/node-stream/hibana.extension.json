@@ -1,0 +1,13 @@
+{
+  "schemaVersion": 2,
+  "runtime": "wasi:http/incoming-handler@0.2.3",
+  "dependencies": [
+    "@hibana/node-buffer",
+    "@hibana/node-events",
+    "@hibana/node-process"
+  ],
+  "aliases": {
+    "stream": "./src/index.mjs",
+    "node:stream": "./src/index.mjs"
+  }
+}

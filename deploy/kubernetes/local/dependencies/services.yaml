@@ -1,0 +1,38 @@
+# Ephemeral development dependencies. Never use these Deployments for production data.
+apiVersion: v1
+kind: Service
+metadata: {name: hibana-postgres}
+spec:
+  selector: {app.kubernetes.io/name: hibana-postgres}
+  ports: [{port: 5432, targetPort: 5432}]
+---
+apiVersion: v1
+kind: Service
+metadata: {name: hibana-redis}
+spec:
+  selector: {app.kubernetes.io/name: hibana-redis}
+  ports: [{port: 6379, targetPort: 6379}]
+---
+apiVersion: v1
+kind: Service
+metadata: {name: hibana-minio}
+spec:
+  selector: {app.kubernetes.io/name: hibana-minio}
+  ports: [{port: 9000, targetPort: 9000}]
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata: {name: hibana-local-dependencies}
+spec:
+  podSelector:
+    matchLabels: {hibana.io/dependency: "true"}
+  policyTypes: [Ingress]
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels: {app.kubernetes.io/part-of: hibana}
+      ports:
+        - {protocol: TCP, port: 5432}
+        - {protocol: TCP, port: 4222}
+        - {protocol: TCP, port: 6379}
+        - {protocol: TCP, port: 9000}

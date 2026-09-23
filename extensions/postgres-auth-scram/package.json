@@ -1,0 +1,32 @@
+{
+  "name": "@hibana/postgres-auth-scram",
+  "version": "0.6.0",
+  "private": true,
+  "type": "module",
+  "license": "MIT",
+  "exports": {
+    ".": "./dist/index.mjs",
+    "./hibana.extension.json": "./hibana.extension.json"
+  },
+  "files": [
+    "hibana.extension.json",
+    "README.md",
+    "LICENSE",
+    "dist/"
+  ],
+  "dependencies": {
+    "@hibana/node-buffer": "0.5.0",
+    "@hibana/random": "0.5.0",
+    "@hibana/sha256": "0.5.0",
+    "@hibana/hmac-sha256": "0.5.0",
+    "@hibana/pbkdf2-sha256": "0.5.0",
+    "@hibana/unicode-nfkc": "0.5.0"
+  },
+  "devDependencies": {
+    "pg": "8.23.0"
+  },
+  "scripts": {
+    "build": "node build.mjs",
+    "prepack": "npm run build"
+  }
+}

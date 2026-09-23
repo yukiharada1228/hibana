@@ -1,0 +1,12 @@
+{
+  "repository": "https://github.com/yukiharada1228/shadcn-digital-agency-jp",
+  "commit": "7d095c65edb9a0f11e377a654d23f65dfc92dbcd",
+  "files": [
+    "src/components/ui/button.tsx",
+    "src/components/ui/input.tsx",
+    "src/components/ui/table.tsx",
+    "src/components/ui/dialog.tsx",
+    "src/styles/digital-agency.css",
+    "src/lib/digital-agency/cn.ts"
+  ]
+}

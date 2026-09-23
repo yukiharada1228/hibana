@@ -5,7 +5,8 @@
 //! `force_path_style(true)` 相当を有効にし、static credentials で接続する。
 //!
 //! 設計判断(承認済み): クライアントは `aws-sdk-s3`。Worker へは presigned GET URL
-//! を JobMessage に同梱（短命・read-only, 既定 TTL 300秒, §3.4）。
+//! を準備用の内部APIで渡す（短命・read-only, 既定 TTL 300秒, §3.4）。
+//! 通常のHTTP実行ではURLを発行せず、準備済みの成果物を使用する。
 
 use std::time::Duration;
 
@@ -16,7 +17,7 @@ use aws_sdk_s3::primitives::ByteStream;
 use aws_sdk_s3::Client;
 use aws_smithy_http_client::tls::{self, rustls_provider::CryptoMode};
 
-use faas_shared::FaasError;
+use hibana_shared::FaasError;
 
 /// MinIO/S3 への薄いラッパ。バケットを内包し、本体保存と presign を提供する。
 #[derive(Clone)]
@@ -55,6 +56,14 @@ impl Storage {
             .endpoint_url(endpoint)
             .credentials_provider(creds)
             .http_client(http_client)
+            .timeout_config(
+                aws_sdk_s3::config::timeout::TimeoutConfig::builder()
+                    .connect_timeout(std::time::Duration::from_secs(3))
+                    .operation_attempt_timeout(std::time::Duration::from_secs(10))
+                    .operation_timeout(std::time::Duration::from_secs(30))
+                    .build(),
+            )
+            .retry_config(aws_sdk_s3::config::retry::RetryConfig::standard().with_max_attempts(2))
             .force_path_style(true)
             .build();
 
@@ -102,25 +111,20 @@ impl Storage {
         Ok(req.uri().to_string())
     }
 
-    /// 短命 presigned **PUT** URL を生成する（大入力アップロード用, §3.4 / §5.2 / §6.4）。
-    ///
-    /// `POST /uploads` がクライアントへ返す「単一キー限定・短 TTL」の書き込み資格。presigned URL は
-    /// 署名対象が `(method=PUT, bucket, key)` に固定されるため、クライアントは **この 1 オブジェクト
-    /// キーにしか PUT できない**（別キー・別テナントへは署名が一致せず拒否される）。GET（read-only,
-    /// `presign_get`）と対称の write 版で、TTL は invoke の wasm presign と同条件の短命にする。
-    pub async fn presign_put(&self, key: &str, ttl: Duration) -> Result<String, FaasError> {
-        let presign_config = PresigningConfig::expires_in(ttl)
-            .map_err(|e| FaasError::Internal(format!("invalid presign ttl: {e}")))?;
-
-        let req = self
-            .client
-            .put_object()
-            .bucket(&self.bucket)
-            .key(key)
-            .presigned(presign_config)
-            .await
-            .map_err(|e| FaasError::Internal(format!("s3 presign_put failed: {e}")))?;
-
-        Ok(req.uri().to_string())
+    pub(crate) async fn delete_object(&self, key: &str) -> Result<(), FaasError> {
+        // Cleanup holds only a journal-row lock, with a shorter I/O deadline than
+        // the DB transaction timeout. Failed deletes retain the journal for retry.
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            self.client
+                .delete_object()
+                .bucket(&self.bucket)
+                .key(key)
+                .send(),
+        )
+        .await
+        .map_err(|_| FaasError::Unavailable)?
+        .map_err(|_| FaasError::Unavailable)?;
+        Ok(())
     }
 }

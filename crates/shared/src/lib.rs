@@ -1,24 +1,21 @@
-//! faas-shared — control-plane と worker が共有する唯一の契約 (M1)。
-//!
-//! ここが「共有契約の唯一の真実」であり、両 bin はこの型・subject・メッセージ・
-//! エラー・ResourceLimits を読む。仕様書 §15 M1 に準拠。
-//!
-//! 原則(§15): M1 は単一テナント "default" でハードコード可だが、将来の M3
-//! (テナント分離・RLS) に備え、関数引数には常に `tenant_id` を通す。
-
 use std::time::Duration;
 
+use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use uuid::Uuid;
 
-// ============================================================================
-// 既定テナント (M1)
-// ============================================================================
+mod redacted;
+pub use redacted::{expose_once, Redacted};
 
-/// M1 で固定使用する単一テナント ID。
-/// TODO(§3.2 / §6.0): M3 で認証コンテキストから解決する。
-pub const DEFAULT_TENANT: &str = "default";
+pub mod capabilities;
+pub mod diagnostics;
+pub mod egress;
+pub mod http;
+pub mod metrics;
+pub mod otel;
+pub mod preparation;
+pub mod subprocess;
 
 // ============================================================================
 // ID 採番ヘルパ（uuid 由来の不透明文字列）
@@ -27,6 +24,10 @@ pub const DEFAULT_TENANT: &str = "default";
 /// `{prefix}_{uuid_simple}` 形式の不透明 ID を生成する。
 fn new_prefixed_id(prefix: &str) -> String {
     format!("{prefix}_{}", Uuid::new_v4().simple())
+}
+
+pub fn new_artifact_reservation_id() -> String {
+    new_prefixed_id("artifact")
 }
 
 /// `cmp_*` Component ID を生成する。
@@ -44,10 +45,6 @@ pub fn new_execution_id() -> String {
     new_prefixed_id("exec")
 }
 
-/// `ten_*` Tenant ID を生成する (§3.2)。
-///
-/// uuid-simple 由来なので subject-safe（`.`/`*`/`>`/空白を含まない）であり、
-/// NATS subject やキー空間にそのまま埋め込める。
 pub fn new_tenant_id() -> String {
     new_prefixed_id("ten")
 }
@@ -60,6 +57,11 @@ pub fn new_user_id() -> String {
 /// `tok_*` API Token ID を生成する (§3.3)。
 pub fn new_token_id() -> String {
     new_prefixed_id("tok")
+}
+
+/// `sec_*`（M7c: per-function secret のメタ行 id）。
+pub fn new_secret_id() -> String {
+    new_prefixed_id("sec")
 }
 
 // ============================================================================
@@ -116,9 +118,7 @@ impl std::fmt::Display for ExecutionStatus {
 pub enum Scope {
     /// 読み取り（一覧・取得）。
     Read,
-    /// 関数の invoke。
-    Invoke,
-    /// component / version のデプロイ・削除。
+    /// component / version のデプロイ・公開設定・ロールバック。
     Deploy,
     /// テナント管理（トークン・ユーザ管理）。
     Admin,
@@ -129,7 +129,6 @@ impl Scope {
     pub fn as_str(&self) -> &'static str {
         match self {
             Scope::Read => "read",
-            Scope::Invoke => "invoke",
             Scope::Deploy => "deploy",
             Scope::Admin => "admin",
         }
@@ -149,7 +148,7 @@ impl std::fmt::Display for Scope {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Role {
-    /// 一般メンバー（read / invoke / deploy）。
+    /// 一般メンバー（read / deploy）。
     Member,
     /// テナント管理者（member + admin）。
     Admin,
@@ -166,12 +165,12 @@ impl Role {
 
     /// このロールが付与しうるスコープ上限。
     ///
-    /// member => read, invoke, deploy
-    /// admin  => read, invoke, deploy, admin
+    /// member => read, deploy
+    /// admin  => read, deploy, admin
     pub fn ceiling(&self) -> &'static [Scope] {
         match self {
-            Role::Member => &[Scope::Read, Scope::Invoke, Scope::Deploy],
-            Role::Admin => &[Scope::Read, Scope::Invoke, Scope::Deploy, Scope::Admin],
+            Role::Member => &[Scope::Read, Scope::Deploy],
+            Role::Admin => &[Scope::Read, Scope::Deploy, Scope::Admin],
         }
     }
 }
@@ -182,161 +181,19 @@ impl std::fmt::Display for Role {
     }
 }
 
-// ============================================================================
-// NATS subjects
-// ============================================================================
-
-/// invoke subject: `tenant.{tenant}.component.invoke`。
-/// control-plane が publish し、worker が JetStream Pull Consumer で購読する。
-pub fn invoke_subject(tenant: &str) -> String {
-    format!("tenant.{tenant}.component.invoke")
-}
-
-/// result subject: `tenant.{tenant}.component.result`。
-/// worker が publish し、control-plane が購読して executions を更新する。
-pub fn result_subject(tenant: &str) -> String {
-    format!("tenant.{tenant}.component.result")
-}
-
-/// invoke subject のテナントワイルドカード形 `tenant.*.component.invoke` (§3.3)。
-///
-/// worker の JetStream stream `subjects` / 共有 Pull Consumer の `filter_subject` に使う。
-/// 単一の `*` は 1 トークン（テナント ID）のみに一致する（`>` のような多段ワイルドカードでは
-/// ない）。テナント ID は subject-safe（`.`/`*`/`>`/空白を含まない）に採番されるため、
-/// 1 トークンに必ず収まる。これにより新規テナント追加時も stream/consumer の再構成が不要。
-pub fn invoke_subject_wildcard() -> &'static str {
-    "tenant.*.component.invoke"
-}
-
-/// result subject のテナントワイルドカード形 `tenant.*.component.result` (§3.3)。
-///
-/// control-plane の subscriber が購読する。テナントは subject の第 2 トークンから導出し
-/// （`subject_tenant`）、メッセージ本文の `tenant_id` を盲信しない（spoof 防止）。
-pub fn result_subject_wildcard() -> &'static str {
-    "tenant.*.component.result"
-}
-
-/// failed (DLQ) subject: `tenant.{tenant}.component.failed` (§3.3 / §6.6, M4c)。
-///
-/// worker が `max_deliver` 直前で結果を出せないと判断したとき（最終配送に失敗するケース）に
-/// publish する DLQ サブジェクト。control-plane の DLQ subscriber が購読し、対象 execution を
-/// CAS で `failed` に終端化して in-flight カウンタを DECR する。これは「result も failed も来ない
-/// 無音失踪」を許さず、終端化の責務を必ず CP に集中させるためのチャネル分離である（§6.6 MUST）。
-pub fn failed_subject(tenant: &str) -> String {
-    format!("tenant.{tenant}.component.failed")
-}
-
-/// failed (DLQ) subject のテナントワイルドカード形 `tenant.*.component.failed` (§3.3 / §6.6)。
-///
-/// control-plane の DLQ subscriber が購読する。テナントは subject の第 2 トークンから導出し
-/// メッセージ本文の `tenant_id` を盲信しない（result と同じ spoof 防止規約）。新規テナント追加時も
-/// stream/consumer の再構成は不要（`*` は 1 トークン=テナント ID に一致）。
-pub fn failed_subject_wildcard() -> &'static str {
-    "tenant.*.component.failed"
-}
-
-/// `tenant.{tenant}.component.{kind}` 形の subject から第 2 トークン（テナント ID）を取り出す。
-///
-/// subscriber が `tenant.*.component.result` のワイルドカード購読で受けた実際の subject から
-/// テナントを導出するために使う。形が一致しなければ `None`（防御的に drop する）。
-pub fn tenant_from_subject(subject: &str) -> Option<&str> {
-    let mut parts = subject.split('.');
-    match (parts.next(), parts.next(), parts.next(), parts.next()) {
-        (Some("tenant"), Some(tenant), Some("component"), Some(_kind))
-            if !tenant.is_empty() && parts.next().is_none() =>
-        {
-            Some(tenant)
-        }
-        _ => None,
-    }
-}
-
-// ============================================================================
-// Object Storage キーレイアウト (§3.4)
-// ============================================================================
-
-/// Object Storage 上の Component 本体オブジェクトキー (§3.4)。
-///
-/// テナントプレフィックスレイアウト
-/// `tenants/{tenant_id}/components/{component_name}/{version}/component.wasm`
-/// を採用し、テナント境界をキー空間で明示する。
-/// M2 は単一テナント "default" 固定だが、将来の M3 分離に備えてレイアウトを固定する。
-pub fn component_object_key(tenant_id: &str, component_name: &str, version: &str) -> String {
-    format!("tenants/{tenant_id}/components/{component_name}/{version}/component.wasm")
-}
-
-/// 大入力の退避先オブジェクトキー (§3.4 / §5.2 / §6.4)。
-///
-/// `tenants/{tenant_id}/io/{execution_id}/input` に固定する。`POST /uploads` はこのキーへの
-/// 短命 presigned PUT を発行し、`POST /invoke` の `input_ref` はこのキーに **完全一致** する
-/// 場合のみ受理される（§3.4 MUST: prefix 一致では不十分。同一テナント内の別 execution /
-/// 別ユーザの入力を指す `input_ref` を拒否する）。テナントと execution の両方をキー空間で
-/// 明示し、execution_id 単位で隔離する。
-pub fn io_input_key(tenant_id: &str, execution_id: &str) -> String {
-    format!("tenants/{tenant_id}/io/{execution_id}/input")
-}
-
-/// 大出力の退避先オブジェクトキー (§3.4 / §5.2 / §6.4)。
-///
-/// `tenants/{tenant_id}/io/{execution_id}/output` に固定する。worker が大出力を退避する際に
-/// 使う（output_ref）。本スライスでは worker 側の write は最小実装（TODO）だが、キーレイアウトは
-/// input と対称に固定しておく。
-pub fn io_output_key(tenant_id: &str, execution_id: &str) -> String {
-    format!("tenants/{tenant_id}/io/{execution_id}/output")
-}
-
-// ============================================================================
-// NATS メッセージ
-// ============================================================================
-
-/// invoke subject に流れるジョブ (§6.3)。
-///
-/// M2: worker は `wasm_url`（短命 presigned GET URL）から本体を取得し、
-/// `wasm_sha256` をキャッシュ／事前コンパイルのキーにする (§3.6)。
-/// `component` / `version` はログ・解決・観測用に残す。
-/// M3c: `job_token` は control-plane が署名した不透明トークン (§3.3)。
-/// worker は中身を解釈せず result にそのまま echo する（鍵を持たない）。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct JobMessage {
-    /// `exec_*`。冪等の最終キー。
     pub execution_id: String,
-    /// M1 は "default"。
     pub tenant_id: String,
-    /// Component 名。ログ・解決・観測用。
     pub component: String,
-    /// semver。ログ・解決・観測用。
-    pub version: String,
-    /// 本体の sha256（16進）。worker のキャッシュキー（§3.6）。
     pub wasm_sha256: String,
-    /// worker が本体を取得する短命 presigned GET URL（read-only, 既定 TTL 300秒）。
-    pub wasm_url: String,
-    /// インライン入力。worker は `serde_json::to_vec(input)` をハンドラへ渡す。
-    /// 大入力時（`input_url` が在るとき）は `null` を入れ、worker は `input_url` を優先する。
     pub input: Value,
-    /// M3d (§3.4 / §5.2): 大入力がある場合に、退避済み入力オブジェクト
-    /// （`tenants/{tenant}/io/{execution_id}/input`）への **そのキー限定** の短命 read-only
-    /// presigned GET URL。CP は invoke 受付時に `input_ref` を当該キーへ完全一致検証してから
-    /// このフィールドへ presign を載せる。worker はこの URL から入力を取得し、**他のキーは
-    /// 読み取らない** (§3.4 MUST NOT)。インライン invoke では `None`（その場合 `input` を使う）。
-    /// 旧 CP のメッセージとの互換のため serde default（None）。
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub input_url: Option<String>,
-    /// M3c: control-plane が署名したジョブトークン (§3.3)。worker は不透明文字列として
-    /// 扱い、result にそのまま echo する。旧 CP のメッセージとの互換のため serde default。
     #[serde(default)]
     pub job_token: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub env_token: Option<String>,
 }
 
-/// worker が 1 実行ごとに計測したリソース利用量 (M5, §15)。
-///
-/// **信頼境界外**: worker は署名鍵を持たない非特権ランタイム (§3.3, keyless by design)
-/// であり、ここの値は worker が自己申告した計測値にすぎない。control-plane の subscriber は
-/// finalize 時にこれを `ResourceLimits` 由来の上限で sanity clamp してから永続化する
-/// （過大値による課金水増し/桁あふれ防止）。clamp 方針は subscriber 側の唯一の真実とする。
-///
-/// `invocation_count` は常に 1 であり wire には載せない（CP 側で固定。改竄面を減らす）。
-/// 全フィールド `#[serde(default)]` で前方/後方互換: 旧 worker が一部欠損 JSON を出しても
-/// 欠けたフィールドは 0 に補完される。
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct UsageMetrics {
     /// 消費 fuel（= 設定 fuel − 残 fuel）。CPU 時間の代理量 (§15)。
@@ -355,12 +212,11 @@ pub struct UsageMetrics {
     pub output_bytes: u64,
 }
 
-/// result subject に流れる実行結果 (§6.5)。
+/// Worker が Control Plane の完了 API に返す実行結果。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ResultMessage {
     /// `exec_*`。
     pub execution_id: String,
-    /// M1 は "default"。
     pub tenant_id: String,
     /// 終端状態 (succeeded | failed | timeout)。
     pub status: ExecutionStatus,
@@ -368,95 +224,11 @@ pub struct ResultMessage {
     pub output: Option<Value>,
     /// 失敗時のエラーメッセージ。
     pub error: Option<String>,
-    /// M3c: worker が JobMessage から verbatim に echo した署名トークン (§3.3)。
-    /// subscriber が kid で検証し、claim を execution 行と突き合わせて出所を認証する。
-    /// 旧 worker のメッセージとの互換のため serde default（空 -> drop+audit）。
     #[serde(default)]
     pub job_token: String,
-    /// M5 (§15): worker が自己申告する per-execution 計量。**信頼境界外**であり、
-    /// worker は鍵を持たない非特権ランタイム (§3.3)。subscriber は finalize 時に
-    /// sanity clamp してから永続化する（過大値による課金水増し/桁あふれ防止）。
-    /// `Option` にするのは、失敗/timeout の result で計量が部分的に欠ける場合を
-    /// `None` で表現でき、かつ旧 worker（`usage` キー欠損）と互換だからである。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub usage: Option<UsageMetrics>,
 }
-
-/// `tenant.*.component.failed` (DLQ) に流れる失敗通知 (M4c, §3.3 / §6.6)。
-///
-/// worker が JetStream の最終配送試行で結果を publish できないと判断したとき
-/// （= 一過性ではない失敗 / `delivered >= max_deliver` の最終再配送が失敗した場合）に publish する。
-/// control-plane の DLQ subscriber がこれを受けて execution を `failed` に CAS 終端化し、
-/// in-flight カウンタを DECR する（result も failed も来ない無音失踪を防ぐ唯一の自動経路）。
-///
-/// `ResultMessage` と分けるのは、(a) wire 形でも DLQ 由来であることが明示され audit/log で
-/// 取り違えないため、(b) `output` のような成功側フィールドを持たない最小スキーマで「失敗のみ」を
-/// 表現するため、である。`status` は明示せず、subscriber 側で常に `ExecutionStatus::Failed` に
-/// 倒すことで「DLQ 経路から succeeded に終端化される」事故をスキーマレベルで不可能にする（§6.6）。
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct FailedMessage {
-    /// `exec_*`。
-    pub execution_id: String,
-    /// 権威テナント（CP-signed claim と一致するはず。subscriber は本文を盲信せず subject 由来と照合する）。
-    pub tenant_id: String,
-    /// DLQ 化の理由（人間可読; subscriber は executions.error に `{"message": reason}` で保存）。
-    pub reason: String,
-    /// M3c: worker が JobMessage から verbatim に echo した署名トークン (§3.3)。
-    /// DLQ 経路でも結果認証は同一ルール: kid で署名検証し、claim を execution 行と突き合わせる。
-    /// 旧 worker のメッセージとの互換のため serde default（空 -> drop+audit）。
-    #[serde(default)]
-    pub job_token: String,
-}
-
-// ============================================================================
-// ジョブ署名トークン TTL 定数 (§3.3)
-// ============================================================================
-//
-// TTL 結合の唯一の真実: control-plane のトークン mint と worker の JetStream
-// consumer 設定は、ここの定数から同一に導出しなければならない (§3.3
-// 「有効期限 ≥ ack_wait × max_deliver + 実行上限 + 余裕」)。両 bin が env で
-// 上書きする場合も既定はここを共有することでドリフトを抑える。
-
-/// JetStream consumer の ack 待ち秒数（既定）。
-pub const ACK_WAIT_SECS: u64 = 30;
-
-/// JetStream consumer の最大再配送回数（既定）。
-pub const MAX_DELIVER: u64 = 5;
-
-/// トークン有効期限に足す余裕秒数（既定）。
-pub const TOKEN_MARGIN_SECS: u64 = 60;
-
-/// トークン有効期限のオフセット秒数を計算する (§3.3)。
-///
-/// `exp = iat + token_exp_offset_secs(...)` で用いる。最悪ケースの再配送
-/// (`ack_wait * max_deliver`) に実行壁時計上限と余裕を足したもの。これにより
-/// 通常の再配送がトークン失効より先に届く（= 正規の遅延結果を取りこぼさない）。
-///
-/// 既定値では `30*5 + wall + 60 = 210 + wall`(秒)。
-pub fn token_exp_offset_secs(
-    wall_time_secs: u64,
-    ack_wait: u64,
-    max_deliver: u64,
-    margin: u64,
-) -> i64 {
-    let total = (ack_wait.saturating_mul(max_deliver))
-        .saturating_add(wall_time_secs)
-        .saturating_add(margin);
-    // u64 -> i64 を飽和的に行う（`as i64` は wrap して負になりうる）。
-    total.min(i64::MAX as u64) as i64
-}
-
-// ============================================================================
-// ジョブ署名トークン (§3.3)
-// ============================================================================
-//
-// 目的: 結果の出所認証 (§3.3「結果の出所認証」)。control-plane がジョブごとの
-// claim を Ed25519 秘密鍵で署名し、worker は不透明トークンを verbatim に echo、
-// subscriber(CP 内) が kid で公開鍵を選んで検証する。
-//
-// crypto 依存はここには入れない。shared はバイト列の組み立てと base64url の
-// みを行う。ed25519-dalek は control-plane だけが持つ。worker は job_token を
-// 解析しない（opaque String）。
 
 /// ジョブトークンに載せる claim (§3.3)。
 ///
@@ -498,26 +270,71 @@ const JOB_TOKEN_DOMAIN: &[u8] = b"faas-job-token-v1";
 /// signer と verifier は **必ず同じこの関数** を呼ぶ。どちらか一方でも再実装
 /// したり serde_json を使うと検証が黙って失敗するか、最悪偽造可能になる。
 pub fn job_claims_signing_bytes(c: &JobClaims) -> Vec<u8> {
-    // 事前に概算容量を確保（厳密でなくてよい）。
-    let mut out = Vec::with_capacity(
-        4 + JOB_TOKEN_DOMAIN.len()
-            + 4 * 4
-            + c.execution_id.len()
-            + c.tenant_id.len()
-            + c.version_id.len()
-            + c.kid.len()
-            + 16,
-    );
+    claims_signing_bytes(
+        JOB_TOKEN_DOMAIN,
+        &[&c.execution_id, &c.tenant_id, &c.version_id, &c.kid],
+        c.iat,
+        c.exp,
+    )
+}
 
-    // ドメインタグ（文字列フィールドと同じ規則: 長さ前置）。
-    write_len_prefixed(&mut out, JOB_TOKEN_DOMAIN);
-    // 6 フィールドを固定順で。
-    write_len_prefixed(&mut out, c.execution_id.as_bytes());
-    write_len_prefixed(&mut out, c.tenant_id.as_bytes());
-    write_len_prefixed(&mut out, c.version_id.as_bytes());
-    write_len_prefixed(&mut out, c.kid.as_bytes());
-    out.extend_from_slice(&c.iat.to_be_bytes());
-    out.extend_from_slice(&c.exp.to_be_bytes());
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct EnvClaims {
+    /// `exec_*`。引き換え時に executions 行と突き合わせる。
+    pub execution_id: String,
+    /// `ten_*`（権威的テナント）。
+    pub tenant_id: String,
+    /// `ver_*`。この版の `capabilities.env` が注入可能な名前を決める。
+    pub version_id: String,
+    /// `cmp_*`。secret の所属 component。
+    pub component_id: String,
+    /// 用途識別子。**常に `"job-env"`**。不一致は 401（job_token との取り違え防止）。
+    pub aud: String,
+    /// 検証側の公開鍵を選ぶ key id。
+    pub kid: String,
+    /// 発行時刻（unix 秒）。
+    pub iat: i64,
+    /// 有効期限（unix 秒）。job_token と同じ TTL 式で有限。
+    pub exp: i64,
+}
+
+/// env-token の `aud`。
+pub const ENV_TOKEN_AUDIENCE: &str = "job-env";
+
+/// env-token の署名バイトのドメインタグ。`JOB_TOKEN_DOMAIN` と**別**であることが本質
+/// （同じ鍵を使っても job_token と env_token を相互に使い回せない）。
+const ENV_TOKEN_DOMAIN: &[u8] = b"faas-env-token-v1";
+
+/// env-token の claim から **正準** 署名バイト列を組み立てる (M7c, §4.6)。
+///
+/// `job_claims_signing_bytes` と同じ作法（ドメインタグ + 4 バイト BE 長さ前置 + 固定順）。
+/// serde_json を使わない理由も同じ（map/key 順序が非正準でドリフトすると検証が黙って壊れる）。
+pub fn env_claims_signing_bytes(c: &EnvClaims) -> Vec<u8> {
+    claims_signing_bytes(
+        ENV_TOKEN_DOMAIN,
+        &[
+            &c.execution_id,
+            &c.tenant_id,
+            &c.version_id,
+            &c.component_id,
+            &c.aud,
+            &c.kid,
+        ],
+        c.iat,
+        c.exp,
+    )
+}
+
+fn claims_signing_bytes(domain: &[u8], fields: &[&str], iat: i64, exp: i64) -> Vec<u8> {
+    let mut out = Vec::with_capacity(
+        4 + domain.len() + fields.iter().map(|field| 4 + field.len()).sum::<usize>() + 16,
+    );
+    write_len_prefixed(&mut out, domain);
+    for field in fields {
+        write_len_prefixed(&mut out, field.as_bytes());
+    }
+    out.extend_from_slice(&iat.to_be_bytes());
+    out.extend_from_slice(&exp.to_be_bytes());
     out
 }
 
@@ -530,80 +347,18 @@ fn write_len_prefixed(out: &mut Vec<u8>, bytes: &[u8]) {
 }
 
 // ----------------------------------------------------------------------------
-// base64url (RFC 4648 §5) パディングなし。pure-Rust 手実装（外部依存なし）。
+// base64url (RFC 4648 §5) パディングなし。
 // ----------------------------------------------------------------------------
-
-const B64URL_ALPHABET: &[u8; 64] =
-    b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
 
 /// 任意バイト列を base64url（パディングなし）に符号化する。
 pub fn b64url_encode(input: &[u8]) -> String {
-    let mut out = String::with_capacity(input.len().div_ceil(3) * 4);
-    let mut chunks = input.chunks_exact(3);
-    for chunk in &mut chunks {
-        let n = (u32::from(chunk[0]) << 16) | (u32::from(chunk[1]) << 8) | u32::from(chunk[2]);
-        out.push(B64URL_ALPHABET[((n >> 18) & 0x3f) as usize] as char);
-        out.push(B64URL_ALPHABET[((n >> 12) & 0x3f) as usize] as char);
-        out.push(B64URL_ALPHABET[((n >> 6) & 0x3f) as usize] as char);
-        out.push(B64URL_ALPHABET[(n & 0x3f) as usize] as char);
-    }
-    let rem = chunks.remainder();
-    match rem.len() {
-        1 => {
-            let n = u32::from(rem[0]) << 16;
-            out.push(B64URL_ALPHABET[((n >> 18) & 0x3f) as usize] as char);
-            out.push(B64URL_ALPHABET[((n >> 12) & 0x3f) as usize] as char);
-        }
-        2 => {
-            let n = (u32::from(rem[0]) << 16) | (u32::from(rem[1]) << 8);
-            out.push(B64URL_ALPHABET[((n >> 18) & 0x3f) as usize] as char);
-            out.push(B64URL_ALPHABET[((n >> 12) & 0x3f) as usize] as char);
-            out.push(B64URL_ALPHABET[((n >> 6) & 0x3f) as usize] as char);
-        }
-        _ => {}
-    }
-    out
+    URL_SAFE_NO_PAD.encode(input)
 }
 
 /// base64url（パディングなし）を復号する。
-///
-/// パディング文字 `=` は受け付けない（no-pad 前提）。不正な文字・不正な長さは
-/// `None` を返す（検証側が drop+audit できるよう全失敗を一様に表す）。
+/// 不正な文字・長さ・余剰ビットは `None` を返す。
 pub fn b64url_decode(input: &str) -> Option<Vec<u8>> {
-    let bytes = input.as_bytes();
-    // base64 の最終グループは 1 文字だけ（= 端数 6bit のみ）にはならない。
-    if bytes.len() % 4 == 1 {
-        return None;
-    }
-    let mut out = Vec::with_capacity(bytes.len() / 4 * 3 + 2);
-    let mut acc: u32 = 0;
-    let mut nbits: u32 = 0;
-    for &b in bytes {
-        let v = b64url_decode_char(b)?;
-        acc = (acc << 6) | u32::from(v);
-        nbits += 6;
-        if nbits >= 8 {
-            nbits -= 8;
-            out.push((acc >> nbits) as u8);
-        }
-    }
-    // 末尾に残るビット（< 8）はすべて 0 でなければならない（正準性）。
-    if nbits > 0 && (acc & ((1 << nbits) - 1)) != 0 {
-        return None;
-    }
-    Some(out)
-}
-
-/// base64url 1 文字 -> 6bit 値。無効文字は `None`。
-fn b64url_decode_char(c: u8) -> Option<u8> {
-    match c {
-        b'A'..=b'Z' => Some(c - b'A'),
-        b'a'..=b'z' => Some(c - b'a' + 26),
-        b'0'..=b'9' => Some(c - b'0' + 52),
-        b'-' => Some(62),
-        b'_' => Some(63),
-        _ => None,
-    }
+    URL_SAFE_NO_PAD.decode(input).ok()
 }
 
 // ============================================================================
@@ -623,6 +378,41 @@ pub const MAX_WALL_TIME_MS_LIMIT: u64 = 30_000;
 /// max_execution_time: 60 000 ms。
 pub const MAX_EXECUTION_TIME_MS_LIMIT: u64 = 60_000;
 
+// ============================================================================
+// per-function 環境変数 / secret の上限 (M7b/M7c, §15 / §4.4)
+// ============================================================================
+//
+// **CP の受付バリデーションと Worker の実行前検証で同じ定数を使う**（二重防御）。
+// CP 側だけで守ると、DB を直接書き換えられた場合や将来の別経路で worker が無制限の env を
+// 組み立ててしまう。
+
+/// env キー名の最大長。POSIX の env 名の慣行に合わせる。
+pub const MAX_ENV_KEY_LEN: usize = 64;
+/// 1 component あたりの env キー数上限（config + secret の合計）。
+/// `WasiCtx` 構築コストと運用可読性の両面から。
+pub const MAX_FUNCTION_ENV_KEYS: usize = 64;
+/// env 値のバイト長上限（config / secret 共通）。secret は資格情報であり、
+/// 数 KiB を超える用途（証明書チェーン等）は M7 の非スコープ。
+pub const MAX_ENV_VALUE_BYTES: usize = 4096;
+/// 1 実行に注入する env の総バイト数上限（キー + 値の合計）。
+pub const MAX_FUNCTION_ENV_TOTAL_BYTES: usize = 32_768;
+
+/// env キー名が `^[A-Z_][A-Z0-9_]{0,63}$` を満たすか（純関数）。
+///
+/// 小文字・`=`・NUL・空文字を拒む。`wasi:cli/environment` 経由でゲストへ渡す名前なので、
+/// POSIX env 名として不正な形を最初から入れさせない。
+pub fn is_valid_env_key(key: &str) -> bool {
+    if key.is_empty() || key.len() > MAX_ENV_KEY_LEN {
+        return false;
+    }
+    let mut bytes = key.bytes();
+    let first = bytes.next().expect("non-empty checked above");
+    if !(first.is_ascii_uppercase() || first == b'_') {
+        return false;
+    }
+    bytes.all(|b| b.is_ascii_uppercase() || b.is_ascii_digit() || b == b'_')
+}
+
 /// Component version ごとのリソース制限 (§4.3)。
 /// component_versions.resource_limits (JSONB) に格納される。
 ///
@@ -630,8 +420,8 @@ pub const MAX_EXECUTION_TIME_MS_LIMIT: u64 = 60_000;
 /// `max_wall_time_ms` を epoch interruption に適用する。
 ///
 /// M4b (§4.3) で以下を追加:
-/// - `max_execution_time_ms`: tokio タイムアウト（ホスト関数込み総経過時間。epoch は
-///   ゲスト内ループは中断できるがホスト関数中のブロッキングは止められないため両者を併用）。
+/// - `max_execution_time_ms`: 環境取得・DNS解決・ホスト関数を含む実行の総経過時間。epoch は
+///   ゲスト内ループは中断できるがホスト関数中の待ちは止められないためtokioタイムアウトと併用。
 ///   既定 5000ms、上限 60000ms。
 /// - `max_fuel`: 任意・決定性用の fuel 単位。`None` のとき epoch のみを適用（既定挙動）。
 ///   `Some(n)` のとき worker は `Store::set_fuel(n)` を呼び、`OutOfFuel` trap は `failed` 分類。
@@ -698,7 +488,7 @@ impl ResourceLimits {
     /// 実行不能な構成として拒否する（既定 0 はサーバが許可しない）。max_fuel は `None` を
     /// 既定とし、`Some(0)` は「即 fuel 切れ」になるため拒否する（仕様の上限は無いので
     /// 上限チェックは行わない）。
-    pub fn validate(&self) -> Result<()> {
+    pub fn validate(&self) -> Result<(), FaasError> {
         if self.max_memory_bytes == 0 {
             return Err(FaasError::InvalidRequest(
                 "max_memory_bytes must be > 0".into(),
@@ -755,14 +545,11 @@ impl ResourceLimits {
 // エラー
 // ============================================================================
 
-/// 共有エラー型。両 bin がこれを横断的に使用する。
-/// TODO(§6.5): M3/M4 でエラー分類を拡張する（リトライ可否など）。
+/// 入力検証と管理APIのエラー。実行結果はExecutionStatusで表す。
 #[derive(Debug, thiserror::Error)]
 pub enum FaasError {
-    /// メッセージの (de)serialize 失敗。
-    #[error("serialization error: {0}")]
-    Serialization(#[from] serde_json::Error),
-
+    #[error("service temporarily unavailable")]
+    Unavailable,
     /// 認証失敗（トークン欠損・不一致・失効・期限切れ）。
     #[error("unauthorized")]
     Unauthorized,
@@ -783,107 +570,14 @@ pub enum FaasError {
     #[error("conflict: {0}")]
     Conflict(String),
 
-    /// ハンドラ実行失敗。
-    #[error("execution failed: {0}")]
-    Execution(String),
-
-    /// 実行が wall-time を超過した。
-    #[error("execution timed out")]
-    Timeout,
-
     /// その他内部エラー。
     #[error("internal error: {0}")]
     Internal(String),
 }
 
-pub type Result<T> = std::result::Result<T, FaasError>;
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn subjects_format() {
-        assert_eq!(invoke_subject("default"), "tenant.default.component.invoke");
-        assert_eq!(result_subject("default"), "tenant.default.component.result");
-    }
-
-    #[test]
-    fn wildcard_subjects_format() {
-        assert_eq!(invoke_subject_wildcard(), "tenant.*.component.invoke");
-        assert_eq!(result_subject_wildcard(), "tenant.*.component.result");
-        assert_eq!(failed_subject_wildcard(), "tenant.*.component.failed");
-        // 具体 subject はワイルドカードの 1 トークンに収まる（テナント ID は subject-safe）。
-        assert_eq!(
-            invoke_subject("ten_abc").split('.').count(),
-            invoke_subject_wildcard().split('.').count()
-        );
-        assert_eq!(
-            failed_subject("ten_abc").split('.').count(),
-            failed_subject_wildcard().split('.').count()
-        );
-    }
-
-    /// M4c: failed (DLQ) subject の形と、`tenant_from_subject` が `.failed` でも第 2 トークンを
-    /// 抽出できることを担保する（subscriber は subject 由来テナントを唯一の権威にする）。
-    #[test]
-    fn failed_subject_format_and_extraction() {
-        assert_eq!(failed_subject("ten_abc"), "tenant.ten_abc.component.failed");
-        assert_eq!(
-            tenant_from_subject("tenant.ten_abc.component.failed"),
-            Some("ten_abc")
-        );
-        // result と failed のワイルドカードは subject 末尾だけが違う。
-        assert_ne!(failed_subject_wildcard(), result_subject_wildcard());
-    }
-
-    /// M4c: `FailedMessage` の round-trip と、job_token 欠落時の fail-closed defaults を確認する。
-    #[test]
-    fn failed_message_roundtrip_and_default_token() {
-        let msg = FailedMessage {
-            execution_id: "exec_1".into(),
-            tenant_id: "ten_a".into(),
-            reason: "max_deliver exhausted".into(),
-            job_token: "hdr.sig".into(),
-        };
-        let json = serde_json::to_string(&msg).unwrap();
-        let back: FailedMessage = serde_json::from_str(&json).unwrap();
-        assert_eq!(back.execution_id, "exec_1");
-        assert_eq!(back.tenant_id, "ten_a");
-        assert_eq!(back.reason, "max_deliver exhausted");
-        assert_eq!(back.job_token, "hdr.sig");
-
-        // 旧 worker（job_token なし）も復号でき、token は空文字（subscriber が drop+audit する）。
-        let legacy = r#"{"execution_id":"exec_1","tenant_id":"ten_a","reason":"crashed"}"#;
-        let parsed: FailedMessage = serde_json::from_str(legacy).unwrap();
-        assert_eq!(parsed.job_token, "");
-    }
-
-    #[test]
-    fn tenant_from_subject_extracts_second_token() {
-        assert_eq!(
-            tenant_from_subject("tenant.ten_abc.component.result"),
-            Some("ten_abc")
-        );
-        assert_eq!(
-            tenant_from_subject(&result_subject("default")),
-            Some("default")
-        );
-        // 形が一致しないものは None（防御的に drop）。
-        assert_eq!(tenant_from_subject("tenant.ten_abc.component"), None);
-        assert_eq!(
-            tenant_from_subject("tenant.ten_abc.component.result.extra"),
-            None
-        );
-        assert_eq!(tenant_from_subject("other.ten_abc.component.result"), None);
-        assert_eq!(tenant_from_subject("tenant..component.result"), None);
-        // ワイルドカード文字そのものはテナントとして導出されない（具体 subject のみ想定）。
-        assert_eq!(
-            tenant_from_subject(result_subject_wildcard()),
-            Some("*"),
-            "literal wildcard parses structurally; real subjects from NATS are concrete"
-        );
-    }
 
     #[test]
     fn status_snake_case_roundtrip() {
@@ -985,57 +679,87 @@ mod tests {
     }
 
     #[test]
-    fn object_key_layout() {
-        assert_eq!(
-            component_object_key("default", "echo", "1.0.0"),
-            "tenants/default/components/echo/1.0.0/component.wasm"
-        );
-    }
-
-    /// 大入力 I/O キーは `tenants/{tenant}/io/{exec}/input` に固定される (§3.4)。
-    /// invoke の input_ref 完全一致検証の権威レイアウト。
-    #[test]
-    fn io_key_layout() {
-        assert_eq!(
-            io_input_key("ten_abc", "exec_123"),
-            "tenants/ten_abc/io/exec_123/input"
-        );
-        assert_eq!(
-            io_output_key("ten_abc", "exec_123"),
-            "tenants/ten_abc/io/exec_123/output"
-        );
-        // テナント / execution の取り違えは別キーになる（境界の混同で衝突しない）。
-        assert_ne!(
-            io_input_key("ten_a", "exec_bc"),
-            io_input_key("ten_ab", "exec_c")
-        );
-    }
-
-    #[test]
-    fn job_message_roundtrip_includes_m2_fields() {
+    fn job_message_roundtrip_preserves_artifact_identity_and_token() {
         let job = JobMessage {
             execution_id: "exec_1".into(),
             tenant_id: "default".into(),
             component: "echo".into(),
-            version: "1.0.0".into(),
             wasm_sha256: "abc123".into(),
-            wasm_url: "http://localhost:9000/faas-components/x?sig".into(),
             input: serde_json::json!({"k": "v"}),
-            input_url: None,
+
             job_token: "payload.sig".into(),
+
+            env_token: None,
         };
         let json = serde_json::to_string(&job).unwrap();
         let back: JobMessage = serde_json::from_str(&json).unwrap();
         assert_eq!(back.wasm_sha256, "abc123");
-        assert_eq!(back.wasm_url, "http://localhost:9000/faas-components/x?sig");
         assert_eq!(back.job_token, "payload.sig");
+        // M7c: env_token も同様（secret を持たない component では wire に一切現れない）。
+        assert!(!json.contains("env_token"));
     }
 
-    /// 旧 CP/worker が出した job_token なしのメッセージも serde(default) で復号でき、
-    /// job_token は空文字になる（フェイルクローズ: subscriber が drop+audit する）。
+    /// M7c (§4.6): env-token の署名バイトが job_token と**別のドメインタグ**を持ち、
+    /// 同じフィールド値でも衝突しないこと（両者を相互に使い回せないことの根拠）。
+    #[test]
+    fn env_token_signing_bytes_are_domain_separated_from_job_token() {
+        let job = JobClaims {
+            execution_id: "exec_1".into(),
+            tenant_id: "ten_a".into(),
+            version_id: "ver_1".into(),
+            kid: "k1".into(),
+            iat: 1,
+            exp: 2,
+        };
+        let env = EnvClaims {
+            execution_id: "exec_1".into(),
+            tenant_id: "ten_a".into(),
+            version_id: "ver_1".into(),
+            component_id: "cmp_1".into(),
+            aud: ENV_TOKEN_AUDIENCE.into(),
+            kid: "k1".into(),
+            iat: 1,
+            exp: 2,
+        };
+        let jb = job_claims_signing_bytes(&job);
+        let eb = env_claims_signing_bytes(&env);
+        // Fixed wire vectors catch changes shared by both signer and verifier.
+        assert_eq!(
+            b64url_encode(&jb),
+            "AAAAEWZhYXMtam9iLXRva2VuLXYxAAAABmV4ZWNfMQAAAAV0ZW5fYQAAAAV2ZXJfMQAAAAJrMQAAAAAAAAABAAAAAAAAAAI"
+        );
+        assert_eq!(
+            b64url_encode(&eb),
+            "AAAAEWZhYXMtZW52LXRva2VuLXYxAAAABmV4ZWNfMQAAAAV0ZW5fYQAAAAV2ZXJfMQAAAAVjbXBfMQAAAAdqb2ItZW52AAAAAmsxAAAAAAAAAAEAAAAAAAAAAg"
+        );
+        assert_ne!(jb, eb);
+        // ドメインタグは先頭に長さ前置で入る。
+        assert!(eb.windows(17).any(|w| w == b"faas-env-token-v1"));
+        assert!(!eb.windows(17).any(|w| w == b"faas-job-token-v1"));
+    }
+
+    /// env-token の署名バイトはフィールド境界が曖昧にならない（長さ前置の効果）。
+    #[test]
+    fn env_claims_signing_bytes_are_unambiguous() {
+        let mk = |exec: &str, ten: &str| EnvClaims {
+            execution_id: exec.into(),
+            tenant_id: ten.into(),
+            version_id: "ver_1".into(),
+            component_id: "cmp_1".into(),
+            aud: ENV_TOKEN_AUDIENCE.into(),
+            kid: "k1".into(),
+            iat: 1,
+            exp: 2,
+        };
+        assert_ne!(
+            env_claims_signing_bytes(&mk("ab", "c")),
+            env_claims_signing_bytes(&mk("a", "bc"))
+        );
+    }
+
     #[test]
     fn messages_decode_without_job_token_field() {
-        let job_json = r#"{"execution_id":"exec_1","tenant_id":"default","component":"echo","version":"1.0.0","wasm_sha256":"abc","wasm_url":"http://x","input":{}}"#;
+        let job_json = r#"{"execution_id":"exec_1","tenant_id":"default","component":"echo","wasm_sha256":"abc","input":{}}"#;
         let job: JobMessage = serde_json::from_str(job_json).unwrap();
         assert_eq!(job.job_token, "");
 
@@ -1150,29 +874,6 @@ mod tests {
     }
 
     // ---- TTL 定数 / exp 算術 -------------------------------------------------
-
-    #[test]
-    fn token_exp_offset_uses_constants() {
-        // 既定: 30*5 + wall + 60。wall=1 で 211。
-        assert_eq!(
-            token_exp_offset_secs(1, ACK_WAIT_SECS, MAX_DELIVER, TOKEN_MARGIN_SECS),
-            211
-        );
-        // wall=0 で 210。
-        assert_eq!(
-            token_exp_offset_secs(0, ACK_WAIT_SECS, MAX_DELIVER, TOKEN_MARGIN_SECS),
-            210
-        );
-        // env 上書き値でも算術が一貫している。
-        assert_eq!(token_exp_offset_secs(5, 10, 3, 7), 10 * 3 + 5 + 7);
-    }
-
-    #[test]
-    fn token_exp_offset_saturates_instead_of_overflow() {
-        // u64 巨大値でもパニックせず i64 に飽和的に収める。
-        let off = token_exp_offset_secs(u64::MAX, u64::MAX, u64::MAX, u64::MAX);
-        assert!(off >= 0);
-    }
 
     // ---- 正準署名バイト ------------------------------------------------------
 
@@ -1331,8 +1032,6 @@ mod tests {
         assert!(b64url_decode("Zg\n").is_none());
     }
 
-    /// トークンの wire 形（payload.sig）を shared だけで組み立て・分解できる
-    /// （署名自体は control-plane の責務だが、搬送コンテナの往復は shared で完結）。
     #[test]
     fn job_token_wire_container_roundtrip() {
         let claims = sample_claims();
@@ -1382,30 +1081,10 @@ mod tests {
         assert!(new_token_id().starts_with("tok_"));
     }
 
-    /// 採番した ID は subject / キー空間に安全に埋め込めること。
-    /// `.` `*` `>`（NATS subject ワイルドカード/区切り）や空白を含まない。
-    #[test]
-    fn ids_are_subject_safe() {
-        let ids = [
-            new_tenant_id(),
-            new_user_id(),
-            new_token_id(),
-            new_component_id(),
-            new_version_id(),
-            new_execution_id(),
-        ];
-        for id in ids {
-            assert!(
-                !id.chars()
-                    .any(|c| matches!(c, '.' | '*' | '>') || c.is_whitespace()),
-                "id contains an unsafe character: {id:?}"
-            );
-        }
-    }
-
     #[test]
     fn scope_snake_case_and_as_str() {
-        assert_eq!(serde_json::to_string(&Scope::Invoke).unwrap(), "\"invoke\"");
+        assert_eq!(serde_json::to_string(&Scope::Deploy).unwrap(), "\"deploy\"");
+        assert!(serde_json::from_str::<Scope>("\"invoke\"").is_err());
         let s: Scope = serde_json::from_str("\"deploy\"").unwrap();
         assert_eq!(s, Scope::Deploy);
         assert_eq!(Scope::Admin.as_str(), "admin");
@@ -1415,13 +1094,10 @@ mod tests {
     #[test]
     fn role_ceiling() {
         assert_eq!(serde_json::to_string(&Role::Member).unwrap(), "\"member\"");
-        assert_eq!(
-            Role::Member.ceiling(),
-            &[Scope::Read, Scope::Invoke, Scope::Deploy]
-        );
+        assert_eq!(Role::Member.ceiling(), &[Scope::Read, Scope::Deploy]);
         assert_eq!(
             Role::Admin.ceiling(),
-            &[Scope::Read, Scope::Invoke, Scope::Deploy, Scope::Admin]
+            &[Scope::Read, Scope::Deploy, Scope::Admin]
         );
         // member の上限に admin は含まれない。
         assert!(!Role::Member.ceiling().contains(&Scope::Admin));

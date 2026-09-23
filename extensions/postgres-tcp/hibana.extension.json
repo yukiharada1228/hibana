@@ -1,0 +1,14 @@
+{
+  "schemaVersion": 2,
+  "runtime": "wasi:http/incoming-handler@0.2.3",
+  "dependencies": [
+    "@hibana/postgres-core",
+    "@hibana/postgres-pool",
+    "@hibana/postgres-transport-tcp",
+    "@hibana/postgres-auth-md5",
+    "@hibana/postgres-auth-scram"
+  ],
+  "aliases": {
+    "pg": "./dist/index.mjs"
+  }
+}

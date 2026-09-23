@@ -1,0 +1,11 @@
+package hibana:dns@0.5.0;
+interface api {
+ record failure { code: string, message: string }
+ record answer { address: option<string>, done: bool }
+ resource query {
+  next: func() -> result<answer,failure>;
+  close: func();
+ }
+ lookup: func(host: string) -> result<query,failure>;
+}
+world resolver { export api; }

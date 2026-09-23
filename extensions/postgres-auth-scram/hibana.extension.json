@@ -1,0 +1,12 @@
+{
+  "schemaVersion": 2,
+  "runtime": "wasi:http/incoming-handler@0.2.3",
+  "dependencies": [
+    "@hibana/node-buffer",
+    "@hibana/random",
+    "@hibana/sha256",
+    "@hibana/hmac-sha256",
+    "@hibana/pbkdf2-sha256",
+    "@hibana/unicode-nfkc"
+  ]
+}

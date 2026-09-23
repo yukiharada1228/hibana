@@ -1,181 +1,166 @@
-//! 環境変数からの設定読み込み (M1/M2)。
-//!
-//! `.env.example` のキーに対応:
-//! DATABASE_URL / NATS_URL / BOOTSTRAP_ADMIN_TOKEN / COMPONENTS_DIR / BIND_ADDR
-//! S3_ENDPOINT / S3_REGION / S3_BUCKET / S3_ACCESS_KEY / S3_SECRET_KEY
-//! MAX_WASM_UPLOAD_BYTES / PRESIGN_TTL_SECS
-//!
-//! 認証は M3a で API トークン方式（DB の api_tokens）へ移行。固定 AUTH_TOKEN は廃止。
-//! BOOTSTRAP_ADMIN_TOKEN は system-admin 用（POST /admin/tenants を gate）。
-//!
-//! TODO(§8): M3 で設定ソースを secrets manager 等へ移す。
-
 use anyhow::Context;
+use hibana_shared::Redacted;
 
-/// wasm 本体の最大アップロードサイズ既定値（32 MiB, §6.2）。
 const DEFAULT_MAX_WASM_UPLOAD_BYTES: u64 = 32 * 1024 * 1024;
-/// presigned GET URL の既定 TTL（秒, 短命 read-only, §3.4）。
 const DEFAULT_PRESIGN_TTL_SECS: u64 = 300;
 
-// --- 共有ストア / クォータ既定値（M3d, §8） ---
-// グローバル既定 → テナント上書き（tenants.quotas JSONB）の優先順位で解決する。
-// ここはグローバル既定（テナント上書きが無い場合の値）。
-/// 共有ストア（Redis）の既定接続 URL。
 const DEFAULT_REDIS_URL: &str = "redis://127.0.0.1:6379";
-/// `invoke_rate` のグローバル既定（req/秒/テナント, §8 表）。
 const DEFAULT_INVOKE_RATE_PER_SEC: u64 = 50;
-/// token-bucket のバースト容量の既定（§8 表の上限相当を許容バーストとする）。
 const DEFAULT_INVOKE_BURST: u64 = 500;
-/// `max_concurrent_executions` のグローバル既定（in-flight pending+running, §8 表）。
 const DEFAULT_MAX_CONCURRENT: u64 = 20;
-/// in-flight カウンタキーの TTL（秒）。reaper が真実へ再同期するまでの孤立カウンタ保険。
-const DEFAULT_INFLIGHT_TTL_SECS: u64 = 3600;
-/// login 失敗ロックアウトの閾値（§6.0）。両キー（(tenant,email) / IP）に同値を適用する。
-const DEFAULT_LOGIN_LOCKOUT_THRESHOLD: u64 = 10;
-/// login 失敗カウンタの減衰窓（秒）。最後の失敗からこの時間無失敗で解放。
-const DEFAULT_LOGIN_LOCKOUT_WINDOW_SECS: u64 = 900;
-/// reaper の再同期間隔（秒, §8 ドリフト補正）。
 const DEFAULT_REAPER_INTERVAL_SECS: u64 = 30;
-/// stuck-execution sweeper の deadline（秒, §8）。`created_at` からこの時間を超えても
-/// 終端化されない pending/running 行を「孤立」とみなし reaper が failed に finalize する。
-///
-/// 必要条件 (§3.3 / §6.6): 「最悪滞留時間 + 実行上限 + 余裕」を **厳密に上回る** こと。
-/// - 固定 `ack_wait` 構成では最悪滞留 = `ack_wait * max_deliver`（既定 `30 * 5 = 150s`）。
-/// - backoff 配列構成（M4c worker の既定 `[5, 15, 60]` 秒）では最悪滞留 = `Σ backoff[i]`
-///   (`<= 80s`) を取り、配列が短ければ短いほど安全側のマージンが広がる。
-///
-/// 実行上限 (`MAX_WALL_TIME_MS_LIMIT` = 30s, `MAX_EXECUTION_TIME_MS_LIMIT` = 60s) を足し
-/// 余裕を 600s 以上確保することで、正規の遅延結果（再配送中）を sweeper が誤って failed 化しない
-/// 既定 900s を採用する。0 で無効化。worker の `backoff` を伸ばす場合はここも上げること（README 注釈）。
 const DEFAULT_STUCK_EXECUTION_DEADLINE_SECS: u64 = 900;
-/// /uploads の presigned PUT URL の既定 TTL（秒, §3.4/§5.2）。
-const DEFAULT_UPLOAD_PRESIGN_TTL_SECS: u64 = 300;
 
-/// control-plane の起動時設定。
-#[derive(Debug, Clone)]
+const DEFAULT_INTERNAL_BIND_ADDR: &str = "127.0.0.1:8081";
+// An admitted request may redeem Secrets once before executing. The default
+// internal budget must cover the public default rate plus its initial burst.
+// Operators raising tenant quotas or sharing many tenants across Worker IPs must
+// also size this per-tenant/per-peer protection explicitly.
+const DEFAULT_JOB_ENV_EXCHANGE_RATE_PER_MIN: u64 =
+    DEFAULT_INVOKE_RATE_PER_SEC * 60 + DEFAULT_INVOKE_BURST;
+
+const DEFAULT_METRICS_INCLUDE_TENANT_LABEL: bool = true;
+
+const SECRETS_MASTER_KEY_PLACEHOLDER: &str = "CHANGE_ME_REPLACE_WITH_32_BYTE_KEY_BEFORE_USE";
+
 pub struct Config {
-    /// ランタイム Postgres 接続 URL。**非特権ロール `faas_app`（NOBYPASSRLS・非 SUPERUSER）**で
-    /// 接続する（M3b §3.2）。superuser/owner で接続すると FORCE RLS が無条件にバイパスされ、
-    /// GUC 未設定時の fail-closed も働かず RLS 層全体が無効化される。起動時に self-check で検証する。
+    pub auth: crate::oidc::config::OidcConfig,
     pub database_url: String,
-    /// マイグレーション専用 Postgres 接続 URL。CREATE ROLE / ALTER TABLE ... FORCE RLS /
-    /// CREATE FUNCTION SECURITY DEFINER はテーブル所有者かつ CREATEROLE 権限を要するため、
-    /// 0004_rls.sql は**特権ロール（所有者）**で適用する必要がある。未設定なら `database_url`
-    /// にフォールバックする（fresh DB を所有者 1 本で立ち上げる開発用途）。
     pub migration_database_url: String,
-    /// NATS 接続 URL。
-    pub nats_url: String,
-    /// system-admin bootstrap トークン（POST /admin/tenants を gate, §3.3）。
-    pub bootstrap_admin_token: String,
-    /// HTTP bind アドレス（例: 0.0.0.0:8080）。
+    pub bootstrap_admin_token: Redacted<String>,
     pub bind_addr: String,
 
-    // --- Object Storage (M2: MinIO, S3 互換, path-style。§3.4) ---
-    /// MinIO/S3 API エンドポイント（例: http://127.0.0.1:9000）。
     pub s3_endpoint: String,
-    /// リージョン（MinIO は任意だが aws-sdk が必須とするため固定）。
     pub s3_region: String,
-    /// 本体保存バケット。
     pub s3_bucket: String,
-    /// アクセスキー（MINIO_ROOT_USER 相当）。
     pub s3_access_key: String,
-    /// シークレットキー（MINIO_ROOT_PASSWORD 相当）。
-    pub s3_secret_key: String,
+    pub s3_secret_key: Redacted<String>,
 
-    // --- アップロード/検証パイプライン (M2: §6.2) ---
-    /// wasm 本体の最大アップロードサイズ（bytes）。
     pub max_wasm_upload_bytes: u64,
-    /// JobMessage に同梱する presigned GET URL の TTL（秒）。
     pub presign_ttl_secs: u64,
 
-    // --- ジョブ署名トークン (M3c, §3.3) ---
-    /// Ed25519 署名鍵 seed（32 バイト）を hex / base64url / base64 で受け取る生文字列。
-    /// `signing::decode_seed` で 32 バイトへ復号して `Signer` を構築する。必須。
-    pub job_signing_key: String,
-    /// 署名トークンに埋める kid（検証側が公開鍵を選ぶキー）。必須。
+    pub job_signing_key: Redacted<String>,
     pub job_signing_kid: String,
-    /// JetStream consumer の ack 待ち秒数（worker と共有。token exp 計算にも使う）。
-    pub ack_wait_secs: u64,
-    /// JetStream consumer の最大再配送回数（worker と共有。token exp 計算にも使う）。
-    pub max_deliver: u64,
-    /// token exp に足す余裕秒数。
     pub token_margin_secs: u64,
 
-    // --- 共有ストア / admission 制御 (M3d, §8) ---
-    // 注: 本フェーズ（共有ストア土台）では redis_url のみを main.rs が消費する。残りの
-    // クォータ/レート/lockout/reaper/uploads パラメータは後続フェーズ（invoke admission・
-    // login lockout・reaper・uploads）の配線で参照するため、それまで dead-code を許可する。
-    /// 共有ストア（Redis）接続 URL。全 Axum インスタンスで共有するカウンタの実体（§8 MUST）。
     pub redis_url: String,
-    /// `invoke_rate` グローバル既定（req/秒/テナント）。token-bucket 補充レート。
     pub invoke_rate_per_sec: u64,
-    /// token-bucket のバースト容量。
     pub invoke_burst: u64,
-    /// `max_concurrent_executions` グローバル既定（in-flight pending+running 上限）。
     pub max_concurrent_executions: u64,
-    /// in-flight カウンタキーの TTL（秒）。reaper の再同期までの保険。
-    pub inflight_ttl_secs: u64,
-    /// login 失敗ロックアウト閾値（両キーに適用）。
-    pub login_lockout_threshold: u64,
-    /// login 失敗カウンタ減衰窓（秒）。
-    pub login_lockout_window_secs: u64,
-    /// reaper 再同期間隔（秒）。
     pub reaper_interval_secs: u64,
-    /// stuck-execution sweeper の deadline（秒, §8）。`created_at + この秒数` を超えても
-    /// 終端化されない pending/running 行を reaper が failed に finalize して in-flight スロットを
-    /// 回収する。0 で無効。
     pub stuck_execution_deadline_secs: u64,
-    /// /uploads の presigned PUT URL TTL（秒, §3.4 / §5.2 / §6.4）。AppState 経由で
-    /// `create_upload` ハンドラが消費する。
-    pub upload_presign_ttl_secs: u64,
-    /// X-Forwarded-For を信頼してクライアント IP を取り出すか（§6.0）。
-    /// 既定 **false**（プロキシ信頼は明示オプトイン。信頼境界外で詐称 IP による
-    /// ロックアウト回避／他者ロックアウトを防ぐ）。
-    pub trust_proxy_headers: bool,
+    pub trusted_proxies: crate::client_ip::TrustedProxies,
 
-    // --- 観測 (M4a, §3.8) ---
-    /// ログ整形（"text" 既定 / "json"）。`json` のとき `tracing_subscriber::fmt().json()` を
-    /// 有効化し、フィールドを flatten した JSON ライン形式で吐く。集約基盤（Loki/ELK 等）に
-    /// パイプする運用で使う。既定の `text` は既存挙動と完全互換。
-    ///
-    /// 注: 起動順の都合（Config::from_env() が必須 env 欠損でエラーする前にログを出したい）で、
-    /// main.rs は env を直接読んで `init_tracing` を呼ぶ。Config 経由は使わないが、設定ソースを
-    /// 1 箇所に集める原則のため Config にも残す（運用ドキュメントから検索しやすくする）。
-    #[allow(dead_code)]
-    pub log_format: String,
+    pub secrets_master_key: Redacted<String>,
+    pub secrets_master_kid: String,
+    pub secrets_retired_keys: Redacted<String>,
+    pub internal_bind_addr: String,
+    pub job_env_exchange_rate_per_min: u64,
+
+    pub metrics_include_tenant_label: bool,
+
+    pub public_apps: crate::public_apps::PublicApps,
+}
+
+impl std::fmt::Debug for Config {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Config")
+            .field("database_url", &"<redacted>")
+            .field("migration_database_url", &"<redacted>")
+            .field("redis_url", &"<redacted>")
+            .field("bootstrap_admin_token", &self.bootstrap_admin_token)
+            .field("bind_addr", &self.bind_addr)
+            .field("s3_endpoint", &self.s3_endpoint)
+            .field("s3_region", &self.s3_region)
+            .field("s3_bucket", &self.s3_bucket)
+            .field("s3_access_key", &self.s3_access_key)
+            .field("s3_secret_key", &self.s3_secret_key)
+            .field("job_signing_key", &self.job_signing_key)
+            .field("job_signing_kid", &self.job_signing_kid)
+            .field("secrets_master_key", &self.secrets_master_key)
+            .field("secrets_master_kid", &self.secrets_master_kid)
+            .field("secrets_retired_keys", &self.secrets_retired_keys)
+            .field("internal_bind_addr", &self.internal_bind_addr)
+            .finish_non_exhaustive()
+    }
 }
 
 impl Config {
-    /// プロセス環境から設定を読み込む。必須キー欠損はエラー。
+    pub fn bootstrap_admin_token_plain(&self) -> &str {
+        self.bootstrap_admin_token.expose()
+    }
+
+    pub fn s3_secret_key_plain(&self) -> &str {
+        self.s3_secret_key.expose()
+    }
+
+    pub fn job_signing_key_plain(&self) -> &str {
+        self.job_signing_key.expose()
+    }
+
+    pub fn secret_keyring(&self) -> anyhow::Result<crate::secrets::SecretKeyring> {
+        parse_secret_keyring(
+            &self.secrets_master_kid,
+            self.secrets_master_key.expose(),
+            self.secrets_retired_keys.expose(),
+        )
+    }
+
     pub fn from_env() -> anyhow::Result<Self> {
+        let secrets_master_key = env_required("SECRETS_MASTER_KEY")?;
+        if secrets_master_key.trim() == SECRETS_MASTER_KEY_PLACEHOLDER {
+            anyhow::bail!(
+                "SECRETS_MASTER_KEY is still the placeholder from .env.example; \
+                 generate a real 32-byte key (e.g. `openssl rand -hex 32`) before starting"
+            );
+        }
+
+        for (name, endpoint) in [
+            ("WORKER_HTTP_URL", Some(env_required("WORKER_HTTP_URL")?)),
+            (
+                "WORKER_PREPARATION_URL",
+                env_optional("WORKER_PREPARATION_URL"),
+            ),
+        ] {
+            if let Some(endpoint) = endpoint {
+                let url = reqwest::Url::parse(&endpoint)?;
+                anyhow::ensure!(
+                    matches!(url.scheme(), "http" | "https") && url.host_str().is_some(),
+                    "{name} must be an HTTP(S) URL"
+                );
+            }
+        }
         let database_url = env_required("DATABASE_URL")?;
-        // 未設定なら database_url にフォールバック（所有者 1 本運用の開発用途）。
         let migration_database_url =
             env_optional("MIGRATION_DATABASE_URL").unwrap_or_else(|| database_url.clone());
-        Ok(Self {
+        anyhow::ensure!(
+            !env_bool("TRUST_PROXY_HEADERS", false),
+            "TRUST_PROXY_HEADERS=true is no longer supported; configure TRUSTED_PROXY_CIDRS"
+        );
+        anyhow::ensure!(
+            env_optional("INGRESS_BASE_DOMAIN").is_none(),
+            "INGRESS_BASE_DOMAIN was removed; configure APP_PUBLIC_ORIGIN"
+        );
+        let cfg = Self {
+            auth: crate::oidc::config::OidcConfig::from_env()?,
             database_url,
             migration_database_url,
-            nats_url: env_or("NATS_URL", "nats://127.0.0.1:4222"),
-            bootstrap_admin_token: env_required("BOOTSTRAP_ADMIN_TOKEN")?,
+            bootstrap_admin_token: Redacted::new(env_required("BOOTSTRAP_ADMIN_TOKEN")?),
             bind_addr: env_or("BIND_ADDR", "0.0.0.0:8080"),
 
             s3_endpoint: env_or("S3_ENDPOINT", "http://127.0.0.1:9000"),
             s3_region: env_or("S3_REGION", "us-east-1"),
-            s3_bucket: env_or("S3_BUCKET", "faas-components"),
+            s3_bucket: env_or("S3_BUCKET", "hibana-components"),
             s3_access_key: env_or("S3_ACCESS_KEY", "minioadmin"),
-            s3_secret_key: env_or("S3_SECRET_KEY", "minioadmin"),
+            s3_secret_key: Redacted::new(env_or("S3_SECRET_KEY", "minioadmin")),
 
             max_wasm_upload_bytes: env_u64("MAX_WASM_UPLOAD_BYTES", DEFAULT_MAX_WASM_UPLOAD_BYTES)?,
             presign_ttl_secs: env_u64("PRESIGN_TTL_SECS", DEFAULT_PRESIGN_TTL_SECS)?,
 
-            // M3c: 署名鍵 / kid は必須。TTL 定数は faas_shared の既定を env で上書き可能。
-            job_signing_key: env_required("JOB_SIGNING_KEY")?,
+            job_signing_key: Redacted::new(env_required("JOB_SIGNING_KEY")?),
             job_signing_kid: env_required("JOB_SIGNING_KID")?,
-            ack_wait_secs: env_u64("ACK_WAIT_SECS", faas_shared::ACK_WAIT_SECS)?,
-            max_deliver: env_u64("MAX_DELIVER", faas_shared::MAX_DELIVER)?,
-            token_margin_secs: env_u64("TOKEN_MARGIN_SECS", faas_shared::TOKEN_MARGIN_SECS)?,
+            token_margin_secs: env_u64("TOKEN_MARGIN_SECS", 60)?,
 
-            // M3d 共有ストア / admission。すべて env で上書き可能（グローバル既定）。
             redis_url: env_or("REDIS_URL", DEFAULT_REDIS_URL),
             invoke_rate_per_sec: env_u64("QUOTA_INVOKE_RATE_PER_SEC", DEFAULT_INVOKE_RATE_PER_SEC)?,
             invoke_burst: env_u64("QUOTA_INVOKE_BURST", DEFAULT_INVOKE_BURST)?,
@@ -183,64 +168,45 @@ impl Config {
                 "QUOTA_MAX_CONCURRENT_EXECUTIONS",
                 DEFAULT_MAX_CONCURRENT,
             )?,
-            inflight_ttl_secs: env_u64("INFLIGHT_TTL_SECS", DEFAULT_INFLIGHT_TTL_SECS)?,
-            login_lockout_threshold: env_u64(
-                "LOGIN_LOCKOUT_THRESHOLD",
-                DEFAULT_LOGIN_LOCKOUT_THRESHOLD,
-            )?,
-            login_lockout_window_secs: env_u64(
-                "LOGIN_LOCKOUT_WINDOW_SECS",
-                DEFAULT_LOGIN_LOCKOUT_WINDOW_SECS,
-            )?,
             reaper_interval_secs: env_u64("REAPER_INTERVAL_SECS", DEFAULT_REAPER_INTERVAL_SECS)?,
             stuck_execution_deadline_secs: env_u64(
                 "STUCK_EXECUTION_DEADLINE_SECS",
                 DEFAULT_STUCK_EXECUTION_DEADLINE_SECS,
             )?,
-            upload_presign_ttl_secs: env_u64(
-                "UPLOAD_PRESIGN_TTL_SECS",
-                DEFAULT_UPLOAD_PRESIGN_TTL_SECS,
+            trusted_proxies: crate::client_ip::TrustedProxies::parse(&env_or(
+                "TRUSTED_PROXY_CIDRS",
+                "",
+            ))?,
+
+            secrets_master_key: Redacted::new(secrets_master_key),
+            secrets_master_kid: env_required("SECRETS_MASTER_KID")?,
+            secrets_retired_keys: Redacted::new(env_or("SECRETS_RETIRED_KEYS", "")),
+            internal_bind_addr: env_or("INTERNAL_BIND_ADDR", DEFAULT_INTERNAL_BIND_ADDR),
+            job_env_exchange_rate_per_min: env_u64(
+                "JOB_ENV_EXCHANGE_RATE_PER_MIN",
+                DEFAULT_JOB_ENV_EXCHANGE_RATE_PER_MIN,
             )?,
-            trust_proxy_headers: env_bool("TRUST_PROXY_HEADERS", false),
+            metrics_include_tenant_label: env_bool(
+                "METRICS_INCLUDE_TENANT_LABEL",
+                DEFAULT_METRICS_INCLUDE_TENANT_LABEL,
+            ),
+            public_apps: crate::public_apps::PublicApps::parse(
+                env_optional("APP_PUBLIC_ORIGIN").as_deref(),
+            )?,
+        };
 
-            log_format: env_or("LOG_FORMAT", "text"),
-        })
+        Ok(cfg)
     }
 
-    /// 指定の壁時計上限（ms）から、トークンの `exp` オフセット秒数を計算する (§3.3)。
-    ///
-    /// `exp = iat + token_exp_offset_secs(wall, ack_wait, max_deliver, margin)`。
-    /// worker の consumer ack_wait/max_deliver と **同一の定数** から導出する（TTL 結合）。
-    pub fn token_exp_offset_secs(&self, wall_time_ms: u64) -> i64 {
-        // ms -> 秒（切り上げ。0ms でも 0 秒、端数は安全側に丸める）。
-        let wall_secs = wall_time_ms.div_ceil(1000);
-        faas_shared::token_exp_offset_secs(
-            wall_secs,
-            self.ack_wait_secs,
-            self.max_deliver,
-            self.token_margin_secs,
-        )
-    }
-
-    /// グローバル既定から admission 制御パラメータ束を組み立てる (M3d, §8)。
-    ///
-    /// 現状はグローバル既定のみを反映する（per-tenant `quotas` 上書きは後続スライス）。
     pub fn admission(&self) -> crate::state::AdmissionConfig {
-        use crate::store::{InflightParams, LockoutParams, RateLimitParams};
+        use crate::store::RateLimitParams;
         crate::state::AdmissionConfig {
             rate: RateLimitParams {
                 refill_per_sec: self.invoke_rate_per_sec as f64,
                 capacity: self.invoke_burst as f64,
             },
-            inflight: InflightParams {
-                max: self.max_concurrent_executions as i64,
-                ttl_secs: self.inflight_ttl_secs,
-            },
-            lockout: LockoutParams {
-                threshold: self.login_lockout_threshold,
-                window_secs: self.login_lockout_window_secs,
-            },
-            trust_proxy_headers: self.trust_proxy_headers,
+            max_concurrent_executions: self.max_concurrent_executions as i64,
+            trusted_proxies: self.trusted_proxies.clone(),
         }
     }
 }
@@ -249,7 +215,6 @@ fn env_required(key: &str) -> anyhow::Result<String> {
     std::env::var(key).with_context(|| format!("required env var {key} is not set"))
 }
 
-/// 文字列の任意 env。欠損／空（trim 後）は `None`。値は `trim()` する。
 fn env_optional(key: &str) -> Option<String> {
     std::env::var(key).ok().and_then(|v| {
         let t = v.trim();
@@ -261,16 +226,12 @@ fn env_optional(key: &str) -> Option<String> {
     })
 }
 
-/// 文字列の任意 env。欠損は default。値は `trim()` する
-/// （Makefile の `include .env` 経由で末尾空白が混入しても壊れないようにする）。
 fn env_or(key: &str, default: &str) -> String {
     std::env::var(key)
         .map(|v| v.trim().to_string())
         .unwrap_or_else(|_| default.to_string())
 }
 
-/// bool の任意 env。欠損は default。`1/true/yes/on`（大文字小文字無視）を真とする。
-/// 値は `trim()` する（Makefile include 経由の末尾空白対策）。
 fn env_bool(key: &str, default: bool) -> bool {
     match std::env::var(key) {
         Ok(v) => matches!(
@@ -281,9 +242,6 @@ fn env_bool(key: &str, default: bool) -> bool {
     }
 }
 
-/// u64 の任意 env。欠損は default、不正値はエラー。
-///
-/// 値は `trim()` してからパースする（同上の理由で末尾空白を許容する）。
 fn env_u64(key: &str, default: u64) -> anyhow::Result<u64> {
     match std::env::var(key) {
         Ok(v) => v
@@ -291,5 +249,83 @@ fn env_u64(key: &str, default: u64) -> anyhow::Result<u64> {
             .parse::<u64>()
             .with_context(|| format!("env var {key} must be a non-negative integer")),
         Err(_) => Ok(default),
+    }
+}
+
+pub(crate) fn parse_secret_keyring(
+    active_kid: &str,
+    active_raw: &str,
+    retired_raw: &str,
+) -> anyhow::Result<crate::secrets::SecretKeyring> {
+    let active = crate::signing::decode_key32(active_raw, "SECRETS_MASTER_KEY")?;
+
+    let mut retired = Vec::new();
+    for entry in retired_raw.split(',') {
+        let entry = entry.trim();
+        if entry.is_empty() {
+            continue;
+        }
+        let (kid, raw) = entry.split_once(':').ok_or_else(|| {
+            anyhow::anyhow!("SECRETS_RETIRED_KEYS entries must be 'kid:key' (comma separated)")
+        })?;
+        let kid = kid.trim();
+        if kid.is_empty() {
+            anyhow::bail!("SECRETS_RETIRED_KEYS: empty kid");
+        }
+        retired.push((
+            kid.to_string(),
+            crate::signing::decode_key32(raw.trim(), "SECRETS_RETIRED_KEYS")?,
+        ));
+    }
+
+    Ok(crate::secrets::SecretKeyring::new(
+        active_kid.to_owned(),
+        active,
+        retired,
+    ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test(start_paused = true)]
+    async fn admitted_default_traffic_can_redeem_secrets() {
+        use crate::store::{InProcStore, RateLimitParams, Store};
+        let store = InProcStore::new();
+        let public = RateLimitParams {
+            refill_per_sec: DEFAULT_INVOKE_RATE_PER_SEC as f64,
+            capacity: DEFAULT_INVOKE_BURST as f64,
+        };
+        let internal = RateLimitParams {
+            refill_per_sec: DEFAULT_JOB_ENV_EXCHANGE_RATE_PER_MIN as f64 / 60.0,
+            capacity: DEFAULT_JOB_ENV_EXCHANGE_RATE_PER_MIN as f64,
+        };
+        // Initial public burst, then two minutes at the admitted steady rate.
+        // The previous 600/min internal default exhausted while public admission
+        // still succeeded, turning otherwise valid Secret-backed HTTP into 502s.
+        let mut previous = 0;
+        for now in
+            std::iter::repeat_n(0, DEFAULT_INVOKE_BURST as usize).chain((20..=120_000).step_by(20))
+        {
+            tokio::time::advance(std::time::Duration::from_millis(now - previous)).await;
+            previous = now;
+            assert!(store.rate_limit("public", public).await.unwrap().allowed);
+            for key in ["env-peer", "env-tenant"] {
+                assert!(store.rate_limit(key, internal).await.unwrap().allowed);
+            }
+        }
+    }
+
+    #[test]
+    fn debug_never_reveals_secrets() {
+        let secret_like = "SENTINEL-DO-NOT-LOG";
+        let wrapped = Redacted::new(secret_like.to_string());
+        let rendered = format!("{wrapped:?}");
+        assert!(
+            !rendered.contains(secret_like),
+            "config secrets must never render in Debug output: {rendered}"
+        );
+        assert_eq!(rendered, "<redacted>");
     }
 }

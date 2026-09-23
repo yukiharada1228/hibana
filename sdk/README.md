@@ -1,0 +1,250 @@
+# Hibana CLI
+
+このソースは候補版`0.2.0-rc.4`です。npm に公開した版は `npx` で利用できます。未公開の候補を試す場合は[候補版の導入手順](../docs/release-candidate.md)を使ってください。
+
+Hibanaの実行契約はWebAssembly Componentです。Honoは対応するJavaScriptフレームワークの一つで、専用SDKのインポートは必要ありません。
+
+Node API などの追加機能は、ユーザーが用意した JS モジュールや Rust 製 Wasm 部品を `extensions` でアプリに同梱できます。本体に互換ランタイムを追加せず、合成した `.wasm` を通常の `deploy` でアップロードします。[設定と実装例](../docs/application-extensions.md)を参照してください。
+
+外向き TCP/TLS が必要なアプリには、任意パッケージ [@hibana/node-net](../extensions/node-net/README.md)・[@hibana/node-tls](../extensions/node-tls/README.md) を追加できます。対応する Node API は限定的で、通信には配備先の管理者による許可が必要です。
+
+Stream は [機能別の入口](../extensions/node-stream/README.md)から必要な API を import します。例えば PassThrough だけなら `@hibana/node-stream/passthrough` を使います。通常の `node:stream` は複数の API をまとめて使う入口として維持しています。
+
+PostgreSQL は [postgres-core に必要な通信・認証を組み合わせる](../extensions/postgres-core/README.md)構成を基本とします。Pool または Drizzle が必要な場合だけ `postgres-pool` を追加します。既存ライブラリの `pg` import には、接続先に合わせた [プリセット](../extensions/README.md#複数の機能をまとめて使うプリセット)も使えます。[検証範囲](../docs/postgres-compatibility.md)を確認してください。
+
+拡張の名前と取得元は `hibana.json` だけに書きます。`build`・`dev`・`deploy` が `.hibana/` に取得し、`hibana-lock.json` で依存を固定します。アプリの `package.json` と `node_modules` は通常の JS 依存だけに使います。例えば次の設定で、依存同梱版の PostgreSQL 拡張を利用できます。
+
+```json
+"extensions": {
+  "@hibana/postgres-scram": "./vendor/hibana-postgres-scram-0.7.5-bundle.tgz"
+}
+```
+
+`hibana-lock.json` は Git に保存し、CI では `hibana build --frozen-lockfile` を使います。取得元には HTTPS の `.tgz` URL や公開済みパッケージの完全なバージョンも指定できます。ローカル拡張の配列形式は開発・互換用に維持します。[詳細と移行手順](../docs/application-extensions.md)。
+
+```ts
+import { Hono } from 'hono'
+
+const app = new Hono()
+
+app.get('/', (c) => c.text('Hello from Hono on Hibana 🔥'))
+
+export default app
+```
+
+素のJavaScript/TypeScriptでも、`export default { fetch(request, env, context) { ... } }`を使えます。CLI内部の共通変換層がFetch APIをWASI HTTPへ接続します。[Honoのfetch契約](https://hono.dev/docs/api/hono#fetch)をそのまま利用します。
+
+## CLIの導入とテンプレート
+
+CLIはNode.js 24以上が必要です。ローカル実行ランタイムは初回の`dev`で自動取得し、Kubernetes基盤は管理者が別途導入します。開発者のPCに基盤のソースやDocker/kubectlは不要です。[リモートCLI構成・配布・オンプレ接続](../docs/remote-cli.md)に全手順があります。CLI は npm の `@yukiharada1228/hibana` と GitHub Releases の tarball で配布します。初回作成にはバージョンを指定した `npx` を使えます。作成後のHono・JavaScriptプロジェクトでは、プロジェクト内のCLIをnpm scriptsから実行します。
+
+[コンソール](../docs/console.md)のある基盤には`hibana login --url https://hibana.example.internal/api ...`で接続できます。ブラウザでは同じホストの`https://hibana.example.internal/`を開きます。CLIとコンソールは同じ管理APIを使い、配備済みアプリの実行・配信は接続先のKubernetesが担当します。
+
+```bash
+npx --yes @yukiharada1228/hibana@0.2.0-rc.4 init my-app
+cd my-app
+npm run dev
+```
+
+`hibana init`や`hibana login`を直接実行したい場合は、グローバルインストールも利用できます。以下は指定した版のnpm公開後に実行します。
+
+```bash
+npm install -g @yukiharada1228/hibana@0.2.0-rc.4
+hibana init my-app
+cd my-app
+npm run dev
+```
+
+どちらの方法でも、生成する`package.json`は次の構成です。CLIのバージョンは`init`を実行した版に固定します。
+
+```json
+{
+  "scripts": {
+    "dev": "hibana dev",
+    "build": "hibana build",
+    "deploy": "hibana deploy"
+  },
+  "devDependencies": {
+    "@yukiharada1228/hibana": "0.2.0-rc.4"
+  }
+}
+```
+
+`npm run`はプロジェクト内のCLIを優先するため、グローバル版を更新しても各プロジェクトのCLIは変わりません。`package.json`と`package-lock.json`をGitに保存し、別のPCやCIでは`npm ci`で開発依存も導入してください。ビルド・配備にはCLIが必要です。
+
+既存のnpx形式のプロジェクトは、プロジェクト内で次のように移行できます。アプリの依存や`test`などのscriptsは維持されます。
+
+```bash
+npm install --save-dev --save-exact @yukiharada1228/hibana@0.2.0-rc.4
+npm pkg set 'scripts.dev=hibana dev' 'scripts.build=hibana build' 'scripts.deploy=hibana deploy'
+```
+
+| `--template` | アプリの記述 | 必要なビルドツール |
+|---|---|---|
+| `hono` | 通常のHonoをdefault export | Node.js、npm、JSコンパイラー依存 |
+| `javascript` | Fetch handlerのTypeScript | Node.js、npm、JSコンパイラー依存 |
+| `rust` | RustのWASI HTTP handler | Rust、`wasm32-wasip2`ターゲット |
+| `go` | GoのWASI HTTP handler | Go 1.25.9以上、固定したcomponentize-go v0.4.2 |
+
+`init`は空のディレクトリに生成します。Honoプロジェクトの`dependencies`は`hono`、`devDependencies`はCLIです。素のJavaScriptプロジェクトにもCLIを`devDependencies`として導入します。未公開の候補や閉域環境では`--cli-package PATH`でtarballや開発用ディレクトリを指定すると、CLIの取得元をそのローカルパッケージに置き換えます。`--no-install`でnpmインストールを省略できます。Rust・Goにはnpm依存を生成しません。CLIの実装自体はどの言語でもNode.jsを使用します。
+
+Rust・Go・ビルド済みComponentだけを扱う場合、`npm ci --prefix sdk --omit=optional --omit=dev`でJSコンパイラーとHonoをインストールせずにCLIを使えます。JS向けビルドを追加するときは`npm ci --prefix sdk`を実行してください。
+
+```bash
+# リポジトリのルートで実行
+rustup target add wasm32-wasip2
+node sdk/src/cli.mjs init my-rust --template rust
+node sdk/src/cli.mjs dev -c my-rust/hibana.json --runtime /opt/hibana/bin/hibana-worker
+
+node sdk/src/cli.mjs init my-go --template go
+node sdk/src/cli.mjs dev -c my-go/hibana.json --runtime /opt/hibana/bin/hibana-worker
+node sdk/src/cli.mjs deploy -c my-go/hibana.json
+```
+
+Goの`componentize-go`は`go.mod`のtool依存として固定しています。初回のビルドで公式バイナリとGo依存を取得します。バインディングは`bindings/`へ生成し、アプリの`go.mod`やHTTP実装を上書きしません。Goサンプルは生成されたWASI HTTPバインディングを使用します。既存の`net/http.ListenAndServe`アプリを無変更で動かす機能ではありません。[公式ツール](https://github.com/bytecodealliance/componentize-go/tree/v0.4.2)を利用しています。
+
+Rust・GoのプロジェクトにはWIT定義と依存ロックもコピーされるので、生成後のビルドはHibana固有の言語SDKに依存しません。Honoテンプレートは公式の最小サンプルの応答テキストを変更した`GET /`だけです。JavaScript・Rust・Goには`GET /`とバイナリを返す`POST /echo`があります。Rust・Goサンプルのecho入力上限は1 MiBです。
+
+以降の `hibana ...` は、CLIを導入済みのHono・JavaScriptプロジェクト内では `npm exec -- hibana ...` として実行できます。グローバル導入済みなら直接 `hibana ...` を使えます。プロジェクト作成前やRust・Goでは `npx --yes @yukiharada1228/hibana@0.2.0-rc.4 ...` も使えます。
+
+## ローカルで外部DBへ接続する
+
+PostgreSQLなど外向き通信を使う拡張は、ローカル開発用の接続先を`hibana.json`に指定します。
+
+```json
+"dev": {
+  "allow_outbound": ["db.example.com:5432"]
+}
+```
+
+指定できるのは最大64件の`HOST:PORT`または`[IPv6]:PORT`です。URL・パスワード・ワイルドカードは指定できません。設定したホストの公開IPとポートだけを許可し、リクエストごとにDNSを解決して接続先を固定します。ループバック・プライベートIP・リンクローカルなどの内部IPへの接続は引き続き拒否します。ローカル設定は配備先の`hibana egress allow`と独立しており、配備時には送信しません。
+
+接続文字列はプロジェクトの`.dev.vars`へ保存します。このファイルはGitに含めません。配備先のSecretは自動取得しません。
+
+```dotenv
+DATABASE_URL="postgresql://USER:PASSWORD@db.example.com:5432/DB?sslmode=require&channel_binding=require"
+```
+
+```bash
+npm run dev
+```
+
+`hibana.json`や`.dev.vars`を変更すると開発サーバーが再起動します。この機能には対応するCLIとPC用ランタイムの両方が必要です。ソースから検証するときは`cargo build --locked -p hibana-worker`でランタイムを作り、`hibana dev --runtime /path/to/hibana/target/debug/hibana-worker`で指定できます。
+
+## アプリと基盤の操作
+
+`hibana --help`で基本の流れとコマンド一覧、`hibana dev --help`でその操作のオプションと実行例を確認できます。`hibana help deploy`の形式も使えます。`runtime`や`platform`などのサブコマンドも同じ形式でヘルプを表示します。
+
+`list`・`secret list`・`egress list`は人が読める一覧を表示します。スクリプトから従来のJSONを読む場合は`hibana list --json`のように`--json`を指定してください。`deploy`はビルド前に認証と権限を確認し、接続先・テナント・アプリ名を表示します。成功時は短いバージョンと公開URL、`--verbose`を付けると内部IDと完全なバージョンも表示します。
+
+不明なコマンド、未対応のオプション、余分な引数は実行前にエラーにします。たとえば`hibana deploy --dry-run`は未対応なので、配備せずに使い方を案内します。CLIの設計方針は[CLIの操作設計](../docs/cli-design.md)にまとめています。
+
+```bash
+hibana dev                         # ローカル開発。Ctrl+Cで停止
+hibana deploy                      # hibana.jsonのアプリを配備
+hibana list                        # 現在のテナントのアプリ
+hibana delete                      # hibana.jsonのnameを削除
+hibana delete my-app --dry-run      # 削除対象を確認
+hibana delete my-app --yes   # 名前を指定して削除
+hibana delete --all --yes           # 現在のテナントの全アプリ
+hibana list --all-tenants
+hibana delete --all --all-tenants --yes
+# 基盤管理者のみ: 既存オンプレのKubernetes資格情報で操作
+hibana platform init my-site       # サイト用設定と秘密値ファイルを生成
+hibana platform status --kubeconfig /secure/config --context onprem
+hibana platform stop --kubeconfig /secure/config --context onprem
+hibana platform start --kubeconfig /secure/config --context onprem
+hibana platform uninstall --kubeconfig /secure/config --context onprem --yes
+```
+
+`delete [NAME]`で名前を指定し、省略時は`--config/-c`の設定から読みます。`--dry-run`で確認でき、`--yes/-y`は確認を省略しますが、実行中アプリの削除を拒否するサーバー側の保護は無効化しません。削除にはRead・Adminスコープを持つテナント管理者の認証情報が必要です。Read・Deployだけでは削除できません。ソースコードやビルドツールは不要です。`--all-tenants`はプラットフォーム管理者用の`BOOTSTRAP_ADMIN_TOKEN`が必要です。
+
+削除は公開URLと通常の一覧からアプリを除き、実行履歴とWasm成果物を残します。同じ名前で再デプロイ可能です。基盤の停止はデータを保持します。Kubernetesの導入条件・既存クラスタへの配備・撤去範囲は[基盤管理ガイド](../deploy/kubernetes/README.md)を参照してください。
+
+## hibana.json
+
+JS系は`main`を指定します。
+
+```json
+{
+  "name": "my-app",
+  "main": "src/index.ts",
+  "vars": {},
+  "limits": { "memory_mb": 256, "timeout_ms": 15000 }
+}
+```
+
+その他の言語はビルド手順と出力先を指定します。次はRustの例です。
+
+```json
+{
+  "name": "my-rust",
+  "component": "target/wasm32-wasip2/release/hibana_http_app.wasm",
+  "build": {
+    "commands": [["cargo", "build", "--release", "--target", "wasm32-wasip2"]],
+    "watch": ["src", "Cargo.toml", "Cargo.lock", "wit"]
+  }
+}
+```
+
+- `main`と`component`は排他。ビルド済みWasmは`"component":"./app.wasm"`だけで指定できます。
+- `build`は`component`と組み合わせます。`commands`は引数配列のリストで、プロジェクトのディレクトリで順に実行します。暗黙のシェル展開は行いません。失敗時は配備せず、前回の完成済み成果物を保持します。
+- `build.watch`はソースファイル・ディレクトリの相対パスです。globは使えません。生成コードを含めないことで再ビルドのループを避けます。設定ファイルと`.dev.vars`は常に監視します。
+- WASI HTTP Component専用です。`http`設定は不要で、指定するとエラーになります。bytes handlerや非同期invokeは提供しません。
+- `memory_mb`: 1–1024、既定256。
+- `memory_mb`は実行内のWasm線形メモリの合計上限です。ホストのHTTPバッファ・コンパイル・コードキャッシュを含むPod全体のメモリとは異なります。Wasm threadsは対象外です。
+- `timeout_ms`: 1–30000、既定15000。ホスト処理込みの期限はさらに5秒。
+- `fuel`: 任意の正整数。Wasmtimeの命令量上限。
+- `vars`: 文字列の環境変数。JSは`fetch`の第2引数（Honoでは`c.env`）、Rust・GoはWASI環境変数として使用します。NUL文字（U+0000）は指定できません。CLIとサーバーで拒否するため、含まれている場合は値から除去してください。
+
+CLIはComponentのヘッダーを確認します。WITの一致や全体の検証はランタイム・配備先が行います。`GOOS=wasip1 GOARCH=wasm go build`だけで生成したcore Wasmをそのまま配備することはできません。
+
+完成した成果物は `.hibana/build/artifacts/<SHA-256>.wasm` に保存し、`build` がそのパスを返します。`deploy` と `dev` も同じ固定ファイルを使うため、並行ビルドで別のコードに置き換わりません。`.hibana/build/app.wasm` は最新ビルドのコピーです。同じ内容は再利用し、過去の成果物は保持します。実行中の `build`・`deploy`・`dev` がないときに `.hibana/build/` を削除するとキャッシュを整理できます。
+
+macOS・Linuxでは、Ctrl+CやSIGTERMを実行中のビルドコマンド・拡張機能のnpm処理とその子孫へ伝えます。終了しなければ5秒後に強制終了します。`platform`のPython処理は操作ロックの解放を待つため35秒まで待ちます。`dev`はビルドとランタイム取得を中断し、起動済みランタイムの終了を待って停止します。
+
+## 開発・配備・Secrets
+
+`dev`は完成したComponentを`hibana-worker --dev-component`で動かします。`--runtime`、`HIBANA_RUNTIME_BIN`、CLIと同じバージョンの管理済みランタイム、PATHの順に選択します。見つからなければ、CLIと同じバージョンの対応OS/CPU版をGitHub Releasesから自動取得し、SHA-256を検証して保存します。次回以降は保存済みのランタイムを再利用します。
+
+`dev`がランタイムの準備と起動をまとめて行います。事前準備には`hibana runtime install`、閉域環境への搬入には`hibana runtime install --from FILE --sha256 HASH`を使い、導入後は通常どおり`hibana dev`で起動します。手元の実行ファイルを使う場合は`--runtime PATH`または`HIBANA_RUNTIME_BIN`を指定できます。ビルド失敗時は起動済みの開発サーバーを維持します。`--no-watch`で監視を無効にできます。
+
+ローカル専用の秘密値は`.dev.vars`にdotenv形式で書きます。値は`vars`より優先します。`.hibana/`と`.dev.vars`をバージョン管理に含めないでください。サーバーのSecretsは管理者が`hibana secret put NAME`の標準入力から登録し、`hibana secret allow-deploy NAME`でそのアプリへの利用を許可します。`hibana.json`に`"secrets": ["NAME"]`を指定し、通常の開発者が`deploy`します。省略時は空配列で、Secretを自動列挙・注入しません。`secret deny-deploy NAME`は今後の配備だけを拒否します。既存バージョンでの利用も止める場合は`secret delete NAME`を使います。
+
+外部 DB などへの通信は、管理者が初回配備後に `hibana egress allow db.example.com:5432` で許可します。`hibana egress list` で確認し、`hibana egress deny db.example.com:5432` で取り消します。アプリの全バージョンに共通で適用し、以後の `deploy` にも引き継ぎます。拡張や hibana.json は権限を自動付与しません。[コンソールでも同じ設定を操作](../docs/console.md#外部通信先の管理)できます。
+
+`hibana login --profile onprem --url https://api.example.internal --tenant team`を実行し、開いたブラウザで組織のアカウントにログインします。接続先と認証はPC共通のプロファイルに保存し、`--profile onprem`で選択できます。`HIBANA_URL`・`HIBANA_TENANT`でも接続先を設定できます。CIでは専用APIトークンを`HIBANA_TOKEN`に設定します。ログインはOIDCのみで、パスワードをHibanaに渡しません。[OIDC設定と移行手順](../docs/authentication.md)を参照してください。
+
+配備先を変えた場合、保存済みの別サーバーのトークンは再利用しません。`deploy --version 1.0.0`で版を指定できます。名前は1〜128文字のASCII文字列で、先頭を英数字、残りを英数字または `.`・`_`・`+`・`-` にします。省略時は一意な開発版を採番します。
+
+プロファイルを変更するコマンドは、保存先の `profiles.json.lock` で同時更新を調整します。5秒待っても利用中ならエラーになります。コマンドの異常終了でロックが残った場合は、プロファイルを変更する Hibana コマンドが動いていないことを確認してから、エラーに表示されたロックディレクトリを削除して再実行してください。
+
+実行用Workerが設定された配備先では、`deploy`はWorkerでの事前コンパイルを待ってから公開します。初回HTTPへのコンパイル待ちを避けるため、その時間はデプロイ所要時間に含まれます。準備に失敗すると配備はエラーになり、旧版の公開設定を維持します。`rollback`も切替先を準備してから公開します。
+
+`hibana rollback`で直前の版へ、`hibana rollback --version 1.0.0`で指定した版へ戻します。コード・環境変数・選択したSecretsの参照を一緒に戻します。Secretsの値・外部データは巻き戻しません。Canaryや重み付き配分はありません。
+
+## 実行モデルと制限
+
+HTTPの契約は`wasi:http/incoming-handler@0.2.3`です。Hono・JS系はesbuildでバンドルし、ComponentizeJS/StarlingMonkeyでComponentに変換します。変換層は`src/javascript.mjs`に閉じており、Rust・Go・既存Componentの配備はJSエンジンを経由しません。`waitUntil`はWASI実行の完了と資源制限の対象です。
+
+コンパイル済みコードはWorkerごとに再利用し、Store・Wasmインスタンスはリクエストごとに新しく作ります。追加・交換されたWorkerはバックグラウンドで準備され、その間の呼び出しは準備済みWorkerへ送ります。全候補が未準備の場合は準備完了まで503を返します。KubernetesのReadyだけで全アプリの準備完了を保証するものではありません。
+
+本番Workerとdevは同じRust実行モジュールを使います。ただしdevは認証なしのloopback HTTPサーバーで、基盤DB・配布・課金・分散処理はありません。外向き通信はdevでは`dev.allow_outbound`の指定、本番では管理者の承認が必要です。JSのPOSTなどの入力は変換層でバッファします。レスポンスはストリーム可能ですが、WebSocket・完全なNode.js互換・Workers Bindingは提供しません。Preview 1単体や任意のWIT worldも未対応です。
+
+バージョンの公開は単一DBトランザクションで行います。コード・vars・選択したSecretsの参照・active版・公開設定が揃って反映され、失敗した配備は稼働中の設定を変えません。初回のアプリ作成は別操作で、失敗時に未公開の空アプリが残る場合があります。詳細と旧環境の移行手順は[デプロイ仕様](../docs/deployment.md)を参照してください。
+
+## オンプレでの役割分担
+
+基盤管理者がKubernetes上のHibana、管理APIのHTTPS、アプリ用DNS/TLS、テナントを用意します。アプリ開発者は配布された管理APIのURLとテナントの認証情報を設定して、同じ`hibana`コマンドで配備します。アプリの配備にkubeconfigやクラスタ管理権限は不要です。通常のdeploy・rollbackに必要なのはRead・Deployスコープです。Secretsの保存・利用許可はAdminスコープとAdminロールを持つテナント管理者が行います。トークンはテナント単位で、アプリ単位の権限制限はありません。
+
+Wranglerを参考にするのは、この短い開発・配備の流れです。サーバーの契約はWASI HTTPに統一し、Hono・JS/TS・Go・Rustのどれも共通の制限と認証を通します。ビルド工程と実行工程の信頼境界、本番前の検証項目は[セキュリティ境界](../docs/security.md)を参照してください。
+
+## 候補版の設定整理
+
+配布拡張は `extensions` に名前と取得元を指定します。アプリの npm 依存や旧 `extensions.packages`、直接の aliases/WIT 設定からの移行は[アプリ拡張](../docs/application-extensions.md#旧候補版の設定から移行する)を参照してください。
+
+重複していた `delete --name NAME` / `--force` は `delete NAME` / `--yes` に、`platform --local --source PATH` は `platform --source PATH` に統一しました。ログインはユーザー設定領域のプロファイル、CI は `HIBANA_URL` / `HIBANA_TOKEN` を使います。旧 `.hibana/auth.json` は読み書きしないため、使用していた場合は `hibana login` で再ログインしてください。既存の認証ファイル自体は削除しません。
+
+`list` は選択した接続先の一覧操作なので `--config` を受け付けません。接続先は `--profile` または `--url` で指定してください。
+
+ソースの整形は `npm run format`、検査は `npm run format:check`、回帰テストは `npm test` です。設定・拡張の検証、ビルド計画、コンパイル、合成の順に処理し、入力設定に生成パスを混ぜません。

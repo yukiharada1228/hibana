@@ -1,0 +1,24 @@
+{
+  "name": "@hibana/node-net",
+  "version": "0.6.4",
+  "private": true,
+  "type": "module",
+  "license": "MIT",
+  "exports": {
+    ".": "./src/index.mjs",
+    "./hibana.extension.json": "./hibana.extension.json",
+    "./socket": "./src/socket.mjs"
+  },
+  "files": [
+    "hibana.extension.json",
+    "README.md",
+    "LICENSE",
+    "src/"
+  ],
+  "dependencies": {
+    "@hibana/node-stream": "0.7.0",
+    "@hibana/node-buffer": "0.5.0",
+    "@hibana/tcp": "0.5.0",
+    "@hibana/dns": "0.5.0"
+  }
+}

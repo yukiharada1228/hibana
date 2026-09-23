@@ -6,12 +6,28 @@
 
 # build artifacts / caches
 **/*.rs.bk
+__pycache__/
 *.wasm
 *.cwasm
 
 # ローカル開発のランタイム生成物
-/components-dist
 /worker-cache
 
 # サンドボックス専用のツールチェイン補正（絶対パスを含むためコミットしない）
 /.cargo
+
+# Isolated Kubernetes development cluster credentials and rendered local secrets.
+/.local/
+
+# Hibana CLI build output and local credentials
+.hibana/
+.dev.vars
+
+# Generated public manifests for npm pack
+/sdk/platform/manifests/
+
+# CLI license copied from the repository license when packing
+/sdk/LICENSE
+
+# Finder metadata
+.DS_Store

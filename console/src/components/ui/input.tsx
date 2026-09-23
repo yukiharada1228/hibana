@@ -1,0 +1,34 @@
+// Portions derived from or inspired by digital-go-jp/design-system-example-components-react.
+// Original code licensed under the MIT License.
+// See THIRD_PARTY_LICENSES.md for details.
+import * as React from "react";
+
+import { cn } from "@/lib/digital-agency/cn";
+
+type InputProps = Omit<React.ComponentProps<"input">, "placeholder"> & {
+  blockSize?: "lg" | "md" | "sm";
+  placeholder?: never;
+};
+
+const isAriaDisabled = (value: unknown) => value === true || value === "true";
+
+const Input = React.forwardRef<HTMLInputElement, InputProps>((props, ref) => {
+  const { className, readOnly, blockSize = "lg", ...rest } = props;
+
+  return (
+    <input
+      data-slot="input"
+      className={cn(
+        "max-w-full rounded-8 border bg-white px-4 py-3 border-solid-gray-600 text-oln-16N-100 text-solid-gray-800 hover:[&:read-write]:border-black data-[size=sm]:h-10 data-[size=md]:h-12 data-[size=lg]:h-14 aria-[invalid=true]:border-error-1 aria-[invalid=true]:[&:read-write]:hover:border-red-1000 focus:outline focus:outline-4 focus:outline-black focus:outline-offset-[calc(2/16*1rem)] focus:ring-[calc(2/16*1rem)] focus:ring-yellow-300 read-only:border-dashed aria-disabled:border-solid-gray-300 aria-disabled:!border-solid aria-disabled:bg-solid-gray-50 aria-disabled:text-solid-gray-420 aria-disabled:pointer-events-none aria-disabled:forced-colors:text-[GrayText] aria-disabled:forced-colors:border-[GrayText]",
+        className,
+      )}
+      data-size={blockSize}
+      readOnly={isAriaDisabled(props["aria-disabled"]) ? true : readOnly}
+      ref={ref}
+      {...rest}
+    />
+  );
+});
+Input.displayName = "Input";
+
+export { Input };

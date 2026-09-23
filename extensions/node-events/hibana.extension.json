@@ -1,0 +1,7 @@
+{
+  "schemaVersion": 2,
+  "runtime": "wasi:http/incoming-handler@0.2.3",
+  "aliases": {
+    "node:events": "./src/index.mjs"
+  }
+}
