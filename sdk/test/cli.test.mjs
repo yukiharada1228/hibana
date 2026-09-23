@@ -219,3 +219,48 @@ test("platform dry-run invokes the operator checks and never asks for deletion c
     assert.doesNotMatch(result.stderr, /--yes/);
   }
 });
+
+test("platform init can provision isolated Keycloak configuration without exposing or replacing credentials", async t => {
+  const f = await fixture(t);
+  const directory = join(f.root, "site");
+  const created = await f.invoke(["platform", "init", directory, "--with-keycloak"]);
+  assert.equal(created.code, 0, created.stderr);
+  const identity = join(directory, "identity");
+  for (const file of ["README.md", "kustomization.yaml", "namespace.yaml", "postgres.yaml", "keycloak.yaml", "config.yaml", "ingress.yaml", "network-policy.yaml", "realm.example.json"]) {
+    assert.ok((await readFile(join(identity, file), "utf8")).length, file);
+  }
+  const credentials = await readFile(join(directory, "control-plane.env"), "utf8");
+  const clientSecret = credentials.match(/^OIDC_CLIENT_SECRET=([a-f0-9]{64})$/m)?.[1];
+  assert.ok(clientSecret);
+  assert.equal(await readFile(join(identity, "client.env"), "utf8"), `HIBANA_OIDC_CLIENT_SECRET=${clientSecret}\n`);
+  const secrets = [clientSecret];
+  for (const file of ["database.env", "bootstrap-admin.env"]) {
+    const contents = await readFile(join(identity, file), "utf8");
+    secrets.push(contents.match(/PASSWORD=([a-f0-9]{64})/)?.[1]);
+  }
+  assert.ok(secrets.every(Boolean));
+  assert.equal(new Set(secrets).size, 3);
+  for (const secret of secrets) assert.ok(!(created.stdout + created.stderr).includes(secret));
+  for (const file of ["database.env", "bootstrap-admin.env", "client.env", "imports/hibana-realm.json"]) {
+    assert.equal((await stat(join(identity, file))).mode & 0o777, 0o600);
+  }
+  assert.equal((await stat(join(identity, "imports"))).mode & 0o777, 0o700);
+  const ignored = await readFile(join(identity, ".gitignore"), "utf8");
+  assert.match(ignored, /\*\.env/);
+  assert.match(ignored, /\/imports\//);
+  // Identity is independently deployed, not part of Hibana's managed inventory.
+  assert.doesNotMatch(await readFile(join(directory, "kustomization.yaml"), "utf8"), /identity/);
+  const realm = JSON.parse(await readFile(join(identity, "imports/hibana-realm.json"), "utf8"));
+  assert.equal(realm.users, undefined);
+  assert.equal(realm.clients[0].secret, "${HIBANA_OIDC_CLIENT_SECRET}");
+  const repeated = await f.invoke(["platform", "init", directory, "--with-keycloak"]);
+  assert.equal(repeated.code, 1);
+  assert.match(repeated.stderr, /Directory is not empty/);
+  assert.equal(await readFile(join(directory, "control-plane.env"), "utf8"), credentials);
+  const another = join(f.root, "another");
+  assert.equal((await f.invoke(["platform", "init", another, "--with-keycloak"])).code, 0);
+  assert.notEqual(await readFile(join(another, "identity/client.env"), "utf8"), `HIBANA_OIDC_CLIENT_SECRET=${clientSecret}\n`);
+  const wrongAction = await f.invoke(["platform", "install", "--with-keycloak"]);
+  assert.equal(wrongAction.code, 1);
+  assert.match(wrongAction.stderr, /--with-keycloak.*not supported/);
+});

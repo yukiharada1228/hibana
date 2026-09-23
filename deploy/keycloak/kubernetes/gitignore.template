@@ -1,0 +1,6 @@
+*.env
+/imports/
+*.dump
+*.tar*
+*.pem
+*.key

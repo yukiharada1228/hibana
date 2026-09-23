@@ -1,8 +1,11 @@
-import { cp, mkdir, readdir, writeFile } from "node:fs/promises";
+import { chmod, cp, mkdir, readdir, rename, writeFile } from "node:fs/promises";
 import { resolve, join } from "node:path";
 import { randomBytes } from "node:crypto";
 
-export async function initPlatform(directory = "hibana-platform") {
+export async function initPlatform(
+  directory = "hibana-platform",
+  { withKeycloak = false } = {},
+) {
   const root = resolve(directory);
   await mkdir(root, { recursive: true, mode: 0o700 });
   if ((await readdir(root)).length)
@@ -20,6 +23,9 @@ export async function initPlatform(directory = "hibana-platform") {
     new URL("../platform/manifests/remote/ingress.yaml", import.meta.url),
     join(root, "ingress.yaml"),
   );
+  const clientSecret = withKeycloak
+    ? randomBytes(32).toString("hex")
+    : "CHANGE_ME";
   const files = {
     "kustomization.yaml": `apiVersion: kustomize.config.k8s.io/v1beta1
 kind: Kustomization
@@ -51,10 +57,10 @@ data:
   S3_BUCKET: CHANGE_ME
   APP_PUBLIC_ORIGIN: https://CHANGE_ME
   TRUSTED_PROXY_CIDRS: CHANGE_ME_TRUSTED_PROXY_CIDRS
-  OIDC_ISSUER_URL: https://CHANGE_ME/realms/hibana
+  OIDC_ISSUER_URL: https://${withKeycloak ? "auth.example.internal" : "CHANGE_ME"}/realms/hibana
   OIDC_CLIENT_ID: hibana
-  OIDC_CALLBACK_URL: https://CHANGE_ME/api/auth/oidc/callback
-  OIDC_CONSOLE_URL: https://CHANGE_ME/
+  OIDC_CALLBACK_URL: https://${withKeycloak ? "hibana.example.internal" : "CHANGE_ME"}/api/auth/oidc/callback
+  OIDC_CONSOLE_URL: https://${withKeycloak ? "hibana.example.internal" : "CHANGE_ME"}/
   OIDC_SESSION_TTL_SECS: "900"
 `,
     "egress.yaml": `# Use the address ranges and ports of your external dependencies.
@@ -96,7 +102,7 @@ spec:
     "control-plane.env": `REDIS_URL=redis://CHANGE_ME
 S3_ACCESS_KEY=CHANGE_ME
 S3_SECRET_KEY=CHANGE_ME
-OIDC_CLIENT_SECRET=CHANGE_ME
+OIDC_CLIENT_SECRET=${clientSecret}
 BOOTSTRAP_ADMIN_TOKEN=${randomBytes(32).toString("hex")}
 JOB_SIGNING_KEY=${randomBytes(32).toString("hex")}
 SECRETS_MASTER_KEY=${randomBytes(32).toString("hex")}
@@ -104,13 +110,14 @@ SECRETS_MASTER_KEY=${randomBytes(32).toString("hex")}
     "migration.env": "MIGRATION_DATABASE_URL=postgres://CHANGE_ME\n",
     ".gitignore": "*.env\n*.pem\n*.key\n",
     "README.md": `# Hibana site configuration
+${withKeycloak ? "\nKeycloak configuration is in identity/. Follow identity/README.md to configure DNS/TLS, deploy it separately, and provision users before installing Hibana. The matching OIDC client secret has already been generated. platform install/stop/uninstall on an existing cluster do not manage identity/.\n" : ""}
 
 1. Fill in runtime.env, control-plane.env and migration.env with your PostgreSQL, Redis and S3 credentials. Keep the generated signing, master and bootstrap keys; back them up securely.
 2. Update site.yaml with your S3 endpoint, bucket and application domain. Set TRUSTED_PROXY_CIDRS to the comma-separated source IP CIDRs of your console and Ingress proxies (single IPs use /32 or /128). Include each trusted hop; do not include ordinary clients or untrusted workloads. The outside Ingress must overwrite X-Forwarded-For with the actual client address, or securely append its peer and trust only known upstream proxies.
 3. Update ingress.yaml with your management hostname, per-tenant app hostname, IngressClass and TLS Secret names. Provision the TLS Secrets in namespace hibana or include them as resources in this overlay. Label the Ingress controller namespace as described in ingress.yaml.
    Update console/ingress.yaml with the intranet console hostname and TLS Secret. Set a released console image (prefer a digest) in console/kustomization.yaml. Browser users open https://CONSOLE_HOST/; the CLI can use https://CONSOLE_HOST/api. The platform --image option only selects the Control Plane/Worker image.
 4. Set your dependency and identity-provider address ranges and ports in egress.yaml. Provision the external databases and bucket before installation.
-   Register a confidential OIDC client with your existing provider (Keycloak is the reference setup). Enable Authorization Code with S256 PKCE, register exactly OIDC_CALLBACK_URL, configure OIDC_CLIENT_SECRET in control-plane.env, and set the issuer and console URLs in site.yaml. See docs/authentication.md in the Hibana repository. The identity provider must be reachable from both users' browsers and the Control Plane.
+   ${withKeycloak ? "The identity/ overlay registers the confidential hibana client on first startup. Keep the issuer, callback and console URLs in site.yaml consistent with identity/config.yaml and follow identity/README.md for existing realms and users." : "Register a confidential OIDC client with your existing provider (Keycloak is the reference setup). Enable Authorization Code with S256 PKCE, register exactly OIDC_CALLBACK_URL, configure OIDC_CLIENT_SECRET in control-plane.env, and set the issuer and console URLs in site.yaml."} See docs/authentication.md in the Hibana repository. The identity provider must be reachable from both users' browsers and the Control Plane.
 5. Run the preview, resolve every reported issue, then install:
 
 \`\`\`sh
@@ -133,7 +140,35 @@ Python HTTPS checks use the system CA trust. For a private CA, configure SSL_CER
       mode: name.endsWith(".env") ? 0o600 : 0o644,
     });
   }
+  if (withKeycloak) {
+    const identity = join(root, "identity");
+    await cp(
+      new URL("../platform/manifests/keycloak/", import.meta.url),
+      identity,
+      { recursive: true },
+    );
+    await rename(
+      join(identity, "gitignore.template"),
+      join(identity, ".gitignore"),
+    );
+    await mkdir(join(identity, "imports"), { mode: 0o700 });
+    await cp(
+      join(identity, "realm.example.json"),
+      join(identity, "imports/hibana-realm.json"),
+    );
+    await chmod(join(identity, "imports/hibana-realm.json"), 0o600);
+    for (const [name, contents] of Object.entries({
+      "database.env": `POSTGRES_PASSWORD=${randomBytes(32).toString("hex")}\n`,
+      "bootstrap-admin.env": `KC_BOOTSTRAP_ADMIN_USERNAME=bootstrap-admin\nKC_BOOTSTRAP_ADMIN_PASSWORD=${randomBytes(32).toString("hex")}\n`,
+      "client.env": `HIBANA_OIDC_CLIENT_SECRET=${clientSecret}\n`,
+    })) {
+      await writeFile(join(identity, name), contents, {
+        flag: "wx",
+        mode: 0o600,
+      });
+    }
+  }
   console.log(
-    `Created platform configuration: ${root}\nFill in the site settings listed in README.md, then run hibana platform install with --overlay pointing to this directory.\nSigning, encryption and bootstrap keys were generated in control-plane.env (excluded from Git).`,
+    `Created platform configuration: ${root}\nFill in the site settings listed in README.md, then run hibana platform install with --overlay pointing to this directory.\nSigning, encryption and bootstrap keys were generated in control-plane.env (excluded from Git).${withKeycloak ? "\nKeycloak: configure and deploy identity/ separately using identity/README.md. Credentials and realm imports are private and excluded from Git." : ""}`,
   );
 }

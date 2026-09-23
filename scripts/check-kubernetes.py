@@ -1,6 +1,9 @@
 #!/usr/bin/env python3
 """Check the rendered deployment's safety contracts, offline. Requires kubectl + PyYAML."""
 import subprocess
+import base64
+import json
+import tempfile
 from pathlib import Path
 import yaml
 
@@ -151,3 +154,83 @@ for name, service, port, host in [
     backend = spec["rules"][0]["http"]["paths"][0]["backend"]["service"]
     assert backend == {"name": service, "port": {"number": port}}
 print("remote ingress: management/app TLS hosts separated; no internal Worker endpoint exposed")
+
+# Render the same independent identity overlay produced by the distributable CLI.
+# Keep generated credentials and rendered Secrets out of test output and Git.
+subprocess.run(["node", "sdk/scripts/pack.mjs"], cwd=root, check=True)
+with tempfile.TemporaryDirectory(prefix="hibana-identity-manifests-") as temporary:
+    site = Path(temporary) / "site"
+    subprocess.run([
+        "node", "--input-type=module", "-e",
+        "import { initPlatform } from './sdk/src/platform-init.mjs'; "
+        "await initPlatform(process.argv[1], {withKeycloak: true});", str(site),
+    ], cwd=root, check=True, stdout=subprocess.DEVNULL)
+    docs = render(site / "identity")
+    assert named(docs, "Namespace", "hibana-identity")
+    assert all(d["metadata"].get("namespace") == "hibana-identity"
+               for d in docs if d["kind"] != "Namespace")
+    platform = render(site)
+    assert not any(d["metadata"].get("namespace") == "hibana-identity" for d in platform)
+    secrets = {d["metadata"]["name"]: d["data"] for d in docs if d["kind"] == "Secret"}
+    deployment = named(docs, "Deployment", "keycloak")["spec"]
+    assert deployment["replicas"] == 1 and deployment["strategy"]["type"] == "Recreate"
+    pod = deployment["template"]["spec"]
+    assert pod["automountServiceAccountToken"] is False
+    assert pod["securityContext"]["runAsNonRoot"] is True
+    assert pod["securityContext"]["seccompProfile"]["type"] == "RuntimeDefault"
+    container = pod["containers"][0]
+    assert container["image"] == "quay.io/keycloak/keycloak:26.7.4"
+    assert container["args"] == ["start", "--import-realm"]
+    assert container["securityContext"]["allowPrivilegeEscalation"] is False
+    assert container["securityContext"]["capabilities"]["drop"] == ["ALL"]
+    for probe, path in [("startupProbe", "started"), ("readinessProbe", "ready"), ("livenessProbe", "live")]:
+        assert container[probe]["httpGet"] == {"path": f"/health/{path}", "port": "health"}
+    for env in container["envFrom"]:
+        if "secretRef" in env:
+            assert env["secretRef"]["name"] in secrets
+    database_ref = container["env"][0]["valueFrom"]["secretKeyRef"]
+    assert database_ref["key"] in secrets[database_ref["name"]]
+    realm_secret = secrets[pod["volumes"][0]["secret"]["secretName"]]
+    realm = json.loads(base64.b64decode(realm_secret["hibana-realm.json"]))
+    assert realm["realm"] == "hibana" and realm["sslRequired"] == "all"
+    assert not realm.get("users") and realm["registrationAllowed"] is False
+    client = realm["clients"][0]
+    assert client["standardFlowEnabled"] is True
+    assert all(client[key] is False for key in ["publicClient", "directAccessGrantsEnabled", "implicitFlowEnabled", "serviceAccountsEnabled"])
+    assert client["attributes"]["pkce.code.challenge.method"] == "S256"
+    assert client["redirectUris"] == ["${HIBANA_OIDC_CALLBACK_URL}"]
+    assert client["secret"] == "${HIBANA_OIDC_CLIENT_SECRET}"
+    client_data = next(data for data in secrets.values() if "HIBANA_OIDC_CLIENT_SECRET" in data)
+    shared_secret = base64.b64decode(client_data["HIBANA_OIDC_CLIENT_SECRET"]).decode()
+    assert len(shared_secret) == 64
+    assert f"OIDC_CLIENT_SECRET={shared_secret}\n" in (site / "control-plane.env").read_text()
+    config = named(docs, "ConfigMap", "keycloak-config")["data"]
+    hibana_config = named(platform, "ConfigMap", "hibana-config")["data"]
+    assert config["KC_PROXY_HEADERS"] == "xforwarded"
+    assert config["KC_PROXY_TRUSTED_ADDRESSES"] == "CHANGE_ME_INGRESS_PROXY_CIDRS"
+    assert hibana_config["OIDC_ISSUER_URL"] == config["KC_HOSTNAME"] + "/realms/hibana"
+    assert hibana_config["OIDC_CALLBACK_URL"] == config["HIBANA_OIDC_CALLBACK_URL"]
+    assert hibana_config["OIDC_CONSOLE_URL"] == config["HIBANA_OIDC_CONSOLE_URL"]
+    db = named(docs, "Deployment", "keycloak-postgres")["spec"]
+    assert db["replicas"] == 1 and db["strategy"]["type"] == "Recreate"
+    db_pod = db["template"]["spec"]
+    assert db_pod["automountServiceAccountToken"] is False
+    assert db_pod["containers"][0]["envFrom"][0]["secretRef"]["name"] == database_ref["name"]
+    claim = db_pod["volumes"][0]["persistentVolumeClaim"]["claimName"]
+    assert named(docs, "PersistentVolumeClaim", claim)["spec"]["resources"]["requests"]["storage"] == "2Gi"
+    for service in (d for d in docs if d["kind"] == "Service"):
+        assert service["spec"].get("type", "ClusterIP") == "ClusterIP"
+        assert all(p["port"] != 9000 for p in service["spec"]["ports"])
+    ingress = named(docs, "Ingress", "keycloak")["spec"]
+    host = config["KC_HOSTNAME"].removeprefix("https://")
+    assert ingress["tls"][0]["hosts"] == [host]
+    assert ingress["rules"][0]["host"] == host
+    assert ingress["rules"][0]["http"]["paths"][0]["backend"]["service"] == {"name": "keycloak", "port": {"number": 8080}}
+    deny = named(docs, "NetworkPolicy", "identity-default-deny")["spec"]
+    assert deny["podSelector"] == {} and set(deny["policyTypes"]) == {"Ingress", "Egress"}
+    access = named(docs, "NetworkPolicy", "keycloak")["spec"]
+    assert access["ingress"] == [{"from": [{"namespaceSelector": {"matchLabels": {"hibana.io/identity-ingress": "true"}}}], "ports": [{"protocol": "TCP", "port": 8080}]}]
+    database = named(docs, "NetworkPolicy", "keycloak-postgres")["spec"]
+    assert database["ingress"] == [{"from": [{"podSelector": {"matchLabels": {"app.kubernetes.io/name": "keycloak"}}}], "ports": [{"protocol": "TCP", "port": 5432}]}]
+    assert database["egress"] == []
+print("identity: generated overlay renders with independent namespace, persistent DB, private credentials and HTTPS/PKCE contracts")

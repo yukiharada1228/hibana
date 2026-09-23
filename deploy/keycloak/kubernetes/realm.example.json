@@ -1,0 +1,27 @@
+{
+  "realm": "hibana",
+  "enabled": true,
+  "sslRequired": "all",
+  "registrationAllowed": false,
+  "clients": [
+    {
+      "clientId": "hibana",
+      "name": "Hibana",
+      "protocol": "openid-connect",
+      "enabled": true,
+      "publicClient": false,
+      "clientAuthenticatorType": "client-secret",
+      "secret": "${HIBANA_OIDC_CLIENT_SECRET}",
+      "standardFlowEnabled": true,
+      "implicitFlowEnabled": false,
+      "directAccessGrantsEnabled": false,
+      "serviceAccountsEnabled": false,
+      "redirectUris": ["${HIBANA_OIDC_CALLBACK_URL}"],
+      "attributes": {
+        "pkce.code.challenge.method": "S256",
+        "post.logout.redirect.uris": "${HIBANA_OIDC_CONSOLE_URL}"
+      },
+      "defaultClientScopes": ["profile", "email", "roles", "web-origins"]
+    }
+  ]
+}

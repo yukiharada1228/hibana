@@ -157,6 +157,8 @@ hibana platform start --kubeconfig /secure/config --context onprem
 hibana platform uninstall --kubeconfig /secure/config --context onprem --yes
 ```
 
+この開発ブランチでは`platform init my-site --with-keycloak`で、専用namespaceのKeycloak・永続DB・HTTPS用Ingressも生成できます。公開済み`0.2.0-rc.5`には未収録です。[Keycloak導入手順](../deploy/keycloak/kubernetes/README.md)に沿ってチェックアウトのCLIで生成し、`identity/`を個別に配備してください。
+
 `delete [NAME]`で名前を指定し、省略時は`--config/-c`の設定から読みます。`--dry-run`で確認でき、`--yes/-y`は確認を省略しますが、実行中アプリの削除を拒否するサーバー側の保護は無効化しません。削除にはRead・Adminスコープを持つテナント管理者の認証情報が必要です。Read・Deployだけでは削除できません。ソースコードやビルドツールは不要です。`--all-tenants`はプラットフォーム管理者用の`BOOTSTRAP_ADMIN_TOKEN`が必要です。
 
 削除は公開URLと通常の一覧からアプリを除き、実行履歴とWasm成果物を残します。同じ名前で再デプロイ可能です。基盤の停止はデータを保持します。Kubernetesの導入条件・既存クラスタへの配備・撤去範囲は[基盤管理ガイド](../deploy/kubernetes/README.md)を参照してください。

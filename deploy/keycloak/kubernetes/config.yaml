@@ -1,0 +1,19 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: keycloak-config
+data:
+  KC_DB: postgres
+  KC_DB_URL: jdbc:postgresql://keycloak-postgres:5432/keycloak
+  KC_DB_USERNAME: keycloak
+  # One HTTPS issuer, reachable from browsers AND Control Plane Pods.
+  KC_HOSTNAME: https://auth.example.internal
+  KC_HTTP_ENABLED: "true"
+  KC_PROXY_HEADERS: xforwarded
+  KC_PROXY_TRUSTED_ADDRESSES: CHANGE_ME_INGRESS_PROXY_CIDRS
+  KC_HEALTH_ENABLED: "true"
+  # This pilot template has one replica, not an HA cache cluster.
+  KC_CACHE: local
+  JAVA_OPTS_KC_HEAP: -Xms128m -Xmx512m
+  HIBANA_OIDC_CALLBACK_URL: https://hibana.example.internal/api/auth/oidc/callback
+  HIBANA_OIDC_CONSOLE_URL: https://hibana.example.internal/

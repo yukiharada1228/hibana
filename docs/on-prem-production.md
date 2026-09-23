@@ -17,6 +17,8 @@ Kubernetesの上にHibanaを置く構成は、Workerの複数配置・ローリ�
 
 `deploy/kubernetes/base`はCP/Worker各2 Pod、PDB、配置分散、リソース制限、段階更新、ネットワーク分離の土台です。`hardened`は管理者が用意する`hibana-sandbox` RuntimeClassを要求します。`persistent-dependencies`は開発依存サービスをPVC化するだけでHA構成ではありません。
 
+[同一クラスタへのKeycloak導入例](../deploy/keycloak/kubernetes/README.md)は専用namespaceと永続DBを使用する検証用構成です。Keycloak・DBは各1 Podで、同じクラスタの障害の影響を受けます。本番では認証基盤の可用性、DB復元、恒久管理者とMFA、証明書更新を別途検証してください。
+
 RedisのTLS接続はControl Planeの`REDIS_URL`に`rediss://ユーザー:パスワード@ホスト:ポート/DB番号`を設定します。Rustlsで証明書の信頼チェーンとホスト名を検証します。通常はコンテナのシステムCAを使い、社内CAの場合はPEM形式のCA証明書バンドルをPodへ読み取り専用でマウントし、Control Planeの`SSL_CERT_FILE`にそのパスを指定してください。既存Kubernetesの導入時のRedis疎通確認もPod内の同じ設定を使います。これは基盤用Redisの設定で、アプリの拡張や`hibana.json`への追加は不要です。
 
 `SSL_CERT_FILE`を指定するとシステムCAの代わりにそのバンドルを使うため、必要な信頼ルートをまとめてください。証明書検証を無効にする`#insecure`はサポートしません。`bash scripts/test-redis-tls.sh`で、使い捨てRedisへのTCP/TLS接続と、不明なCA・ホスト名不一致の拒否、導入時の疎通確認を検証できます。

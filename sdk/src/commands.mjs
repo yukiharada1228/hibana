@@ -44,6 +44,9 @@ const options = {
   image: string("IMAGE", "Prebuilt platform image"),
   source: string("CHECKOUT", "Source checkout for local platform development"),
   cluster: string("NAME", "Local development cluster (default: hibana)"),
+  "with-keycloak": boolean(
+    "Also create a separate Keycloak overlay with a persistent database",
+  ),
 };
 const remote = ["profile", "url"];
 const projectRemote = ["config", ...remote];
@@ -271,12 +274,15 @@ const commands = {
       init: leaf(
         "Create site configuration for an existing Kubernetes cluster",
         "hibana platform init [directory]",
-        [],
+        ["with-keycloak"],
         {
           max: 1,
-          examples: ["hibana platform init my-site"],
+          examples: [
+            "hibana platform init my-site",
+            "hibana platform init my-site --with-keycloak",
+          ],
           notes:
-            "Creates a portable overlay and private credential files. Fill in the site settings, then run platform install.\nThe default directory is hibana-platform. Existing files are never overwritten.",
+            "Creates a portable overlay and private credential files. Fill in the site settings, then run platform install.\n--with-keycloak adds identity/ for separate deployment in namespace hibana-identity; see identity/README.md.\nThe default directory is hibana-platform. Existing files are never overwritten.",
         },
       ),
       ...Object.fromEntries(

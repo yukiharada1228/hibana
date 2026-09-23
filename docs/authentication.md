@@ -4,6 +4,8 @@ Hibanaの対話ログインは、開発環境も含めOpenID Connect（OIDC）�
 
 `hibana dev`でアプリだけをローカル開発する場合、認証基盤は不要です。
 
+Keycloakを同じKubernetesの専用namespaceで運用するための[設定生成・導入・既存ユーザー移行手順](../deploy/keycloak/kubernetes/README.md)を用意しています。開発ブランチの`platform init --with-keycloak`で生成し、Hibanaとは個別に配備します。KeycloakのDBは専用PVCへ保存します。
+
 社内基盤がSAMLの場合は、[Keycloakを仲介する接続手順](saml-keycloak.md)を使用できます。署名付きSAMLからHibanaのコンソール・CLIまでを通す自動試験と設定テンプレートを用意しています。Hibana自体の接続方式はOIDCです。
 
 ## 実装と責務

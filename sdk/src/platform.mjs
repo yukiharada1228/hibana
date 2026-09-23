@@ -70,7 +70,8 @@ export async function platform(args, options) {
     console.log(help("platform"));
     return;
   }
-  if (args[0] === "init") return initPlatform(args[1]);
+  if (args[0] === "init")
+    return initPlatform(args[1], { withKeycloak: options["with-keycloak"] });
   const { command, target, action } = platformCommand(args, options);
   console.log(`${options["dry-run"] ? "Preview" : "Target"}: ${target}`);
   if (

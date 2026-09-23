@@ -1,0 +1,22 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+namespace: hibana-identity
+resources:
+  - namespace.yaml
+  - config.yaml
+  - postgres.yaml
+  - keycloak.yaml
+  - ingress.yaml
+  - network-policy.yaml
+# Generate private inputs with `hibana platform init SITE --with-keycloak`.
+# Hashes make Secret changes roll out the consuming Pods. Do not prune old
+# Secrets until the rollout is healthy; never prune the database PVC.
+secretGenerator:
+  - name: keycloak-database
+    envs: [database.env]
+  - name: keycloak-bootstrap-admin
+    envs: [bootstrap-admin.env]
+  - name: keycloak-client
+    envs: [client.env]
+  - name: keycloak-realm
+    files: [hibana-realm.json=imports/hibana-realm.json]
