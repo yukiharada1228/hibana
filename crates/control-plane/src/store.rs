@@ -1,4 +1,5 @@
 use async_trait::async_trait;
+pub(crate) mod tail;
 
 #[cfg(test)]
 mod test_support;
@@ -46,12 +47,32 @@ pub struct RateLimitParams {
 
 /// 共有ストア契約（M3d, §8）。
 ///
-/// invoke admission（レート制限）と OIDC stateを集約する。RedisStore が
+/// invoke admission（レート制限）、OIDC state、短命なライブ通知を集約する。RedisStore が
 /// 本実装、`InProcStore` がテスト用スタブ、`FailingStore` が fail-mode 検証用。
 ///
 /// 状態更新は原子的に行う。枠の消費とstateの取得は冪等ではなく、自動再送しない。
+/// ライブ通知の読み取りはカーソル指定で再送でき、ログ本文をRedisには置かない。
 #[async_trait]
 pub trait Store: Send + Sync {
+    /// Live notifications contain only execution IDs; log bodies stay in PostgreSQL.
+    async fn publish_tail(
+        &self,
+        tenant: &str,
+        component: &str,
+        execution: &str,
+    ) -> Result<(), StoreError> {
+        let _ = (tenant, component, execution);
+        Err(StoreError::Unavailable("tail store unavailable".into()))
+    }
+    async fn read_tail(
+        &self,
+        tenant: &str,
+        component: &str,
+        cursor: Option<&str>,
+    ) -> Result<tail::Page, StoreError> {
+        let _ = (tenant, component, cursor);
+        Err(StoreError::Unavailable("tail store unavailable".into()))
+    }
     /// token-bucket からトークンを 1 つ消費しようとする（per-tenant レート制限, §8）。
     ///
     /// ストア自身の時刻で補充し、拒否時は `Retry-After`（秒）を返す。
@@ -198,6 +219,27 @@ return {allowed, retry}
     }
     #[async_trait]
     impl Store for RedisStore {
+        async fn publish_tail(
+            &self,
+            tenant: &str,
+            component: &str,
+            execution: &str,
+        ) -> Result<(), StoreError> {
+            super::tail::publish(&mut self.conn.clone(), tenant, component, execution)
+                .await
+                .map_err(map_err)
+        }
+
+        async fn read_tail(
+            &self,
+            tenant: &str,
+            component: &str,
+            cursor: Option<&str>,
+        ) -> Result<super::tail::Page, StoreError> {
+            super::tail::read(&mut self.conn.clone(), tenant, component, cursor)
+                .await
+                .map_err(map_err)
+        }
         async fn put_auth_state(
             &self,
             key: &str,

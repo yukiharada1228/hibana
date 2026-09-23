@@ -71,30 +71,9 @@ async fn execution_page(
     db::find_component_by_id(&tx, tenant, &component_id)
         .await?
         .ok_or_else(|| FaasError::NotFound("component".into()))?;
-    let mut select = executions::Entity::find()
-        .select_only()
-        .column_as(executions::Column::Id, "execution_id")
-        .column_as(db::http_status_expression(), "http_status")
-        .column_as(
-            if include_logs {
-                db::application_logs_expression()
-            } else {
-                Expr::val(None::<Value>)
-            },
-            "logs",
-        )
-        .columns([
-            executions::Column::VersionId,
-            executions::Column::Status,
-            executions::Column::Error,
-            executions::Column::CreatedAt,
-            executions::Column::WallTimeMs,
-        ])
-        .filter(executions::Column::TenantId.eq(tenant))
-        .filter(executions::Column::ComponentId.eq(&component_id))
-        .filter(
-            executions::Column::CreatedAt.gte(chrono::Utc::now() - chrono::Duration::hours(24)),
-        );
+    let mut select = db::execution_summary_query(tenant, &component_id, include_logs).filter(
+        executions::Column::CreatedAt.gte(chrono::Utc::now() - chrono::Duration::hours(24)),
+    );
     if query.errors_only {
         select = select.filter(db::execution_errors_condition());
     }

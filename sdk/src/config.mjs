@@ -25,6 +25,8 @@ export async function readConfigFile(file = "hibana.json") {
   }
   if (!value || typeof value !== "object" || Array.isArray(value))
     throw new Error("hibana.json must be an object");
+  if (!isApplicationName(value.name))
+    throw new Error("name must be a lowercase DNS label (1..63 characters)");
   return value;
 }
 
@@ -45,8 +47,6 @@ export async function loadConfig(file = "hibana.json") {
   for (const key of Object.keys(value))
     if (!supported.has(key))
       throw new Error(`Unsupported hibana.json field: ${key}`);
-  if (!isApplicationName(value.name))
-    throw new Error("name must be a lowercase DNS label (1..63 characters)");
   if ((value.main !== undefined) === (value.component !== undefined))
     throw new Error(
       "Specify exactly one of main (JavaScript/TypeScript) or component (.wasm)",

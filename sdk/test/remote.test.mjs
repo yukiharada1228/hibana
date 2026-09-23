@@ -196,6 +196,8 @@ test("remote login, deploy, rollback, secrets and deletion work across directori
   assert.match(deployed.output, /Target:.*\nTenant: team\nApp: hello/);
   assert.match(deployed.output, /Deployed hello · auto [a-f0-9]{8}/);
   assert.doesNotMatch(deployed.output, /0\.0\.0-dev\.|\(cmp\)/);
+  // Remote operations must remain usable while the next build is unconfigured.
+  await writeFile(join(f.project, "hibana.json"), JSON.stringify({ name: "hello", limits: [] }));
   const secretList = await f.invoke(["secret", "list"]);
   assert.match(secretList.output, /NAME\s+VALUE\s+UPDATED/);
   assert.match(secretList.output, /API_KEY\s+Stored/);

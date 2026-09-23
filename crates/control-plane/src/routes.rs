@@ -55,6 +55,7 @@ pub(crate) fn build_router(state: AppState) -> Router {
             "/components/{component_id}/logs",
             get(handlers::executions::list_logs),
         )
+        .route("/components/{component_id}/tail", get(handlers::tail::poll))
         // Return environment names and approved destinations, never values.
         .route(
             "/components/{component_id}/versions/{version}/capabilities",

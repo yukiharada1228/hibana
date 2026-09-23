@@ -55,12 +55,21 @@ export async function apiClient(options = {}) {
     if (response.status === 204) return;
     try {
       return await response.json();
-    } catch {
+    } catch (cause) {
       // Never confirm success from a malformed or incomplete response. Parser
       // errors can include response values, so report only the endpoint/status.
-      throw new Error(
+      const error = new Error(
         `${method} ${path}: Invalid JSON response (HTTP ${response.status}). Check the operation's status before retrying.`,
       );
+      // Read-only live polling may retry a broken response stream. Do not retain
+      // the original parser error: it can contain response values. Mutation
+      // callers still never retry an ambiguous operation automatically.
+      error.retryableRead = [
+        "TypeError",
+        "AbortError",
+        "TimeoutError",
+      ].includes(cause?.name);
+      throw error;
     }
   }
   return {
@@ -79,8 +88,8 @@ export async function apiClient(options = {}) {
   };
 }
 
-export async function findComponent(api, name) {
-  const result = await api.request("/components");
+export async function findComponent(api, name, options) {
+  const result = await api.request("/components", options);
   return result.find((item) => item.name === name);
 }
 

@@ -37,8 +37,10 @@ test("help is contextual, has examples, and works outside a project without side
   assert.match(rootHelp.stdout, /hibana init my-api/);
   assert.match(rootHelp.stdout, /npm run dev/);
   assert.match(rootHelp.stdout, /egress\s+Manage application outbound destinations/);
+  assert.match(rootHelp.stdout, /tail\s+Watch live application executions/);
+  assert.doesNotMatch(rootHelp.stdout, /^\s+logs\s/m);
   assert.doesNotMatch(rootHelp.stdout, /--sha256|--kubeconfig/);
-  for (const command of ["init", "dev", "build", "deploy", "rollback", "list", "logs", "delete", "login", "logout", "runtime", "profile", "secret", "platform"]) {
+  for (const command of ["init", "dev", "build", "deploy", "rollback", "list", "tail", "delete", "login", "logout", "runtime", "profile", "secret", "platform"]) {
     const direct = await f.invoke([command, "--help"]);
     const alias = await f.invoke(["help", command]);
     assert.equal(direct.code, 0, direct.stderr);
@@ -75,6 +77,11 @@ test("invalid commands, flags and arguments fail before any project or network w
   const env = { HIBANA_URL: `http://127.0.0.1:${server.address().port}`, HIBANA_TOKEN: "test-token" };
   for (const [args, expected] of [
     [["deply"], /Did you mean 'deploy'/],
+    [["logs", "hello"], /Unknown command 'logs'/],
+    [["logs", "--help"], /Unknown command 'logs'/],
+    [["tail", "--execution", "exec_ID"], /Unknown option '--execution'/],
+    [["tail", "--before", "cursor"], /Unknown option '--before'/],
+    [["tail", "--errors-only"], /Unknown option '--errors-only'/],
     [["dev", "--por", "3000"], /Did you mean '--port'/],
     [["deploy", "--dry-run"], /--dry-run.*not supported.*deploy/],
     [["deploy", "--profile", ""], /--profile.*requires a non-empty NAME/],
@@ -263,53 +270,4 @@ test("platform init can provision isolated Keycloak configuration without exposi
   const wrongAction = await f.invoke(["platform", "install", "--with-keycloak"]);
   assert.equal(wrongAction.code, 1);
   assert.match(wrongAction.stderr, /--with-keycloak.*not supported/);
-});
-
-test("application logs support named apps, execution IDs, cursors and safe terminal output", async t => {
-  const f = await fixture(t), calls = [];
-  const cursor = "2026-09-23T01:02:03+00:00,exec_1";
-  const item = { execution_id: "exec_1", component_id: "cmp_1", version_id: "ver_1", status: "failed", created_at: "2026-09-23T01:02:03Z",
-    logs: { stdout: "雪\n\u001b[2J\u001b]52;c;fixture\u0007", stderr: "failed\n", truncated: true } };
-  let denied = false;
-  const server = createServer((req, res) => {
-    calls.push(req.url);
-    assert.equal(req.headers.authorization, "Bearer fixture-read");
-    if (denied) { res.writeHead(403).end("private rejection details"); return; }
-    const url = new URL(req.url, "http://fixture.invalid");
-    res.setHeader("content-type", "application/json");
-    if (url.pathname === "/components") return res.end(JSON.stringify([{name:"logs-app",component_id:"cmp_1"}]));
-    if (url.pathname === "/executions/exec_1") return res.end(JSON.stringify(item));
-    assert.equal(url.pathname, "/components/cmp_1/logs");
-    if (url.searchParams.has("before")) {
-      assert.equal(url.searchParams.get("before"), cursor);
-      assert.equal(url.searchParams.get("errors_only"), "true");
-      res.end(JSON.stringify({items:[],next_cursor:null}));
-    } else res.end(JSON.stringify({items:[item],next_cursor:cursor}));
-  });
-  await new Promise(resolve => server.listen(0, "127.0.0.1", resolve));
-  t.after(() => new Promise(resolve => server.close(resolve)));
-  const env = {HIBANA_URL:`http://127.0.0.1:${server.address().port}`,HIBANA_TOKEN:"fixture-read"};
-  const human = await f.invoke(["logs", "logs-app"], {env});
-  assert.equal(human.code, 0, human.stderr);
-  assert.match(human.stdout, /exec_1.*ver_1.*failed/);
-  assert.match(human.stdout, /雪/);
-  assert.match(human.stdout, /truncated at 16 KiB/);
-  assert.match(human.stdout, /Next page/);
-  assert.doesNotMatch(human.stdout, /[\u001b\u0007]/);
-  const detail = await f.invoke(["logs", "--execution", "exec_1", "--json"], {env});
-  assert.equal(detail.code, 0, detail.stderr);
-  assert.deepEqual(JSON.parse(detail.stdout), {items:[item],next_cursor:null});
-  const next = await f.invoke(["logs", "logs-app", "--before", cursor, "--errors-only"], {env});
-  assert.equal(next.code, 0, next.stderr);
-  assert.match(next.stdout, /No executions/);
-  await writeFile(join(f.root, "hibana.json"), JSON.stringify({name:"logs-app",component:"unused.wasm"}));
-  assert.equal((await f.invoke(["logs"], {env})).code, 0);
-  const count = calls.length;
-  assert.equal((await f.invoke(["logs", "--execution", "exec_1", "--before", cursor], {env})).code, 1);
-  assert.equal(calls.length, count);
-  denied = true;
-  const rejected = await f.invoke(["logs", "--execution", "exec_1"], {env});
-  assert.equal(rejected.code, 1);
-  assert.match(rejected.stderr, /Permission denied/);
-  assert.doesNotMatch(rejected.stderr, /private rejection/);
 });

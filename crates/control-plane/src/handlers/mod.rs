@@ -10,6 +10,7 @@ pub(crate) mod executions;
 pub(crate) mod health;
 pub(crate) mod identity;
 pub(crate) mod signing_keys;
+pub(crate) mod tail;
 pub(crate) mod tenants;
 mod upload;
 pub(crate) mod usage;

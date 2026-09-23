@@ -14,9 +14,19 @@ const boolean = (description, short) => ({
 const options = {
   help: boolean("Show help for this command", "h"),
   json: boolean("Output the complete API response as JSON"),
-  execution: string("ID", "Read logs for one execution"),
-  before: string("CURSOR", "Read the next page of executions"),
-  "errors-only": boolean("Show HTTP errors, failed executions and timeouts"),
+  format: string(
+    "FORMAT",
+    "pretty or json (default: pretty in a terminal, json when piped)",
+  ),
+  status: string(
+    "STATUS",
+    "Filter invocation outcome: ok, error or canceled (HTTP status is separate)",
+  ),
+  search: string(
+    "TEXT",
+    "Match literal, case-sensitive text in stdout or stderr",
+  ),
+  "version-id": string("ID", "Filter by deployed version ID"),
   verbose: boolean("Include internal identifiers and the full version"),
   config: string("FILE", "Project configuration (default: hibana.json)", "c"),
   template: string("NAME", "hono (default), javascript, rust or go"),
@@ -123,19 +133,26 @@ const commands = {
         connectionHelp,
     },
   ),
-  logs: leaf(
-    "Read application stdout and stderr after execution",
-    "hibana logs [NAME]",
-    [...projectRemote, "execution", "before", "errors-only", "json"],
+  tail: leaf(
+    "Watch live application executions and their output",
+    "hibana tail [NAME]",
+    [...projectRemote, "format", "status", "search", "version-id", "verbose"],
     {
       max: 1,
       examples: [
-        "hibana logs",
-        "hibana logs my-api --errors-only",
-        "hibana logs --execution exec_ID --json",
+        "hibana tail",
+        "hibana tail my-api --format pretty",
+        "hibana tail my-api --status error",
+        "hibana tail my-api --search 'connection failed'",
+        "hibana tail my-api --format json",
       ],
       notes:
-        "Uses hibana.json when NAME is omitted, except with --execution.\nLists 20 executions from the last 24 hours, newest first.\nLogs are limited to 16 KiB per execution and expire 24 hours after completion. Requires Read permission.\n" +
+        "Uses hibana.json when NAME is omitted. Requires Read permission.\n" +
+        "Starts watching now; completed invocations appear as they arrive. Press Ctrl+C to stop.\n" +
+        "ok means the application completed, including HTTP 4xx/5xx. error includes traps and timeouts.\n" +
+        "Hibana does not currently produce canceled invocations.\n" +
+        "JSON emits one execution per line; connection messages and gap warnings go to stderr.\n" +
+        "Live delivery is best effort. View stored logs in the Console's execution history.\n" +
         connectionHelp,
     },
   ),
@@ -359,7 +376,7 @@ Development:
 ${rows(["init", "dev", "build", "deploy"].map((name) => [name, commands[name].description]))}
 
 Applications and connections:
-${rows(["login", "logout", "list", "logs", "rollback", "delete", "secret", "egress", "profile"].map((name) => [name, commands[name].description]))}
+${rows(["login", "logout", "list", "tail", "rollback", "delete", "secret", "egress", "profile"].map((name) => [name, commands[name].description]))}
 
 Advanced:
 ${rows(["runtime", "platform"].map((name) => [name, commands[name].description]))}

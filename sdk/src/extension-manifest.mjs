@@ -31,7 +31,7 @@ export function isLocalExtension(value) {
   return typeof value === "string" && value.startsWith("./");
 }
 
-export function isExtensionPackage(value) {
+function isExtensionPackage(value) {
   return (
     typeof value === "string" && value.length <= 214 && PACKAGE_NAME.test(value)
   );

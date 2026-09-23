@@ -84,7 +84,17 @@ export class Api {
           `処理に失敗しました（HTTP ${response.status}）。`,
       );
     }
-    return response.status === 204 ? (undefined as T) : response.json();
+    if (response.status === 204) return undefined as T;
+    try {
+      return await response.json();
+    } catch {
+      this.lifetime.signal.throwIfAborted();
+      // Parser/stream errors may quote response data. A successful status alone
+      // cannot confirm a mutation when its response was incomplete.
+      throw new Error(
+        "基盤からの応答を読み取れませんでした。操作中だった場合は、再実行の前に状態を確認してください。",
+      );
+    }
   }
 
   loginOptions() {
@@ -185,7 +195,9 @@ export class Api {
   }
 
   execution(id: string) {
-    return this.request<ExecutionDetails>(`/executions/${encodeURIComponent(id)}`);
+    return this.request<ExecutionDetails>(
+      `/executions/${encodeURIComponent(id)}`,
+    );
   }
   rollback(id: string, version: string) {
     return this.request(

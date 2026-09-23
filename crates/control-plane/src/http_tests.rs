@@ -13,6 +13,8 @@ use sea_orm::{
 };
 use serde_json::json;
 use std::sync::Arc;
+#[path = "http_tests/tail.rs"]
+mod tail;
 fn state(pool: DatabaseConnection, store: Arc<dyn crate::store::Store>) -> AppState {
     let cfg = crate::config::Config::from_env().unwrap();
     let storage = crate::storage::Storage::new(
@@ -697,6 +699,7 @@ async fn http_mvp_regression() {
     direct_http_dispatch_regression(&owner, &pool).await;
     completion_diagnostic_regression(&owner, &state).await;
     application_logs_regression(&owner, &state).await;
+    tail::regression(&owner, &pool).await;
     completion_concurrency_regression(&owner, &state).await;
     // Keep identities used by the subsequent cross-tenant RLS checks, but do
     // not ask the real fleet to prepare these fake, unstored Wasm versions.

@@ -103,6 +103,36 @@ pub fn execution_errors_condition() -> Condition {
         .add(http_status_expression().between(serde_json::json!(400), serde_json::json!(599)))
 }
 
+/// Shared history/live projection. Never fetch request/response bodies or refs;
+/// application output is opt-in and always obeys the same retention boundary.
+pub fn execution_summary_query(
+    tenant: &str,
+    component: &str,
+    include_logs: bool,
+) -> sea_orm::Select<executions::Entity> {
+    executions::Entity::find()
+        .select_only()
+        .column_as(executions::Column::Id, "execution_id")
+        .column_as(http_status_expression(), "http_status")
+        .column_as(
+            if include_logs {
+                application_logs_expression()
+            } else {
+                Expr::val(None::<Value>)
+            },
+            "logs",
+        )
+        .columns([
+            executions::Column::VersionId,
+            executions::Column::Status,
+            executions::Column::Error,
+            executions::Column::CreatedAt,
+            executions::Column::WallTimeMs,
+        ])
+        .filter(executions::Column::TenantId.eq(tenant))
+        .filter(executions::Column::ComponentId.eq(component))
+}
+
 /// Old Control Planes can still finish requests after the retention migration.
 /// Sweep those inputs repeatedly, including after rolling upgrades. Bound each
 /// transaction and use the retained-input index instead of scanning all history.

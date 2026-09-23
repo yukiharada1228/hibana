@@ -1,6 +1,6 @@
 # Hibana CLI
 
-このソースは候補版`0.2.0-rc.7`です。npm に公開した版は `npx` で利用できます。未公開の候補を試す場合は[候補版の導入手順](../docs/release-candidate.md)を使ってください。
+このソースは候補版`0.2.0-rc.8`です。npm に公開した版は `npx` で利用できます。未公開の候補を試す場合は[候補版の導入手順](../docs/release-candidate.md)を使ってください。
 
 Hibanaの実行契約はWebAssembly Componentです。Honoは対応するJavaScriptフレームワークの一つで、専用SDKのインポートは必要ありません。
 
@@ -41,7 +41,7 @@ CLIはNode.js 24以上が必要です。ローカル実行ランタイムは初�
 [コンソール](../docs/console.md)のある基盤には`hibana login --url https://hibana.example.internal/api ...`で接続できます。ブラウザでは同じホストの`https://hibana.example.internal/`を開きます。CLIとコンソールは同じ管理APIを使い、配備済みアプリの実行・配信は接続先のKubernetesが担当します。
 
 ```bash
-npx --yes @yukiharada1228/hibana@0.2.0-rc.7 init my-app
+npx --yes @yukiharada1228/hibana@0.2.0-rc.8 init my-app
 cd my-app
 npm run dev
 ```
@@ -49,7 +49,7 @@ npm run dev
 `hibana init`や`hibana login`を直接実行したい場合は、グローバルインストールも利用できます。以下は指定した版のnpm公開後に実行します。
 
 ```bash
-npm install -g @yukiharada1228/hibana@0.2.0-rc.7
+npm install -g @yukiharada1228/hibana@0.2.0-rc.8
 hibana init my-app
 cd my-app
 npm run dev
@@ -65,7 +65,7 @@ npm run dev
     "deploy": "hibana deploy"
   },
   "devDependencies": {
-    "@yukiharada1228/hibana": "0.2.0-rc.7"
+    "@yukiharada1228/hibana": "0.2.0-rc.8"
   }
 }
 ```
@@ -75,7 +75,7 @@ npm run dev
 既存のnpx形式のプロジェクトは、プロジェクト内で次のように移行できます。アプリの依存や`test`などのscriptsは維持されます。
 
 ```bash
-npm install --save-dev --save-exact @yukiharada1228/hibana@0.2.0-rc.7
+npm install --save-dev --save-exact @yukiharada1228/hibana@0.2.0-rc.8
 npm pkg set 'scripts.dev=hibana dev' 'scripts.build=hibana build' 'scripts.deploy=hibana deploy'
 ```
 
@@ -105,7 +105,7 @@ Goの`componentize-go`は`go.mod`のtool依存として固定しています。�
 
 Rust・GoのプロジェクトにはWIT定義と依存ロックもコピーされるので、生成後のビルドはHibana固有の言語SDKに依存しません。Honoテンプレートは公式の最小サンプルの応答テキストを変更した`GET /`だけです。JavaScript・Rust・Goには`GET /`とバイナリを返す`POST /echo`があります。Rust・Goサンプルのecho入力上限は1 MiBです。
 
-以降の `hibana ...` は、CLIを導入済みのHono・JavaScriptプロジェクト内では `npm exec -- hibana ...` として実行できます。グローバル導入済みなら直接 `hibana ...` を使えます。プロジェクト作成前やRust・Goでは `npx --yes @yukiharada1228/hibana@0.2.0-rc.7 ...` も使えます。
+以降の `hibana ...` は、CLIを導入済みのHono・JavaScriptプロジェクト内では `npm exec -- hibana ...` として実行できます。グローバル導入済みなら直接 `hibana ...` を使えます。プロジェクト作成前やRust・Goでは `npx --yes @yukiharada1228/hibana@0.2.0-rc.8 ...` も使えます。
 
 ## ローカルで外部DBへ接続する
 
@@ -136,6 +136,8 @@ npm run dev
 `hibana --help`で基本の流れとコマンド一覧、`hibana dev --help`でその操作のオプションと実行例を確認できます。`hibana help deploy`の形式も使えます。`runtime`や`platform`などのサブコマンドも同じ形式でヘルプを表示します。
 
 `list`・`secret list`・`egress list`は人が読める一覧を表示します。スクリプトから従来のJSONを読む場合は`hibana list --json`のように`--json`を指定してください。`deploy`はビルド前に認証と権限を確認し、接続先・テナント・アプリ名を表示します。成功時は短いバージョンと公開URL、`--verbose`を付けると内部IDと完全なバージョンも表示します。
+
+`tail`・`rollback`・`secret`・`egress`・`delete`は、プロジェクトから対象を選ぶ際に`hibana.json`の`name`を使います。ソースファイルやビルド設定を編集中でも、配備済みアプリを操作できます。ビルド設定全体の検証は`build`・`dev`・`deploy`で行います。
 
 不明なコマンド、未対応のオプション、余分な引数は実行前にエラーにします。たとえば`hibana deploy --dry-run`は未対応なので、配備せずに使い方を案内します。CLIの設計方針は[CLIの操作設計](../docs/cli-design.md)にまとめています。
 
@@ -223,7 +225,18 @@ macOS・Linuxでは、Ctrl+CやSIGTERMを実行中のビルドコマンド・拡
 
 実行用Workerが設定された配備先では、`deploy`はWorkerでの事前コンパイルを待ってから公開します。初回HTTPへのコンパイル待ちを避けるため、その時間はデプロイ所要時間に含まれます。準備に失敗すると配備はエラーになり、旧版の公開設定を維持します。`rollback`も切替先を準備してから公開します。
 
-`0.2.0-rc.7`以降は`hibana logs`でアプリの標準出力・標準エラーを取得できます。`hibana logs my-api --errors-only`、`hibana logs --execution exec_ID --json`にも対応します。Read権限が必要で、完了後24時間・1実行合計16KiBまで保存します。CLI・Control Plane・Workerを同じ版に揃えてください。[アプリログ](../docs/application-logs.md)を参照してください。
+`0.2.0-rc.7`以降はアプリの標準出力・標準エラーを収集し、完了後24時間・1実行合計16KiBまで保存します。閲覧にはRead権限が必要です。CLI・Control Plane・Workerを同じ版に揃えてください。[アプリログ](../docs/application-logs.md)を参照してください。
+
+rc.8ではCLIのログ閲覧をWranglerの`tail`に寄せたライブ監視へ統一し、従来の`logs`コマンドを削除しました。対応するCLIとControl Planeへ更新後、`hibana tail [NAME]`で開始後に完了した実行を監視できます。
+
+```sh
+hibana tail my-api
+hibana tail my-api --status error
+hibana tail my-api --search 'connection failed'
+hibana tail my-api --format json
+```
+
+Ctrl+Cで終了します。端末では実行概要とログを表示し、パイプ時は1実行1行のJSONを出力します。HTTP 4xx/5xxを返して正常終了した実行は`ok`、失敗・タイムアウトは`error`です。過去の保存ログはConsoleの実行履歴から取得します。
 
 `hibana rollback`で直前の版へ、`hibana rollback --version 1.0.0`で指定した版へ戻します。コード・環境変数・選択したSecretsの参照を一緒に戻します。Secretsの値・外部データは巻き戻しません。Canaryや重み付き配分はありません。
 

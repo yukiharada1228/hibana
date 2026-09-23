@@ -39,7 +39,9 @@ try {
     assert.ok(paths.includes(`platform/manifests/keycloak/${file}`), file);
   }
   assert.ok(paths.includes("src/extension-manifest.mjs"), "src/extension-manifest.mjs");
-  for (const required of ["LICENSE", "src/cli.mjs", "src/logs.mjs", "src/runtime.mjs", "src/profiles.mjs", "platform/remote.py", "platform/common.py", "platform/maintenance.py", "platform/preflight.py", "platform/existing.py", "platform/manifests/base/kustomization.yaml", "platform/manifests/remote/ingress.yaml", "platform/manifests/migration/job.yaml", "templates/hono/src/index.ts", "wit/world.wit"]) assert.ok(paths.includes(required), required);
+  assert.ok(paths.includes("src/tail.mjs"), "src/tail.mjs");
+  assert.ok(!paths.includes("src/logs.mjs"), "removed logs command must not ship");
+  for (const required of ["LICENSE", "src/cli.mjs", "src/runtime.mjs", "src/profiles.mjs", "platform/remote.py", "platform/common.py", "platform/maintenance.py", "platform/preflight.py", "platform/existing.py", "platform/manifests/base/kustomization.yaml", "platform/manifests/remote/ingress.yaml", "platform/manifests/migration/job.yaml", "templates/hono/src/index.ts", "wit/world.wit"]) assert.ok(paths.includes(required), required);
   assert.ok(paths.every(path => !/^(examples|test|node_modules)\/|kubernetes\.py$|\.hibana|\.env$|Dockerfile|Cargo\.toml/.test(path) || path === "templates/rust/Cargo.toml"));
   const tarball = join(temporary, packed.filename);
   if (github) {
@@ -81,7 +83,7 @@ try {
   assert.equal((await run(process.execPath, [cli, "--version"])).trim(), `hibana ${packed.version}`);
   assert.match(await run(process.execPath, [cli, "--help"]), /--profile/);
   console.log("Packed CLI installed without JS compilers, Docker, platform source or a local runtime.");
-  console.log(await run(process.execPath, ["--test", join(sdk, "test/remote.test.mjs"), join(sdk, "test/dev.test.mjs"), join(sdk, "test/cli.test.mjs")], temporary, { HIBANA_TEST_CLI: cli }));
+  console.log(await run(process.execPath, ["--test", join(sdk, "test/remote.test.mjs"), join(sdk, "test/dev.test.mjs"), join(sdk, "test/cli.test.mjs"), join(sdk, "test/tail.test.mjs")], temporary, { HIBANA_TEST_CLI: cli }));
   assert.match(await run(process.execPath, [cli, "platform", "install", "--help"]), /--kubeconfig/);
 
   const project = join(temporary, "hello");

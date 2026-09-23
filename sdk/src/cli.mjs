@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 import { randomUUID } from "node:crypto";
-import { loadConfig } from "./config.mjs";
+import { loadConfig, readConfigFile } from "./config.mjs";
 import { build } from "./build.mjs";
 import { init } from "./init.mjs";
 import { readStdin } from "./process.mjs";
@@ -71,11 +71,14 @@ async function main() {
     else applications(result, values["all-tenants"]);
     return;
   }
-  if (command === "logs") {
-    const { logs } = await import("./logs.mjs");
-    return logs(args, values);
+  if (command === "tail") {
+    const { tail } = await import("./tail.mjs");
+    return tail(args, values);
   }
-  const config = await loadConfig(values.config);
+  // Operating a deployed application needs its name, not a buildable checkout.
+  const config = ["build", "dev", "deploy"].includes(command)
+    ? await loadConfig(values.config)
+    : await readConfigFile(values.config);
   if (command === "build") {
     console.log(
       await build(config, {

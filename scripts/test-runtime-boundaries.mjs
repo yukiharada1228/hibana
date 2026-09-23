@@ -1,11 +1,10 @@
 import { issueFixtureToken } from "./test-api-credentials.mjs";
-import {runCommand} from "./bounded-process.mjs";
-import {resolve} from "node:path";
 // Uses the disposable database and real CP/Worker/Wasm from test-http.sh.
 import assert from 'node:assert/strict';
 import {createServer, request} from 'node:http';
 import {connect} from 'node:net';
 import {setTimeout as sleep} from 'node:timers/promises';
+import {testLiveTail} from './test-live-tail.mjs';
 
 export async function testRuntimeBoundaries({api, sql, token, wasm, upload, url, internal, metricsUrl, startWorker, stopWorker}) {
   let rejectResults = false, failures = 0;
@@ -66,18 +65,16 @@ export async function testRuntimeBoundaries({api, sql, token, wasm, upload, url,
     assert.equal(logs.logs.truncated, false);
     const reader = await (await issueFixtureToken(sql, {tenant_slug:'upload',email:'test@example.invalid',scopes:['read']})).json();
     const deployer = await (await issueFixtureToken(sql, {tenant_slug:'upload',email:'test@example.invalid',scopes:['deploy']})).json();
-    for (const path of [`/executions/${logged.execution_id}`, `/components/${id}/logs`]) {
+    for (const path of [`/executions/${logged.execution_id}`, `/components/${id}/logs`, `/components/${id}/tail`]) {
       assert.equal((await api(path)).status, 401);
       assert.equal((await api(path, {token:deployer.token})).status, 403);
       const response = await api(path, {token:reader.token});
       assert.equal(response.status, 200);
       assert.equal(response.headers.get('cache-control'), 'no-store');
     }
-    const cli = JSON.parse(await runCommand(process.execPath, [resolve('sdk/src/cli.mjs'), 'logs', 'runtime-boundaries', '--json'], {
-      env:{...process.env, HIBANA_URL:url, HIBANA_TOKEN:reader.token, HIBANA_PROFILE:''},
-    }));
-    assert.deepEqual(cli.items[0].logs, logs.logs);
-    assert.equal(cli.items[0].version_id, logs.version_id);
+    const stored = await (await api(`/components/${id}/logs`, {token:reader.token})).json();
+    assert.deepEqual(stored.items[0].logs, logs.logs);
+    assert.equal(stored.items[0].version_id, logs.version_id);
     assert.equal((await invoke('GET', '/log-overflow')).body, 'overflow survived');
     const overflow = await detail((await waitForTerminal()).execution_id);
     assert.equal(overflow.status, 'succeeded');
@@ -85,7 +82,8 @@ export async function testRuntimeBoundaries({api, sql, token, wasm, upload, url,
     assert.equal(Buffer.byteLength(overflow.logs.stdout) + Buffer.byteLength(overflow.logs.stderr), 16 * 1024);
     const logMetrics = await (await fetch(metricsUrl+'/metrics')).text();
     assert.match(logMetrics,/^faas_guest_log_dropped_bytes_total [1-9][0-9]*$/m);
-    console.log('PASS stdout/stderr, Unicode, overflow without guest failure, Read scope and real CLI retrieval');
+    console.log('PASS stdout/stderr, Unicode, overflow without guest failure, Read scope and stored log retrieval');
+    await testLiveTail({url, token:reader.token, invoke});
 
     for (const path of ['/header-limit', '/header-resources']) {
       assert.equal((await invoke('GET', path)).status,502);

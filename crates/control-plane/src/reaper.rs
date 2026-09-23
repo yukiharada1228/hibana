@@ -101,6 +101,16 @@ async fn reconcile_tenant(
 
     tx.commit().await?;
 
+    crate::store::tail::publish_completed(
+        state.store(),
+        tenant,
+        &swept
+            .iter()
+            .map(|row| (row.component_id.as_str(), row.id.as_str()))
+            .collect::<Vec<_>>(),
+    )
+    .await;
+
     if !swept.is_empty() {
         state
             .metrics()

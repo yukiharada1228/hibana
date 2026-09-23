@@ -36,6 +36,14 @@ impl InProcStore {
 
 #[async_trait]
 impl Store for InProcStore {
+    async fn publish_tail(
+        &self,
+        _tenant: &str,
+        _component: &str,
+        _execution: &str,
+    ) -> Result<(), StoreError> {
+        Ok(()) // No live subscribers in DB-free fixtures; live delivery uses real Redis tests.
+    }
     async fn put_auth_state(
         &self,
         key: &str,

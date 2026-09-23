@@ -49,7 +49,7 @@ flowchart LR
 
 管理 API・アプリ入口・内部 API は同じ Control Plane バイナリの別 listener です。Kubernetes では既存の Service / NetworkPolicy で到達範囲を分けます。この図はコードの責務を示すもので、各箱を別サービスとして配備するものではありません。
 
-PostgreSQL は配備・実行記録・テナント情報の正本、Redis は共有の受付制限と一回限りのトークン管理、S3/MinIO は Wasm の保管に使います。Worker は非特権 DB ロールで実行の取得と設定の参照を行います。Secrets の復号鍵は Control Plane だけが持ちます。
+PostgreSQL は配備・実行記録・テナント情報の正本、Redis は共有の受付制限、一回限りのトークン管理、短命な実行完了通知、S3/MinIO は Wasm の保管に使います。Worker は非特権 DB ロールで実行の取得と設定の参照を行います。Secrets の復号鍵は Control Plane だけが持ちます。
 
 DBの構成、テーブル一覧、空DBからの作成と既存DBの切替方針は[基盤DB](database.md)を参照してください。
 
@@ -118,6 +118,10 @@ DNS は実行前に承認済みホストだけを解決し、IP 制限を通過�
 共有ストアの`InProcStore`・`FailingStore`は`control-plane/src/store/test_support.rs`に置き、テスト時だけコンパイルします。実行時はRedis実装を使います。Workerの`wasmtime_memory_pages`は計測処理がなく常に0だったため削除しました。実際に更新するメモリ予約量・予算のメトリクスは引き続き公開します。
 
 レート制限の補充時刻はRedisの[`TIME`](https://redis.io/docs/latest/commands/time/)から取得し、Luaスクリプト内で残量更新と一緒に確定します。Control Planeごとの時計は使わず、Redisの時計が戻った場合も前回の補充時刻を保持して同じ時間を二重計上しません。テストの時刻制御はTokioの仮想時計を使います。
+
+ライブ監視の`hibana tail`は、完了トランザクションのコミット後にRedis Streamsへ実行IDを通知します。監視中のアプリごとに最大1,000件・最終取得から90秒のバッファを持ち、本文はRead認証とRLSを通してDBから取得します。通知待ちは完了処理1件またはreaperの1テナント分につき最大100msで、通知失敗は確定済みの実行結果を変更しません。再接続時の欠落検出と保存ログとの違いは[アプリログ](application-logs.md)を参照してください。
+
+通知の取得前にDBトランザクションを終了し、Redisの応答待ちでDB接続を占有しません。通知がある場合だけ別のテナントトランザクションで本文を取得します。実行履歴とライブ監視の列選択・ログ保存期限・テナント条件はDB層の同じクエリを使います。
 
 ## デプロイ時の設定
 

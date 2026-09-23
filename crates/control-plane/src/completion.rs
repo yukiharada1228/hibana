@@ -100,6 +100,12 @@ pub(crate) async fn complete(
     tx.commit().await?;
 
     // Observe only committed transitions, including for the duration histogram.
+    crate::store::tail::publish_completed(
+        state.store(),
+        &claims.tenant_id,
+        &[(component_id.as_str(), claims.execution_id.as_str())],
+    )
+    .await;
     state
         .metrics()
         .execution_duration_seconds
