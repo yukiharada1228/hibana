@@ -1,6 +1,6 @@
 # Hibana CLI
 
-このソースは候補版`0.2.0-rc.5`です。npm に公開した版は `npx` で利用できます。未公開の候補を試す場合は[候補版の導入手順](../docs/release-candidate.md)を使ってください。
+このソースは候補版`0.2.0-rc.6`です。npm に公開した版は `npx` で利用できます。未公開の候補を試す場合は[候補版の導入手順](../docs/release-candidate.md)を使ってください。
 
 Hibanaの実行契約はWebAssembly Componentです。Honoは対応するJavaScriptフレームワークの一つで、専用SDKのインポートは必要ありません。
 
@@ -41,7 +41,7 @@ CLIはNode.js 24以上が必要です。ローカル実行ランタイムは初�
 [コンソール](../docs/console.md)のある基盤には`hibana login --url https://hibana.example.internal/api ...`で接続できます。ブラウザでは同じホストの`https://hibana.example.internal/`を開きます。CLIとコンソールは同じ管理APIを使い、配備済みアプリの実行・配信は接続先のKubernetesが担当します。
 
 ```bash
-npx --yes @yukiharada1228/hibana@0.2.0-rc.5 init my-app
+npx --yes @yukiharada1228/hibana@0.2.0-rc.6 init my-app
 cd my-app
 npm run dev
 ```
@@ -49,7 +49,7 @@ npm run dev
 `hibana init`や`hibana login`を直接実行したい場合は、グローバルインストールも利用できます。以下は指定した版のnpm公開後に実行します。
 
 ```bash
-npm install -g @yukiharada1228/hibana@0.2.0-rc.5
+npm install -g @yukiharada1228/hibana@0.2.0-rc.6
 hibana init my-app
 cd my-app
 npm run dev
@@ -65,7 +65,7 @@ npm run dev
     "deploy": "hibana deploy"
   },
   "devDependencies": {
-    "@yukiharada1228/hibana": "0.2.0-rc.5"
+    "@yukiharada1228/hibana": "0.2.0-rc.6"
   }
 }
 ```
@@ -75,7 +75,7 @@ npm run dev
 既存のnpx形式のプロジェクトは、プロジェクト内で次のように移行できます。アプリの依存や`test`などのscriptsは維持されます。
 
 ```bash
-npm install --save-dev --save-exact @yukiharada1228/hibana@0.2.0-rc.5
+npm install --save-dev --save-exact @yukiharada1228/hibana@0.2.0-rc.6
 npm pkg set 'scripts.dev=hibana dev' 'scripts.build=hibana build' 'scripts.deploy=hibana deploy'
 ```
 
@@ -105,7 +105,7 @@ Goの`componentize-go`は`go.mod`のtool依存として固定しています。�
 
 Rust・GoのプロジェクトにはWIT定義と依存ロックもコピーされるので、生成後のビルドはHibana固有の言語SDKに依存しません。Honoテンプレートは公式の最小サンプルの応答テキストを変更した`GET /`だけです。JavaScript・Rust・Goには`GET /`とバイナリを返す`POST /echo`があります。Rust・Goサンプルのecho入力上限は1 MiBです。
 
-以降の `hibana ...` は、CLIを導入済みのHono・JavaScriptプロジェクト内では `npm exec -- hibana ...` として実行できます。グローバル導入済みなら直接 `hibana ...` を使えます。プロジェクト作成前やRust・Goでは `npx --yes @yukiharada1228/hibana@0.2.0-rc.5 ...` も使えます。
+以降の `hibana ...` は、CLIを導入済みのHono・JavaScriptプロジェクト内では `npm exec -- hibana ...` として実行できます。グローバル導入済みなら直接 `hibana ...` を使えます。プロジェクト作成前やRust・Goでは `npx --yes @yukiharada1228/hibana@0.2.0-rc.6 ...` も使えます。
 
 ## ローカルで外部DBへ接続する
 
@@ -157,7 +157,7 @@ hibana platform start --kubeconfig /secure/config --context onprem
 hibana platform uninstall --kubeconfig /secure/config --context onprem --yes
 ```
 
-この開発ブランチでは`platform init my-site --with-keycloak`で、専用namespaceのKeycloak・永続DB・HTTPS用Ingressも生成できます。公開済み`0.2.0-rc.5`には未収録です。[Keycloak導入手順](../deploy/keycloak/kubernetes/README.md)に沿ってチェックアウトのCLIで生成し、`identity/`を個別に配備してください。
+`0.2.0-rc.6`以降は`platform init my-site --with-keycloak`で、専用namespaceのKeycloak・永続DB・HTTPS用Ingressも生成できます。[Keycloak導入手順](../deploy/keycloak/kubernetes/README.md)に沿って生成し、`identity/`を個別に配備してください。
 
 `delete [NAME]`で名前を指定し、省略時は`--config/-c`の設定から読みます。`--dry-run`で確認でき、`--yes/-y`は確認を省略しますが、実行中アプリの削除を拒否するサーバー側の保護は無効化しません。削除にはRead・Adminスコープを持つテナント管理者の認証情報が必要です。Read・Deployだけでは削除できません。ソースコードやビルドツールは不要です。`--all-tenants`はプラットフォーム管理者用の`BOOTSTRAP_ADMIN_TOKEN`が必要です。
 

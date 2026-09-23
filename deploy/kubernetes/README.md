@@ -64,7 +64,7 @@ Kustomizeがリソース定義、CLI内のPython処理が「依存サービス �
 
 `hibana platform init my-site`でサイト用Kustomize overlayを生成できます。生成されたREADMEに沿って外部PostgreSQL・Redis・S3の接続情報、DNS・TLS・IngressClass、外部依存への通信許可を設定します。署名・暗号化・bootstrap用のキーは自動生成します。秘密値の`.env`ファイルは0600で保存し、`.gitignore`に含めます。キーは安全な場所へバックアップしてください。既存の設定ディレクトリは上書きしません。
 
-Keycloakも同じクラスタで運用する場合、この開発ブランチでは`platform init my-site --with-keycloak`で専用namespace・PostgreSQL PVC・HTTPS Ingress・OIDCクライアントも生成できます。[Keycloakの導入・既存ユーザー移行手順](../keycloak/kubernetes/README.md)に従い、生成した`identity/`を先に個別配備します。既存クラスタ向けのHibana停止・撤去操作の対象には入りません。公開済み`0.2.0-rc.5`にはこのフラグがないため、現時点ではチェックアウトのCLIを使用してください。
+Keycloakも同じクラスタで運用する場合、`0.2.0-rc.6`以降の`platform init my-site --with-keycloak`で専用namespace・PostgreSQL PVC・HTTPS Ingress・OIDCクライアントも生成できます。[Keycloakの導入・既存ユーザー移行手順](../keycloak/kubernetes/README.md)に従い、生成した`identity/`を先に個別配備します。既存クラスタ向けのHibana停止・撤去操作の対象には入りません。
 
 CLIのインストール先に基盤のソースは不要です。既存クラスタと配布済みイメージを使います。
 

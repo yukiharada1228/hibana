@@ -4,7 +4,13 @@ Hibana用Keycloakを専用namespace `hibana-identity`へ配備する、検証環
 
 ## 設定の生成
 
-この機能は開発ブランチのCLIに含まれます。公開済み`0.2.0-rc.5`には含まれていません。チェックアウトからは次を実行します。
+この機能は`0.2.0-rc.6`から含まれます。公開後はNode.js 24以上で次を実行します。
+
+```sh
+npx --yes @yukiharada1228/hibana@0.2.0-rc.6 platform init my-site --with-keycloak
+```
+
+チェックアウトから実行する場合は次を使います。
 
 ```sh
 npm ci --prefix sdk
@@ -12,7 +18,7 @@ node sdk/scripts/pack.mjs
 node sdk/src/cli.mjs platform init my-site --with-keycloak
 ```
 
-この変更を含むCLI配布物を導入した場合は`hibana platform init my-site --with-keycloak`でも生成できます。以降は生成先`my-site`で作業します。`identity/`がこのディレクトリのコピーで、Hibana用のルートoverlayとは個別に適用します。既存ディレクトリへの生成は拒否します。
+CLIをグローバル導入している場合は`hibana platform init my-site --with-keycloak`でも生成できます。以降は生成先`my-site`で作業します。`identity/`がこのディレクトリのコピーで、Hibana用のルートoverlayとは個別に適用します。既存ディレクトリへの生成は拒否します。
 
 `identity/database.env`・`bootstrap-admin.env`・`client.env`と`control-plane.env`の鍵はランダム生成し、0600で保存します。OIDCクライアント秘密値はKeycloakとHibanaで一致します。`identity/imports/hibana-realm.json`も0600、親ディレクトリは0700です。`.env`と`imports/`はGit対象外です。秘密値とバックアップは別の安全な保管先へ保存してください。`kubectl kustomize identity`や`kubectl diff -k identity`の出力にはSecretが含まれるため、共有ログへ出力しないでください。
 
