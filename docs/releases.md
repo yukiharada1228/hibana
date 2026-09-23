@@ -88,6 +88,8 @@ node scripts/release.mjs checksums .local/release
 
 npm は[公開時の自動検査](https://github.blog/changelog/2026-07-28-npm-publish-time-malware-scanning-and-dual-use-metadata/)を行うため、公開成功後も通常約5分、混雑時などは15分以上インストールできない場合があります。CI はパッケージを取得できるまで20秒間隔で最大45回確認してから `npx` を検証します。待機が時間切れになった場合は公開状態を確認し、同じ版を再公開しないでください。
 
+GitHub Release公開後、npm公開前の検証や設定不足で止まった場合は、原因を修正し、npmにその版が未公開であることを確認してから、Hibana releaseの手動実行で`publish_tag`に既存タグを指定します。元のコミットのCI・依存監査、全配布物のチェックサム、公開URLからのCLI・ランタイム導入を再検証して、同じtarballをnpmへ公開します。タグや公開済み配布物は置き換えません。通常の候補ビルドではこの入力を空欄にします。
+
 候補ブランチでは通常CIと依存監査も実行します。全OS/CPUの成果物を集めた`hibana-release-candidate`を14日間保存します。バージョンに`-rc.1`などの接尾辞があるタグは、GitHubのprereleaseとして公開する設定です。
 
 - Linux x64/arm64、macOS x64/arm64をネイティブビルド。各OSでtarballの独立インストール、HonoのWasm変換、ランタイム導入、実HTTP応答、Ctrl+C停止を検証。
