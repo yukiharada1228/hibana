@@ -77,6 +77,7 @@ impl ControlPlaneClient {
         if let Some(error) = &mut result.error {
             *error = hibana_shared::diagnostics::format_error(&*error);
         }
+        result.logs = result.logs.map(|logs| logs.bounded());
         for attempt in 0..3 {
             let response = self
                 .http
@@ -218,6 +219,11 @@ mod tests {
             crate::metrics::Metrics::init(),
         );
         let result = ResultMessage {
+            logs: Some(hibana_shared::application_logs::ApplicationLogs {
+                stdout: "\u{1}".repeat(512 * 1024),
+                stderr: "overflow".into(),
+                truncated: false,
+            }),
             execution_id: "fixture-execution".into(),
             tenant_id: "fixture-tenant".into(),
             status: ExecutionStatus::Failed,
@@ -234,13 +240,21 @@ mod tests {
         let first = received.recv().await.unwrap();
         let retry = received.recv().await.unwrap();
         assert_eq!(first.error, retry.error);
+        assert_eq!(first.logs, retry.logs);
+        let logs = first.logs.as_ref().unwrap();
+        assert_eq!(
+            logs.stdout.len(),
+            hibana_shared::application_logs::MAX_LOG_BYTES
+        );
+        assert!(logs.stderr.is_empty());
+        assert!(logs.truncated);
         assert_eq!(first.execution_id, "fixture-execution");
         assert_eq!(first.status, ExecutionStatus::Failed);
         let message = first.error.as_ref().unwrap();
         assert!(message.len() <= MAX_DIAGNOSTIC_BYTES);
         assert!(message.ends_with("\n[diagnostic truncated]"));
         assert!(!message.contains('\0'));
-        assert!(serde_json::to_vec(&first).unwrap().len() < 100 * 1024);
+        assert!(serde_json::to_vec(&first).unwrap().len() < 256 * 1024);
     }
 
     #[tokio::test]

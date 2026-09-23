@@ -71,6 +71,10 @@ async function main() {
     else applications(result, values["all-tenants"]);
     return;
   }
+  if (command === "logs") {
+    const { logs } = await import("./logs.mjs");
+    return logs(args, values);
+  }
   const config = await loadConfig(values.config);
   if (command === "build") {
     console.log(

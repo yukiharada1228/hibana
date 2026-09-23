@@ -1,3 +1,4 @@
+pub mod application_logs;
 use std::time::Duration;
 
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
@@ -228,6 +229,8 @@ pub struct ResultMessage {
     pub job_token: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub usage: Option<UsageMetrics>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub logs: Option<application_logs::ApplicationLogs>,
 }
 
 /// ジョブトークンに載せる claim (§3.3)。
@@ -771,6 +774,7 @@ mod tests {
     #[test]
     fn result_message_roundtrip_includes_job_token() {
         let res = ResultMessage {
+            logs: None,
             execution_id: "exec_1".into(),
             tenant_id: "ten_a".into(),
             status: ExecutionStatus::Succeeded,
@@ -799,6 +803,7 @@ mod tests {
     #[test]
     fn result_message_roundtrip_includes_usage() {
         let res = ResultMessage {
+            logs: None,
             execution_id: "exec_1".into(),
             tenant_id: "ten_a".into(),
             status: ExecutionStatus::Succeeded,
@@ -830,6 +835,7 @@ mod tests {
     #[test]
     fn result_message_none_usage_is_omitted_from_wire() {
         let res = ResultMessage {
+            logs: None,
             execution_id: "exec_1".into(),
             tenant_id: "ten_a".into(),
             status: ExecutionStatus::Failed,

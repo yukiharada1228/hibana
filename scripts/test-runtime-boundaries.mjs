@@ -1,10 +1,13 @@
+import { issueFixtureToken } from "./test-api-credentials.mjs";
+import {runCommand} from "./bounded-process.mjs";
+import {resolve} from "node:path";
 // Uses the disposable database and real CP/Worker/Wasm from test-http.sh.
 import assert from 'node:assert/strict';
 import {createServer, request} from 'node:http';
 import {connect} from 'node:net';
 import {setTimeout as sleep} from 'node:timers/promises';
 
-export async function testRuntimeBoundaries({api, token, wasm, upload, url, internal, metricsUrl, startWorker, stopWorker}) {
+export async function testRuntimeBoundaries({api, sql, token, wasm, upload, url, internal, metricsUrl, startWorker, stopWorker}) {
   let rejectResults = false, failures = 0;
   let stalled;
   const proxy = createServer((req, res) => {
@@ -52,9 +55,37 @@ export async function testRuntimeBoundaries({api, token, wasm, upload, url, inte
     assert.match(JSON.stringify(trapped.error),/wasm trap/);
     assert.doesNotMatch(JSON.stringify(trapped.error),/runtime regression fixture/);
     assert.ok(performance.now()-trapStart < 1000,'an immediate trap must not wait for the execution deadline');
-    const trapMetrics = await (await fetch(metricsUrl+'/metrics')).text();
-    assert.match(trapMetrics,/^faas_guest_stderr_dropped_bytes_total [1-9][0-9]*$/m,'stderr is captured even without Secrets');
-    console.log('PASS guest trap is immediately recorded as failed, not timeout; guest stderr is discarded even without Secrets');
+    const detail = async id => (await (await api(`/executions/${id}`, {token})).json());
+    assert.match((await detail(trapped.execution_id)).logs.stderr, /runtime regression fixture/);
+    console.log('PASS trapped Wasm retains tenant-private stderr');
+    assert.equal((await invoke('GET', '/logs')).body, 'logged');
+    const logged = await waitForTerminal();
+    const logs = await detail(logged.execution_id);
+    assert.equal(logs.logs.stdout, 'hello 雪\n');
+    assert.equal(logs.logs.stderr, 'fixture stderr\n');
+    assert.equal(logs.logs.truncated, false);
+    const reader = await (await issueFixtureToken(sql, {tenant_slug:'upload',email:'test@example.invalid',scopes:['read']})).json();
+    const deployer = await (await issueFixtureToken(sql, {tenant_slug:'upload',email:'test@example.invalid',scopes:['deploy']})).json();
+    for (const path of [`/executions/${logged.execution_id}`, `/components/${id}/logs`]) {
+      assert.equal((await api(path)).status, 401);
+      assert.equal((await api(path, {token:deployer.token})).status, 403);
+      const response = await api(path, {token:reader.token});
+      assert.equal(response.status, 200);
+      assert.equal(response.headers.get('cache-control'), 'no-store');
+    }
+    const cli = JSON.parse(await runCommand(process.execPath, [resolve('sdk/src/cli.mjs'), 'logs', 'runtime-boundaries', '--json'], {
+      env:{...process.env, HIBANA_URL:url, HIBANA_TOKEN:reader.token, HIBANA_PROFILE:''},
+    }));
+    assert.deepEqual(cli.items[0].logs, logs.logs);
+    assert.equal(cli.items[0].version_id, logs.version_id);
+    assert.equal((await invoke('GET', '/log-overflow')).body, 'overflow survived');
+    const overflow = await detail((await waitForTerminal()).execution_id);
+    assert.equal(overflow.status, 'succeeded');
+    assert.equal(overflow.logs.truncated, true);
+    assert.equal(Buffer.byteLength(overflow.logs.stdout) + Buffer.byteLength(overflow.logs.stderr), 16 * 1024);
+    const logMetrics = await (await fetch(metricsUrl+'/metrics')).text();
+    assert.match(logMetrics,/^faas_guest_log_dropped_bytes_total [1-9][0-9]*$/m);
+    console.log('PASS stdout/stderr, Unicode, overflow without guest failure, Read scope and real CLI retrieval');
 
     for (const path of ['/header-limit', '/header-resources']) {
       assert.equal((await invoke('GET', path)).status,502);
@@ -72,7 +103,9 @@ export async function testRuntimeBoundaries({api, token, wasm, upload, url, inte
     await health.text();
     const healthMs = Math.round(performance.now()-healthStart);
     assert.equal((await busy).status,502);
-    assert.equal((await waitForTerminal()).status,'timeout');
+    const timed = await waitForTerminal();
+    assert.equal(timed.status,'timeout');
+    assert.match((await detail(timed.execution_id)).logs.stderr, /before timeout/);
     assert.ok(healthMs < 500,`CPU-bound Wasm blocked the single-thread executor for ${healthMs} ms`);
     console.log(`PASS CPU-bound Wasm yields on a single executor thread; health answered in ${healthMs} ms`);
 

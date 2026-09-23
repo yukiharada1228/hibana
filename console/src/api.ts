@@ -5,6 +5,7 @@ import type {
   Version,
   Settings,
   ExecutionsPage,
+  ExecutionDetails,
   VersionDetails,
   EgressPolicy,
 } from "./types";
@@ -181,6 +182,10 @@ export class Api {
     return this.request<ExecutionsPage>(
       `/components/${encodeURIComponent(id)}/executions?${query}`,
     );
+  }
+
+  execution(id: string) {
+    return this.request<ExecutionDetails>(`/executions/${encodeURIComponent(id)}`);
   }
   rollback(id: string, version: string) {
     return this.request(

@@ -1453,3 +1453,42 @@ for (const name of [".", ".."]) {
     await expect(row).toHaveCount(0);
   });
 }
+
+test("application logs load on demand, render safely, retry failures and fit mobile", async ({ page }, testInfo) => {
+  let mode = "error", requests = 0;
+  await page.route("**/api/executions/exe_0", route => {
+    requests++;
+    if (mode === "error") return route.fulfill({status:503,json:{}});
+    return route.fulfill({json:{execution_id:"exe_0",version_id:"ver_2",status:"timeout",logs:
+      mode === "expired" ? null : mode === "empty" ? {stdout:"",stderr:"",truncated:false} : {
+        stdout:'hello 雪\n<script>window.logExecuted = true</script>\n' + 'long-line-'.repeat(200),
+        stderr:"before timeout\n\u001b[2J",truncated:true,
+      }}});
+  });
+  await login(page, "reader@example.internal");
+  await page.getByRole("link", { name: "hello-api", exact: true }).click();
+  await page.getByRole("tab", { name: "実行履歴", exact: true }).click();
+  const row = page.getByRole("row").filter({hasText:"exe_0"});
+  await row.locator("summary").click();
+  expect(requests).toBe(0);
+  await row.getByRole("button", {name:"アプリログを表示"}).click();
+  await expect(row.getByRole("alert")).toContainText("基盤が処理を受け付けられません");
+  mode = "logs";
+  await row.getByRole("button", {name:"ログを再取得"}).click();
+  await expect(row.getByLabel("標準出力ログ")).toContainText("hello 雪");
+  await expect(row.getByLabel("標準出力ログ")).toContainText("<script>");
+  await expect(row.getByLabel("標準エラーログ")).toContainText("before timeout");
+  await expect(row.getByRole("status")).toContainText("16KiB");
+  expect(await page.evaluate(() => (window as unknown as Record<string, unknown>).logExecuted)).toBeUndefined();
+  await page.setViewportSize({width:390,height:844});
+  await row.getByLabel("標準出力ログ").scrollIntoViewIfNeeded();
+  expect(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth)).toBe(true);
+  await page.screenshot({path:testInfo.outputPath("application-logs-mobile.png")});
+  mode = "empty";
+  await row.getByRole("button", {name:"ログを再取得"}).click();
+  await expect(row).toContainText("アプリからの出力はありません");
+  mode = "expired";
+  await row.getByRole("button", {name:"ログを再取得"}).click();
+  await expect(row).toContainText("ログは取得できません");
+  await expect(row.getByLabel("標準出力ログ")).toHaveCount(0);
+});

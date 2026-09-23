@@ -29,6 +29,8 @@ pub struct ExecutionSummary {
     pub error: Option<Value>,
     pub created_at: chrono::DateTime<chrono::Utc>,
     pub wall_time_ms: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub logs: Option<Value>,
 }
 
 fn serialize_http_status<S: serde::Serializer>(
@@ -44,6 +46,25 @@ pub async fn list_executions(
     Path(component_id): Path<String>,
     Query(query): Query<ExecutionsQuery>,
 ) -> Result<impl IntoResponse, AppError> {
+    execution_page(state, principal, component_id, query, false).await
+}
+
+pub async fn list_logs(
+    State(state): State<AppState>,
+    principal: Principal,
+    Path(component_id): Path<String>,
+    Query(query): Query<ExecutionsQuery>,
+) -> Result<impl IntoResponse, AppError> {
+    execution_page(state, principal, component_id, query, true).await
+}
+
+async fn execution_page(
+    state: AppState,
+    principal: Principal,
+    component_id: String,
+    query: ExecutionsQuery,
+    include_logs: bool,
+) -> Result<impl IntoResponse, AppError> {
     let tenant = &principal.tenant_id;
     let tx = state.pool().begin().await?;
     db::set_tenant_guc(&tx, tenant).await?;
@@ -54,6 +75,14 @@ pub async fn list_executions(
         .select_only()
         .column_as(executions::Column::Id, "execution_id")
         .column_as(db::http_status_expression(), "http_status")
+        .column_as(
+            if include_logs {
+                db::application_logs_expression()
+            } else {
+                Expr::val(None::<Value>)
+            },
+            "logs",
+        )
         .columns([
             executions::Column::VersionId,
             executions::Column::Status,
@@ -105,8 +134,9 @@ pub async fn list_executions(
     } else {
         None
     };
-    Ok(Json(
-        serde_json::json!({"items": items, "next_cursor": next_cursor}),
+    Ok((
+        [(axum::http::header::CACHE_CONTROL, "no-store")],
+        Json(serde_json::json!({"items": items, "next_cursor": next_cursor})),
     ))
 }
 
@@ -123,6 +153,7 @@ pub struct ExecutionResponse {
     pub created_at: String,
     pub started_at: Option<String>,
     pub finished_at: Option<String>,
+    pub logs: Option<Value>,
 }
 
 pub async fn get_execution(
@@ -141,16 +172,20 @@ pub async fn get_execution(
         .ok_or_else(|| FaasError::NotFound(format!("execution '{id}'")))?;
     tx.commit().await?;
 
-    Ok(Json(ExecutionResponse {
-        execution_id: row.id,
-        tenant_id: row.tenant_id,
-        component_id: row.component_id,
-        version_id: row.version_id,
-        status: row.status,
-        http_status: db::http_status_code(row.http_status.as_ref()),
-        error: row.error,
-        created_at: row.created_at.to_rfc3339(),
-        started_at: row.started_at.map(|t| t.to_rfc3339()),
-        finished_at: row.finished_at.map(|t| t.to_rfc3339()),
-    }))
+    Ok((
+        [(axum::http::header::CACHE_CONTROL, "no-store")],
+        Json(ExecutionResponse {
+            execution_id: row.id,
+            tenant_id: row.tenant_id,
+            component_id: row.component_id,
+            version_id: row.version_id,
+            status: row.status,
+            http_status: db::http_status_code(row.http_status.as_ref()),
+            error: row.error,
+            logs: row.logs,
+            created_at: row.created_at.to_rfc3339(),
+            started_at: row.started_at.map(|t| t.to_rfc3339()),
+            finished_at: row.finished_at.map(|t| t.to_rfc3339()),
+        }),
+    ))
 }

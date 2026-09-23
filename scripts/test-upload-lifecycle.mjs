@@ -165,7 +165,16 @@ try {
       Err(_) => serde_json::json!({"ok":false}),
     };
     (200, "application/json", serde_json::to_vec(&result).unwrap())
+  } else if path == "/logs" {
+    println!("hello 雪");
+    eprintln!("fixture stderr");
+    (200, "text/plain", b"logged".to_vec())
+  } else if path == "/log-overflow" {
+    println!("{}", "x".repeat(64 * 1024));
+    eprintln!("still running");
+    (200, "text/plain", b"overflow survived".to_vec())
   } else if path == "/busy" {
+    eprintln!("before timeout");
     loop { std::hint::black_box(1); }
   } else if path == "/header-limit" {
     let fields = Fields::new();
@@ -458,7 +467,7 @@ try {
   await testUploadCapacity({api, sql, token, wasm, upload, url, holdStorage, releaseStorage:() => releasePut()});
   await testSecretRekey({api, sql, pg, restart:async env => { await stop(); await start(env); }});
   await testExecutionShutdown({api, token, wasm, upload, url, internal, metricsUrl:`http://127.0.0.1:${metricsPort}`, startWorker, stopWorker:() => stop(worker)});
-  await testRuntimeBoundaries({api, token, wasm, upload, url, internal, metricsUrl:`http://127.0.0.1:${metricsPort}`, startWorker, stopWorker:() => stop(worker)});
+  await testRuntimeBoundaries({api, sql, token, wasm, upload, url, internal, metricsUrl:`http://127.0.0.1:${metricsPort}`, startWorker, stopWorker:() => stop(worker)});
 } catch (error) {
   // Preserve diagnostics before the disposable fixture and its log are removed.
   const details = await readFile(join(folder, 'cp.log'), 'utf8');

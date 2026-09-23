@@ -11,6 +11,73 @@ use hibana_shared::UsageMetrics;
 use sea_orm::sea_query::extension::postgres::PgExpr;
 use serde_json::Value;
 
+fn log_cutoff() -> Expr {
+    now().sub(
+        Expr::cust("interval '1 hour'").mul(hibana_shared::application_logs::LOG_RETENTION_HOURS),
+    )
+}
+
+/// Expiry is enforced on reads even when background cleanup is delayed.
+pub fn application_logs_expression() -> Expr {
+    Expr::case(
+        Expr::col(executions::Column::FinishedAt).gt(log_cutoff()),
+        Expr::col(executions::Column::ApplicationLogs),
+    )
+    .finally(Expr::val(None::<Value>))
+    .into()
+}
+
+/// Bound each cleanup transaction. Suspended tenants are included by the reaper.
+pub const LOG_CLEANUP_BATCH_SIZE: u64 = 500;
+
+pub async fn purge_expired_application_logs(
+    tx: &DatabaseTransaction,
+    tenant: &str,
+) -> Result<u64, DbErr> {
+    let expired = Condition::all()
+        .add(executions::Column::TenantId.eq(tenant))
+        .add(executions::Column::ApplicationLogs.is_not_null())
+        .add(Expr::col(executions::Column::FinishedAt).lte(log_cutoff()));
+    let batch = executions::Entity::find()
+        .select_only()
+        .column(executions::Column::Id)
+        .filter(expired.clone())
+        .order_by_asc(executions::Column::FinishedAt)
+        .order_by_asc(executions::Column::Id)
+        .limit(LOG_CLEANUP_BATCH_SIZE)
+        .into_query();
+    Ok(executions::Entity::update_many()
+        .col_expr(
+            executions::Column::ApplicationLogs,
+            Expr::val(None::<Value>),
+        )
+        .filter(expired)
+        .filter(executions::Column::Id.in_subquery(batch))
+        .exec(tx)
+        .await?
+        .rows_affected)
+}
+
+/// Called only inside the locked, first completion transaction. Retries cannot
+/// replace output or refresh its lifetime; accounting failure rolls logs back too.
+pub async fn save_application_logs(
+    tx: &DatabaseTransaction,
+    tenant: &str,
+    id: &str,
+    logs: &hibana_shared::application_logs::ApplicationLogs,
+) -> Result<(), DbErr> {
+    executions::Entity::update_many()
+        .col_expr(
+            executions::Column::ApplicationLogs,
+            Expr::val(serde_json::json!(logs.bounded())),
+        )
+        .filter(executions::Column::TenantId.eq(tenant))
+        .filter(executions::Column::Id.eq(id))
+        .exec(tx)
+        .await?;
+    Ok(())
+}
+
 /// Select only the status from HTTP result metadata, never the response body.
 pub fn http_status_expression() -> Expr {
     Expr::case(
@@ -79,6 +146,7 @@ pub struct ExecutionRow {
     pub status: String,
     pub http_status: Option<Value>,
     pub error: Option<Value>,
+    pub logs: Option<Value>,
     pub created_at: DateTime<Utc>,
     pub started_at: Option<DateTime<Utc>>,
     pub finished_at: Option<DateTime<Utc>>,
@@ -114,6 +182,7 @@ pub async fn get_execution(
     executions::Entity::find()
         .select_only()
         .column_as(http_status_expression(), "http_status")
+        .column_as(application_logs_expression(), "logs")
         .columns([
             executions::Column::Id,
             executions::Column::TenantId,

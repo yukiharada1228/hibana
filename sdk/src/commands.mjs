@@ -14,6 +14,9 @@ const boolean = (description, short) => ({
 const options = {
   help: boolean("Show help for this command", "h"),
   json: boolean("Output the complete API response as JSON"),
+  execution: string("ID", "Read logs for one execution"),
+  before: string("CURSOR", "Read the next page of executions"),
+  "errors-only": boolean("Show HTTP errors, failed executions and timeouts"),
   verbose: boolean("Include internal identifiers and the full version"),
   config: string("FILE", "Project configuration (default: hibana.json)", "c"),
   template: string("NAME", "hono (default), javascript, rust or go"),
@@ -117,6 +120,22 @@ const commands = {
       notes:
         "Builds and activates a new version. A version is generated when --version is omitted.\n" +
         "Version names use 1..128 ASCII characters: start with a letter or digit, then letters, digits, '.', '_', '+', '-'.\n" +
+        connectionHelp,
+    },
+  ),
+  logs: leaf(
+    "Read application stdout and stderr after execution",
+    "hibana logs [NAME]",
+    [...projectRemote, "execution", "before", "errors-only", "json"],
+    {
+      max: 1,
+      examples: [
+        "hibana logs",
+        "hibana logs my-api --errors-only",
+        "hibana logs --execution exec_ID --json",
+      ],
+      notes:
+        "Uses hibana.json when NAME is omitted, except with --execution.\nLists 20 executions from the last 24 hours, newest first.\nLogs are limited to 16 KiB per execution and expire 24 hours after completion. Requires Read permission.\n" +
         connectionHelp,
     },
   ),
@@ -340,7 +359,7 @@ Development:
 ${rows(["init", "dev", "build", "deploy"].map((name) => [name, commands[name].description]))}
 
 Applications and connections:
-${rows(["login", "logout", "list", "rollback", "delete", "secret", "egress", "profile"].map((name) => [name, commands[name].description]))}
+${rows(["login", "logout", "list", "logs", "rollback", "delete", "secret", "egress", "profile"].map((name) => [name, commands[name].description]))}
 
 Advanced:
 ${rows(["runtime", "platform"].map((name) => [name, commands[name].description]))}

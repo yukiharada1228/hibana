@@ -84,6 +84,12 @@ export type Execution = {
   wall_time_ms: number | null;
 };
 export type ExecutionsPage = { items: Execution[]; next_cursor: string | null };
+export type ExecutionDetails = {
+  execution_id: string;
+  version_id: string;
+  status: string;
+  logs: { stdout: string; stderr: string; truncated: boolean } | null;
+};
 export interface EgressPolicy {
   allow_outbound: string[];
 }

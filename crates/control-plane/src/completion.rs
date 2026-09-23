@@ -85,6 +85,9 @@ pub(crate) async fn complete(
     )
     .await?
     .ok_or_else(|| FaasError::Conflict("HTTP result rejected".into()))?;
+    if let Some(logs) = &result.logs {
+        db::save_application_logs(&tx, &claims.tenant_id, &claims.execution_id, logs).await?;
+    }
     db::upsert_usage_rollup(
         &tx,
         &claims.tenant_id,

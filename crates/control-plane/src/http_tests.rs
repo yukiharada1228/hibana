@@ -324,6 +324,7 @@ async fn http_mvp_regression() {
         .unwrap());
     assert_eq!(inflight(&pool, "http").await, 1);
     let mut result = ResultMessage {
+        logs: None,
         execution_id: id.clone(),
         tenant_id: "http".into(),
         status: ExecutionStatus::Succeeded,
@@ -695,6 +696,7 @@ async fn http_mvp_regression() {
     console_information_regression(&state).await;
     direct_http_dispatch_regression(&owner, &pool).await;
     completion_diagnostic_regression(&owner, &state).await;
+    application_logs_regression(&owner, &state).await;
     completion_concurrency_regression(&owner, &state).await;
     // Keep identities used by the subsequent cross-tenant RLS checks, but do
     // not ask the real fleet to prepare these fake, unstored Wasm versions.
@@ -745,6 +747,11 @@ async fn completion_diagnostic_regression(owner: &DatabaseConnection, state: &Ap
             vec![id.clone().into()]).await.unwrap();
         assert_eq!(inflight(state.pool(), "diagnostics").await, 1);
         let result = ResultMessage {
+            logs: Some(hibana_shared::application_logs::ApplicationLogs {
+                stdout: "\0雪".repeat(20_000),
+                stderr: "fixture stderr".into(),
+                truncated: false,
+            }),
             execution_id: id.clone(),
             tenant_id: "diagnostics".into(),
             status: ExecutionStatus::Failed,
@@ -775,6 +782,23 @@ async fn completion_diagnostic_regression(owner: &DatabaseConnection, state: &Ap
             .unwrap();
         tx.commit().await.unwrap();
         assert_eq!(saved.status, "failed");
+        let expected_logs = result.logs.as_ref().unwrap().bounded();
+        assert_eq!(saved.application_logs, Some(json!(expected_logs)));
+        let mut retry = result.clone();
+        retry.logs = Some(Default::default());
+        crate::completion::complete(State(state.clone()), headers(&retry.job_token), Json(retry))
+            .await
+            .unwrap();
+        let tx = state.pool().begin().await.unwrap();
+        db::set_tenant_guc(&tx, "diagnostics").await.unwrap();
+        let after = executions::Entity::find_by_id(&id)
+            .one(&tx)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(after.application_logs, saved.application_logs);
+        assert_eq!(after.finished_at, saved.finished_at);
+        tx.commit().await.unwrap();
         assert_eq!(
             saved.error,
             expected.map(|message| json!({ "message": message }))
@@ -793,6 +817,212 @@ async fn completion_diagnostic_regression(owner: &DatabaseConnection, state: &Ap
     println!("PASS completion diagnostics: bounded UTF-8 / NUL-safe JSONB / unchanged text / terminal state / input cleanup / immediate slot release / idempotent usage");
 }
 
+async fn application_logs_regression(owner: &DatabaseConnection, state: &AppState) {
+    use crate::handlers::executions::{get_execution, list_executions, list_logs, ExecutionsQuery};
+    use axum::extract::{Path, Query};
+    let principal = |tenant: &str| crate::auth::Principal {
+        tenant_id: tenant.into(),
+        user_id: None,
+        token_id: "fixture".into(),
+        scopes: vec![hibana_shared::Scope::Read],
+        role: hibana_shared::Role::Member,
+    };
+    async fn body(response: impl IntoResponse) -> serde_json::Value {
+        let response = response.into_response();
+        assert_eq!(response.headers()["cache-control"], "no-store");
+        let bytes = axum::body::to_bytes(response.into_body(), 2 * 1024 * 1024)
+            .await
+            .unwrap();
+        serde_json::from_slice(&bytes).unwrap()
+    }
+    fixture_execute(owner, r#"
+        INSERT INTO tenants (id,slug,name,status) VALUES ('logs','logs','Logs','active');
+        INSERT INTO components (id,tenant_id,name) VALUES ('logs-app','logs','app');
+        INSERT INTO component_versions (id,tenant_id,component_id,version,storage_uri,wasm_sha256)
+            VALUES ('logs-v1','logs','logs-app','1','unused','abcd');
+        INSERT INTO executions (id,tenant_id,component_id,version_id,status,http_request,created_at,finished_at,application_logs)
+            SELECT 'logs-'||lpad(i::text,3,'0'),'logs','logs-app','logs-v1','succeeded',true,now(),now(),
+                '{"stdout":"tenant-private 雪","stderr":"","truncated":false}'::jsonb FROM generate_series(1,26) AS i;
+        INSERT INTO executions (id,tenant_id,component_id,version_id,status,http_request,finished_at,application_logs)
+            SELECT 'expired-'||i,'logs','logs-app','logs-v1','failed',true,now()-interval '25 hours',
+                '{"stdout":"expired private output","stderr":"","truncated":false}'::jsonb FROM generate_series(1,501) AS i;
+    "#, vec![]).await.unwrap();
+    // Expiry is enforced before cleanup. Old runtimes and pending executions also have no logs.
+    let expired = body(
+        get_execution(
+            State(state.clone()),
+            principal("logs"),
+            Path("expired-1".into()),
+        )
+        .await
+        .unwrap(),
+    )
+    .await;
+    assert!(expired["logs"].is_null());
+    let detail = body(
+        get_execution(
+            State(state.clone()),
+            principal("logs"),
+            Path("logs-001".into()),
+        )
+        .await
+        .unwrap(),
+    )
+    .await;
+    assert_eq!(detail["logs"]["stdout"], "tenant-private 雪");
+    assert_eq!(detail["version_id"], "logs-v1");
+    for key in ["input", "output", "input_ref", "output_ref"] {
+        assert!(detail.get(key).is_none());
+    }
+    assert_eq!(
+        get_execution(
+            State(state.clone()),
+            principal("other"),
+            Path("logs-001".into())
+        )
+        .await
+        .err()
+        .unwrap()
+        .into_response()
+        .status(),
+        StatusCode::NOT_FOUND
+    );
+    assert_eq!(
+        list_logs(
+            State(state.clone()),
+            principal("other"),
+            Path("logs-app".into()),
+            Query(ExecutionsQuery::default())
+        )
+        .await
+        .err()
+        .unwrap()
+        .into_response()
+        .status(),
+        StatusCode::NOT_FOUND
+    );
+
+    let page = body(
+        list_logs(
+            State(state.clone()),
+            principal("logs"),
+            Path("logs-app".into()),
+            Query(ExecutionsQuery::default()),
+        )
+        .await
+        .unwrap(),
+    )
+    .await;
+    assert_eq!(page["items"].as_array().unwrap().len(), 20);
+    // Cursor ordering must also work when creation timestamps are identical.
+    let next = body(
+        list_logs(
+            State(state.clone()),
+            principal("logs"),
+            Path("logs-app".into()),
+            Query(ExecutionsQuery {
+                before: Some(page["next_cursor"].as_str().unwrap().into()),
+                errors_only: false,
+            }),
+        )
+        .await
+        .unwrap(),
+    )
+    .await;
+    let ids: std::collections::HashSet<_> = page["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|r| r["execution_id"].as_str().unwrap())
+        .collect();
+    assert!(next["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .all(|r| !ids.contains(r["execution_id"].as_str().unwrap())));
+    // The small history endpoint must not automatically download application output.
+    let history = body(
+        list_executions(
+            State(state.clone()),
+            principal("logs"),
+            Path("logs-app".into()),
+            Query(ExecutionsQuery::default()),
+        )
+        .await
+        .unwrap(),
+    )
+    .await;
+    assert!(history["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .all(|r| r.get("logs").is_none()));
+    assert!(list_logs(
+        State(state.clone()),
+        principal("logs"),
+        Path("logs-app".into()),
+        Query(ExecutionsQuery {
+            before: Some("invalid".into()),
+            errors_only: false
+        })
+    )
+    .await
+    .is_err());
+
+    // Explicit tenant predicates and RLS both apply, including the cleanup worker.
+    let tx = state.pool().begin().await.unwrap();
+    db::set_tenant_guc(&tx, "other").await.unwrap();
+    assert_eq!(
+        db::purge_expired_application_logs(&tx, "logs")
+            .await
+            .unwrap(),
+        0
+    );
+    tx.commit().await.unwrap();
+    let tx = state.pool().begin().await.unwrap();
+    db::set_tenant_guc(&tx, "logs").await.unwrap();
+    assert_eq!(
+        db::purge_expired_application_logs(&tx, "logs")
+            .await
+            .unwrap(),
+        500
+    );
+    tx.commit().await.unwrap();
+    fixture_execute(
+        owner,
+        "UPDATE tenants SET status='suspended' WHERE id='logs'",
+        vec![],
+    )
+    .await
+    .unwrap();
+    fixture_execute(
+        owner,
+        "UPDATE executions SET application_logs='{\"stdout\":\"expired\"}' WHERE tenant_id='logs' AND id LIKE 'expired-%'; UPDATE executions SET input_ref='legacy-fixture' WHERE id='expired-501'",
+        vec![],
+    )
+    .await
+    .unwrap();
+    crate::reaper::reconcile_once(state, 0).await.unwrap();
+    assert_eq!(
+        scalar(
+            owner,
+            "SELECT count(*) FROM executions WHERE tenant_id='logs' AND input_ref IS NOT NULL"
+        )
+        .await,
+        0
+    );
+    assert_eq!(scalar(owner, "SELECT count(*) FROM executions WHERE tenant_id='logs' AND application_logs IS NOT NULL").await, 26);
+    assert_eq!(
+        scalar(
+            owner,
+            "SELECT count(*) FROM executions WHERE tenant_id='logs'"
+        )
+        .await,
+        527
+    );
+    println!("PASS application logs: tenant isolation / expiry before cleanup / bounded cleanup / suspended tenants / stable pagination / unchanged execution history");
+}
+
 async fn completion_concurrency_regression(owner: &DatabaseConnection, state: &AppState) {
     fixture_execute(owner, r#"
         INSERT INTO tenants (id,slug,name,status) VALUES ('completion','completion','Completion','active');
@@ -804,6 +1034,7 @@ async fn completion_concurrency_regression(owner: &DatabaseConnection, state: &A
             FROM unnest(ARRAY['completion-duplicate','completion-conflict','completion-rollback']) AS id;
     "#, vec![]).await.unwrap();
     let result = |id: &str, status| ResultMessage {
+        logs: None,
         execution_id: id.into(),
         tenant_id: "completion".into(),
         status,
@@ -950,6 +1181,7 @@ async fn direct_http_dispatch_regression(owner: &DatabaseConnection, pool: &Data
             started.send(()).await.unwrap();
             gate.acquire().await.unwrap().forget();
             let result = ResultMessage {
+                logs: None,
                 execution_id: job.execution_id,
                 tenant_id: job.tenant_id,
                 status: ExecutionStatus::Succeeded,
@@ -1642,7 +1874,7 @@ async fn assert_fresh_schema(owner: &DatabaseConnection) {
     assert_eq!(scalar(owner,"SELECT count(*) FROM information_schema.tables WHERE table_schema='public' AND table_type='BASE TABLE'").await,16);
     assert_eq!(
         scalar(owner, "SELECT count(*) FROM seaql_migrations").await,
-        12
+        13
     );
     assert_eq!(scalar(owner,"SELECT count(*) FROM pg_class c JOIN pg_namespace n ON c.relnamespace=n.oid WHERE n.nspname='public' AND c.relkind='r' AND c.relrowsecurity AND c.relforcerowsecurity").await,13);
     assert_eq!(scalar(owner,"SELECT count(*) FROM information_schema.columns WHERE table_schema='public' AND column_name IN ('canary_weight','canary_version_id','chain_depth','routing_reason','idempotency_key')").await,0);
@@ -2034,9 +2266,16 @@ async fn assert_execution_input_upgrade(owner: &DatabaseConnection) {
     let runtime = hibana_database::postgres::connect(&std::env::var("DATABASE_URL").unwrap(), 2, 0)
         .await
         .unwrap();
-    let state = state(runtime.clone(), Arc::new(crate::store::InProcStore::new()));
-    // The production reaper must clean even with stuck-job recovery disabled.
-    crate::reaper::reconcile_once(&state, 0).await.unwrap();
+    // This fixture intentionally stops before the OIDC/log schema migrations.
+    // Exercise the input query here; the full reaper is tested after all migrations.
+    for tenant in ["http", "other"] {
+        let tx = runtime.begin().await.unwrap();
+        db::set_tenant_guc(&tx, tenant).await.unwrap();
+        db::purge_terminal_execution_inputs(&tx, tenant)
+            .await
+            .unwrap();
+        tx.commit().await.unwrap();
+    }
     assert_eq!(scalar(owner, "SELECT count(*) FROM executions WHERE id LIKE 'retention-upgrade-%' AND status='succeeded' AND (input IS NOT NULL OR input_ref IS NOT NULL)").await, 0);
     assert_eq!(scalar(owner, "SELECT count(*) FROM executions WHERE id='retention-upgrade-other-pending' AND input IS NOT NULL AND input_ref IS NOT NULL").await, 1);
     // More than one batch must progress without touching live or foreign inputs.

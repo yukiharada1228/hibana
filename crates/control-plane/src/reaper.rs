@@ -120,6 +120,18 @@ async fn reconcile_tenant(
             "stuck-execution sweeper finalized orphaned pending/running rows to 'failed' (reclaiming in-flight slots)"
         );
     }
+    // Ten short batches can keep up with the default 50 requests/s at a 30s
+    // interval. One 500-row batch alone could only retire 16 logs/s. Commit
+    // each batch separately and cap the pass so one tenant cannot monopolize it.
+    for _ in 0..10 {
+        let tx = state.pool().begin().await?;
+        crate::db::set_tenant_guc(&tx, tenant).await?;
+        let removed = crate::db::purge_expired_application_logs(&tx, tenant).await?;
+        tx.commit().await?;
+        if removed < crate::db::LOG_CLEANUP_BATCH_SIZE {
+            break;
+        }
+    }
     Ok(())
 }
 

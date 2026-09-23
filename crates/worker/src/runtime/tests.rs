@@ -89,7 +89,7 @@ fn preparing_memory_images_does_not_execute_guest_start() {
 #[tokio::test]
 async fn expired_preparation_deadline_prevents_guest_instantiation() {
     let engine = build_engine().unwrap();
-    let runtime = Runtime::new(engine.clone(), crate::metrics::Metrics::init()).unwrap();
+    let runtime = Runtime::new(engine.clone()).unwrap();
     // Deliberately not an HTTP proxy: trying to instantiate it would return Failed.
     let component =
         PreparedComponent::new(Component::new(&engine, "(component)").unwrap()).unwrap();
@@ -97,6 +97,7 @@ async fn expired_preparation_deadline_prevents_guest_instantiation() {
     let result = runtime
         .run_http(
             Invocation {
+                logs: Default::default(),
                 component: Arc::new(component),
                 request: HttpRequest::default(),
                 limits: ResourceLimits::default(),
@@ -120,7 +121,7 @@ async fn long_wasm_backtraces_are_bounded_during_execution_and_instantiation() {
     use hibana_shared::diagnostics::MAX_DIAGNOSTIC_BYTES;
 
     let engine = build_engine().unwrap();
-    let runtime = Runtime::new(engine.clone(), crate::metrics::Metrics::init()).unwrap();
+    let runtime = Runtime::new(engine.clone()).unwrap();
     for (start, fuel, prefix) in [
         (false, None, "wasm trap:"),
         (true, None, "failed to instantiate proxy:"),
@@ -159,6 +160,7 @@ async fn long_wasm_backtraces_are_bounded_during_execution_and_instantiation() {
         let result = runtime
             .run_http(
                 Invocation {
+                    logs: Default::default(),
                     component: Arc::new(component),
                     request: HttpRequest {
                         authority: "fixture.invalid".into(),
@@ -194,7 +196,7 @@ async fn long_wasm_backtraces_are_bounded_during_execution_and_instantiation() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
 async fn cpu_bound_guest_yields_to_other_tasks_and_still_times_out() {
     let engine = build_engine().unwrap();
-    let runtime = Runtime::new(engine.clone(), crate::metrics::Metrics::init()).unwrap();
+    let runtime = Runtime::new(engine.clone()).unwrap();
     let module = Module::new(&engine, "(module (func (export \"run\") (loop br 0)))").unwrap();
     let mut store = Store::new(&engine, ());
     store.set_fuel(u64::MAX).unwrap();

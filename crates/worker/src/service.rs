@@ -57,8 +57,7 @@ impl Worker {
             metrics.clone(),
         );
         Ok(Self {
-            runtime: Runtime::new(engine, metrics.clone())?
-                .with_tcp_policy(settings.tcp_policy.clone()),
+            runtime: Runtime::new(engine)?.with_tcp_policy(settings.tcp_policy.clone()),
             repository: ExecutionRepository::new(pool),
             artifacts,
             control_plane,
@@ -137,9 +136,10 @@ impl Worker {
         // One budget covers environment retrieval, every approved DNS lookup and
         // the runtime. A slow resolver must not retain execution capacity before
         // the runtime's own timeout starts. Persist the timeout outside this scope.
+        let logs = crate::runtime::logs::Capture::default();
         let outcome = tokio::time::timeout_at(
             deadline,
-            self.execute(job, resolved, component, stream, deadline)
+            self.execute(job, resolved, component, stream, deadline, logs.clone())
                 .instrument(tracing::debug_span!(target: "hibana_latency", "invocation", execution_id = %execution_id)),
         )
         .await
@@ -186,7 +186,12 @@ impl Worker {
             error,
             job_token,
             usage: Some(usage),
+            logs: Some(logs.snapshot()),
         };
+
+        self.metrics
+            .guest_log_dropped_bytes_total
+            .inc_by(logs.dropped_bytes());
 
         // M4a (§3.8): outcome 別に duration histogram + executions_total を更新する。
         self.metrics
@@ -218,6 +223,7 @@ impl Worker {
         component: Arc<crate::runtime::PreparedComponent>,
         stream: crate::runtime::ResponseSender,
         deadline: tokio::time::Instant,
+        logs: crate::runtime::logs::Capture,
     ) -> std::result::Result<(crate::runtime::HttpResponseReceipt, UsageMetrics), ExecError> {
         let limits = resolved.limits;
 
@@ -249,6 +255,7 @@ impl Worker {
         self.runtime
             .run_http(
                 crate::runtime::Invocation {
+                    logs,
                     component,
                     request,
                     limits,

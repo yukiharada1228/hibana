@@ -39,7 +39,7 @@ try {
     assert.ok(paths.includes(`platform/manifests/keycloak/${file}`), file);
   }
   assert.ok(paths.includes("src/extension-manifest.mjs"), "src/extension-manifest.mjs");
-  for (const required of ["LICENSE", "src/cli.mjs", "src/runtime.mjs", "src/profiles.mjs", "platform/remote.py", "platform/common.py", "platform/maintenance.py", "platform/preflight.py", "platform/existing.py", "platform/manifests/base/kustomization.yaml", "platform/manifests/remote/ingress.yaml", "platform/manifests/migration/job.yaml", "templates/hono/src/index.ts", "wit/world.wit"]) assert.ok(paths.includes(required), required);
+  for (const required of ["LICENSE", "src/cli.mjs", "src/logs.mjs", "src/runtime.mjs", "src/profiles.mjs", "platform/remote.py", "platform/common.py", "platform/maintenance.py", "platform/preflight.py", "platform/existing.py", "platform/manifests/base/kustomization.yaml", "platform/manifests/remote/ingress.yaml", "platform/manifests/migration/job.yaml", "templates/hono/src/index.ts", "wit/world.wit"]) assert.ok(paths.includes(required), required);
   assert.ok(paths.every(path => !/^(examples|test|node_modules)\/|kubernetes\.py$|\.hibana|\.env$|Dockerfile|Cargo\.toml/.test(path) || path === "templates/rust/Cargo.toml"));
   const tarball = join(temporary, packed.filename);
   if (github) {
@@ -98,6 +98,13 @@ try {
   const lock = JSON.parse(await readFile(join(project, "package-lock.json"), "utf8"));
   assert.equal(lock.packages[`node_modules/${metadata.name}`].version, metadata.version);
   await writeFile(join(guard, "npx"), '#!/bin/sh\necho "Unexpected npx dependency in project scripts" >&2\nexit 99\n', {mode: 0o755});
+  const entry = join(project, "src/index.ts");
+  await writeFile(entry, (await readFile(entry, "utf8")).replace("const app = new Hono()", `const app = new Hono()
+app.use('*', async (_c, next) => {
+  console.log('fixture stdout 雪');
+  console.error('fixture stderr');
+  await next();
+})`));
   await run("npm", ["run", "build"], project, { npm_config_offline: "true" });
   const wasm = await readFile(join(project, ".hibana/build/app.wasm"));
   assert.deepEqual(wasm.subarray(0, 8), Buffer.from([0, 97, 115, 109, 13, 0, 1, 0]));
@@ -132,6 +139,9 @@ try {
       assert.match(await response.text(), /Hello from Hono on Hibana/);
       assert.equal((await run(managedRuntime, ["--version"])).trim(), `hibana-worker ${packed.version}`);
       if (github) assert.match(output, /Downloading the runtime matching this CLI version/);
+      for (let i = 0; i < 40 && !output.includes('fixture stderr'); i++) await new Promise(resolve => setTimeout(resolve, 50));
+      assert.match(output, /fixture stdout 雪/);
+      assert.match(output, /fixture stderr/);
       console.log("Hono response verified on the checksum-installed Wasmtime runtime, discovered without --runtime or PATH changes.");
       const pending = await Promise.all(Array.from({ length: 8 }, () => incompleteRequest(port, sockets)));
       // Each upload acknowledged admission. A competing probe before that

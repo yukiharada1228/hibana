@@ -15,7 +15,7 @@ pub struct Metrics {
     pub wasmtime_component_cache_hits_total: IntCounterVec,
     pub wasmtime_component_cache_misses_total: IntCounter,
     pub executions_total: IntCounterVec,
-    pub guest_stderr_dropped_bytes_total: IntCounter,
+    pub guest_log_dropped_bytes_total: IntCounter,
     pub inflight_executions: IntGauge,
     pub control_plane_request_duration_seconds: HistogramVec,
 }
@@ -74,11 +74,11 @@ impl Metrics {
             ),
         );
 
-        let guest_stderr_dropped_bytes_total = register(
+        let guest_log_dropped_bytes_total = register(
             &registry,
             IntCounter::new(
-                "faas_guest_stderr_dropped_bytes_total",
-                "Guest stderr bytes captured and discarded instead of being sent to shared logs",
+                "faas_guest_log_dropped_bytes_total",
+                "Guest stdout/stderr bytes discarded after the per-execution log capture limit",
             ),
         );
 
@@ -132,7 +132,7 @@ impl Metrics {
             wasmtime_component_cache_hits_total,
             wasmtime_component_cache_misses_total,
             executions_total,
-            guest_stderr_dropped_bytes_total,
+            guest_log_dropped_bytes_total,
             inflight_executions,
         })
     }

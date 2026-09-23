@@ -14,6 +14,7 @@ mod m20260922_000009_oidc_profile;
 mod m20260922_000010_management_scopes;
 mod m20260922_000011_application_egress;
 mod m20260922_000012_version_publication;
+mod m20260923_000013_application_logs;
 
 pub struct Migrator;
 
@@ -78,6 +79,7 @@ impl MigratorTrait for Migrator {
             Box::new(m20260922_000010_management_scopes::Migration),
             Box::new(m20260922_000011_application_egress::Migration),
             Box::new(m20260922_000012_version_publication::Migration),
+            Box::new(m20260923_000013_application_logs::Migration),
         ]
     }
 }

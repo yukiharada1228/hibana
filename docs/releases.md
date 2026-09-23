@@ -4,15 +4,15 @@ CLI は npm の `@yukiharada1228/hibana` と [GitHub Releases](https://github.co
 
 MVPではCLI・ローカルランタイム・Control Plane・Workerを同じバージョンに揃えます。異なる版の混在は検証対象外です。
 
-現在のソース候補は`0.2.0-rc.6`です。以下のnpxの例は、その版のnpm公開後に使用できます。公開前は[候補版の導入手順](release-candidate.md)でtarballから取得・検証します。
+現在のソース候補は`0.2.0-rc.7`です。以下のnpxの例は、その版のnpm公開後に使用できます。公開前は[候補版の導入手順](release-candidate.md)でtarballから取得・検証します。
 
 ## 開発者のPC
 
 Node.js 24以上を用意し、公開されているバージョンを指定します。
 
 ```bash
-npx --yes @yukiharada1228/hibana@0.2.0-rc.6 --version
-npx --yes @yukiharada1228/hibana@0.2.0-rc.6 init hello
+npx --yes @yukiharada1228/hibana@0.2.0-rc.7 --version
+npx --yes @yukiharada1228/hibana@0.2.0-rc.7 init hello
 cd hello
 npm run dev
 # Ctrl+Cで停止
@@ -31,8 +31,8 @@ CLIの導入にリポジトリ、Rust、Docker、kubectlは不要です。`init`
 Releaseの`hibana-cli-VERSION.tgz`、OSに合う`hibana-worker-VERSION-OS-ARCH`、`SHA256SUMS`を搬入します。HASHには該当バイナリのチェックサムを指定します。
 
 ```bash
-npx --yes --package=/path/to/hibana-cli-0.2.0-rc.6.tgz hibana runtime install --from /path/to/hibana-worker-0.2.0-rc.6-linux-x64 --sha256 HASH
-npx --yes --package=/path/to/hibana-cli-0.2.0-rc.6.tgz hibana init hello --cli-package /path/to/hibana-cli-0.2.0-rc.6.tgz
+npx --yes --package=/path/to/hibana-cli-0.2.0-rc.7.tgz hibana runtime install --from /path/to/hibana-worker-0.2.0-rc.7-linux-x64 --sha256 HASH
+npx --yes --package=/path/to/hibana-cli-0.2.0-rc.7.tgz hibana init hello --cli-package /path/to/hibana-cli-0.2.0-rc.7.tgz
 cd hello
 npm run dev
 ```
@@ -44,10 +44,10 @@ npm run dev
 CPUに合う`hibana-platform-VERSION-linux-ARCH.tar`をDockerへ読み込み、社内レジストリへ搬入します。`registry.example.com`は自社の宛先へ置き換えます。
 
 ```bash
-docker load --input hibana-platform-0.2.0-rc.6-linux-amd64.tar
-docker tag hibana-platform:0.2.0-rc.6-linux-amd64 registry.example.com/hibana/platform:0.2.0-rc.6-amd64
-docker push registry.example.com/hibana/platform:0.2.0-rc.6-amd64
-tar -xzf hibana-kubernetes-0.2.0-rc.6.tar.gz
+docker load --input hibana-platform-0.2.0-rc.7-linux-amd64.tar
+docker tag hibana-platform:0.2.0-rc.7-linux-amd64 registry.example.com/hibana/platform:0.2.0-rc.7-amd64
+docker push registry.example.com/hibana/platform:0.2.0-rc.7-amd64
+tar -xzf hibana-kubernetes-0.2.0-rc.7.tar.gz
 ```
 
 `hibana platform init my-site`でサイト用overlayを生成し、同梱のREADMEに沿ってAPIとアプリのDNS・TLS、DB・Redis・S3の接続情報を設定します。署名・暗号化・bootstrap用のキーは生成時に作成し、秘密値のファイルはGitから除外します。
@@ -84,7 +84,7 @@ node scripts/release.mjs checksums .local/release
 
 `.github/workflows/release.yml`（Hibana release）は`release/**`ブランチまたは手動実行で候補をビルドします。`vVERSION`タグでは、同じコミットのCIとSecurity dependenciesの最新実行が両方成功したことを確認してからGitHub Releaseを公開・検証し、同じCLI tarballをnpmへ公開します。未実行・実行中・失敗の場合は公開を止めます。正式版は`latest`、候補版は`next`タグを使います。ローカルランタイムの自動取得先が先に利用可能になる順序です。
 
-公開担当者は npm の `@yukiharada1228` スコープへの公開権限を用意します。初回は同じ版のランタイムをGitHub Releaseに公開した上で、`npm login` 後に検証済みの tarball を `npm publish ./hibana-cli-0.2.0-rc.6.tgz --access public --tag next` で公開し、以後は [npm trusted publishing](https://docs.npmjs.com/trusted-publishers/) を設定します。npm のパッケージ設定に GitHub owner `yukiharada1228`、repository `hibana`、workflow filename `release.yml` を登録し、`npm publish` を許可します。CI は Node.js 24 と npm 11.5.1 以上を使い、公開ジョブだけに `id-token: write` を付与します。長期間有効なnpmトークンは保存しません。
+公開担当者は npm の `@yukiharada1228` スコープへの公開権限を用意します。初回は同じ版のランタイムをGitHub Releaseに公開した上で、`npm login` 後に検証済みの tarball を `npm publish ./hibana-cli-0.2.0-rc.7.tgz --access public --tag next` で公開し、以後は [npm trusted publishing](https://docs.npmjs.com/trusted-publishers/) を設定します。npm のパッケージ設定に GitHub owner `yukiharada1228`、repository `hibana`、workflow filename `release.yml` を登録し、`npm publish` を許可します。CI は Node.js 24 と npm 11.5.1 以上を使い、公開ジョブだけに `id-token: write` を付与します。長期間有効なnpmトークンは保存しません。
 
 公開後は `npm view @yukiharada1228/hibana@VERSION version` と `npx --yes @yukiharada1228/hibana@VERSION --version` で確認します。npm は公開済みの同じバージョンを上書きできないため、変更した候補は新しいバージョン番号で配布します。コンソールも同じ版を取得できることを確認してから更新してください。
 

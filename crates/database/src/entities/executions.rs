@@ -12,6 +12,7 @@ pub struct Model {
     pub input: Option<Json>,
     pub output: Option<Json>,
     pub error: Option<Json>,
+    pub application_logs: Option<Json>,
     pub created_at: DateTimeUtc,
     pub started_at: Option<DateTimeUtc>,
     pub finished_at: Option<DateTimeUtc>,

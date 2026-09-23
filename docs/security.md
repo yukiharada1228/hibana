@@ -19,7 +19,7 @@ Hibana の MVP は、組織が管理するオンプレ Kubernetes 上で、Hono�
 | 管理 API | 認証・スコープ確認と tenant-scoped トランザクション / FORCE RLS。マイグレーション権限を通常プロセスに渡さない |
 | 配備成果物 | HTTP Component の形式・契約と import を検証。検証子プロセスに時間・Linux メモリ制限。Worker は Wasm の SHA-256 を照合する |
 | 内部実行 | 署名トークン、期限、テナント・実行・バージョンの照合。公開アプリ API と管理 API と内部 API を分離。HTTP を自動再実行しない |
-| ゲスト | 実行ごとの Store / WASI context。ホストの環境・ファイルを継承しない。vars / Secrets は承認したキーだけ注入し、ゲスト stderr を共有ログへ出さない |
+| ゲスト | 実行ごとの Store / WASI context。ホストの環境・ファイルを継承しない。vars / Secrets は承認したキーだけ注入し、ゲスト stdout / stderr を共有ログへ出さない。アプリ出力はテナントのRead権限で参照する[専用ログ](application-logs.md)として上限付きで保存 |
 | 資源 | 実行時間・fuel・同時実行数・合計線形メモリ量を制限。Wasm threads をビルドから除外。WASI リソース数 4096、テーブル要素は実行合計 100,000、core instance / memory / table 数は各 256、乱数取得は1回1 MiBまで |
 | 通信 | ゲスト外向き通信は既定拒否。承認時も内部 IP を拒否して接続 IP を固定し、プロキシ環境・リダイレクトで迂回させない。クラスタ側でも NetworkPolicy を強制する |
 | 共有制限 | Redis を確認できなければ受付を 503 で拒否。DB の受付記録でもテナント同時実行上限を保証する |

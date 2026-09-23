@@ -48,7 +48,7 @@ else if (command === "runtime" && args.length === 2) {
 } else if (command === "platform" && args.length === 1) {
   const output = resolve(args[0]); await mkdir(output, { recursive: true });
   const destination = join(output, `hibana-kubernetes-${version}.tar.gz`);
-  execFileSync("tar", ["-czf", destination, "LICENSE", "deploy/kubernetes/README.md", "deploy/kubernetes/base", "deploy/kubernetes/remote", "deploy/kubernetes/console", "deploy/kubernetes/migration", "deploy/kubernetes/autoscaling", "deploy/keycloak", "docs/authentication.md", "docs/saml-keycloak.md", "docs/security.md", "docs/resilience.md", "docs/deployment.md", "docs/console.md", "docs/database.md", "docs/remote-cli.md", "docs/on-prem-production.md", "docs/releases.md", "docs/release-candidate.md"], { cwd: root, timeout: 30000 });
+  execFileSync("tar", ["-czf", destination, "LICENSE", "deploy/kubernetes/README.md", "deploy/kubernetes/base", "deploy/kubernetes/remote", "deploy/kubernetes/console", "deploy/kubernetes/migration", "deploy/kubernetes/autoscaling", "deploy/keycloak", "docs/authentication.md", "docs/saml-keycloak.md", "docs/security.md", "docs/resilience.md", "docs/deployment.md", "docs/console.md", "docs/application-logs.md", "docs/database.md", "docs/remote-cli.md", "docs/on-prem-production.md", "docs/releases.md", "docs/release-candidate.md"], { cwd: root, timeout: 30000 });
   console.log(destination);
 } else if (command === "checksums" && (args.length === 1 || (args.length === 2 && args[1] === "--complete"))) {
   const directory = resolve(args[0]);

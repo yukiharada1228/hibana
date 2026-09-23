@@ -1,5 +1,5 @@
 //! Wasmtime execution shared by fleet requests and local development.
-use crate::{env, metrics};
+use crate::env;
 mod dns;
 mod egress;
 pub(crate) use dns::ApprovedEgress;
@@ -7,6 +7,7 @@ mod http;
 mod http_buffer;
 mod http_limits;
 mod limits;
+pub(crate) mod logs;
 use anyhow::{anyhow, Context as _};
 use egress::gated_send_request;
 use hibana_shared::http::HttpRequest;
@@ -30,12 +31,10 @@ use wasmtime_wasi_http::{
     bindings::{http::types::Scheme, ProxyPre},
     WasiHttpView as _,
 };
-const GUEST_STDERR_CAPTURE_BYTES: usize = 64 * 1024;
 pub(crate) struct Runtime {
     tcp_policy: crate::network::TcpPolicy,
     http_buffer_budget: Arc<tokio::sync::Semaphore>,
     pub engine: Engine,
-    pub metrics: Arc<metrics::Metrics>,
     _epoch_ticker: EpochTickerGuard,
 }
 
@@ -139,6 +138,7 @@ pub(crate) fn build_engine() -> anyhow::Result<Engine> {
 }
 
 pub(crate) struct Invocation {
+    pub logs: logs::Capture,
     pub component: Arc<PreparedComponent>,
     pub request: HttpRequest,
     pub limits: ResourceLimits,
@@ -149,7 +149,7 @@ pub(crate) struct Invocation {
 }
 
 impl Runtime {
-    pub(crate) fn new(engine: Engine, metrics: Arc<metrics::Metrics>) -> anyhow::Result<Self> {
+    pub(crate) fn new(engine: Engine) -> anyhow::Result<Self> {
         let stop = Arc::new(AtomicBool::new(false));
         let stop_thread = stop.clone();
         let tick_engine = engine.clone();
@@ -165,7 +165,6 @@ impl Runtime {
             tcp_policy: crate::network::TcpPolicy::default(),
             http_buffer_budget: http_buffer::worker_budget(),
             engine,
-            metrics,
             _epoch_ticker: EpochTickerGuard(stop),
         })
     }
@@ -186,6 +185,7 @@ impl Runtime {
     ) -> std::result::Result<(HttpResponseReceipt, UsageMetrics), ExecError> {
         let setup_started = Instant::now();
         let Invocation {
+            logs,
             component,
             request,
             limits,
@@ -206,9 +206,9 @@ impl Runtime {
             .allow_tcp(false)
             .allow_udp(false)
             .allow_ip_name_lookup(false);
-        let captured_stderr =
-            wasmtime_wasi::p2::pipe::MemoryOutputPipe::new(GUEST_STDERR_CAPTURE_BYTES);
-        wasi_builder.stderr(captured_stderr.clone());
+        wasi_builder
+            .stdout(logs.stream(false))
+            .stderr(logs.stream(true));
         for (k, v) in &built_env.pairs {
             wasi_builder.env(k, v);
         }
@@ -323,13 +323,6 @@ impl Runtime {
         };
 
         let timed = tokio::time::timeout_at(deadline, exec_future).await;
-
-        let dropped = captured_stderr.contents().len() as u64;
-        if dropped > 0 {
-            self.metrics
-                .guest_stderr_dropped_bytes_total
-                .inc_by(dropped);
-        }
 
         match timed {
             Err(_elapsed) => Err(ExecError::Timeout),

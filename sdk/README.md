@@ -1,6 +1,6 @@
 # Hibana CLI
 
-このソースは候補版`0.2.0-rc.6`です。npm に公開した版は `npx` で利用できます。未公開の候補を試す場合は[候補版の導入手順](../docs/release-candidate.md)を使ってください。
+このソースは候補版`0.2.0-rc.7`です。npm に公開した版は `npx` で利用できます。未公開の候補を試す場合は[候補版の導入手順](../docs/release-candidate.md)を使ってください。
 
 Hibanaの実行契約はWebAssembly Componentです。Honoは対応するJavaScriptフレームワークの一つで、専用SDKのインポートは必要ありません。
 
@@ -41,7 +41,7 @@ CLIはNode.js 24以上が必要です。ローカル実行ランタイムは初�
 [コンソール](../docs/console.md)のある基盤には`hibana login --url https://hibana.example.internal/api ...`で接続できます。ブラウザでは同じホストの`https://hibana.example.internal/`を開きます。CLIとコンソールは同じ管理APIを使い、配備済みアプリの実行・配信は接続先のKubernetesが担当します。
 
 ```bash
-npx --yes @yukiharada1228/hibana@0.2.0-rc.6 init my-app
+npx --yes @yukiharada1228/hibana@0.2.0-rc.7 init my-app
 cd my-app
 npm run dev
 ```
@@ -49,7 +49,7 @@ npm run dev
 `hibana init`や`hibana login`を直接実行したい場合は、グローバルインストールも利用できます。以下は指定した版のnpm公開後に実行します。
 
 ```bash
-npm install -g @yukiharada1228/hibana@0.2.0-rc.6
+npm install -g @yukiharada1228/hibana@0.2.0-rc.7
 hibana init my-app
 cd my-app
 npm run dev
@@ -65,7 +65,7 @@ npm run dev
     "deploy": "hibana deploy"
   },
   "devDependencies": {
-    "@yukiharada1228/hibana": "0.2.0-rc.6"
+    "@yukiharada1228/hibana": "0.2.0-rc.7"
   }
 }
 ```
@@ -75,7 +75,7 @@ npm run dev
 既存のnpx形式のプロジェクトは、プロジェクト内で次のように移行できます。アプリの依存や`test`などのscriptsは維持されます。
 
 ```bash
-npm install --save-dev --save-exact @yukiharada1228/hibana@0.2.0-rc.6
+npm install --save-dev --save-exact @yukiharada1228/hibana@0.2.0-rc.7
 npm pkg set 'scripts.dev=hibana dev' 'scripts.build=hibana build' 'scripts.deploy=hibana deploy'
 ```
 
@@ -105,7 +105,7 @@ Goの`componentize-go`は`go.mod`のtool依存として固定しています。�
 
 Rust・GoのプロジェクトにはWIT定義と依存ロックもコピーされるので、生成後のビルドはHibana固有の言語SDKに依存しません。Honoテンプレートは公式の最小サンプルの応答テキストを変更した`GET /`だけです。JavaScript・Rust・Goには`GET /`とバイナリを返す`POST /echo`があります。Rust・Goサンプルのecho入力上限は1 MiBです。
 
-以降の `hibana ...` は、CLIを導入済みのHono・JavaScriptプロジェクト内では `npm exec -- hibana ...` として実行できます。グローバル導入済みなら直接 `hibana ...` を使えます。プロジェクト作成前やRust・Goでは `npx --yes @yukiharada1228/hibana@0.2.0-rc.6 ...` も使えます。
+以降の `hibana ...` は、CLIを導入済みのHono・JavaScriptプロジェクト内では `npm exec -- hibana ...` として実行できます。グローバル導入済みなら直接 `hibana ...` を使えます。プロジェクト作成前やRust・Goでは `npx --yes @yukiharada1228/hibana@0.2.0-rc.7 ...` も使えます。
 
 ## ローカルで外部DBへ接続する
 
@@ -222,6 +222,8 @@ macOS・Linuxでは、Ctrl+CやSIGTERMを実行中のビルドコマンド・拡
 プロファイルを変更するコマンドは、保存先の `profiles.json.lock` で同時更新を調整します。5秒待っても利用中ならエラーになります。コマンドの異常終了でロックが残った場合は、プロファイルを変更する Hibana コマンドが動いていないことを確認してから、エラーに表示されたロックディレクトリを削除して再実行してください。
 
 実行用Workerが設定された配備先では、`deploy`はWorkerでの事前コンパイルを待ってから公開します。初回HTTPへのコンパイル待ちを避けるため、その時間はデプロイ所要時間に含まれます。準備に失敗すると配備はエラーになり、旧版の公開設定を維持します。`rollback`も切替先を準備してから公開します。
+
+`0.2.0-rc.7`以降は`hibana logs`でアプリの標準出力・標準エラーを取得できます。`hibana logs my-api --errors-only`、`hibana logs --execution exec_ID --json`にも対応します。Read権限が必要で、完了後24時間・1実行合計16KiBまで保存します。CLI・Control Plane・Workerを同じ版に揃えてください。[アプリログ](../docs/application-logs.md)を参照してください。
 
 `hibana rollback`で直前の版へ、`hibana rollback --version 1.0.0`で指定した版へ戻します。コード・環境変数・選択したSecretsの参照を一緒に戻します。Secretsの値・外部データは巻き戻しません。Canaryや重み付き配分はありません。
 

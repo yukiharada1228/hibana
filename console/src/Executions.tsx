@@ -3,6 +3,7 @@ import { Api, errorMessage } from "./api";
 import type { Component, ExecutionsPage, Version } from "./types";
 import { date, Empty, Notice, versionLabel } from "./components/common";
 import { Button } from "./components/ui/button";
+import { ExecutionLogs } from "./ExecutionLogs";
 import {
   executionError,
   executionFailed,
@@ -163,6 +164,7 @@ export function Executions({
                             完全なバージョン <code>{version}</code>
                           </p>
                         )}
+                        <ExecutionLogs api={api} executionId={item.execution_id} />
                       </details>
                     </TableCell>
                   </TableRow>

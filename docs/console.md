@@ -57,7 +57,7 @@ hibana egress deny db.example.com:5432
 
 ## Kubernetes への導入
 
-候補版 `0.2.0-rc.6` の CLI・Control Plane と同じソースから作ったコンソールを使用してください。CLI 接続画面は npm の同じ版を案内するため、コンソールの公開前に `npm view @yukiharada1228/hibana@VERSION version` で取得できることを確認します。以前の公開版には新しい `/auth/session`・`/auth/logout` API がありません。
+候補版 `0.2.0-rc.7` の CLI・Control Plane と同じソースから作ったコンソールを使用してください。CLI 接続画面は npm の同じ版を案内するため、コンソールの公開前に `npm view @yukiharada1228/hibana@VERSION version` で取得できることを確認します。以前の公開版には新しい `/auth/session`・`/auth/logout` API がありません。
 
 `deploy/kubernetes/remote` および `hibana platform init` が生成するサイト設定にはコンソールを含めています。既存のサイト設定では `console/` 一式をコピーし、サイトの `kustomization.yaml` の `resources` に `console` を追加します。
 
@@ -70,8 +70,8 @@ hibana egress deny db.example.com:5432
 イメージの作成例:
 
 ```sh
-docker build -t registry.example.internal/hibana/console:0.2.0-rc.6 console
-docker push registry.example.internal/hibana/console:0.2.0-rc.6
+docker build -t registry.example.internal/hibana/console:0.2.0-rc.7 console
+docker push registry.example.internal/hibana/console:0.2.0-rc.7
 ```
 
 アプリの公開先は基盤の `APP_PUBLIC_ORIGIN` に一度だけ設定します。例は `https://apps.example.internal`、標準以外のポートなら `https://apps.example.internal:8443` です。基盤が `<app>.<tenant>` を付けた完全な公開 URL を返し、CLI とコンソールは同じ値を表示します。開発時は `http://localhost:28084` のように指定できます（HTTP は localhost のみ）。コンソールのイメージは接続先ごとに再ビルドする必要がありません。
@@ -142,3 +142,7 @@ HIBANA_TEST_CONSOLE_IMAGE=hibana-console:verification bash scripts/test-http.sh
 「公開設定済み」は、配備されたバージョンと HTTP 公開設定が存在し、公開 URL を取得できる状態です。疎通や正常稼働を保証する表示ではありません。公開 URL を構成できない場合は「公開 URL 未設定」と表示します。詳細の上部に直近24時間の最新実行を表示します。実行履歴は全件が標準で、HTTP 4xx/5xx とランタイムの失敗・タイムアウトを絞り込めます。HTTPステータスは保存済みの応答メタデータから取得し、不明な場合は「未記録」と表示します。応答本文や console.log は取得しません。エラー全文は「実行の詳細」で展開できます。利用状況の集計はランタイムの成否であり、HTTP 4xx/5xx の集計とは異なります。
 
 バージョンの登録日時は初回の配備日時です。切り戻し時刻ではありません。設定画面では現在のバージョンが参照する Secret の識別子まで照合するため、削除後に同名の Secret が作られても元の参照が復旧したとは表示しません。
+
+## アプリログ
+
+実行履歴の「実行の詳細」から「アプリログを表示」を選ぶと、標準出力・標準エラーを取得できます。Read権限が必要です。出力上限・保存期間・未取得時の扱いは[アプリログ](application-logs.md)を参照してください。公開済みrc.6には含まれません。

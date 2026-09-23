@@ -1,5 +1,5 @@
 //! Standalone HTTP development server. Uses the fleet runtime without infrastructure credentials.
-use crate::{env, metrics, runtime::Runtime};
+use crate::{env, runtime::Runtime};
 use anyhow::{Context, Result};
 use axum::{
     body::{to_bytes, Body, Bytes, HttpBody},
@@ -72,7 +72,7 @@ pub async fn run(args: &[String]) -> Result<()> {
     let component =
         Component::from_file(&engine, component.context("--dev-component is required")?)?;
     let state = Arc::new(DevState {
-        runtime: Runtime::new(engine, metrics::Metrics::init())?,
+        runtime: Runtime::new(engine)?,
         component: Arc::new(crate::runtime::PreparedComponent::new(component)?),
         resources: settings.resources,
         built_env,
@@ -164,10 +164,12 @@ async fn invoke(State(state): State<Arc<DevState>>, request: Request<Body>) -> R
         let _slot = slot;
         let deadline = Instant::now() + state.resources.max_execution_time();
         let approved_egress = resolve_outbound(&state.runtime, &state.outbound, deadline).await;
+        let logs = crate::runtime::logs::Capture::default();
         let result = state
             .runtime
             .run_http(
                 crate::runtime::Invocation {
+                    logs: logs.clone(),
                     component: state.component.clone(),
                     request,
                     limits: state.resources,
@@ -178,6 +180,25 @@ async fn invoke(State(state): State<Arc<DevState>>, request: Request<Body>) -> R
                 stream,
             )
             .await;
+        let output = logs.snapshot();
+        for (stream, value) in [("stdout", output.stdout), ("stderr", output.stderr)] {
+            if !value.is_empty() {
+                let safe: String = value
+                    .chars()
+                    .map(|c| {
+                        if c.is_control() && c != '\n' && c != '\t' {
+                            '�'
+                        } else {
+                            c
+                        }
+                    })
+                    .collect();
+                eprintln!("[app {stream}] {safe}");
+            }
+        }
+        if output.truncated {
+            eprintln!("[app logs truncated at 16 KiB]");
+        }
         if result.is_ok() {
             let _ = completed.send(());
         }
@@ -296,7 +317,7 @@ mod tests {
         let engine = crate::runtime::build_engine().unwrap();
         let component = Component::new(&engine, "(component)").unwrap();
         Arc::new(DevState {
-            runtime: Runtime::new(engine, metrics::Metrics::init()).unwrap(),
+            runtime: Runtime::new(engine).unwrap(),
             component: Arc::new(crate::runtime::PreparedComponent::new(component).unwrap()),
             resources: ResourceLimits::default(),
             built_env: env::BuiltEnv::default(),
@@ -440,11 +461,7 @@ mod tests {
 
     #[tokio::test]
     async fn development_dns_snapshot_keeps_exact_destinations_and_blocks_internal_ips() {
-        let runtime = Runtime::new(
-            crate::runtime::build_engine().unwrap(),
-            metrics::Metrics::init(),
-        )
-        .unwrap();
+        let runtime = Runtime::new(crate::runtime::build_engine().unwrap()).unwrap();
         let entries = [
             "1.1.1.1:5432",
             "127.0.0.1:5432",

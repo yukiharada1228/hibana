@@ -9,6 +9,7 @@ name = "hibana-worker"
 path = "src/main.rs"
 
 [dependencies]
+async-trait = { workspace = true }
 hex = { workspace = true }
 hibana-shared = { workspace = true }
 hibana-database = { workspace = true }
