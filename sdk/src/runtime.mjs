@@ -11,7 +11,7 @@ import { constants } from "node:fs";
 import { homedir } from "node:os";
 import { join, resolve } from "node:path";
 import { createHash, randomUUID } from "node:crypto";
-import { packageInfo, releaseBase } from "./package.mjs";
+import { packageInfo, releaseBase, releaseVersion } from "./package.mjs";
 
 const binaryLimit = 160 * 1024 * 1024;
 export function runtimeTarget(
@@ -27,11 +27,6 @@ export function runtimeTarget(
     );
   return `${platform}-${arch}`;
 }
-function checkedVersion(version) {
-  if (!/^\d+\.\d+\.\d+(?:-[a-zA-Z0-9.-]+)?$/.test(version))
-    throw new Error("Runtime version must be a release version such as 0.1.0");
-  return version;
-}
 export function runtimePath(
   version,
   {
@@ -43,7 +38,7 @@ export function runtimePath(
     target = runtimeTarget(),
   } = {},
 ) {
-  return join(resolve(home), checkedVersion(version), target, "hibana-worker");
+  return join(resolve(home), releaseVersion(version), target, "hibana-worker");
 }
 export async function installedRuntime() {
   const { version } = await packageInfo();
@@ -114,7 +109,7 @@ export async function installRuntime(
   } = {},
 ) {
   cancellation?.throwIfAborted();
-  const version = checkedVersion(
+  const version = releaseVersion(
     options.version || (await packageInfo()).version,
   );
   if (Boolean(options.from) !== Boolean(options.sha256))

@@ -2,7 +2,7 @@ import { createServer } from "node:http";
 import { randomBytes, createHash } from "node:crypto";
 import { spawn } from "node:child_process";
 
-export async function openBrowser(url) {
+async function openBrowser(url) {
   const [command, args] =
     process.platform === "darwin"
       ? ["open", [url]]

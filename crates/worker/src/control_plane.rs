@@ -157,15 +157,11 @@ impl ControlPlaneClient {
 
         #[derive(serde::Deserialize)]
         struct JobEnvResponse {
-            env: std::collections::BTreeMap<String, String>,
+            env: std::collections::BTreeMap<String, hibana_shared::Redacted<String>>,
         }
         let body: JobEnvResponse = resp.json().await.map_err(|error| request_failure(&error))?;
 
-        Ok(body
-            .env
-            .into_iter()
-            .map(|(k, v)| (k, hibana_shared::Redacted::new(v)))
-            .collect())
+        Ok(body.env)
     }
 }
 

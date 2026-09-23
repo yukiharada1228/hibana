@@ -135,7 +135,7 @@ async function main() {
     const component = await findComponent(api, config.name);
     if (!component)
       throw new Error("Deploy this application before managing secrets");
-    const base = `/components/${encodeURIComponent(component.component_id || component.id)}/secrets`;
+    const base = `/components/${encodeURIComponent(component.component_id)}/secrets`;
     if (action === "list") {
       const result = await api.request(base);
       if (values.json) console.log(JSON.stringify(result, null, 2));

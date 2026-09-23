@@ -10,12 +10,7 @@ const SECRET_BYTES: usize = 32;
 pub fn generate_secret() -> String {
     let mut bytes = [0u8; SECRET_BYTES];
     OsRng.fill_bytes(&mut bytes);
-    let mut s = String::with_capacity(SECRET_BYTES * 2);
-    for b in bytes {
-        s.push(char::from_digit((b >> 4) as u32, 16).unwrap());
-        s.push(char::from_digit((b & 0xf) as u32, 16).unwrap());
-    }
-    s
+    hex::encode(bytes)
 }
 
 #[cfg(test)]

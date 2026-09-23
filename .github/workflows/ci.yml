@@ -87,7 +87,9 @@ jobs:
       # SET app.tenant_id ハザード（LOCAL 欠落・文字列結合）と、tenant-scoped db:: 呼び出しを
       # 生 pool に渡している箇所（GUC 未設定→FORCE RLS で fail-closed する）を検出して落とす。
       - name: rls-lint
-        run: ./scripts/rls-lint.sh
+        run: |
+          python3 scripts/test_rls_lint.py
+          ./scripts/rls-lint.sh
 
       - name: Architecture boundaries
         run: python3 scripts/check-architecture.py

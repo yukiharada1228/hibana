@@ -14,6 +14,9 @@ edition = "2021"
 license = "MIT"
 
 [workspace.dependencies]
+base64 = "0.22"
+hex = "0.4"
+ipnet = "2.12"
 # --- 共有 ---
 hibana-shared = { path = "crates/shared" }
 hibana-database = { path = "crates/database" }
@@ -37,7 +40,7 @@ zeroize = "1"
 # XChaCha20-Poly1305（24 バイト nonce）を使うので、nonce を毎回 OsRng で引いても衝突確率が
 # 無視でき、カウンタ管理（＝状態）が要らない（ステートレス×N の CP と噛み合う）。
 chacha20poly1305 = { version = "0.10", features = ["alloc"], default-features = false }
-# 共有ストアとログイン制限の非同期 trait。
+# 共有ストアの非同期 trait。
 async-trait = "0.1"
 
 # --- 分散トレーシング (M10, §3.8 / §10): opt-in（OTEL_EXPORTER_OTLP_ENDPOINT 設定時のみ有効）。
@@ -54,10 +57,10 @@ opentelemetry-otlp = { version = "0.32", default-features = false, features = [
 tracing-opentelemetry = "0.33"
 
 # --- 共有ストア (M3d, §8): 全 Axum インスタンスで共有する低レイテンシカウンタ。
-# レート制限（token-bucket）/ 同時実行 in-flight / login 失敗ロックアウトを集計する。
+# レート制限（token-bucket）とOIDCの一回限りのstateを共有する。
 # `tokio-rustls-comp` で通常の TCP と Rustls/ring の TLS 接続を提供し、
-# `connection-manager` で自動再接続プールを有効化する。
-# `script` でレート制限とログイン失敗回数の Lua アトミック操作を使う。
+# `connection-manager` で自動再接続を有効化する。
+# `script` でRedis自身の時刻に基づくレート制限を原子的に更新する。
 # 既定機能に C 依存（native TLS の openssl-sys 等）が紛れ込まないよう
 # default-features = false で必要分だけ取り込む。証明書はシステムの CA
 # または SSL_CERT_FILE / SSL_CERT_DIR で検証し、検証無効化の機能は含めない。

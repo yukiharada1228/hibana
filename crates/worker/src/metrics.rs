@@ -78,7 +78,7 @@ impl Metrics {
             &registry,
             IntCounter::new(
                 "faas_guest_stderr_dropped_bytes_total",
-                "Guest stderr bytes discarded because the execution had secrets injected",
+                "Guest stderr bytes captured and discarded instead of being sent to shared logs",
             ),
         );
 

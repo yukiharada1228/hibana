@@ -215,10 +215,10 @@ class Preflight:
                 env = environment_values(container, require)
                 keys = list(required["hibana-migration"] if name == "migrate" else required["hibana-runtime"])
                 if name == "control-plane":
-                    keys += required["hibana-control-plane"] + ["S3_ENDPOINT", "S3_BUCKET"]
+                    keys += required["hibana-control-plane"] + ["S3_ENDPOINT", "S3_BUCKET", "APP_PUBLIC_ORIGIN"]
                     errors.extend(oidc_setting_errors(env))
-                    if not env.get("INGRESS_BASE_DOMAIN"):
-                        keys.append("APP_PUBLIC_ORIGIN")
+                    if str(env.get("INGRESS_BASE_DOMAIN", "")).strip():
+                        errors.append("INGRESS_BASE_DOMAIN was removed; configure APP_PUBLIC_ORIGIN")
                     if behind_proxy:
                         keys.append("TRUSTED_PROXY_CIDRS")
                     if str(env.get("TRUST_PROXY_HEADERS", "")).lower().strip() in ("1", "true", "yes", "on"):

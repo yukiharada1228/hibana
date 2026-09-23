@@ -6,6 +6,12 @@ use chrono::NaiveDate;
 use hibana_shared::ExecutionStatus;
 use hibana_shared::UsageMetrics;
 
+// Compute in PostgreSQL numeric before narrowing. Saturating individual events
+// does not prevent BIGINT overflow when a day or a date range is accumulated.
+fn bounded_counter(value: Expr) -> Expr {
+    Func::least([value, Expr::val(i64::MAX)]).cast_as("bigint")
+}
+
 pub async fn upsert_usage_rollup(
     executor: &impl ConnectionTrait,
     tenant_id: &str,
@@ -31,7 +37,11 @@ pub async fn upsert_usage_rollup(
     ] {
         conflict.value(
             column,
-            Expr::col((usage_rollups::Entity, column)).add(Expr::col(("excluded", column))),
+            bounded_counter(
+                Expr::col((usage_rollups::Entity, column))
+                    .cast_as("numeric")
+                    .add(Expr::col(("excluded", column))),
+            ),
         );
     }
     conflict
@@ -61,14 +71,22 @@ pub async fn upsert_usage_rollup(
         ..Default::default()
     })
     .on_conflict(conflict.to_owned())
-    .exec(executor)
+    .exec_without_returning(executor)
     .await?;
     Ok(())
 }
 
-#[derive(Debug, Clone, FromQueryResult)]
+#[derive(Debug, Clone, serde::Serialize, FromQueryResult)]
 pub struct UsageRollupRow {
     pub component_id: String,
+    #[serde(flatten)]
+    #[sea_orm(nested)]
+    pub usage: UsageTotals,
+}
+
+/// One shape for database aggregates, per-application usage and response totals.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, FromQueryResult)]
+pub struct UsageTotals {
     pub invocation_count: i64,
     pub cpu_fuel_used: i64,
     pub wall_time_ms: i64,
@@ -84,7 +102,7 @@ pub struct UsageRollupRow {
 /// `period_start`（UTC 日境界）が `[from, to]`（両端含む）にある行を component 別に集約する。
 /// `tenant_id` は RLS の GUC（`set_tenant_guc`）と二重防御で WHERE にもバインドする（既存 db
 /// クエリ規約。文字列結合はしない: injection 防止）。`component_id` が `Some` なら単一 component に
-/// 絞り込む（`$4::text IS NULL OR ...` で NULL なら全件）。totals はハンドラ側で本行を畳んで算出する。
+/// 絞り込む。totals はハンドラ側で本行を畳んで算出する。累計は BIGINT の上限で飽和させる。
 pub async fn get_usage_rollups(
     executor: &impl ConnectionTrait,
     tenant_id: &str,
@@ -113,7 +131,7 @@ pub async fn get_usage_rollups(
         (usage_rollups::Column::FailedCount, "failed_count"),
         (usage_rollups::Column::TimeoutCount, "timeout_count"),
     ] {
-        query = query.column_as(column.sum().cast_as("bigint"), name);
+        query = query.column_as(bounded_counter(column.sum()), name);
     }
     query
         .group_by(usage_rollups::Column::ComponentId)

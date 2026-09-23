@@ -1,5 +1,6 @@
 //! Executions persistence.
 use hibana_database::prelude::*;
+use hibana_database::queries::exists;
 
 use super::saturating_i64;
 use chrono::DateTime;
@@ -83,22 +84,24 @@ pub struct ExecutionRow {
     pub finished_at: Option<DateTime<Utc>>,
 }
 
-pub async fn find_execution_provenance(
-    executor: &impl ConnectionTrait,
+/// Serialize completions against other results and the reaper, after checking
+/// all signed provenance fields. The caller holds this lock through accounting.
+pub async fn lock_http_completion(
+    tx: &DatabaseTransaction,
     tenant_id: &str,
     execution_id: &str,
-) -> Result<Option<(String, String, String)>, DbErr> {
+    version_id: &str,
+) -> Result<Option<(String, String)>, DbErr> {
     executions::Entity::find()
         .select_only()
-        .columns([
-            executions::Column::ComponentId,
-            executions::Column::VersionId,
-            executions::Column::Status,
-        ])
+        .columns([executions::Column::ComponentId, executions::Column::Status])
         .filter(executions::Column::TenantId.eq(tenant_id))
         .filter(executions::Column::Id.eq(execution_id))
+        .filter(executions::Column::VersionId.eq(version_id))
+        .filter(executions::Column::HttpRequest.eq(true))
+        .lock_exclusive()
         .into_tuple()
-        .one(executor)
+        .one(tx)
         .await
 }
 
@@ -165,14 +168,21 @@ pub async fn has_active_executions_for_component(
     tenant_id: &str,
     component_id: &str,
 ) -> Result<bool, DbErr> {
-    Ok(executions::Entity::find()
-        .filter(executions::Column::TenantId.eq(tenant_id))
-        .filter(executions::Column::HttpRequest.eq(true))
-        .filter(executions::Column::Status.is_in(["pending", "running"]))
-        .filter(executions::Column::ComponentId.eq(component_id))
-        .count(executor)
-        .await?
-        > 0)
+    exists(
+        executor,
+        executions::Entity::find()
+            .filter(inflight_condition(tenant_id))
+            .filter(executions::Column::ComponentId.eq(component_id)),
+    )
+    .await
+}
+
+/// The same admitted HTTP executions consume capacity and protect deletion.
+fn inflight_condition(tenant_id: &str) -> Condition {
+    Condition::all()
+        .add(executions::Column::TenantId.eq(tenant_id))
+        .add(executions::Column::HttpRequest.eq(true))
+        .add(executions::Column::Status.is_in(["pending", "running"]))
 }
 
 /// List versions protected by pending/running HTTP executions in one query.
@@ -185,10 +195,8 @@ pub async fn active_execution_version_ids(
         .select_only()
         .column(executions::Column::VersionId)
         .distinct()
-        .filter(executions::Column::TenantId.eq(tenant_id))
+        .filter(inflight_condition(tenant_id))
         .filter(executions::Column::ComponentId.eq(component_id))
-        .filter(executions::Column::HttpRequest.eq(true))
-        .filter(executions::Column::Status.is_in(["pending", "running"]))
         .into_tuple::<String>()
         .all(executor)
         .await
@@ -200,14 +208,13 @@ pub async fn has_active_executions_for_version(
     tenant_id: &str,
     version_id: &str,
 ) -> Result<bool, DbErr> {
-    Ok(executions::Entity::find()
-        .filter(executions::Column::TenantId.eq(tenant_id))
-        .filter(executions::Column::HttpRequest.eq(true))
-        .filter(executions::Column::Status.is_in(["pending", "running"]))
-        .filter(executions::Column::VersionId.eq(version_id))
-        .count(executor)
-        .await?
-        > 0)
+    exists(
+        executor,
+        executions::Entity::find()
+            .filter(inflight_condition(tenant_id))
+            .filter(executions::Column::VersionId.eq(version_id)),
+    )
+    .await
 }
 
 /// 同時実行枠を使用している pending/running の HTTP 実行数。
@@ -219,9 +226,7 @@ pub async fn count_inflight_executions(
 ) -> Result<i64, DbErr> {
     Ok(std::cmp::min(
         executions::Entity::find()
-            .filter(executions::Column::TenantId.eq(tenant_id))
-            .filter(executions::Column::HttpRequest.eq(true))
-            .filter(executions::Column::Status.is_in(["pending", "running"]))
+            .filter(inflight_condition(tenant_id))
             .count(executor)
             .await?,
         i64::MAX as u64,
@@ -243,9 +248,7 @@ pub async fn finalize_stuck_executions(
         .col_expr(executions::Column::InputRef, Expr::val(None::<String>))
         .col_expr(executions::Column::Error, Expr::val(error))
         .col_expr(executions::Column::FinishedAt, now())
-        .filter(executions::Column::TenantId.eq(tenant_id))
-        .filter(executions::Column::HttpRequest.eq(true))
-        .filter(executions::Column::Status.is_in(["pending", "running"]))
+        .filter(inflight_condition(tenant_id))
         .filter(Expr::col((executions::Entity, executions::Column::CreatedAt)).lt(cutoff))
         .into_query();
     query.returning(Query::returning().columns([

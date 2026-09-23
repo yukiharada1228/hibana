@@ -39,7 +39,8 @@ EOF
   export OIDC_TEST_TLS_CERT="$certs/server.crt" OIDC_TEST_TLS_KEY="$certs/server.key"
   export OIDC_TEST_CA="$certs/ca.crt" NODE_EXTRA_CA_CERTS="$certs/ca.crt"
 fi
-docker run --rm -d --name "$keycloak" "${keycloak_args[@]}" \
+# Bound the fixture heap to its container instead of the entire Docker VM.
+docker run --rm -d --memory 1g --name "$keycloak" "${keycloak_args[@]}" \
   -e KC_BOOTSTRAP_ADMIN_USERNAME=fixture-admin -e KC_BOOTSTRAP_ADMIN_PASSWORD=fixture-admin-password \
   quay.io/keycloak/keycloak:26.7.4 start-dev >/dev/null
 export OIDC_TEST_PG="$pg" OIDC_TEST_REDIS="$redis" OIDC_TEST_KEYCLOAK="$keycloak"

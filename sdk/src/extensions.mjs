@@ -10,28 +10,20 @@ import {
   writeFile,
 } from "node:fs/promises";
 import { createRequire } from "node:module";
-import { dirname, isAbsolute, join, relative, resolve } from "node:path";
+import { dirname, join, resolve } from "node:path";
+import { isInside } from "./paths.mjs";
 import {
   HTTP_CONTRACT,
   extensionNames,
   managesExtensions,
   isLocalExtension,
+  isExtensionVersion,
   validateExtensionList,
   validateManifest,
 } from "./extension-manifest.mjs";
 import { installExtensionPackages } from "./extension-packages.mjs";
 
 const MANIFEST = "hibana.extension.json";
-
-function isInside(root, path) {
-  const part = relative(root, path);
-  return (
-    part !== ".." &&
-    !part.startsWith("../") &&
-    !part.startsWith("..\\") &&
-    !isAbsolute(part)
-  );
-}
 
 async function packagePath(root, input, directory = false) {
   if (
@@ -117,21 +109,7 @@ async function readExtension(config, name, from) {
         throw error;
     }
     const version = pkg?.version ?? null;
-    if (
-      version !== null &&
-      (typeof version !== "string" ||
-        version.length > 128 ||
-        !/^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)(?:-[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?(?:\+[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?$/.test(
-          version,
-        ) ||
-        version
-          .split("+")[0]
-          .split("-")
-          .slice(1)
-          .join("-")
-          .split(".")
-          .some((part) => /^0\d+$/.test(part)))
-    )
+    if (version !== null && !isExtensionVersion(version))
       throw new Error(
         "package.json version must be a concrete semantic version",
       );
@@ -156,7 +134,6 @@ async function readExtension(config, name, from) {
       aliases.push([alias, await packagePath(root, input)]);
     }
     const resolved = {
-      name,
       version,
       root,
       dependencies: manifest.dependencies,
@@ -208,7 +185,6 @@ export async function resolveExtensions(config, options = {}) {
   const aliases = new Map();
   const imports = new Map();
   const permissions = new Set();
-  const visited = new Set();
   const visiting = new Set();
   const packages = new Map();
   const names = new Map();
@@ -223,8 +199,8 @@ export async function resolveExtensions(config, options = {}) {
       throw new Error(
         `Extension dependency cycle: ${[...trail, reference].join(" -> ")}`,
       );
-    if (visited.has(root)) return names.get(root);
-    if (visiting.size + visited.size >= 64)
+    if (names.has(root)) return names.get(root);
+    if (names.size >= 64)
       throw new Error(
         "At most 64 extensions are allowed, including dependencies",
       );
@@ -261,7 +237,6 @@ export async function resolveExtensions(config, options = {}) {
     if (extension.wit) plan.witDirectories.push(extension.wit);
     for (const permission of extension.permissions) permissions.add(permission);
     visiting.delete(root);
-    visited.add(root);
     plan.metadata.extensions.push({
       name: reference,
       version: extension.version,

@@ -111,11 +111,7 @@ export function EgressSettings({
           !loadError && <p>通信先を読み込み中…</p>
         ) : (
           <>
-            {policy.allow_outbound === null ? (
-              <p className="muted">
-                共通設定は未設定です。既存のバージョン別許可は「拡張」タブで確認できます。最初の変更で、ここに指定した通信先だけを全バージョンに適用します。
-              </p>
-            ) : policy.allow_outbound.length ? (
+            {policy.allow_outbound.length ? (
               <ul className="egress-destinations">
                 {policy.allow_outbound.map((endpoint) => (
                   <li key={endpoint}>

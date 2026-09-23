@@ -1,50 +1,14 @@
 //! Graceful shutdown and process probes.
 use crate::metrics;
 use std::sync::Arc;
+use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
-pub(crate) struct Shutdown {
-    draining: std::sync::atomic::AtomicBool,
-    notify: tokio::sync::Notify,
-}
-
-impl Shutdown {
-    pub(crate) fn new() -> Arc<Self> {
-        Arc::new(Self {
-            draining: std::sync::atomic::AtomicBool::new(false),
-            notify: tokio::sync::Notify::new(),
-        })
-    }
-
-    pub(crate) fn is_draining(&self) -> bool {
-        self.draining.load(std::sync::atomic::Ordering::Relaxed)
-    }
-
-    pub(crate) fn begin(&self) {
-        self.draining
-            .store(true, std::sync::atomic::Ordering::Relaxed);
-        self.notify.notify_waiters();
-    }
-
-    /// ドレイン開始まで待つ。既に開始済みなら即座に返る（通知の取りこぼし対策）。
-    pub(crate) async fn wait(&self) {
-        if self.is_draining() {
-            return;
-        }
-        let notified = self.notify.notified();
-        // `notified()` を作った**後**に再確認する。この二度読みが無いと、
-        // `is_draining()` と `notified()` の間に来たシグナルを永久に待つ窓ができる。
-        if self.is_draining() {
-            return;
-        }
-        notified.await;
-    }
-}
 
 /// SIGTERM / Ctrl-C を待ってドレインを開始するタスクを起こす（§4.6）。
 ///
 /// `drain_timeout_secs == 0` のときは**ハンドラを一切インストールしない**。既定の
 /// シグナルによる即時終了を使用する。既定では処理中のHTTPを待つ。
-pub(crate) fn spawn_shutdown_listener(shutdown: Arc<Shutdown>, drain_timeout_secs: u64) {
+pub(crate) fn spawn_shutdown_listener(shutdown: CancellationToken, drain_timeout_secs: u64) {
     if drain_timeout_secs == 0 {
         info!(
             "graceful drain disabled (WORKER_DRAIN_TIMEOUT_SECS=0); SIGTERM terminates immediately"
@@ -69,14 +33,14 @@ pub(crate) fn spawn_shutdown_listener(shutdown: Arc<Shutdown>, drain_timeout_sec
                 Err(e) => { warn!(error = %e, "ctrl_c listener failed"); return; }
             },
         }
-        shutdown.begin();
+        shutdown.cancel();
     });
 }
 
 pub(crate) fn spawn_metrics_server(
     worker: Arc<crate::service::Worker>,
     bind_addr: String,
-    shutdown: Arc<Shutdown>,
+    shutdown: CancellationToken,
 ) {
     let prepared = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let readiness = prepared.clone();
@@ -85,7 +49,7 @@ pub(crate) fn spawn_metrics_server(
     tokio::spawn(async move {
         loop {
             tokio::select! {
-                _ = shutdown_check.wait() => return,
+                _ = shutdown_check.cancelled() => return,
                 result = worker.applications_prepared() => match result {
                     Ok(true) => {
                         readiness.store(true, std::sync::atomic::Ordering::Release);
@@ -97,7 +61,7 @@ pub(crate) fn spawn_metrics_server(
                 }
             }
             tokio::select! {
-                _ = shutdown_check.wait() => return,
+                _ = shutdown_check.cancelled() => return,
                 _ = tokio::time::sleep(std::time::Duration::from_secs(1)) => {},
             }
         }
@@ -108,7 +72,7 @@ pub(crate) fn spawn_metrics_server(
         #[derive(Clone)]
         struct ProbeState {
             metrics: Arc<metrics::Metrics>,
-            shutdown: Arc<Shutdown>,
+            shutdown: CancellationToken,
             prepared: Arc<std::sync::atomic::AtomicBool>,
         }
 
@@ -116,7 +80,7 @@ pub(crate) fn spawn_metrics_server(
             axum::http::StatusCode::OK
         }
         async fn readyz(AxState(s): AxState<ProbeState>) -> axum::http::StatusCode {
-            if s.shutdown.is_draining() || !s.prepared.load(std::sync::atomic::Ordering::Acquire) {
+            if s.shutdown.is_cancelled() || !s.prepared.load(std::sync::atomic::Ordering::Acquire) {
                 return axum::http::StatusCode::SERVICE_UNAVAILABLE;
             }
             // Once warm, overload/dependency failures do not remove the entire

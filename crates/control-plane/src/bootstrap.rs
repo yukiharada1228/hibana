@@ -83,11 +83,6 @@ pub(crate) async fn run() -> anyhow::Result<()> {
     let store: std::sync::Arc<dyn store::Store> =
         std::sync::Arc::new(store::RedisStore::connect(&config.redis_url).await?);
 
-    // token exp 計算器をクロージャ化して AppState に渡す（Config を抱えない）。
-    let exp_cfg = config.clone();
-    let token_exp_offset_secs =
-        Box::new(move |wall_ms: u64| exp_cfg.token_exp_offset_secs(wall_ms));
-
     // 観測メトリクス（M4a, §3.8）。プロセスで 1 つ。AppState 経由でハンドラ・タスクから参照する。
     let metrics = metrics::Metrics::init();
 
@@ -101,7 +96,7 @@ pub(crate) async fn run() -> anyhow::Result<()> {
         config.presign_ttl_secs,
         config.bootstrap_admin_token_plain().to_string(),
         signer,
-        token_exp_offset_secs,
+        config.token_margin_secs,
         store,
         config.admission(),
         metrics,

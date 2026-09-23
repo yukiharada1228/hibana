@@ -32,39 +32,38 @@ pub(crate) async fn send(
 pub(crate) async fn discover(endpoint: &str, operation: &str) -> anyhow::Result<Vec<reqwest::Url>> {
     let mut url = reqwest::Url::parse(endpoint)?;
     url.set_path(&format!("{}/{operation}", url.path().trim_end_matches('/')));
-    let mut targets = vec![url.clone()];
     // A headless Service provides ready Pod IPs without Kubernetes API credentials.
     // HTTPS keeps the configured hostname for TLS validation (use an upstream LB).
-    if url.scheme() == "http" {
-        let host = url
-            .host_str()
-            .ok_or_else(|| anyhow::anyhow!("Worker host missing"))?
-            .trim_matches(['[', ']']);
-        // URL hosts retain IPv6 brackets. Literal IPs already identify one
-        // Worker and must not be sent to the OS hostname resolver.
-        if host.parse::<std::net::IpAddr>().is_ok() {
-            return Ok(targets);
-        }
-        let port = url
-            .port_or_known_default()
-            .ok_or_else(|| anyhow::anyhow!("Worker port missing"))?;
-        let addresses = tokio::time::timeout(
-            Duration::from_secs(2),
-            tokio::net::lookup_host((host, port)),
-        )
-        .await??;
-        targets.clear();
-        for address in addresses {
-            let mut target = url.clone();
-            target
-                .set_ip_host(address.ip())
-                .map_err(|_| anyhow::anyhow!("Invalid Worker IP"))?;
-            if !targets.contains(&target) {
-                targets.push(target);
-            }
-        }
-        targets.sort_by(|a, b| a.as_str().cmp(b.as_str()));
+    if url.scheme() != "http" {
+        return Ok(vec![url]);
     }
+    let host = url
+        .host_str()
+        .ok_or_else(|| anyhow::anyhow!("Worker host missing"))?
+        .trim_matches(['[', ']']);
+    // URL hosts retain IPv6 brackets. Literal IPs already identify one
+    // Worker and must not be sent to the OS hostname resolver.
+    if host.parse::<std::net::IpAddr>().is_ok() {
+        return Ok(vec![url]);
+    }
+    let port = url
+        .port_or_known_default()
+        .ok_or_else(|| anyhow::anyhow!("Worker port missing"))?;
+    let addresses = tokio::time::timeout(
+        Duration::from_secs(2),
+        tokio::net::lookup_host((host, port)),
+    )
+    .await??;
+    let mut targets = Vec::new();
+    for address in addresses {
+        let mut target = url.clone();
+        target
+            .set_ip_host(address.ip())
+            .map_err(|_| anyhow::anyhow!("Invalid Worker IP"))?;
+        targets.push(target);
+    }
+    targets.sort_by(|a, b| a.as_str().cmp(b.as_str()));
+    targets.dedup();
     if targets.is_empty() {
         anyhow::bail!("No ready Workers");
     }

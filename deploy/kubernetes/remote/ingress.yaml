@@ -22,7 +22,7 @@ spec:
                 port:
                   number: 8080
 ---
-# App URLs contain TWO labels before INGRESS_BASE_DOMAIN: <app>.<tenant>.
+# App URLs add TWO labels to the APP_PUBLIC_ORIGIN hostname: <app>.<tenant>.
 # Standard Ingress/TLS wildcards cover one label, so add a rule/certificate per tenant.
 apiVersion: networking.k8s.io/v1
 kind: Ingress

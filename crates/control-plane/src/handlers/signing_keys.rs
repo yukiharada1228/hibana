@@ -27,13 +27,6 @@ pub struct RegisterSigningKeyRequest {
     pub public_key: String,
 }
 
-#[derive(Debug, Serialize)]
-pub struct SigningKeyView {
-    pub key_id: String,
-    pub public_key: String,
-    pub status: String,
-}
-
 /// PUT /admin/signing-keys/{key_id} — 署名鍵を登録 / 差し替える（admin）。
 ///
 /// 同一 key_id への再 PUT は公開鍵を上書きし status を active に戻す（ローテーション時の再登録）。
@@ -78,7 +71,7 @@ pub async fn register_signing_key(
     tx.commit().await?;
 
     tracing::info!(%key_id, "component signing key registered");
-    Ok(Json(SigningKeyView {
+    Ok(Json(db::SigningKey {
         key_id,
         public_key: req.public_key,
         status: "active".into(),
@@ -98,15 +91,7 @@ pub async fn list_signing_keys(
     let keys = db::list_signing_keys(&tx, tenant).await?;
     tx.commit().await?;
 
-    let out: Vec<SigningKeyView> = keys
-        .into_iter()
-        .map(|k| SigningKeyView {
-            key_id: k.key_id,
-            public_key: k.public_key,
-            status: k.status,
-        })
-        .collect();
-    Ok(Json(out))
+    Ok(Json(keys))
 }
 
 /// DELETE /admin/signing-keys/{key_id} — 鍵を retire する（admin）。

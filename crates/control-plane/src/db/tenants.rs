@@ -25,11 +25,11 @@ pub async fn tenant_is_active(
     executor: &impl ConnectionTrait,
     tenant_id: &str,
 ) -> Result<bool, DbErr> {
-    Ok(tenants::Entity::find_by_id(tenant_id)
-        .filter(tenants::Column::Status.eq("active"))
-        .count(executor)
-        .await?
-        > 0)
+    hibana_database::queries::exists(
+        executor,
+        tenants::Entity::find_by_id(tenant_id).filter(tenants::Column::Status.eq("active")),
+    )
+    .await
 }
 
 /// M4d (§8): テナント別クォータ上書き値。`tenants.quotas` JSONB から読む。

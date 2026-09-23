@@ -1,8 +1,9 @@
 //! In-memory and unavailable stores for DB-free regression tests.
 use std::collections::HashMap;
 use std::sync::Mutex;
+use tokio::time::{Duration, Instant};
 
-use super::{now_unix_millis, RateDecision, RateLimitParams, Store, StoreError};
+use super::{RateDecision, RateLimitParams, Store, StoreError};
 use async_trait::async_trait;
 
 // ============================================================================
@@ -17,15 +18,14 @@ use async_trait::async_trait;
 #[derive(Default)]
 pub struct InProcStore {
     buckets: Mutex<HashMap<String, Bucket>>,
-    auth_states: Mutex<HashMap<String, (String, u64)>>,
+    auth_states: Mutex<HashMap<String, (String, Instant)>>,
 }
 
 #[derive(Clone, Copy)]
 struct Bucket {
     /// 残トークン数。
     tokens: f64,
-    /// 最終補充時刻（ms）。
-    last_ms: u64,
+    last: Instant,
 }
 
 impl InProcStore {
@@ -42,13 +42,16 @@ impl Store for InProcStore {
         value: &str,
         ttl_secs: u64,
     ) -> Result<(), StoreError> {
-        let now = now_unix_millis();
         let mut states = self.auth_states.lock().unwrap();
+        let now = Instant::now();
         states.retain(|_, (_, expires)| *expires > now);
         if states.contains_key(key) {
             return Err(StoreError::Backend("auth state collision".into()));
         }
-        states.insert(key.into(), (value.into(), now + ttl_secs * 1000));
+        states.insert(
+            key.into(),
+            (value.into(), now + Duration::from_secs(ttl_secs)),
+        );
         Ok(())
     }
 
@@ -58,7 +61,7 @@ impl Store for InProcStore {
             .lock()
             .unwrap()
             .remove(key)
-            .filter(|(_, expires)| *expires > now_unix_millis())
+            .filter(|(_, expires)| *expires > Instant::now())
             .map(|(value, _)| value))
     }
 
@@ -66,18 +69,16 @@ impl Store for InProcStore {
         &self,
         tenant: &str,
         params: RateLimitParams,
-        now_ms: u64,
     ) -> Result<RateDecision, StoreError> {
         let mut buckets = self.buckets.lock().unwrap();
+        let now = Instant::now();
         let bucket = buckets.entry(tenant.to_string()).or_insert(Bucket {
             tokens: params.capacity,
-            last_ms: now_ms,
+            last: now,
         });
-        // 経過時間ぶんトークンを補充（容量で頭打ち）。now_ms < last_ms（時計巻き戻り）は 0 経過扱い。
-        let elapsed_ms = now_ms.saturating_sub(bucket.last_ms);
-        let refilled = (elapsed_ms as f64) / 1000.0 * params.refill_per_sec;
+        let refilled = now.duration_since(bucket.last).as_secs_f64() * params.refill_per_sec;
         bucket.tokens = (bucket.tokens + refilled).min(params.capacity);
-        bucket.last_ms = now_ms;
+        bucket.last = now;
 
         if bucket.tokens >= 1.0 {
             bucket.tokens -= 1.0;
@@ -125,7 +126,6 @@ impl Store for FailingStore {
         &self,
         _tenant: &str,
         _params: RateLimitParams,
-        _now_ms: u64,
     ) -> Result<RateDecision, StoreError> {
         Self::down()
     }

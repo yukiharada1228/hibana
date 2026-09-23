@@ -1,6 +1,6 @@
 //! Usage management HTTP handlers.
 use crate::auth::Principal;
-use crate::db;
+use crate::db::{self, UsageRollupRow, UsageTotals};
 use crate::error::AppError;
 use crate::state::AppState;
 use axum::extract::{Query, State};
@@ -39,33 +39,7 @@ pub struct UsageResponse {
     /// 集計対象期間の終了（UTC 日, 含む）。`YYYY-MM-DD`。
     pub to: String,
     pub totals: UsageTotals,
-    pub by_component: Vec<UsageByComponent>,
-}
-
-#[derive(Debug, Serialize, PartialEq, Eq)]
-pub struct UsageTotals {
-    pub invocation_count: i64,
-    pub cpu_fuel_used: i64,
-    pub wall_time_ms: i64,
-    pub peak_memory_bytes_max: i64,
-    pub output_bytes: i64,
-    pub succeeded_count: i64,
-    pub failed_count: i64,
-    pub timeout_count: i64,
-}
-
-/// component 別の集計 1 件。
-#[derive(Debug, Serialize, PartialEq, Eq)]
-pub struct UsageByComponent {
-    pub component_id: String,
-    pub invocation_count: i64,
-    pub cpu_fuel_used: i64,
-    pub wall_time_ms: i64,
-    pub peak_memory_bytes_max: i64,
-    pub output_bytes: i64,
-    pub succeeded_count: i64,
-    pub failed_count: i64,
-    pub timeout_count: i64,
+    pub by_component: Vec<UsageRollupRow>,
 }
 
 /// `from`/`to` クエリ文字列を `NaiveDate` に解決する（純関数・時計を引数化してテスト可能）。
@@ -120,30 +94,21 @@ pub(super) fn resolve_usage_range(
 }
 
 /// `by_component` を期間全体の `totals` へ畳む（純関数）。SUM 列は和、peak は max を取る。
-pub(super) fn fold_usage_totals(by_component: &[UsageByComponent]) -> UsageTotals {
-    by_component.iter().fold(
-        UsageTotals {
-            invocation_count: 0,
-            cpu_fuel_used: 0,
-            wall_time_ms: 0,
-            peak_memory_bytes_max: 0,
-            output_bytes: 0,
-            succeeded_count: 0,
-            failed_count: 0,
-            timeout_count: 0,
-        },
-        |mut acc, c| {
-            acc.invocation_count += c.invocation_count;
-            acc.cpu_fuel_used += c.cpu_fuel_used;
-            acc.wall_time_ms += c.wall_time_ms;
+pub(super) fn fold_usage_totals(by_component: &[UsageRollupRow]) -> UsageTotals {
+    by_component
+        .iter()
+        .fold(UsageTotals::default(), |mut acc, c| {
+            let c = &c.usage;
+            acc.invocation_count = acc.invocation_count.saturating_add(c.invocation_count);
+            acc.cpu_fuel_used = acc.cpu_fuel_used.saturating_add(c.cpu_fuel_used);
+            acc.wall_time_ms = acc.wall_time_ms.saturating_add(c.wall_time_ms);
             acc.peak_memory_bytes_max = acc.peak_memory_bytes_max.max(c.peak_memory_bytes_max);
-            acc.output_bytes += c.output_bytes;
-            acc.succeeded_count += c.succeeded_count;
-            acc.failed_count += c.failed_count;
-            acc.timeout_count += c.timeout_count;
+            acc.output_bytes = acc.output_bytes.saturating_add(c.output_bytes);
+            acc.succeeded_count = acc.succeeded_count.saturating_add(c.succeeded_count);
+            acc.failed_count = acc.failed_count.saturating_add(c.failed_count);
+            acc.timeout_count = acc.timeout_count.saturating_add(c.timeout_count);
             acc
-        },
-    )
+        })
 }
 
 /// GET /usage — テナント利用量参照 (M5, §15 / §6.0, read スコープ)。
@@ -163,23 +128,9 @@ pub async fn get_usage(
 
     let tx = state.pool().begin().await?;
     db::set_tenant_guc(&tx, tenant).await?;
-    let rows = db::get_usage_rollups(&tx, tenant, from, to, q.component_id.as_deref()).await?;
+    let by_component =
+        db::get_usage_rollups(&tx, tenant, from, to, q.component_id.as_deref()).await?;
     tx.commit().await?;
-
-    let by_component: Vec<UsageByComponent> = rows
-        .into_iter()
-        .map(|r| UsageByComponent {
-            component_id: r.component_id,
-            invocation_count: r.invocation_count,
-            cpu_fuel_used: r.cpu_fuel_used,
-            wall_time_ms: r.wall_time_ms,
-            peak_memory_bytes_max: r.peak_memory_bytes_max,
-            output_bytes: r.output_bytes,
-            succeeded_count: r.succeeded_count,
-            failed_count: r.failed_count,
-            timeout_count: r.timeout_count,
-        })
-        .collect();
 
     let totals = fold_usage_totals(&by_component);
 

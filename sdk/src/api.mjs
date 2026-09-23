@@ -35,15 +35,9 @@ export async function apiClient(options = {}) {
       redirect: "error",
       signal: signal ? AbortSignal.any([signal, deadline]) : deadline,
     });
-    const text = await response.text();
-    let result;
-    try {
-      result = text ? JSON.parse(text) : {};
-    } catch {
-      result = {};
-    }
     // Error bodies can contain user values; do not copy them into terminal/CI logs.
     if (!response.ok) {
+      await response.body?.cancel().catch(() => {});
       const error = new ApiError(method, path, response.status);
       const login = `hibana login --profile ${quote(selected.profile)} --url ${quote(url)}`;
       if (response.status === 401)
@@ -58,16 +52,15 @@ export async function apiClient(options = {}) {
           "The platform is unavailable (HTTP 503). Check its status before retrying.";
       throw error;
     }
-    return result;
-  }
-  async function acceptLogin(result, save) {
-    token = result.token;
-    if (typeof token !== "string" || !token)
-      throw new Error("Login returned no access token");
-    if (save) {
-      const { profile, ...value } = selected;
-      await saveProfile(profile, { ...value, token });
-      return profile;
+    if (response.status === 204) return;
+    try {
+      return await response.json();
+    } catch {
+      // Never confirm success from a malformed or incomplete response. Parser
+      // errors can include response values, so report only the endpoint/status.
+      throw new Error(
+        `${method} ${path}: Invalid JSON response (HTTP ${response.status}). Check the operation's status before retrying.`,
+      );
     }
   }
   return {
@@ -76,16 +69,19 @@ export async function apiClient(options = {}) {
     async loginOidc(options = {}) {
       const { browserLogin } = await import("./oidc.mjs");
       const result = await browserLogin({ ...selected, request }, options);
-      return acceptLogin(result, true);
+      if (typeof result.token !== "string" || !result.token)
+        throw new Error("Login returned no access token");
+      const { profile, ...value } = selected;
+      await saveProfile(profile, { ...value, token: result.token });
+      token = result.token;
+      return profile;
     },
   };
 }
 
 export async function findComponent(api, name) {
   const result = await api.request("/components");
-  return (Array.isArray(result) ? result : result.components).find(
-    (item) => item.name === name,
-  );
+  return result.find((item) => item.name === name);
 }
 
 export async function deploy(api, config, artifact, version) {
@@ -105,7 +101,7 @@ export async function deploy(api, config, artifact, version) {
       if (!component) throw error;
     }
   }
-  const id = component.component_id || component.id;
+  const id = component.component_id;
   const base = `/components/${encodeURIComponent(id)}`;
   const form = new FormData();
   form.set("version", version);
@@ -129,7 +125,7 @@ export async function deploy(api, config, artifact, version) {
 export async function rollback(api, config, version) {
   const component = await findComponent(api, config.name);
   if (!component) throw new Error("Application has not been deployed");
-  const id = component.component_id || component.id;
+  const id = component.component_id;
   return api.request(`/components/${encodeURIComponent(id)}/rollback`, {
     method: "POST",
     body: version === undefined ? {} : { version },

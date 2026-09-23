@@ -82,6 +82,7 @@ test("deploy keeps its build snapshot while another build replaces the latest ar
 
 test("native CLI builds without any installed JavaScript compiler packages", () => fixture(async root => {
   await cp(new URL("../src/", import.meta.url), join(root, "src"), { recursive: true });
+  await cp(new URL(".", import.meta.resolve("semver/package.json")), join(root, "node_modules/semver"), { recursive: true });
   await writeFile(join(root, "app.wasm"), component);
   await writeFile(join(root, "hibana.json"), JSON.stringify({ name: "native", component: "app.wasm" }));
   execFileSync(process.execPath, [join(root, "src/cli.mjs"), "build"], { cwd: root, stdio: "pipe" });

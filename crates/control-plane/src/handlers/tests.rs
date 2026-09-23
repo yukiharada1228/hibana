@@ -3,10 +3,9 @@ use super::health::check_db_ready;
 use super::tenants::bootstrap_token_matches;
 use super::usage::fold_usage_totals;
 use super::usage::resolve_usage_range;
-use super::usage::UsageByComponent;
-use super::usage::UsageTotals;
 use super::*;
 use crate::authz::resolve_token_scopes;
+use crate::db::{UsageRollupRow, UsageTotals};
 use axum::http::StatusCode;
 use hibana_shared::{FaasError, Role, Scope};
 use serde_json::Value;
@@ -139,17 +138,19 @@ fn usage_range_rejects_inverted_bounds() {
     ));
 }
 
-fn by_component(component_id: &str, inv: i64, cpu: i64, peak: i64) -> UsageByComponent {
-    UsageByComponent {
+fn by_component(component_id: &str, inv: i64, cpu: i64, peak: i64) -> UsageRollupRow {
+    UsageRollupRow {
         component_id: component_id.to_string(),
-        invocation_count: inv,
-        cpu_fuel_used: cpu,
-        wall_time_ms: 0,
-        peak_memory_bytes_max: peak,
-        output_bytes: 0,
-        succeeded_count: inv,
-        failed_count: 0,
-        timeout_count: 0,
+        usage: UsageTotals {
+            invocation_count: inv,
+            cpu_fuel_used: cpu,
+            wall_time_ms: 0,
+            peak_memory_bytes_max: peak,
+            output_bytes: 0,
+            succeeded_count: inv,
+            failed_count: 0,
+            timeout_count: 0,
+        },
     }
 }
 
@@ -187,6 +188,32 @@ fn fold_totals_empty_is_zero() {
 }
 
 #[test]
+fn fold_totals_never_overflows_across_components() {
+    let rows = [
+        by_component("c1", i64::MAX, i64::MAX, 4096),
+        by_component("c2", 1, 1, 8192),
+    ];
+    let totals = fold_usage_totals(&rows);
+    assert_eq!(totals.invocation_count, i64::MAX);
+    assert_eq!(totals.cpu_fuel_used, i64::MAX);
+    assert_eq!(totals.succeeded_count, i64::MAX);
+    assert_eq!(totals.peak_memory_bytes_max, 8192);
+}
+
+#[test]
+fn usage_response_keeps_flat_metrics_without_a_copy() {
+    let row = by_component("c1", 2, 100, 4096);
+    assert_eq!(
+        serde_json::to_value(row).unwrap(),
+        serde_json::json!({
+            "component_id": "c1", "invocation_count": 2, "cpu_fuel_used": 100,
+            "wall_time_ms": 0, "peak_memory_bytes_max": 4096, "output_bytes": 0,
+            "succeeded_count": 2, "failed_count": 0, "timeout_count": 0,
+        })
+    );
+}
+
+#[test]
 fn bootstrap_token_matches_only_on_exact_value() {
     assert!(bootstrap_token_matches("s3cret", "s3cret"));
     assert!(!bootstrap_token_matches("s3cret", "s3cre"));
@@ -204,7 +231,7 @@ fn bootstrap_empty_expected_never_matches() {
 /// create_token のスコープ ceiling: caller=member相当が admin 要求すると 403。
 #[test]
 fn create_token_scope_ceiling_rejects_escalation() {
-    let caller = vec![Scope::Read, Scope::Invoke, Scope::Deploy];
+    let caller = vec![Scope::Read, Scope::Deploy];
     let err = resolve_token_scopes(&[Scope::Admin], &caller, Role::Admin).unwrap_err();
     assert!(matches!(err, FaasError::Forbidden));
 }
@@ -212,7 +239,7 @@ fn create_token_scope_ceiling_rejects_escalation() {
 /// 対象ユーザが member なら admin スコープは付与不能（caller が admin でも）。
 #[test]
 fn create_token_target_role_ceiling_enforced() {
-    let caller = vec![Scope::Read, Scope::Invoke, Scope::Deploy, Scope::Admin];
+    let caller = vec![Scope::Read, Scope::Deploy, Scope::Admin];
     let err = resolve_token_scopes(&[Scope::Admin], &caller, Role::Member).unwrap_err();
     assert!(matches!(err, FaasError::Forbidden));
 }

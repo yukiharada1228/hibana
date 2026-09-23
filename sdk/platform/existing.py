@@ -162,11 +162,7 @@ class ExistingCluster(KubernetesTarget):
             current_resources[resource_id(doc)] = current
             if current:
                 labels = current["metadata"].get("labels", {})
-                # Legacy releases used kubectl apply in the labelled Hibana
-                # namespace without top-level resource labels.
-                previous = json.loads(current["metadata"].get("annotations", {}).get("kubectl.kubernetes.io/last-applied-configuration", "{}"))
-                legacy = namespace is not None and previous.get("metadata", {}).get("name") == doc["metadata"]["name"] and previous.get("metadata", {}).get("namespace") == "hibana"
-                if labels.get(LABEL) not in (None, "hibana") or (labels.get(LABEL) != "hibana" and labels.get("app.kubernetes.io/part-of") != "hibana" and not legacy):
+                if labels.get(LABEL) not in (None, "hibana") or (labels.get(LABEL) != "hibana" and labels.get("app.kubernetes.io/part-of") != "hibana"):
                     raise ValueError(f"Resource belongs to another installation: {doc['kind']}/{doc['metadata']['name']}")
         current_job = current_resources.get(("Job", MIGRATION_JOB))
         if current_job and current_job.get("status", {}).get("succeeded", 0) != 1:

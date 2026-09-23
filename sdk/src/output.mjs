@@ -23,8 +23,7 @@ export function table(headers, rows, empty) {
     );
 }
 
-export function applications(result, allTenants = false) {
-  const rows = Array.isArray(result) ? result : result.components;
+export function applications(rows, allTenants = false) {
   if (allTenants) {
     table(
       ["TENANT", "APP", "DEPLOYED"],
@@ -66,11 +65,7 @@ export function secrets(result) {
 }
 
 export function egressPolicy(policy) {
-  if (policy.allow_outbound === null)
-    console.log(
-      "No shared policy. Existing version-specific permissions apply.\nRun hibana egress allow HOST:PORT to configure outbound destinations.",
-    );
-  else if (!policy.allow_outbound.length)
+  if (!policy.allow_outbound.length)
     console.log("No destinations allowed. Outbound access is denied.");
   else
     table(

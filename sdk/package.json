@@ -55,5 +55,8 @@
   "homepage": "https://github.com/yukiharada1228/hibana/tree/main/sdk",
   "bugs": {
     "url": "https://github.com/yukiharada1228/hibana/issues"
+  },
+  "dependencies": {
+    "semver": "7.8.5"
   }
 }

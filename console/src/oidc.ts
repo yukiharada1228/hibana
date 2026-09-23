@@ -1,4 +1,7 @@
 import { Api, type LoginOptions } from "./api";
+import type { Session } from "./types";
+
+export type Connection = { api: Api; session: Session; expires: string };
 
 const storageKey = "hibana.oidc.pending";
 const random = () =>
@@ -57,11 +60,7 @@ export async function beginOidc(
   location.assign(authorization.href);
 }
 
-let completion: Promise<{
-  api: Api;
-  session: Awaited<ReturnType<Api["finishOidc"]>>["session"];
-  expires: string;
-}> | null = null;
+let completion: Promise<Connection> | null = null;
 
 export function completeOidc() {
   if (completion) return completion;

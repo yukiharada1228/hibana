@@ -15,9 +15,10 @@ mod repository;
 mod runtime;
 mod service;
 use config::Settings;
-use lifecycle::{spawn_metrics_server, spawn_shutdown_listener, Shutdown};
+use lifecycle::{spawn_metrics_server, spawn_shutdown_listener};
 use service::Worker;
 use std::{sync::Arc, time::Duration};
+use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
 fn main() -> anyhow::Result<()> {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -45,7 +46,7 @@ async fn run(args: Vec<String>) -> anyhow::Result<()> {
     let settings = Settings::from_env()?;
     let metrics = metrics::Metrics::init();
     let worker = Arc::new(Worker::connect(&settings, metrics.clone()).await?);
-    let shutdown = Shutdown::new();
+    let shutdown = CancellationToken::new();
     spawn_shutdown_listener(shutdown.clone(), settings.drain_timeout_secs);
     let server =
         direct_http::start(worker.clone(), shutdown.clone(), &settings.http_bind_addr).await?;
@@ -54,7 +55,7 @@ async fn run(args: Vec<String>) -> anyhow::Result<()> {
     tokio::select! {
         result = server => result??,
         _ = async {
-            shutdown.wait().await;
+            shutdown.cancelled().await;
             tokio::time::sleep(Duration::from_secs(settings.drain_timeout_secs)).await;
         } => warn!("HTTP drain deadline reached; stopping worker"),
     }

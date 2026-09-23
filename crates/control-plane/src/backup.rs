@@ -23,18 +23,6 @@ struct Row {
     dek_nonce: String,
     value_len: i32,
 }
-fn hex(raw: &str) -> anyhow::Result<Vec<u8>> {
-    anyhow::ensure!(
-        raw.len().is_multiple_of(2) && raw.is_ascii(),
-        "invalid envelope encoding"
-    );
-    raw.as_bytes()
-        .as_chunks::<2>()
-        .0
-        .iter()
-        .map(|p| u8::from_str_radix(std::str::from_utf8(p)?, 16).map_err(Into::into))
-        .collect()
-}
 fn line(input: &mut impl BufRead) -> anyhow::Result<zeroize::Zeroizing<String>> {
     use std::io::Read;
     let mut raw = zeroize::Zeroizing::new(String::new());
@@ -56,10 +44,14 @@ pub(crate) fn verify(mut input: impl BufRead) -> anyhow::Result<usize> {
         let row: Row = serde_json::from_str(&raw)?;
         let envelope = Envelope {
             kek_kid: row.kek_kid,
-            ciphertext: hex(&row.ciphertext)?,
-            nonce: hex(&row.nonce)?,
-            wrapped_dek: hex(&row.wrapped_dek)?,
-            dek_nonce: hex(&row.dek_nonce)?,
+            ciphertext: hex::decode(&row.ciphertext)
+                .map_err(|_| anyhow::anyhow!("invalid envelope encoding"))?,
+            nonce: hex::decode(&row.nonce)
+                .map_err(|_| anyhow::anyhow!("invalid envelope encoding"))?,
+            wrapped_dek: hex::decode(&row.wrapped_dek)
+                .map_err(|_| anyhow::anyhow!("invalid envelope encoding"))?,
+            dek_nonce: hex::decode(&row.dek_nonce)
+                .map_err(|_| anyhow::anyhow!("invalid envelope encoding"))?,
             value_len: row.value_len,
         };
         let value = secrets::decrypt(
@@ -94,11 +86,10 @@ mod tests {
         let keyring =
             secrets::SecretKeyring::new("rotated-k2".into(), [2; 32], vec![("k1".into(), [1; 32])]);
         let env = secrets::encrypt(&keyring, "t", "c", "s", "TOKEN", 1, b"private").unwrap();
-        let hex = |v: &[u8]| v.iter().map(|b| format!("{b:02x}")).collect::<String>();
         let keys = serde_json::json!({"active_kid":"rotated-k2","active_key":"02".repeat(32),"retired":format!("k1:{}", "01".repeat(32))});
         let row = serde_json::json!({"tenant_id":"t","component_id":"c","secret_id":"s","name":"TOKEN","version":1,
-            "kek_kid":env.kek_kid,"ciphertext":hex(&env.ciphertext),"nonce":hex(&env.nonce),
-            "wrapped_dek":hex(&env.wrapped_dek),"dek_nonce":hex(&env.dek_nonce),"value_len":env.value_len});
+            "kek_kid":env.kek_kid,"ciphertext":hex::encode(&env.ciphertext),"nonce":hex::encode(&env.nonce),
+            "wrapped_dek":hex::encode(&env.wrapped_dek),"dek_nonce":hex::encode(&env.dek_nonce),"value_len":env.value_len});
         format!("{keys}\n{row}\n")
     }
     #[test]

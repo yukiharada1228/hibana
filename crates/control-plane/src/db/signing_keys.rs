@@ -1,12 +1,14 @@
 //! Signing keys persistence.
 use hibana_database::prelude::*;
+use sea_orm::DerivePartialModel;
 
 // ---------------------------------------------------------------------------
 // M9a: Component 署名鍵（component_signing_keys）
 // ---------------------------------------------------------------------------
 
 /// テナントが登録した署名鍵の 1 行。
-#[derive(Debug, Clone, FromQueryResult)]
+#[derive(Debug, Clone, serde::Serialize, DerivePartialModel)]
+#[sea_orm(entity = "component_signing_keys::Entity")]
 pub struct SigningKey {
     pub key_id: String,
     /// Ed25519 公開鍵（base64url, パディング無し）。
@@ -21,17 +23,11 @@ pub async fn list_signing_keys(
     tenant_id: &str,
 ) -> Result<Vec<SigningKey>, DbErr> {
     component_signing_keys::Entity::find()
-        .select_only()
-        .columns([
-            component_signing_keys::Column::KeyId,
-            component_signing_keys::Column::PublicKey,
-            component_signing_keys::Column::Status,
-        ])
         .filter(component_signing_keys::Column::TenantId.eq(tenant_id))
         .order_by_asc(component_signing_keys::Column::CreatedAt)
         .order_by_asc(component_signing_keys::Column::KeyId)
         .lock_shared()
-        .into_model::<SigningKey>()
+        .into_partial_model::<SigningKey>()
         .all(executor)
         .await
 }
@@ -63,7 +59,7 @@ pub async fn upsert_signing_key(
         ])
         .to_owned(),
     )
-    .exec(executor)
+    .exec_without_returning(executor)
     .await?;
     Ok(())
 }

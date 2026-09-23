@@ -45,11 +45,9 @@ pub async fn ingress_fallback(
     req: axum::extract::Request,
 ) -> Response {
     let Some(base) = state.ingress_base_domain() else {
-        // gateway 無効（INGRESS_BASE_DOMAIN 未設定）。
+        // gateway 無効（APP_PUBLIC_ORIGIN 未設定）。
         return not_found();
     };
-    let base = base.to_string();
-
     let (parts, body) = req.into_parts();
     let host = parts
         .headers
@@ -57,7 +55,7 @@ pub async fn ingress_fallback(
         .and_then(|v| v.to_str().ok())
         .unwrap_or("")
         .to_ascii_lowercase();
-    let Some((app, tenant_slug)) = split_host(&host, &base) else {
+    let Some((app, tenant_slug)) = split_host(&host, base) else {
         return not_found();
     };
 
@@ -68,7 +66,7 @@ pub async fn ingress_fallback(
     };
 
     // 1) tenant_slug -> tenant_id（GUC 不要の SECURITY DEFINER 経路。login と同じ）。
-    let tenant_id = match db_find_tenant(&state, tenant_slug).await {
+    let tenant_id = match crate::db::find_tenant_id_by_slug(state.pool(), tenant_slug).await {
         Ok(Some(t)) => t,
         Ok(None) => return not_found(),
         Err(error) => return lookup_unavailable(error),
@@ -106,11 +104,10 @@ pub async fn ingress_fallback(
             .authority()
             .expect("configured public authority")
             .to_string();
-        request
-            .headers
-            .insert("host".into(), request.authority.clone());
-        request.additional_headers.remove("host");
-        request.encoded_headers.remove("host");
+        request.headers.insert(
+            "host".into(),
+            vec![hibana_shared::b64url_encode(request.authority.as_bytes())],
+        );
         Ok(serde_json::to_value(request).expect("HTTP request serialization"))
     };
 
@@ -125,10 +122,6 @@ pub async fn ingress_fallback(
 fn lookup_unavailable(error: sea_orm::DbErr) -> Response {
     tracing::error!(error = %error, "ingress application lookup failed");
     crate::error::AppError(hibana_shared::FaasError::Unavailable).into_response()
-}
-
-async fn db_find_tenant(state: &AppState, slug: &str) -> Result<Option<String>, sea_orm::DbErr> {
-    crate::db::find_tenant_id_by_slug(state.pool(), slug).await
 }
 
 async fn db_find_component(

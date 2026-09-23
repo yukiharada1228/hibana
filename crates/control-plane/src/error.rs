@@ -38,7 +38,9 @@ impl From<sea_orm::DbErr> for AppError {
 
 impl From<serde_json::Error> for AppError {
     fn from(e: serde_json::Error) -> Self {
-        AppError(FaasError::Serialization(e))
+        // Client JSON is rejected explicitly by the request extractors. Errors
+        // reaching this conversion concern persisted/server-generated data.
+        AppError(FaasError::Internal(e.to_string()))
     }
 }
 
@@ -58,9 +60,6 @@ impl AppError {
             FaasError::NotFound(_) => "not_found",
             FaasError::InvalidRequest(_) => "invalid_request",
             FaasError::Conflict(_) => "conflict",
-            FaasError::Serialization(_) => "invalid_request",
-            FaasError::Timeout => "timeout",
-            FaasError::Execution(_) => "execution_failed",
             FaasError::Internal(_) => "internal_error",
         }
     }
@@ -74,19 +73,13 @@ impl AppError {
             FaasError::NotFound(_) => StatusCode::NOT_FOUND,
             FaasError::InvalidRequest(_) => StatusCode::BAD_REQUEST,
             FaasError::Conflict(_) => StatusCode::CONFLICT,
-            FaasError::Serialization(_) => StatusCode::BAD_REQUEST,
-            FaasError::Timeout => StatusCode::GATEWAY_TIMEOUT,
-            FaasError::Execution(_) => StatusCode::INTERNAL_SERVER_ERROR,
             FaasError::Internal(_) => StatusCode::INTERNAL_SERVER_ERROR,
         }
     }
 
     /// クライアントがリトライしてよいか（ヒント）。
     fn retryable(&self) -> bool {
-        matches!(
-            self.0,
-            FaasError::Timeout | FaasError::Internal(_) | FaasError::Unavailable
-        )
+        matches!(self.0, FaasError::Internal(_) | FaasError::Unavailable)
     }
 }
 
@@ -117,51 +110,41 @@ impl IntoResponse for AppError {
 mod tests {
     use super::*;
 
-    /// envelope の構造とフィールドを検証する（DB 非依存）。
-    fn envelope(err: FaasError) -> (StatusCode, serde_json::Value) {
-        let app = AppError(err);
-        let status = app.status();
-        let message: String = if status.is_server_error() {
-            "internal server error".to_string()
-        } else {
-            app.0.to_string()
-        };
-        let body = json!({
-            "error": {
-                "code": app.code(),
-                "message": message,
-                "retryable": app.retryable(),
-            }
-        });
-        (status, body)
+    async fn envelope(err: impl Into<AppError>) -> (StatusCode, serde_json::Value) {
+        let response = err.into().into_response();
+        let status = response.status();
+        let body = axum::body::to_bytes(response.into_body(), 64 * 1024)
+            .await
+            .unwrap();
+        (status, serde_json::from_slice(&body).unwrap())
     }
 
-    #[test]
-    fn forbidden_maps_to_403() {
-        let (status, body) = envelope(FaasError::Forbidden);
+    #[tokio::test]
+    async fn forbidden_maps_to_403() {
+        let (status, body) = envelope(FaasError::Forbidden).await;
         assert_eq!(status, StatusCode::FORBIDDEN);
         assert_eq!(body["error"]["code"], "forbidden");
         assert_eq!(body["error"]["retryable"], false);
     }
 
-    #[test]
-    fn unauthorized_maps_to_401() {
-        let (status, body) = envelope(FaasError::Unauthorized);
+    #[tokio::test]
+    async fn unauthorized_maps_to_401() {
+        let (status, body) = envelope(FaasError::Unauthorized).await;
         assert_eq!(status, StatusCode::UNAUTHORIZED);
         assert_eq!(body["error"]["code"], "unauthorized");
     }
 
-    #[test]
-    fn not_found_maps_to_404() {
-        let (status, body) = envelope(FaasError::NotFound("x".into()));
+    #[tokio::test]
+    async fn not_found_maps_to_404() {
+        let (status, body) = envelope(FaasError::NotFound("x".into())).await;
         assert_eq!(status, StatusCode::NOT_FOUND);
         assert_eq!(body["error"]["code"], "not_found");
     }
 
     /// 5xx はボディに内部詳細を漏らさない（redaction）。
-    #[test]
-    fn internal_5xx_body_is_redacted() {
-        let (status, body) = envelope(FaasError::Internal("db error: secret table x".into()));
+    #[tokio::test]
+    async fn internal_5xx_body_is_redacted() {
+        let (status, body) = envelope(FaasError::Internal("db error: secret table x".into())).await;
         assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
         assert_eq!(body["error"]["code"], "internal_error");
         assert_eq!(body["error"]["message"], "internal server error");
@@ -174,24 +157,27 @@ mod tests {
     }
 
     /// ORM エラー由来の Internal もボディに詳細を載せない。
-    #[test]
-    fn orm_error_does_not_leak_detail() {
-        let app: AppError = sea_orm::DbErr::Custom("missing fixture row".into()).into();
-        // From<sea_orm::DbErr> は詳細を保持しない（空文字 Internal）。
-        let status = app.status();
-        let message: String = if status.is_server_error() {
-            "internal server error".to_string()
-        } else {
-            app.0.to_string()
-        };
+    #[tokio::test]
+    async fn orm_error_does_not_leak_detail() {
+        let (status, body) = envelope(sea_orm::DbErr::Custom("missing fixture row".into())).await;
         assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
-        assert_eq!(message, "internal server error");
+        assert_eq!(body["error"]["message"], "internal server error");
+    }
+
+    #[tokio::test]
+    async fn stored_json_errors_are_internal_and_redacted() {
+        let error = serde_json::from_value::<u64>(json!("private-fixture-value")).unwrap_err();
+        assert!(error.to_string().contains("private-fixture-value"));
+        let (status, body) = envelope(error).await;
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(body["error"]["code"], "internal_error");
+        assert_eq!(body["error"]["message"], "internal server error");
     }
 
     /// envelope は常に code/message/retryable の 3 キーを持つ。
-    #[test]
-    fn envelope_shape_is_stable() {
-        let (_status, body) = envelope(FaasError::InvalidRequest("bad".into()));
+    #[tokio::test]
+    async fn envelope_shape_is_stable() {
+        let (_status, body) = envelope(FaasError::InvalidRequest("bad".into())).await;
         let obj = body["error"].as_object().unwrap();
         assert!(obj.contains_key("code"));
         assert!(obj.contains_key("message"));

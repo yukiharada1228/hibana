@@ -619,7 +619,7 @@ test("administrator manages shared egress with persistence, revocation and visib
   await login(page, "admin-only@example.internal");
   await page.getByRole("link", { name: "hello-api", exact: true }).click();
   await page.getByRole("tab", { name: "設定", exact: true }).click();
-  await expect(page.getByText(/共通設定は未設定/)).toBeVisible();
+  await expect(page.getByText("なし（外部通信は拒否）", { exact: true })).toBeVisible();
   await page
     .getByLabel("通信先（ホスト名:ポート）")
     .fill("db.example.com:5432");
@@ -723,9 +723,9 @@ test("extension composition distinguishes recorded, empty and unrecorded version
   expect(details).toEqual([]);
   await page.getByRole("tab", { name: "拡張", exact: true }).click();
   await expect(page.getByText("./database", { exact: true })).toBeVisible();
-  await expect(page.getByText(/このバージョンの旧設定を適用中/)).toBeVisible();
+  await expect(page.getByText(/アプリ共通の設定を適用中/)).toBeVisible();
   await expect(
-    page.getByText("db.example.internal:5432", { exact: true }),
+    page.getByText("なし（外部通信は拒否）", { exact: true }),
   ).toBeVisible();
   await expect(
     page.getByText("@example/tcp", { exact: true }),
@@ -802,7 +802,7 @@ test("extension details fail visibly and do not display another version's metada
   );
 });
 
-test("Read users can inspect shared egress and failed policy reads do not imply legacy permissions", async ({
+test("Read users can inspect shared egress and failed policy reads do not imply denied access", async ({
   page,
   request,
 }) => {
@@ -820,7 +820,6 @@ test("Read users can inspect shared egress and failed policy reads do not imply 
   await expect(page.getByRole("alert")).toContainText(
     "通信先の適用元を取得できませんでした",
   );
-  await expect(page.getByText(/このバージョンの旧設定を適用中/)).toHaveCount(0);
   await expect(
     page.getByText("なし（外部通信は拒否）", { exact: true }),
   ).toHaveCount(0);
@@ -1153,6 +1152,19 @@ test("environment values and deletion require an explicit confirmation", async (
   await expect(
     page.getByRole("cell", { name: "Hello from Hibana", exact: true }),
   ).toBeVisible();
+  const deleteApp = page.getByRole("button", { name: "アプリを削除", exact: true });
+  await deleteApp.click();
+  const dialog = page.getByRole("dialog");
+  await expect(dialog.getByRole("button", { name: "キャンセル" })).toBeFocused();
+  await page.keyboard.press("Tab");
+  await expect(
+    dialog.getByRole("button", { name: "削除する", exact: true }),
+  ).toBeFocused();
+  await page.keyboard.press("Shift+Tab");
+  await expect(dialog.getByRole("button", { name: "キャンセル" })).toBeFocused();
+  await page.keyboard.press("Escape");
+  await expect(dialog).toHaveCount(0);
+  await expect(deleteApp).toBeFocused();
   await page.getByRole("button", { name: "アプリを削除", exact: true }).click();
   await page
     .getByRole("dialog")
@@ -1214,7 +1226,7 @@ test("operational details, pagination and usage refresh reflect the platform", a
   await expect(
     page.getByRole("row").filter({ hasText: "OLD_KEY" }),
   ).toContainText("参照先が削除されています");
-  await expect(page.getByText(/共通設定は未設定/)).toBeVisible();
+  await expect(page.getByText("なし（外部通信は拒否）", { exact: true })).toBeVisible();
   await page.screenshot({
     path: info.outputPath("settings.png"),
     fullPage: true,
@@ -1341,6 +1353,9 @@ test("Deploy without Admin can roll back but cannot delete versions", async ({
       .filter({ hasText: "1.0.0" })
       .getByRole("button", { name: "切り戻す" }),
   ).toBeVisible();
+  const unselected = page.getByRole("row").filter({ hasText: "0.8.0" });
+  await expect(unselected).toContainText("未選択");
+  await expect(unselected.getByRole("button", { name: "切り戻す" })).toBeVisible();
   await expect(
     page.getByRole("button", { name: "削除", exact: true }),
   ).toHaveCount(0);

@@ -4,14 +4,29 @@ import assert from 'node:assert/strict';
 import {createHash, generateKeyPairSync} from 'node:crypto';
 
 export async function testManagementAudit({api, sql, wasm, upload}) {
-  const created = await api('/admin/tenants', {method:'POST',token:'test-only',body:{
-    slug:'management-audit',name:'Management audit',admin_email:'test@example.invalid',admin_oidc_subject: 'fixture-admin',
-  }});
+  const tenantRequest = {
+    slug:'management-audit',name:' Management audit ',admin_email:' test@example.invalid ',admin_oidc_subject: 'fixture-admin',
+  };
+  for (const token of [undefined,'invalid-bootstrap-token']) {
+    const denied = await api('/admin/tenants', {method:'POST',token,body:tenantRequest});
+    assert.equal(denied.status,401,'tenant creation requires the platform bootstrap credential');
+    await denied.text();
+  }
+  assert.equal((await sql("SELECT count(*) FROM tenants WHERE slug='management-audit'")).trim(),'0');
+  const created = await api('/admin/tenants', {method:'POST',token:'test-only',body:tenantRequest});
   assert.equal(created.status,201);
-  const {tenant_id:tenant,admin_user_id:user} = await created.json();
+  const {tenant_id:tenant,admin_user_id:user,...details} = await created.json();
+  assert.deepEqual(details,{slug:'management-audit',name:'Management audit',admin_email:'test@example.invalid'});
   const login = await issueFixtureToken(sql, {tenant_slug:'management-audit',email:'test@example.invalid',});
   assert.equal(login.status,201);
   const {token:userToken} = await login.json();
+  const member = await api(`/tenants/${tenant}/users`, {method:'POST',token:userToken,body:{
+    email:' member@example.invalid ',role:'member',oidc_subject:'fixture-normalized-member',
+  }});
+  assert.equal(member.status,201);
+  const {user_id:memberId,...memberDetails} = await member.json();
+  assert.deepEqual(memberDetails,{email:'member@example.invalid',role:'member'});
+  assert.equal((await sql(`SELECT email FROM users WHERE id='${memberId}'`)).trim(),memberDetails.email);
   const snapshot = async () => JSON.parse((await sql(`SELECT json_build_object('status',status,'quotas',quotas) FROM tenants WHERE id='${tenant}'`)).trim());
   const auditActors = async (action,target) => JSON.parse((await sql(`SELECT coalesce(json_agg(actor ORDER BY id),'[]') FROM audit_logs
     WHERE tenant_id='${tenant}' AND action='${action}' AND ${target === null ? 'target IS NULL' : `target='${target}'`}`)).trim());
@@ -49,6 +64,7 @@ export async function testManagementAudit({api, sql, wasm, upload}) {
   const hash = createHash('sha256').update(serviceToken).digest('hex');
   await sql(`INSERT INTO api_tokens(id,tenant_id,user_id,token_hash,scopes,expires_at,auth_method,user_auth_version) VALUES
     ('${serviceId}','${tenant}',NULL,'${hash}',ARRAY['read','admin','deploy'],now()+interval '10 minutes','api',0)`);
+  const expectedKeys = [];
   for (const [kind,token,actor] of [['user',userToken,user],['service',serviceToken,serviceId]]) {
     // Check exact attribution for each operation, including actions with NULL targets.
     const audited = async (action,target,operation,status=200) => {
@@ -70,7 +86,11 @@ export async function testManagementAudit({api, sql, wasm, upload}) {
     const {publicKey} = generateKeyPairSync('ed25519');
     const public_key = publicKey.export({type:'spki',format:'der'}).subarray(-32).toString('base64url');
     const keyId = `audit-${kind}`;
-    await audited('signing_key_registered',keyId,() => send(`/admin/signing-keys/${keyId}`,{public_key}));
+    const registered = await audited('signing_key_registered',keyId,() => send(`/admin/signing-keys/${keyId}`,{public_key}));
+    const key = {key_id:keyId,public_key,status:'active'};
+    assert.deepEqual(await registered.json(),key);
+    expectedKeys.push(key);
+    assert.deepEqual(await (await api('/admin/signing-keys',{token})).json(),expectedKeys);
     await audited('signing_policy_updated',null,() => send('/admin/signing-policy',{require_signed_components:true}));
     try {
       await audited('component_signature_rejected',id,() => upload(id,token,'unsigned',wasm),400);
@@ -78,9 +98,10 @@ export async function testManagementAudit({api, sql, wasm, upload}) {
       await audited('signing_policy_updated',null,() => send('/admin/signing-policy',{require_signed_components:false}));
     }
     await audited('signing_key_retired',keyId,() => send(`/admin/signing-keys/${keyId}`,undefined,'DELETE'),204);
+    key.status = 'retired';
+    assert.deepEqual(await (await api('/admin/signing-keys',{token})).json(),expectedKeys);
 
-    const first = await audited('version_environment_published',id,() => upload(id,token,'one',wasm),201);
-    await audited('capability_egress_approved',first.data.version_id,() => send(`${base}/versions/one/capabilities/egress`,{allow_outbound:['example.invalid:443']}));
+    await audited('version_environment_published',id,() => upload(id,token,'one',wasm),201);
     await audited('component_egress_updated',id,() => send(`${base}/egress`,{allow:['example.invalid:443']},'PATCH'));
     await audited('version_environment_published',id,() => upload(id,token,'two',wasm),201);
     await audited('active_version_switched',id,() => send(`${base}/active-version`,{version:'one'}));

@@ -1,7 +1,6 @@
 import { useEffect, useState, type FormEvent } from "react";
 import { Api, errorMessage, type LoginOptions } from "./api";
-import { beginOidc, completeOidc } from "./oidc";
-import type { Session } from "./types";
+import { beginOidc, completeOidc, type Connection } from "./oidc";
 import { Button } from "./components/ui/button";
 import { Input } from "./components/ui/input";
 import { Brand, Notice } from "./components/common";
@@ -11,7 +10,7 @@ export function Login({
   onLogin,
 }: {
   message: string;
-  onLogin: (api: Api, session: Session, expires: string, email: string) => void;
+  onLogin: (connection: Connection) => void;
 }) {
   const [busy, setBusy] = useState(true),
     [error, setError] = useState("");
@@ -31,12 +30,7 @@ export function Login({
       .then((result) => {
         if (active && result) {
           adopted = result.api === api;
-          onLogin(
-            result.api,
-            result.session,
-            result.expires,
-            result.session.email || "ログイン中",
-          );
+          onLogin(result);
         }
       })
       .catch((error) => {

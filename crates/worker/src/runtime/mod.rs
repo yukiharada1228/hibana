@@ -206,11 +206,9 @@ impl Runtime {
             .allow_tcp(false)
             .allow_udp(false)
             .allow_ip_name_lookup(false);
-        let captured_stderr = {
-            let pipe = wasmtime_wasi::p2::pipe::MemoryOutputPipe::new(GUEST_STDERR_CAPTURE_BYTES);
-            wasi_builder.stderr(pipe.clone());
-            Some(pipe)
-        };
+        let captured_stderr =
+            wasmtime_wasi::p2::pipe::MemoryOutputPipe::new(GUEST_STDERR_CAPTURE_BYTES);
+        wasi_builder.stderr(captured_stderr.clone());
         for (k, v) in &built_env.pairs {
             wasi_builder.env(k, v);
         }
@@ -326,13 +324,11 @@ impl Runtime {
 
         let timed = tokio::time::timeout_at(deadline, exec_future).await;
 
-        if let Some(pipe) = captured_stderr {
-            let dropped = pipe.contents().len() as u64;
-            if dropped > 0 {
-                self.metrics
-                    .guest_stderr_dropped_bytes_total
-                    .inc_by(dropped);
-            }
+        let dropped = captured_stderr.contents().len() as u64;
+        if dropped > 0 {
+            self.metrics
+                .guest_stderr_dropped_bytes_total
+                .inc_by(dropped);
         }
 
         match timed {

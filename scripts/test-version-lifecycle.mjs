@@ -58,6 +58,16 @@ export async function testVersionLifecycle({api, sql, pg, token, wasm, upload, a
   assert.equal(created.status,201);
   const id = (await created.json()).component_id;
   const base = `/components/${id}`;
+  const listedApp = async () => {
+    const response = await api('/components',{token});
+    assert.equal(response.status,200);
+    return (await response.json()).find(item => item.component_id === id);
+  };
+  const initial = await listedApp();
+  assert.ok(initial, 'an application without a version remains in the list');
+  assert.equal(initial.active_version_id,null);
+  assert.equal(initial.active_version,null);
+  assert.equal(initial.active_version_created_at,null);
   assert.equal((await upload(id,token,'stable',wasm,0,{vars:{GREETING:'stable'},ingress:true})).status,201);
   const snapshot = async () => JSON.parse((await sql(`SELECT json_build_object(
     'active',active_version_id,'previous',previous_active_version_id) FROM components WHERE id='${id}'`)).trim());
@@ -66,11 +76,13 @@ export async function testVersionLifecycle({api, sql, pg, token, wasm, upload, a
   for (const mode of ['active-version','rollback']) {
     for (const first of ['publish','delete']) {
       const version = `${mode}-${first}`;
+      const before = await snapshot();
       const uploaded = await upload(id,token,version,wasm,0,{activate:false,vars:{GREETING:version}});
       assert.equal(uploaded.status,201);
+      assert.equal(Object.hasOwn(uploaded.data, 'status'), false);
+      assert.deepEqual(await snapshot(), before, 'inactive registration must preserve publication');
       const versionId = uploaded.data.version_id;
       assert.match(versionId, /^ver_[a-f0-9]{32}$/);
-      const before = await snapshot();
       const release = await holdComponent(pg,id);
       const pending = {};
       const send = operation => {
@@ -100,6 +112,11 @@ export async function testVersionLifecycle({api, sql, pg, token, wasm, upload, a
       assert.equal((await sql(`SELECT count(*) FROM components c JOIN component_versions v
         ON v.id=c.active_version_id WHERE c.id='${id}' AND v.deleted_at IS NOT NULL`)).trim(),'0');
       if (wins) expectedMessage = version;
+      const listed = await listedApp();
+      const current = await snapshot();
+      assert.equal(listed.active_version_id,current.active);
+      assert.equal(listed.active_version,expectedMessage);
+      assert.ok(Number.isFinite(Date.parse(listed.active_version_created_at)));
       const response = await app('version-race');
       assert.equal(response.status,200,'the surviving public version must keep serving HTTP');
       assert.equal(response.body.message,expectedMessage,'code must retain the surviving version configuration');
@@ -114,6 +131,7 @@ export async function testVersionLifecycle({api, sql, pg, token, wasm, upload, a
     return response.json();
   };
   const protectedVersions = await listedVersions();
+  assert.ok(protectedVersions.every(v => !Object.hasOwn(v, 'status')));
   assert.equal(protectedVersions.find(v => v.version_id===live.active).deletion_blocked_reason,'active_version');
   assert.equal(protectedVersions.find(v => v.version_id===live.previous).deletion_blocked_reason,'rollback_target');
   assert.ok(protectedVersions.filter(v => ![live.active,live.previous].includes(v.version_id))

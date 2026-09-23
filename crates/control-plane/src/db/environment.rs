@@ -1,8 +1,7 @@
 //! Combined vars/Secret sizes. Callers hold the component publication lock.
 //! Only Secret length metadata is read; plaintext and ciphertext stay out of this query.
 use hibana_database::prelude::*;
-use sea_orm::sea_query::{Alias, SelectStatement};
-use std::collections::BTreeMap;
+use sea_orm::sea_query::{Alias, SelectStatement, UnionType};
 
 pub async fn version_environment_within_limit(
     tx: &sea_orm::DatabaseTransaction,
@@ -56,17 +55,14 @@ async fn environments_within_limit(
         Func::cust(Alias::new("octet_length")).arg(Expr::col(version_configs::Column::Key)),
     )
     .add(Func::cust(Alias::new("octet_length")).arg(Expr::col(version_configs::Column::Value)));
-    let vars = version_configs::Entity::find()
+    let mut sizes = version_configs::Entity::find()
         .select_only()
         .column(version_configs::Column::VersionId)
-        .column_as(var_bytes.sum(), "bytes")
+        .column_as(var_bytes, "bytes")
         .filter(version_configs::Column::TenantId.eq(tenant))
         .filter(version_configs::Column::ComponentId.eq(component))
         .filter(version_configs::Column::VersionId.in_subquery(versions.clone()))
-        .group_by(version_configs::Column::VersionId)
-        .into_tuple::<(String, i64)>()
-        .all(tx)
-        .await?;
+        .into_query();
     let secret_bytes = Expr::expr(Func::cust(Alias::new("octet_length")).arg(Expr::col((
         version_secret_bindings::Entity,
         version_secret_bindings::Column::Name,
@@ -108,20 +104,29 @@ async fn environments_within_limit(
         )
         .select_only()
         .column(version_secret_bindings::Column::VersionId)
-        .column_as(secret_bytes.sum(), "bytes")
+        .column_as(secret_bytes, "bytes")
         .filter(version_secret_bindings::Column::TenantId.eq(tenant))
         .filter(version_secret_bindings::Column::ComponentId.eq(component))
         .filter(version_secret_bindings::Column::VersionId.in_subquery(versions))
         .filter(function_secrets::Column::DeletedAt.is_null())
-        .group_by(version_secret_bindings::Column::VersionId)
-        .into_tuple::<(String, i64)>()
-        .all(tx)
-        .await?;
-    let mut totals = BTreeMap::<String, i64>::new();
-    for (version, bytes) in vars.into_iter().chain(secrets) {
-        *totals.entry(version).or_default() += bytes;
-    }
-    Ok(totals
-        .values()
-        .all(|&bytes| (0..=hibana_shared::MAX_FUNCTION_ENV_TOTAL_BYTES as i64).contains(&bytes)))
+        .into_query();
+    // Keep equal-sized entries, aggregate once per version, and return at most
+    // one marker. Empty environments have no violating group and remain valid.
+    sizes.union(UnionType::All, secrets);
+    Ok(tx
+        .query_one(
+            &Query::select()
+                .expr(Expr::val(1))
+                .from_subquery(sizes, "environment_sizes")
+                .group_by_col("version_id")
+                .cond_having(
+                    Expr::col("bytes")
+                        .sum()
+                        .not_between(0_i64, hibana_shared::MAX_FUNCTION_ENV_TOTAL_BYTES as i64),
+                )
+                .limit(1)
+                .to_owned(),
+        )
+        .await?
+        .is_none())
 }

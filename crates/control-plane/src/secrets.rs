@@ -96,7 +96,6 @@ impl std::error::Error for SecretError {}
 
 /// KEK キーリング (§10)。**暗号化は常に `active_kid`、復号は行の kid で選ぶ**（rotation-ready）。
 ///
-/// `signing.rs` の `Signer`（現行鍵 1 本 + kid）/ `Verifier`（kid -> 鍵）の 2 段構成をそのまま写す。
 /// retired キーは復号専用で、再ラップが全行に行き渡るまで残す（早期撤去すると復号不能 ＝ データ喪失）。
 pub struct SecretKeyring {
     active_kid: String,

@@ -22,7 +22,6 @@ fn state(pool: DatabaseConnection, store: Arc<dyn crate::store::Store>) -> AppSt
         &cfg.s3_access_key,
         cfg.s3_secret_key_plain(),
     );
-    let exp_cfg = cfg.clone();
     AppState::new(
         pool,
         storage,
@@ -33,7 +32,7 @@ fn state(pool: DatabaseConnection, store: Arc<dyn crate::store::Store>) -> AppSt
             crate::signing::decode_seed(cfg.job_signing_key_plain()).unwrap(),
             cfg.job_signing_kid.clone(),
         )),
-        Box::new(move |wall| exp_cfg.token_exp_offset_secs(wall)),
+        cfg.token_margin_secs,
         store,
         cfg.admission(),
         crate::metrics::Metrics::init(),
@@ -121,6 +120,8 @@ async fn http_mvp_regression() {
         .await
         .unwrap();
     assert_tenant_context_is_transaction_local().await;
+    assert_inflight_queries(&owner, &pool).await;
+    assert_usage_boundaries(&pool).await;
     let store = Arc::new(crate::store::InProcStore::new());
     let state = state(pool.clone(), store.clone());
 
@@ -256,7 +257,10 @@ async fn http_mvp_regression() {
         .await
         .unwrap()
         .0;
-    assert_eq!(job.version, "1");
+    assert_eq!(
+        state.signer().verify(&job.job_token).unwrap().version_id,
+        "source-v1"
+    );
     assert_eq!(job.input["path"], "/");
     for invalid in [
         token(&state, &id, "other", "source-v1"),
@@ -327,6 +331,7 @@ async fn http_mvp_regression() {
         error: None,
         job_token: job.job_token.clone(),
         usage: Some(UsageMetrics {
+            cpu_fuel_used: u64::MAX,
             wall_time_ms: u64::MAX,
             peak_memory_bytes: u64::MAX,
             ..Default::default()
@@ -367,7 +372,7 @@ async fn http_mvp_regression() {
             .status(),
         StatusCode::FORBIDDEN
     );
-    let mut expired = state.verifier().verify(&job.job_token).unwrap();
+    let mut expired = state.signer().verify(&job.job_token).unwrap();
     expired.exp = chrono::Utc::now().timestamp() - 1;
     result.job_token = state.signer().sign(&expired);
     assert_eq!(
@@ -385,7 +390,7 @@ async fn http_mvp_regression() {
         let mut forged = result.clone();
         forged.job_token = bad_token.clone();
         assert_eq!(
-            direct_http::complete(State(state.clone()), headers(&bad_token), Json(forged))
+            crate::completion::complete(State(state.clone()), headers(&bad_token), Json(forged))
                 .await
                 .unwrap_err()
                 .into_response()
@@ -394,7 +399,7 @@ async fn http_mvp_regression() {
         );
     }
     assert_eq!(
-        direct_http::complete(
+        crate::completion::complete(
             State(state.clone()),
             headers(&job.job_token),
             Json(result.clone())
@@ -407,7 +412,7 @@ async fn http_mvp_regression() {
     );
     let mut forged = result.clone();
     forged.tenant_id = "other".into();
-    assert!(direct_http::complete(
+    assert!(crate::completion::complete(
         State(state.clone()),
         headers(&result.job_token),
         Json(forged)
@@ -416,7 +421,7 @@ async fn http_mvp_regression() {
     .is_err());
     let mut nonterminal = result.clone();
     nonterminal.status = ExecutionStatus::Running;
-    assert!(direct_http::complete(
+    assert!(crate::completion::complete(
         State(state.clone()),
         headers(&result.job_token),
         Json(nonterminal)
@@ -425,7 +430,7 @@ async fn http_mvp_regression() {
     .is_err());
     for _ in 0..2 {
         assert_eq!(
-            direct_http::complete(
+            crate::completion::complete(
                 State(state.clone()),
                 headers(&result.job_token),
                 Json(result.clone())
@@ -436,6 +441,15 @@ async fn http_mvp_regression() {
         );
     }
     assert_eq!(inflight(&pool, "http").await, 0);
+    assert_eq!(
+        scalar(
+            &owner,
+            "SELECT sum(cpu_fuel_used)::bigint FROM usage_rollups"
+        )
+        .await,
+        0,
+        "a Worker cannot report fuel use for an unmetered version"
+    );
     assert_eq!(
         scalar(
             &owner,
@@ -601,7 +615,7 @@ async fn http_mvp_regression() {
             .status(),
         StatusCode::UNAUTHORIZED
     );
-    fixture_execute(&owner, "INSERT INTO components (id,tenant_id,name) VALUES ('delete-test','other','reusable'); INSERT INTO component_versions (id,tenant_id,component_id,version,storage_uri,wasm_sha256,status) VALUES ('delete-v1','other','delete-test','1','delete.wasm','abcd','active'); INSERT INTO executions (id,tenant_id,component_id,version_id,status,http_request) VALUES ('delete-pending','other','delete-test','delete-v1','pending',true);", vec![]).await.unwrap();
+    fixture_execute(&owner, "INSERT INTO components (id,tenant_id,name) VALUES ('delete-test','other','reusable'); INSERT INTO component_versions (id,tenant_id,component_id,version,storage_uri,wasm_sha256) VALUES ('delete-v1','other','delete-test','1','delete.wasm','abcd'); INSERT INTO executions (id,tenant_id,component_id,version_id,status,http_request) VALUES ('delete-pending','other','delete-test','delete-v1','pending',true);", vec![]).await.unwrap();
     let Json(inventory) = admin_list_components(State(state.clone()), admin.clone())
         .await
         .unwrap();
@@ -681,6 +695,7 @@ async fn http_mvp_regression() {
     console_information_regression(&state).await;
     direct_http_dispatch_regression(&owner, &pool).await;
     completion_diagnostic_regression(&owner, &state).await;
+    completion_concurrency_regression(&owner, &state).await;
     // Keep identities used by the subsequent cross-tenant RLS checks, but do
     // not ask the real fleet to prepare these fake, unstored Wasm versions.
     fixture_execute(
@@ -699,8 +714,8 @@ async fn completion_diagnostic_regression(owner: &DatabaseConnection, state: &Ap
     fixture_execute(owner, r#"
         INSERT INTO tenants (id,slug,name,status) VALUES ('diagnostics','diagnostics','Diagnostics','active');
         INSERT INTO components (id,tenant_id,name) VALUES ('diagnostics-app','diagnostics','app');
-        INSERT INTO component_versions (id,tenant_id,component_id,version,storage_uri,wasm_sha256,status)
-            VALUES ('diagnostics-v1','diagnostics','diagnostics-app','1','unused','abcd','active');
+        INSERT INTO component_versions (id,tenant_id,component_id,version,storage_uri,wasm_sha256)
+            VALUES ('diagnostics-v1','diagnostics','diagnostics-app','1','unused','abcd');
     "#, vec![]).await.unwrap();
 
     // Wasmtime preserves NUL in debug names when formatting a trap backtrace.
@@ -740,7 +755,7 @@ async fn completion_diagnostic_regression(owner: &DatabaseConnection, state: &Ap
         };
         for _ in 0..2 {
             assert_eq!(
-                direct_http::complete(
+                crate::completion::complete(
                     State(state.clone()),
                     headers(&result.job_token),
                     Json(result.clone()),
@@ -778,6 +793,120 @@ async fn completion_diagnostic_regression(owner: &DatabaseConnection, state: &Ap
     println!("PASS completion diagnostics: bounded UTF-8 / NUL-safe JSONB / unchanged text / terminal state / input cleanup / immediate slot release / idempotent usage");
 }
 
+async fn completion_concurrency_regression(owner: &DatabaseConnection, state: &AppState) {
+    fixture_execute(owner, r#"
+        INSERT INTO tenants (id,slug,name,status) VALUES ('completion','completion','Completion','active');
+        INSERT INTO components (id,tenant_id,name) VALUES ('completion-app','completion','app');
+        INSERT INTO component_versions (id,tenant_id,component_id,version,storage_uri,wasm_sha256)
+            VALUES ('completion-v1','completion','completion-app','1','unused','abcd');
+        INSERT INTO executions (id,tenant_id,component_id,version_id,status,input,http_request)
+            SELECT id,'completion','completion-app','completion-v1','running','{}',true
+            FROM unnest(ARRAY['completion-duplicate','completion-conflict','completion-rollback']) AS id;
+    "#, vec![]).await.unwrap();
+    let result = |id: &str, status| ResultMessage {
+        execution_id: id.into(),
+        tenant_id: "completion".into(),
+        status,
+        output: None,
+        error: None,
+        job_token: token(state, id, "completion", "completion-v1"),
+        usage: Some(UsageMetrics::default()),
+    };
+    let complete = |result: ResultMessage| async move {
+        crate::completion::complete(
+            State(state.clone()),
+            headers(&result.job_token),
+            Json(result),
+        )
+        .await
+        .unwrap_or_else(|error| error.into_response().status())
+    };
+    for (id, second_status) in [
+        ("completion-duplicate", ExecutionStatus::Succeeded),
+        ("completion-conflict", ExecutionStatus::Failed),
+    ] {
+        let (first, second) = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            tokio::join!(
+                complete(result(id, ExecutionStatus::Succeeded)),
+                complete(result(id, second_status)),
+            )
+        })
+        .await
+        .expect("concurrent completions must not deadlock");
+        if second_status == ExecutionStatus::Succeeded {
+            assert_eq!(
+                (first, second),
+                (StatusCode::NO_CONTENT, StatusCode::NO_CONTENT)
+            );
+        } else {
+            assert!(matches!(
+                (first, second),
+                (StatusCode::NO_CONTENT, StatusCode::CONFLICT)
+                    | (StatusCode::CONFLICT, StatusCode::NO_CONTENT)
+            ));
+        }
+    }
+    assert_eq!(
+        scalar(
+            owner,
+            "SELECT sum(invocation_count)::bigint FROM usage_rollups WHERE tenant_id='completion'"
+        )
+        .await,
+        2
+    );
+    assert_eq!(inflight(state.pool(), "completion").await, 1);
+
+    // Fail at COMMIT, after finalization and the rollup both succeeded. Neither
+    // the execution nor metrics may record a transition that was rolled back.
+    fixture_execute(
+        owner,
+        r#"
+        CREATE FUNCTION reject_completion_commit() RETURNS trigger LANGUAGE plpgsql AS $$
+        BEGIN RAISE EXCEPTION 'fixture commit failure'; END $$;
+        CREATE CONSTRAINT TRIGGER reject_completion_commit AFTER UPDATE ON executions
+            DEFERRABLE INITIALLY DEFERRED FOR EACH ROW
+            WHEN (NEW.id = 'completion-rollback') EXECUTE FUNCTION reject_completion_commit();
+    "#,
+        vec![],
+    )
+    .await
+    .unwrap();
+    let durations = state
+        .metrics()
+        .execution_duration_seconds
+        .with_label_values(&["succeeded"]);
+    let count = state
+        .metrics()
+        .executions_total
+        .with_label_values(&["succeeded"]);
+    let before = (durations.get_sample_count(), count.get());
+    assert_eq!(
+        complete(result("completion-rollback", ExecutionStatus::Succeeded)).await,
+        StatusCode::INTERNAL_SERVER_ERROR
+    );
+    assert_eq!((durations.get_sample_count(), count.get()), before);
+    assert_eq!(scalar(owner, "SELECT count(*) FROM executions WHERE id='completion-rollback' AND status='running' AND input IS NOT NULL").await, 1);
+    assert_eq!(
+        scalar(
+            owner,
+            "SELECT sum(invocation_count)::bigint FROM usage_rollups WHERE tenant_id='completion'"
+        )
+        .await,
+        2
+    );
+    fixture_execute(owner, "DROP TRIGGER reject_completion_commit ON executions; DROP FUNCTION reject_completion_commit()", vec![]).await.unwrap();
+    assert_eq!(
+        complete(result("completion-rollback", ExecutionStatus::Succeeded)).await,
+        StatusCode::NO_CONTENT
+    );
+    assert_eq!(
+        (durations.get_sample_count(), count.get()),
+        (before.0 + 1, before.1 + 1)
+    );
+    assert_eq!(inflight(state.pool(), "completion").await, 0);
+    println!("PASS concurrent duplicate/conflicting completions: one committed result, one usage count; failed commit rolls back execution, usage and metrics");
+}
+
 async fn direct_http_dispatch_regression(owner: &DatabaseConnection, pool: &DatabaseConnection) {
     use axum::{routing::post, Router};
     use hibana_shared::http::HttpRequest;
@@ -789,8 +918,8 @@ async fn direct_http_dispatch_regression(owner: &DatabaseConnection, pool: &Data
         INSERT INTO tenants (id,slug,name,status,quotas)
             VALUES ('slots','slots','Slots','active','{"max_concurrent_executions":1}');
         INSERT INTO components (id,tenant_id,name,ingress_enabled) VALUES ('slots-app','slots','app',true);
-        INSERT INTO component_versions (id,tenant_id,component_id,version,storage_uri,wasm_sha256,status)
-            VALUES ('slots-v1','slots','slots-app','1','unused','abcd','active');
+        INSERT INTO component_versions (id,tenant_id,component_id,version,storage_uri,wasm_sha256)
+            VALUES ('slots-v1','slots','slots-app','1','unused','abcd');
         UPDATE components SET active_version_id='slots-v1' WHERE id='slots-app';
     "#, vec![]).await.unwrap();
 
@@ -829,9 +958,9 @@ async fn direct_http_dispatch_regression(owner: &DatabaseConnection, pool: &Data
                 job_token: job.job_token.clone(),
                 usage: Some(UsageMetrics::default()),
             };
-            assert_eq!(direct_http::complete(State(state), headers(&job.job_token), Json(result)).await.unwrap(),
+            assert_eq!(crate::completion::complete(State(state), headers(&job.job_token), Json(result)).await.unwrap(),
                 StatusCode::NO_CONTENT);
-            (StatusCode::OK, request.body_bytes().unwrap())
+            (StatusCode::OK, request.into_body_bytes().unwrap())
         }
     }));
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -927,6 +1056,153 @@ async fn direct_http_dispatch_regression(owner: &DatabaseConnection, pool: &Data
     println!("PASS HTTP body: text, NUL and binary survive JSONB persistence and Worker handoff byte-for-byte");
 }
 
+async fn assert_usage_boundaries(pool: &DatabaseConnection) {
+    let tx = pool.begin().await.unwrap();
+    db::set_tenant_guc(&tx, "http").await.unwrap();
+    db::create_component(&tx, "http", "usage-boundary", "usage-boundary")
+        .await
+        .unwrap();
+    let from = chrono::NaiveDate::from_ymd_opt(2000, 1, 1).unwrap();
+    let to = from.succ_opt().unwrap();
+    let usage = UsageMetrics {
+        cpu_fuel_used: u64::MAX,
+        wall_time_ms: u64::MAX,
+        peak_memory_bytes: u64::MAX,
+        output_bytes: u64::MAX,
+    };
+    for day in [from, to] {
+        db::upsert_usage_rollup(
+            &tx,
+            "http",
+            "usage-boundary",
+            day,
+            ExecutionStatus::Succeeded,
+            &usage,
+        )
+        .await
+        .unwrap();
+    }
+    // Exercise every additive column, including counters normally reached only
+    // after many invocations. The next completion must still be able to commit.
+    fixture_execute(&tx, "UPDATE usage_rollups SET invocation_count=9223372036854775807, succeeded_count=9223372036854775807, failed_count=9223372036854775807, timeout_count=9223372036854775807 WHERE component_id='usage-boundary'", vec![]).await.unwrap();
+    for status in [
+        ExecutionStatus::Succeeded,
+        ExecutionStatus::Failed,
+        ExecutionStatus::Timeout,
+    ] {
+        db::upsert_usage_rollup(&tx, "http", "usage-boundary", from, status, &usage)
+            .await
+            .unwrap();
+    }
+    // PostgreSQL SUM(bigint) returns numeric; spanning days must also stay bounded.
+    let rows = db::get_usage_rollups(&tx, "http", from, to, Some("usage-boundary"))
+        .await
+        .unwrap();
+    assert_eq!(rows.len(), 1);
+    let row = &rows[0].usage;
+    for value in [
+        row.invocation_count,
+        row.cpu_fuel_used,
+        row.wall_time_ms,
+        row.peak_memory_bytes_max,
+        row.output_bytes,
+        row.succeeded_count,
+        row.failed_count,
+        row.timeout_count,
+    ] {
+        assert_eq!(value, i64::MAX);
+    }
+    db::set_tenant_guc(&tx, "other").await.unwrap();
+    assert!(db::get_usage_rollups(&tx, "http", from, to, None)
+        .await
+        .unwrap()
+        .is_empty());
+    tx.rollback().await.unwrap();
+    println!("PASS usage accumulation and date aggregation saturate without blocking completion or bypassing RLS");
+}
+
+async fn assert_inflight_queries(owner: &DatabaseConnection, pool: &DatabaseConnection) {
+    fixture_execute(
+        owner,
+        r#"
+        INSERT INTO executions(id,tenant_id,component_id,version_id,status,http_request,created_at)
+        SELECT 'existence-'||status,'http','source','source-v1',status,true,now()-interval '1 day'
+        FROM unnest(ARRAY['pending','running','succeeded','failed','timeout']) AS status;
+        INSERT INTO executions(id,tenant_id,component_id,version_id,status,http_request)
+        VALUES ('existence-non-http','http','source','source-v2','pending',false);
+    "#,
+        vec![],
+    )
+    .await
+    .unwrap();
+    for context in ["http", "other"] {
+        let tx = pool.begin().await.unwrap();
+        db::set_tenant_guc(&tx, context).await.unwrap();
+        let visible = context == "http";
+        assert_eq!(
+            db::has_active_executions_for_component(&tx, "http", "source")
+                .await
+                .unwrap(),
+            visible
+        );
+        assert_eq!(
+            db::has_active_executions_for_version(&tx, "http", "source-v1")
+                .await
+                .unwrap(),
+            visible
+        );
+        assert!(
+            !db::has_active_executions_for_component(&tx, "http", "target")
+                .await
+                .unwrap()
+        );
+        assert!(
+            !db::has_active_executions_for_version(&tx, "http", "source-v2")
+                .await
+                .unwrap()
+        );
+        assert!(
+            !db::has_active_executions_for_component(&tx, "other", "source")
+                .await
+                .unwrap()
+        );
+        let versions = db::active_execution_version_ids(&tx, "http", "source")
+            .await
+            .unwrap();
+        assert_eq!(
+            versions,
+            if visible {
+                vec!["source-v1".to_string()]
+            } else {
+                vec![]
+            }
+        );
+        assert_eq!(
+            db::count_inflight_executions(&tx, "http").await.unwrap(),
+            if visible { 2 } else { 0 }
+        );
+        let swept = db::finalize_stuck_executions(&tx, "http", 60)
+            .await
+            .unwrap();
+        assert_eq!(swept.len(), if visible { 2 } else { 0 });
+        assert!(
+            !db::has_active_executions_for_component(&tx, "http", "source")
+                .await
+                .unwrap()
+        );
+        assert_eq!(db::count_inflight_executions(&tx, "http").await.unwrap(), 0);
+        tx.rollback().await.unwrap();
+    }
+    fixture_execute(
+        owner,
+        "DELETE FROM executions WHERE id LIKE 'existence-%'",
+        vec![],
+    )
+    .await
+    .unwrap();
+    println!("PASS execution existence, capacity and recovery share HTTP state filters and preserve tenant RLS");
+}
+
 async fn console_information_regression(state: &AppState) {
     use crate::handlers::{
         configuration::get_function_config,
@@ -957,7 +1233,6 @@ async fn console_information_regression(state: &AppState) {
         4,
         &json!({}),
         &json!(hibana_shared::ResourceLimits::default()),
-        "active",
         None,
     )
     .await
@@ -1367,7 +1642,7 @@ async fn assert_fresh_schema(owner: &DatabaseConnection) {
     assert_eq!(scalar(owner,"SELECT count(*) FROM information_schema.tables WHERE table_schema='public' AND table_type='BASE TABLE'").await,16);
     assert_eq!(
         scalar(owner, "SELECT count(*) FROM seaql_migrations").await,
-        8
+        12
     );
     assert_eq!(scalar(owner,"SELECT count(*) FROM pg_class c JOIN pg_namespace n ON c.relnamespace=n.oid WHERE n.nspname='public' AND c.relkind='r' AND c.relrowsecurity AND c.relforcerowsecurity").await,13);
     assert_eq!(scalar(owner,"SELECT count(*) FROM information_schema.columns WHERE table_schema='public' AND column_name IN ('canary_weight','canary_version_id','chain_depth','routing_reason','idempotency_key')").await,0);
@@ -1412,6 +1687,44 @@ async fn assert_oidc_cutover(owner: &DatabaseConnection) {
         VALUES ('cutover-service','http','cutover-service',ARRAY['read'],now()+interval '1 hour','api',0,NULL),
                ('cutover-revoked','http','cutover-revoked',ARRAY['read'],now()+interval '1 hour','api',0,'2026-01-01T00:00:00Z');
     "#, vec![]).await.unwrap();
+    hibana_migration::Migrator::up(owner, Some(1))
+        .await
+        .unwrap();
+    assert!(hibana_database::postgres::assert_runtime_schema(owner)
+        .await
+        .is_err());
+    fixture_execute(owner, "INSERT INTO api_tokens(id,tenant_id,user_id,token_hash,scopes,expires_at,auth_method,user_auth_version) VALUES ('profile-migration-token','http','cutover-user','profile-migration-token',ARRAY['read','invoke','deploy','admin'],now()+interval '1 hour','api',5), ('profile-migration-invoke','http','cutover-user','profile-migration-invoke',ARRAY['invoke'],now()+interval '1 hour','api',5)", vec![]).await.unwrap();
+    fixture_execute(owner, r#"
+        UPDATE component_versions SET capabilities='{"imports":["wasi:cli/environment@0.2.0"],"env":["KEY"],"net_allow_outbound":["legacy.example:443"]}' WHERE id='source-v1';
+        UPDATE components SET egress_policy='["approved.example:443"]' WHERE id='target';
+        INSERT INTO components(id,tenant_id,name,deleted_at) VALUES ('egress-cutover','other','egress-cutover',now());
+        INSERT INTO component_versions(id,tenant_id,component_id,version,storage_uri,wasm_sha256,status,capabilities,deleted_at)
+        VALUES ('egress-cutover-v1','other','egress-cutover','1','unused','abcd','active','{"net_allow_outbound":["deleted.example:443"]}',now());
+    "#, vec![]).await.unwrap();
+    hibana_migration::Migrator::up(owner, Some(3))
+        .await
+        .unwrap();
+    assert!(hibana_database::postgres::assert_runtime_schema(owner)
+        .await
+        .is_err());
+    fixture_execute(
+        owner,
+        "UPDATE components SET previous_active_version_id='source-v2' WHERE id='source'",
+        vec![],
+    )
+    .await
+    .unwrap();
+    let publication_sql = "SELECT jsonb_agg(jsonb_build_object('id',id,'active',active_version_id,'previous',previous_active_version_id) ORDER BY id) FROM components";
+    let publication: serde_json::Value = fixture_scalar(owner, publication_sql, vec![])
+        .await
+        .unwrap();
+    let versions: serde_json::Value = fixture_scalar(
+        owner,
+        "SELECT jsonb_agg(to_jsonb(v) - 'status' ORDER BY id) FROM component_versions v",
+        vec![],
+    )
+    .await
+    .unwrap();
     let (first, second) = tokio::join!(
         crate::migrations::run_migrations(owner),
         crate::migrations::run_migrations(owner)
@@ -1421,6 +1734,90 @@ async fn assert_oidc_cutover(owner: &DatabaseConnection) {
     hibana_database::postgres::assert_runtime_schema(owner)
         .await
         .unwrap();
+    assert_eq!(scalar(owner, "SELECT count(*) FROM information_schema.columns WHERE table_schema='public' AND table_name='component_versions' AND column_name='status'").await, 0);
+    assert_eq!(
+        fixture_scalar::<serde_json::Value>(owner, publication_sql, vec![])
+            .await
+            .unwrap(),
+        publication
+    );
+    assert_eq!(
+        fixture_scalar::<serde_json::Value>(
+            owner,
+            "SELECT jsonb_agg(to_jsonb(v) ORDER BY id) FROM component_versions v",
+            vec![]
+        )
+        .await
+        .unwrap(),
+        versions
+    );
+    fixture_execute(
+        owner,
+        "UPDATE components SET previous_active_version_id=NULL WHERE id='source'",
+        vec![],
+    )
+    .await
+    .unwrap();
+    println!("PASS version publication migration: removed redundant status, preserved active/previous pointers and version data across tenants and deleted rows");
+    assert_eq!(
+        scalar(
+            owner,
+            "SELECT count(*) FROM components WHERE egress_policy IS NULL"
+        )
+        .await,
+        0
+    );
+    assert_eq!(
+        scalar(
+            owner,
+            "SELECT count(*) FROM component_versions WHERE capabilities ? 'net_allow_outbound'"
+        )
+        .await,
+        0
+    );
+    assert!(fixture_scalar::<bool>(
+        owner,
+        "SELECT egress_policy='[]'::jsonb FROM components WHERE id='source'",
+        vec![]
+    )
+    .await
+    .unwrap());
+    assert!(fixture_scalar::<bool>(owner, "SELECT egress_policy='[\"approved.example:443\"]'::jsonb FROM components WHERE id='target'", vec![]).await.unwrap());
+    assert!(fixture_scalar::<bool>(owner, r#"SELECT capabilities='{"imports":["wasi:cli/environment@0.2.0"],"env":["KEY"]}'::jsonb FROM component_versions WHERE id='source-v1'"#, vec![]).await.unwrap());
+    for invalid in ["NULL", "'null'::jsonb", "'{}'::jsonb"] {
+        assert!(fixture_execute(
+            owner,
+            &format!("UPDATE components SET egress_policy={invalid} WHERE id='source'"),
+            vec![]
+        )
+        .await
+        .is_err());
+    }
+    fixture_execute(owner, "UPDATE components SET egress_policy='[]' WHERE id='target'; UPDATE component_versions SET capabilities='{}' WHERE id='source-v1'; DELETE FROM component_versions WHERE id='egress-cutover-v1'; DELETE FROM components WHERE id='egress-cutover'", vec![]).await.unwrap();
+    println!("PASS application egress migration: default deny, preserved application grants, removed version grants across tenants and deleted rows");
+    assert!(fixture_scalar::<bool>(
+        owner,
+        "SELECT to_regclass('public.users_tenant_id_email_key') IS NULL",
+        vec![]
+    )
+    .await
+    .unwrap());
+    assert!(fixture_scalar::<bool>(
+        owner,
+        "SELECT revoked_at IS NULL FROM api_tokens WHERE id='profile-migration-token'",
+        vec![]
+    )
+    .await
+    .unwrap());
+    assert!(fixture_scalar::<bool>(owner, "SELECT scopes=ARRAY['read','deploy','admin'] FROM api_tokens WHERE id='profile-migration-token'", vec![]).await.unwrap());
+    assert!(fixture_scalar::<bool>(owner, "SELECT scopes=ARRAY[]::text[] AND revoked_at IS NULL FROM api_tokens WHERE id='profile-migration-invoke'", vec![]).await.unwrap());
+    assert!(fixture_execute(
+        owner,
+        "UPDATE api_tokens SET scopes=ARRAY['invoke'] WHERE id='profile-migration-token'",
+        vec![]
+    )
+    .await
+    .is_err());
     assert_eq!(
         scalar(
             owner,
@@ -1528,7 +1925,7 @@ async fn assert_oidc_cutover(owner: &DatabaseConnection) {
         .await
         .unwrap();
     runtime.close().await.unwrap();
-    fixture_execute(owner, "DELETE FROM api_tokens WHERE id LIKE 'cutover-%'; DELETE FROM users WHERE id='cutover-user'", vec![]).await.unwrap();
+    fixture_execute(owner, "DELETE FROM api_tokens WHERE id LIKE 'cutover-%' OR id LIKE 'profile-migration-%'; DELETE FROM users WHERE id='cutover-user'", vec![]).await.unwrap();
     println!("PASS OIDC cutover removes password storage and legacy writers, revokes existing credentials, preserves rows, and permits current token issuance");
 }
 

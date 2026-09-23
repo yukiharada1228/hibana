@@ -16,6 +16,7 @@ import { testIdentityRevocation } from "./test-identity-revocation.mjs";
 import { issueFixtureToken } from "./test-api-credentials.mjs";
 import { testOidcRateLimit } from "./test-oidc-rate-limit.mjs";
 import { testConsoleSession } from "./test-console-session.mjs";
+import { testOidcProfile } from "./test-oidc-profile.mjs";
 const { chromium } = createRequire(
   new URL("../console/package.json", import.meta.url),
 )("@playwright/test");
@@ -235,6 +236,9 @@ async function grant(tenant = "team", username = "alice", mutations = {}) {
     endpoint: secondary,
   });
   assert.equal(start.status, 200, JSON.stringify(start.data));
+  const authorization = new URL(start.data.authorization_url);
+  assert.deepEqual(authorization.searchParams.get("scope").split(" ").sort(), ["email", "openid"]);
+  assert.deepEqual(JSON.parse(authorization.searchParams.get("claims")), { id_token: { email: null } });
   const ctx = await browser.newContext(),
     page = await ctx.newPage();
   let callback;
@@ -441,11 +445,10 @@ try {
   const auditsBeforeConflict = (await sql(`SELECT count(*) FROM audit_logs WHERE tenant_id='${tenant}' AND action='user_created'`)).trim();
   for (const body of [
     { email: "duplicate-identity@example.invalid", role: "member", oidc_subject: alice },
-    { email: "shared@example.invalid", role: "member", oidc_subject: "fixture-unused-subject" },
   ]) {
     assert.equal((await api(`/tenants/${tenant}/users`, {
       method: "POST", token: issued.data.token, body,
-    })).status, 409, "duplicate email/identity must not create a partial user");
+    })).status, 409, "duplicate identity must not create a partial user");
   }
   assert.equal((await sql(`SELECT count(*) FROM users WHERE tenant_id='${tenant}'`)).trim(), usersBeforeConflict);
   assert.equal((await sql(`SELECT count(*) FROM audit_logs WHERE tenant_id='${tenant}' AND action='user_created'`)).trim(), auditsBeforeConflict);
@@ -459,7 +462,7 @@ try {
   })).status, 409, "linking an existing identity must fail without changing the target");
   assert.equal((await sql(`SELECT oidc_subject FROM users WHERE id='${linked.data.user_id}'`)).trim(), "fixture-link-conflict");
   assert.equal((await sql(`SELECT count(*) FROM audit_logs WHERE target='${linked.data.user_id}' AND action='user_oidc_linked'`)).trim(), "0");
-  console.log("PASS provisioning inserts complete OIDC identities and rolls back duplicate email/subject conflicts");
+  console.log("PASS provisioning inserts complete OIDC identities and rolls back duplicate subject conflicts");
   assert.equal(
     (await exchange(g)).status,
     401,
@@ -471,6 +474,10 @@ try {
     "provider callback is one-use",
   );
   let token = issued.data.token;
+  assert.deepEqual(issued.data.scopes, ["read", "deploy", "admin"]);
+  assert.equal((await api("/tokens", { method: "POST", token,
+    body: { user_id: user, scopes: ["invoke"], ttl_secs: 60 } })).status, 400,
+    "removed invocation scope cannot be issued");
   assert.equal(
     (await api("/auth/session", { token })).data.email,
     "shared@example.invalid",
@@ -479,6 +486,22 @@ try {
   console.log(
     "PASS real Keycloak code flow, provider PKCE, issuer/subject binding and cross-replica one-use exchange",
   );
+  const idpAdmin = async (path, method = "GET", body) => {
+    const auth = await fetch(`${idp}/realms/master/protocol/openid-connect/token`, {
+      method: "POST", body: credentials,
+    });
+    assert.equal(auth.status, 200);
+    const { access_token } = await auth.json();
+    const response = await fetch(`${idp}/admin/realms/hibana${path}`, {
+      method,
+      headers: { authorization: `Bearer ${access_token}`, "content-type": "application/json" },
+      body: body === undefined ? undefined : JSON.stringify(body),
+    });
+    assert.ok(response.ok, `fixture IdP admin ${method} ${path}: ${response.status}`);
+    return response.status === 204 ? undefined : response.json();
+  };
+  token = await testOidcProfile({ api, sql, grant, exchange, idpAdmin, subject: alice, tenant, user, token,
+    otherUser: otherTenant.data.admin_user_id, browser, consoleUrl });
 
   const bad = await grant();
   assert.equal(
@@ -530,7 +553,7 @@ try {
   );
   assert.ok(!page.url().includes("oidc_code"));
   await page.screenshot({ path: join(folder, "console.png"), fullPage: true });
-  await testConsoleSession({ page, context: ctx, consoleUrl, secondary, grant, sql });
+  await testConsoleSession({ page, context: ctx, consoleUrl, secondary, grant, sql, pg });
   await ctx.close();
   const cliContext = await browser.newContext(),
     cliPage = await cliContext.newPage();

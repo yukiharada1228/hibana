@@ -4,20 +4,13 @@ import subprocess
 import time
 
 
-# Do not infer legacy support from kubectl's exit code: both an exec transport
-# error and grep's "no match" can be exit 1. Only successful inspection may opt
-# into the legacy lifecycle; an unfamiliar maintenance implementation must stop.
+# Inspect bytes rather than executing unknown binaries: older servers ignore
+# command-line flags. Transport/read failures must also stop the operation.
 PROTOCOL_PROBE = '''
 grep -aFq -- "$1" "$2"
 case $? in
-    0) printf supported; exit 0;;
-    1) ;;
-    *) exit 2;;
-esac
-grep -aFq -- --maintenance "$2"
-case $? in
-    0) printf incompatible;;
-    1) printf legacy;;
+    0) printf supported;;
+    1) printf unsupported;;
     *) exit 2;;
 esac
 '''
@@ -36,16 +29,10 @@ class Maintenance:
             f"app.kubernetes.io/name=hibana-{component}", "-o", "json", capture=True, timeout=30))["items"]
         return {p["metadata"]["uid"]: p for p in items}
 
-    def supports_protocol(self):
-        """Inspect legacy images without executing their server with unknown flags.
-
-        The original binary ignores --maintenance and starts a second server.
-        Its successor embeds this command's usage text. Inspect it inside the
-        container: image tags are mutable and all candidate Pods must agree.
-        A different maintenance implementation is incompatible, not legacy.
-        """
+    def require_protocol(self):
+        """Require the current protocol on every running CP before maintenance."""
         before = self.pods("control-plane")
-        supported = set()
+        checked = False
         for pod in before.values():
             if not any(c.get("name") == "control-plane" and "running" in c.get("state", {})
                        for c in pod.get("status", {}).get("containerStatuses", [])):
@@ -55,14 +42,13 @@ class Maintenance:
                 "hibana-maintenance-probe",
                 "Usage: --maintenance close|open OWNER | status | prepare OWNER WORKER_IPS",
                 "/usr/local/bin/hibana-control-plane", capture=True, quiet=True, timeout=15)
-            if result not in ("supported", "legacy"):
-                raise ValueError("Could not determine Control Plane maintenance compatibility; maintenance was not attempted")
-            supported.add(result == "supported")
-        if not supported:
+            if result != "supported":
+                raise ValueError("Control Plane maintenance protocol is unsupported; install the current platform image and retry")
+            checked = True
+        if not checked:
             raise NoControlPlane("No running Control Plane; maintenance compatibility is unknown")
-        if len(supported) != 1 or self.identity(before) != self.identity(self.pods("control-plane")):
-            raise ValueError("Control Plane changed or mixes maintenance protocols; finish the rollout and retry")
-        return supported.pop()
+        if self.identity(before) != self.identity(self.pods("control-plane")):
+            raise ValueError("Control Plane changed; finish the rollout and retry")
 
     def call(self, pod, *args, timeout=25):
         return self.target.kube("-n", "hibana", "exec", f"pod/{pod}", "-c", "control-plane", "--",

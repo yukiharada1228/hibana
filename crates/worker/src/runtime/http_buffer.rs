@@ -112,18 +112,11 @@ impl AsRef<[u8]> for Buffer {
 mod tests {
     use super::*;
 
-    fn budget(invocation: usize, worker: Arc<Semaphore>) -> Budget {
-        Budget {
-            invocation: Arc::new(Semaphore::new(invocation)),
-            worker,
-        }
-    }
-
     #[test]
     fn retained_frames_share_invocation_and_worker_budgets_until_the_last_drop() {
         let worker = Arc::new(Semaphore::new(64));
-        let first = budget(32, worker.clone());
-        let second = budget(64, worker.clone());
+        let first = Budget::for_test(32, worker.clone());
+        let second = Budget::for_test(64, worker.clone());
         let mut a = Buffer::new(first.clone());
         a.extend(&[1; 32]).unwrap();
         let data = a.into_bytes();
@@ -154,7 +147,7 @@ mod tests {
     #[tokio::test]
     async fn growth_and_cancellation_release_every_reservation() {
         let worker = Arc::new(Semaphore::new(128));
-        let budget = budget(64, worker.clone());
+        let budget = Budget::for_test(64, worker.clone());
         let mut buffer = Buffer::new(budget.clone());
         buffer.extend(&[1; 17]).unwrap();
         assert_eq!(

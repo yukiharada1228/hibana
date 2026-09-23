@@ -1,4 +1,4 @@
-//! Tenant-scoped ORM access to immutable execution configuration.
+//! Tenant-scoped ORM access to pinned version configuration and current egress.
 use hibana_database::{prelude::*, queries::pinned_execution};
 use hibana_shared::ResourceLimits;
 use std::collections::{BTreeMap, BTreeSet};
@@ -17,6 +17,7 @@ struct PinnedVersion {
     version_id: String,
     resource_limits: serde_json::Value,
     capabilities: serde_json::Value,
+    egress_policy: serde_json::Value,
 }
 
 pub(crate) struct ExecutionRepository {
@@ -84,11 +85,20 @@ impl ExecutionRepository {
                 )),
                 "capabilities",
             )
+            .column_as(
+                Expr::col((components::Entity, components::Column::EgressPolicy)),
+                "egress_policy",
+            )
             .into_model::<PinnedVersion>()
             .one(&tx)
             .await?
             .ok_or_else(|| anyhow::anyhow!("version configuration missing"))?;
-        let capabilities = hibana_shared::capabilities::parse_capabilities(&row.capabilities);
+        let allowed_env = hibana_shared::capabilities::allowed_env(&row.capabilities);
+        let allow_outbound = serde_json::from_value::<BTreeSet<String>>(row.egress_policy)?
+            .iter()
+            .map(|value| hibana_shared::egress::parse_egress_endpoint(value))
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|_| anyhow::anyhow!("invalid application egress policy"))?;
         let limits = serde_json::from_value(row.resource_limits)?;
         let config = version_configs::Entity::find()
             .select_only()
@@ -105,8 +115,8 @@ impl ExecutionRepository {
         tx.commit().await?;
         Ok(ResolvedVersion {
             limits,
-            allow_outbound: capabilities.outbound_endpoints(),
-            allowed_env: capabilities.env,
+            allow_outbound,
+            allowed_env,
             config,
         })
     }
@@ -128,12 +138,12 @@ mod tests {
         // Session-local tables shadow real names, including when another test has
         // populated the disposable DB. All assertions execute the production query.
         pool.execute_unprepared(r#"
-          CREATE TEMP TABLE components(id text, tenant_id text, name text, deleted_at timestamptz);
+          CREATE TEMP TABLE components(id text, tenant_id text, name text, deleted_at timestamptz, egress_policy jsonb NOT NULL DEFAULT '[]');
           CREATE TEMP TABLE component_versions(id text, tenant_id text, component_id text, version text,
             wasm_sha256 text, resource_limits jsonb, capabilities jsonb, deleted_at timestamptz);
           CREATE TEMP TABLE executions(id text, tenant_id text, component_id text, version_id text, status text, http_request boolean, started_at timestamptz);
           CREATE TEMP TABLE version_configs(tenant_id text, component_id text, version_id text, key text, value text);
-          INSERT INTO components VALUES ('old','t','hello',now()), ('new','t','hello',NULL);
+          INSERT INTO components(id,tenant_id,name,deleted_at) VALUES ('old','t','hello',now()), ('new','t','hello',NULL);
           INSERT INTO component_versions VALUES
             ('old-v','t','old','1','old-hash','{"max_memory_bytes":123}',
              '{"env":["OLD_SECRET"],"net_allow_outbound":["old.example:443"]}',NULL),
@@ -159,6 +169,7 @@ mod tests {
             '{"env":["API_KEY","API_KEY","bad-name",42],"net_allow_outbound":["api.example:443","api.example:443","bad",null]}',NULL);
           INSERT INTO version_configs VALUES ('t','new','later-v','MESSAGE','later');
           INSERT INTO executions VALUES ('later','t','new','later-v','pending',true,NULL);
+          UPDATE components SET egress_policy='["approved.example:443"]' WHERE id='new';
         "#).await.unwrap();
         assert_eq!(
             repo.resolve_execution("t", "accepted", "new-hash")
@@ -176,10 +187,42 @@ mod tests {
         assert_eq!(
             later.allow_outbound,
             vec![hibana_shared::egress::EgressEndpoint {
-                host: "api.example".into(),
+                host: "approved.example".into(),
                 port: 443,
             }]
         );
+        // Both pinned versions read the live policy. A stale version grant can
+        // neither add access nor restore a destination after revocation.
+        assert_eq!(
+            repo.resolve_execution("t", "accepted", "new-hash")
+                .await
+                .unwrap()
+                .allow_outbound,
+            later.allow_outbound
+        );
+        pool.execute_unprepared("UPDATE components SET egress_policy='[]' WHERE id='new'")
+            .await
+            .unwrap();
+        assert!(repo
+            .resolve_execution("t", "later", "later-hash")
+            .await
+            .unwrap()
+            .allow_outbound
+            .is_empty());
+        for invalid in ["null", "{}", "[42]", "[\"invalid\"]"] {
+            pool.execute_unprepared(&format!(
+                "UPDATE components SET egress_policy='{invalid}' WHERE id='new'"
+            ))
+            .await
+            .unwrap();
+            assert!(repo
+                .resolve_execution("t", "later", "later-hash")
+                .await
+                .is_err());
+        }
+        pool.execute_unprepared("UPDATE components SET egress_policy='[]' WHERE id='new'")
+            .await
+            .unwrap();
         assert!(repo
             .resolve_execution("other", "accepted", "new-hash")
             .await

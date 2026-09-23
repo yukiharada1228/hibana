@@ -1,8 +1,5 @@
 //! Internal HTTP transport: reserve capacity, redeem a token, claim once, stream a response.
-use crate::{
-    lifecycle::Shutdown,
-    service::{InflightGuard, Worker},
-};
+use crate::service::{InflightGuard, Worker};
 use axum::{
     body::Body,
     extract::State,
@@ -13,18 +10,18 @@ use axum::{
     Router,
 };
 use std::sync::Arc;
-use tokio_util::task::TaskTracker;
+use tokio_util::{sync::CancellationToken, task::TaskTracker};
 
 #[derive(Clone)]
 struct HttpState {
     worker: Arc<Worker>,
-    shutdown: Arc<Shutdown>,
+    shutdown: CancellationToken,
     executions: TaskTracker,
 }
 
 async fn invoke(State(state): State<HttpState>, headers: HeaderMap) -> Response {
     let started = std::time::Instant::now();
-    if state.shutdown.is_draining() {
+    if state.shutdown.is_cancelled() {
         return reject_capacity(&state.worker, "draining");
     }
     let Ok(slot) = state.worker.execution_slots.clone().try_acquire_owned() else {
@@ -113,7 +110,7 @@ async fn prepare(
     method: axum::http::Method,
     headers: HeaderMap,
 ) -> Response {
-    if state.shutdown.is_draining() {
+    if state.shutdown.is_cancelled() {
         return StatusCode::SERVICE_UNAVAILABLE.into_response();
     }
     let Ok(_slot) = state.worker.preparation_slots.clone().try_acquire_owned() else {
@@ -175,7 +172,7 @@ fn reject_capacity(worker: &Worker, reason: &str) -> Response {
 
 pub async fn start(
     worker: Arc<Worker>,
-    shutdown: Arc<Shutdown>,
+    shutdown: CancellationToken,
     bind_addr: &str,
 ) -> anyhow::Result<tokio::task::JoinHandle<anyhow::Result<()>>> {
     let listener = tokio::net::TcpListener::bind(bind_addr).await?;
@@ -198,7 +195,7 @@ pub async fn start(
     Ok(tokio::spawn(async move {
         axum::serve(listener, app)
             .with_graceful_shutdown(async move {
-                shutdown.wait().await;
+                shutdown.cancelled().await;
             })
             .await?;
         // All handlers have returned, so no new execution can be registered.

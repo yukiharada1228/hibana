@@ -2,11 +2,11 @@ import { spawn } from "node:child_process";
 import { access, readFile, writeFile, chmod, mkdir } from "node:fs/promises";
 import { constants, watch } from "node:fs";
 import { parseEnv } from "node:util";
-import { dirname, resolve, relative, join, delimiter } from "node:path";
+import { dirname, resolve, join, delimiter } from "node:path";
 import { loadConfig } from "./config.mjs";
+import { isInside } from "./paths.mjs";
 import { installedRuntime, installRuntime } from "./runtime.mjs";
 import { resolveExtensions } from "./extensions.mjs";
-import { devConfig } from "./dev-config.mjs";
 import {
   isLocalExtension,
   extensionNames,
@@ -21,9 +21,10 @@ export function shouldRebuild(config, file) {
   if (path === join(config.root, "hibana-lock.json")) return true;
   if (
     managesExtensions(config.extensions) &&
-    Object.values(config.extensions)
-      .filter(isExtensionArchive)
-      .some((source) => path === resolve(config.root, source))
+    Object.values(config.extensions).some(
+      (source) =>
+        isExtensionArchive(source) && path === resolve(config.root, source),
+    )
   )
     return true;
   if (
@@ -48,31 +49,18 @@ export function shouldRebuild(config, file) {
   // Local extension sources and their dist/ outputs participate in reload even
   // when a native app restricts build.watch. Generated target/ stays ignored.
   if (
-    extensionNames(config.extensions)
-      .filter(isLocalExtension)
-      .some((input) => {
-        const within = relative(resolve(config.root, input), path);
-        return (
-          within === "" ||
-          (within !== ".." &&
-            !within.startsWith("../") &&
-            !within.startsWith("..\\"))
-        );
-      })
+    extensionNames(config.extensions).some(
+      (input) =>
+        isLocalExtension(input) && isInside(resolve(config.root, input), path),
+    )
   )
     return true;
   if (config.component && path === resolve(config.root, config.component))
     return !config.build;
   if (!config.build?.watch) return true;
-  return config.build.watch.some((input) => {
-    const within = relative(resolve(config.root, input), path);
-    return (
-      within === "" ||
-      (within !== ".." &&
-        !within.startsWith("../") &&
-        !within.startsWith("..\\"))
-    );
-  });
+  return config.build.watch.some((input) =>
+    isInside(resolve(config.root, input), path),
+  );
 }
 
 export async function dev(config, options, build) {
@@ -111,7 +99,7 @@ export async function dev(config, options, build) {
   }
   async function start() {
     builds.signal.throwIfAborted();
-    const localNetwork = devConfig(config.dev);
+    const localNetwork = config.dev;
     const artifact = await build(config, extensionOptions);
     let local = {};
     try {

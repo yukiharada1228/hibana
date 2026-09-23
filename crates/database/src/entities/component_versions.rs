@@ -11,7 +11,6 @@ pub struct Model {
     pub storage_uri: String,
     pub wasm_sha256: String,
     pub resource_limits: Json,
-    pub status: String,
     pub created_at: DateTimeUtc,
     pub size_bytes: i64,
     pub capabilities: Json,

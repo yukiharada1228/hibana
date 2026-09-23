@@ -48,33 +48,36 @@ impl VersionEnvironment {
                 );
             }
         }
+        let mut bindings = Vec::with_capacity(self.secrets.len());
         for name in &self.secrets {
             let row = rows
                 .iter()
                 .find(|r| &r.name == name && r.deploy_allowed)
                 .ok_or(FaasError::Forbidden)?;
-            version_secret_bindings::Entity::insert(version_secret_bindings::ActiveModel {
+            bindings.push(version_secret_bindings::ActiveModel {
                 tenant_id: Set(tenant.into()),
                 component_id: Set(component.into()),
                 version_id: Set(version.into()),
                 secret_id: Set(row.id.clone()),
                 name: Set(name.clone()),
-            })
-            .exec(tx)
-            .await?;
+            });
         }
-        for (key, value) in &self.vars {
-            version_configs::Entity::insert(version_configs::ActiveModel {
+        // SeaORM skips empty batches and keeps each nonempty table to one INSERT.
+        version_secret_bindings::Entity::insert_many(bindings)
+            .exec_without_returning(tx)
+            .await?;
+        version_configs::Entity::insert_many(self.vars.iter().map(|(key, value)| {
+            version_configs::ActiveModel {
                 tenant_id: Set(tenant.into()),
                 component_id: Set(component.into()),
                 version_id: Set(version.into()),
                 key: Set(key.clone()),
                 value: Set(value.clone()),
                 ..Default::default()
-            })
-            .exec(tx)
-            .await?;
-        }
+            }
+        }))
+        .exec_without_returning(tx)
+        .await?;
         if !crate::db::version_environment_within_limit(tx, tenant, component, version).await? {
             return Err(FaasError::InvalidRequest(
                 "vars and selected Secrets together exceed the environment size limit".into(),

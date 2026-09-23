@@ -71,7 +71,7 @@ pub async fn create_user(
         &req.oidc_subject,
     )
     .await
-    .map_err(|e| map_unique_conflict(e, "email or identity already exists in this tenant"))?;
+    .map_err(|e| map_unique_conflict(e, "identity already exists in this tenant"))?;
     // §3.7: identity プロビジョニングを記録する（GUC 設定済み → user 行と同一 tx で commit）。
     // パスワード/ハッシュは載せない。target は新 user_id、detail に role のみ。
     db::insert_audit_log(
@@ -90,7 +90,7 @@ pub async fn create_user(
         StatusCode::CREATED,
         Json(CreateUserResponse {
             user_id,
-            email: req.email,
+            email: req.email.trim().to_owned(),
             role: req.role,
         }),
     )
@@ -281,7 +281,7 @@ pub async fn get_session(
         "ingress_base_domain": state.ingress_base_domain(),
         "user_id": principal.user_id,
         "email": session_email(&state, &principal).await?,
-        "token_id": token.id,
+        "token_id": principal.token_id,
         "expires_at": token.expires_at.to_rfc3339(),
         "expires_in_ms": (token.expires_at - chrono::Utc::now()).num_milliseconds().max(0),
     })))
@@ -296,9 +296,7 @@ async fn session_email(
     };
     let tx = state.pool().begin().await?;
     db::set_tenant_guc(&tx, &principal.tenant_id).await?;
-    let email = db::lock_user(&tx, &principal.tenant_id, user)
-        .await?
-        .map(|u| u.email);
+    let email = db::user_email(&tx, &principal.tenant_id, user).await?;
     tx.commit().await?;
     Ok(email)
 }

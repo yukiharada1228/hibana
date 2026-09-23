@@ -196,7 +196,7 @@ export function Extensions({
               )}
               {!policy ? (
                 !policyError && <p className="muted">通信先を読み込み中…</p>
-              ) : policy.allow_outbound !== null ? (
+              ) : (
                 <>
                   <p className="muted small">アプリ共通の設定を適用中。</p>
                   {policy.allow_outbound.length ? (
@@ -212,23 +212,6 @@ export function Extensions({
                         ))}
                       </ul>
                     </details>
-                  ) : (
-                    <p className="muted">なし（外部通信は拒否）</p>
-                  )}
-                </>
-              ) : (
-                <>
-                  <p className="muted small">
-                    このバージョンの旧設定を適用中。アプリ共通の設定は未設定です。
-                  </p>
-                  {data.net_allow_outbound.length ? (
-                    <ul className="extension-destinations">
-                      {data.net_allow_outbound.map((host) => (
-                        <li key={host}>
-                          <code>{host}</code>
-                        </li>
-                      ))}
-                    </ul>
                   ) : (
                     <p className="muted">なし（外部通信は拒否）</p>
                   )}

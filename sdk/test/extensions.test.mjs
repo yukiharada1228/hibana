@@ -7,7 +7,7 @@ import { build, build as bundle } from 'esbuild';
 import { build as buildApplication } from '../src/build.mjs';
 import { loadConfig } from '../src/config.mjs';
 import { resolveExtensions, prepareExtensionWit } from '../src/extensions.mjs';
-import { HTTP_CONTRACT } from '../src/extension-manifest.mjs';
+import { HTTP_CONTRACT, validateExtensionList } from '../src/extension-manifest.mjs';
 import { dev, shouldRebuild } from '../src/dev.mjs';
 
 test('extension configuration rejects malformed interfaces and platform compatibility flags', async () => {
@@ -76,6 +76,27 @@ async function fixture(t) {
   }
   return { root, config, install };
 }
+
+test('installed extension versions and exact sources use the same canonical versions', async t => {
+  const f = await fixture(t);
+  for (const version of ['1.2.3', '1.2.3-rc.1', '1.2.3+build.01', '1.2.3-0.alpha+linux', `1.2.3+${'a'.repeat(122)}`]) {
+    assert.doesNotThrow(() => validateExtensionList({ '@example/compat': version }));
+    await f.install({}, '@example/compat', { version });
+    const plan = await resolveExtensions(f.config);
+    assert.equal(plan.metadata.extensions[0].version, version);
+  }
+});
+
+test('invalid extension versions fail before producing build metadata', async t => {
+  const f = await fixture(t);
+  for (const version of ['1.2.3\n', '1.2.3+build\n', '9007199254740992.0.0', '01.2.3', '1.2.3-01', '1.2.3-rc.01', 'v1.2.3', ' 1.2.3', '1.2.3+', '1.2.3+build..1', `1.2.3+${'a'.repeat(123)}`, '^1.2.3', 'latest', '', 123]) {
+    await t.test(JSON.stringify(version), async () => {
+      assert.throws(() => validateExtensionList({ '@example/compat': version }));
+      await f.install({}, '@example/compat', { version });
+      await assert.rejects(resolveExtensions(f.config), /concrete semantic version/);
+    });
+  }
+});
 
 test('declared extension dependencies initialize first, deduplicate and propagate requirements without running package code', async t => {
   const f = await fixture(t);
@@ -153,11 +174,16 @@ test('extension dependency declarations reject cycles, undeclared packages and n
 
 test('the extension limit includes indirect dependencies', async t => {
   const f = await fixture(t);
-  for (let i = 0; i < 65; i++) {
+  for (let i = 0; i < 64; i++) {
     const name = i === 0 ? '@example/compat' : `@example/chain-${i}`;
     const next = `@example/chain-${i + 1}`;
-    await f.install({ schemaVersion: 2, aliases: {}, dependencies: i < 64 ? [next] : [] }, name, { dependencies: { [next]: '1.0.0' } });
+    await f.install({ schemaVersion: 2, aliases: {}, dependencies: i < 63 ? [next] : [] }, name, { dependencies: { [next]: '1.0.0' } });
   }
+  const plan = await resolveExtensions({ ...f.config, extensions: ['@example/compat', '@example/chain-63'] });
+  assert.equal(plan.metadata.extensions.length,64);
+  assert.deepEqual(plan.metadata.roots,['@example/compat','@example/chain-63']);
+  await f.install({ schemaVersion: 2, aliases: {}, dependencies: ['@example/chain-64'] }, '@example/chain-63', { dependencies: { '@example/chain-64': '1.0.0' } });
+  await f.install({ aliases: {} }, '@example/chain-64');
   await assert.rejects(resolveExtensions(f.config), /At most 64 extensions/);
 });
 

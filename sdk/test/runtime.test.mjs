@@ -1,10 +1,29 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
+import { mkdtemp, readFile, readdir, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createHash } from "node:crypto";
 import { installRuntime, runtimePath, runtimeTarget, releaseChecksum } from "../src/runtime.mjs";
+import { releaseBase } from "../src/package.mjs";
+
+test("online and offline runtime selection require the same canonical release version", async t => {
+  const f = await fixture(t), from = join(f.home, "source");
+  await writeFile(from, f.bytes);
+  for (const version of ["1.2.3", "1.2.3-rc.1", "1.2.3-0.alpha"]) {
+    assert.ok(releaseBase(version).endsWith(`/v${version}/`));
+    assert.equal(runtimePath(version, f), join(f.home, version, f.target, "hibana-worker"));
+  }
+  for (const version of ["01.2.3", "1.2.3-01", "1.2.3-..", "9007199254740992.0.0", "1.2.3\n", "v1.2.3", "1.2.3+build.1", "^1.2.3", "../outside", null, undefined, 123]) {
+    assert.throws(() => releaseBase(version), /release version/);
+    assert.throws(() => runtimePath(version, f), /release version/);
+    // An omitted version selects the CLI's own version; explicit invalid strings must fail before I/O.
+    if (version == null) continue;
+    for (const options of [{version}, {version, from, sha256: f.checksum}])
+      await assert.rejects(installRuntime(options, {...f, fetcher() { assert.fail("invalid versions must not download"); }}), /release version/);
+  }
+  assert.deepEqual(await readdir(f.home), ["source"], "invalid offline versions must not create installations");
+});
 
 async function fixture(t) {
   const home = await mkdtemp(join(tmpdir(), "hibana-runtime-"));

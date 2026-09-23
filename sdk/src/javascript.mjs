@@ -18,14 +18,8 @@ ${(extensions.preload || []).map((path) => `import ${JSON.stringify(path)};`).jo
 import app from ${JSON.stringify(resolve(config.root, config.main))};
 if (!app || typeof app.fetch !== "function") throw new Error("Default export must expose fetch(request, env, context); a Hono app can be exported directly");
 function decodeEnv(value) {
-  const alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
-  const bytes = []; let bits = 0, buffer = 0;
-  for (const c of value) {
-    const n = alphabet.indexOf(c); if (n < 0) throw new Error("Invalid host environment");
-    buffer = (buffer << 6) | n; bits += 6;
-    if (bits >= 8) { bits -= 8; bytes.push((buffer >> bits) & 255); }
-  }
-  return JSON.parse(new TextDecoder().decode(new Uint8Array(bytes)));
+  const bytes = Uint8Array.from(atob(value.replace(/-/g, "+").replace(/_/g, "/")), c => c.charCodeAt(0));
+  return JSON.parse(new TextDecoder().decode(bytes));
 }
 addEventListener("fetch", event => {
   event.respondWith((async () => {

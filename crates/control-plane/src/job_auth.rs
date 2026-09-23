@@ -15,7 +15,6 @@ pub(crate) fn verified_claims(
         .ok_or(FaasError::Unauthorized)?;
     let claims = state
         .signer()
-        .verifier()
         .verify(token)
         .map_err(|_| FaasError::Unauthorized)?;
     Ok(claims)

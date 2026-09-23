@@ -1,4 +1,5 @@
 // Applications declare extension sources; author details live in a manifest.
+import validVersion from "semver/functions/valid.js";
 export const HTTP_CONTRACT = "wasi:http/incoming-handler@0.2.3";
 const API_VERSIONS = [1, 2];
 const MAX_ITEMS = 64;
@@ -48,6 +49,17 @@ export function isExtensionArchive(source) {
   );
 }
 
+export function isExtensionVersion(version) {
+  // semver's normalized result omits build metadata. Require canonical spelling
+  // and the metadata's version length limit for sources and installed packages.
+  return (
+    typeof version === "string" &&
+    version.length <= 128 &&
+    version.trim() === version &&
+    validVersion(version) === version.split("+", 1)[0]
+  );
+}
+
 function validSource(source) {
   if (
     !isText(source) ||
@@ -57,12 +69,7 @@ function validSource(source) {
     return false;
   if (isExtensionArchive(source))
     return !source.includes("\\") && !source.split("/").includes("..");
-  if (
-    /^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)(?:-[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?(?:\+[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?$/.test(
-      source,
-    )
-  )
-    return true;
+  if (isExtensionVersion(source)) return true;
   try {
     const url = new URL(source);
     return (

@@ -25,4 +25,19 @@ for (const threads of ["64", "0"]) {
     assert.match(outcome.Rejected.message, expected);
   }
 }
+if (process.platform === "linux") {
+  // A non-root validator cannot raise the hard limit inherited from its parent.
+  // It must fail before parsing, rather than silently running without its limit.
+  const result = spawnSync("/bin/sh", [
+    "-c", 'ulimit -v 524288 || exit; exec "$1" --validate-stdin',
+    "fixture", executable,
+  ], {
+    env: { ...process.env, VALIDATION_MEM_LIMIT_MB: "1024" },
+    input: component, encoding: "utf8", timeout: 5000, maxBuffer: 65536,
+  });
+  assert.ifError(result.error);
+  assert.notEqual(result.status, 0);
+  assert.equal(result.stdout, "");
+  assert.match(result.stderr, /os error 1/);
+}
 console.log("PASS validation subprocess: 256 MiB limit, parser and HTTP contract, independent of Tokio settings");

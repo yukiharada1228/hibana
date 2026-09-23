@@ -6,9 +6,9 @@ import { createHash, randomBytes } from "node:crypto";
 const literal = (value) => "'" + String(value).replaceAll("'", "''") + "'";
 
 export async function issueFixtureToken(sql, {
-  tenant_slug, email, scopes = ["read", "invoke", "deploy", "admin"], ttl_secs = 3600,
+  tenant_slug, email, scopes = ["read", "deploy", "admin"], ttl_secs = 3600,
 }) {
-  assert.ok(scopes.every((s) => ["read", "invoke", "deploy", "admin"].includes(s)));
+  assert.ok(scopes.every((s) => ["read", "deploy", "admin"].includes(s)));
   assert.ok(Number.isInteger(ttl_secs) && ttl_secs >= 60 && ttl_secs <= 90000,
     "fixture token lifetime must be 60..90000 seconds");
   const token = randomBytes(32).toString("hex");

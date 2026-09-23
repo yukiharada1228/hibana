@@ -153,3 +153,78 @@ test("an upload conflict does not trigger component lookup or upload retry", asy
     ["/components", "/components/cmp_fixture/versions"],
   );
 });
+
+for (const [name, body] of [
+  ["empty", ""],
+  ["HTML", "<html>private-server-value</html>"],
+  ["truncated JSON", '{"private-server-value":'],
+]) {
+  test(`${name} upload response cannot confirm a deployment or trigger a retry`, async (t) => {
+    const { api, artifact, calls } = await fixture(t, ({ method }) =>
+      method === "GET"
+        ? json([component])
+        : new Response(body, { status: 201 }),
+    );
+    await assert.rejects(deploy(api, config, artifact, "first"), (error) => {
+      assert.match(
+        error.message,
+        /^POST \/components\/cmp_fixture\/versions: Invalid JSON response \(HTTP 201\)/,
+      );
+      assert.doesNotMatch(error.message, /private-server-value/);
+      return true;
+    });
+    assert.deepEqual(
+      calls.map((call) => call.method),
+      ["GET", "POST"],
+    );
+  });
+}
+
+test(
+  "HTTP errors cancel an unfinished response body and preserve the status hint",
+  { timeout: 2000 },
+  async (t) => {
+    let canceled = false;
+    const body = new ReadableStream({
+      cancel() {
+        canceled = true;
+      },
+    });
+    const { api, calls } = await fixture(
+      t,
+      () => new Response(body, { status: 401 }),
+    );
+    await assert.rejects(api.request("/components"), (error) => {
+      assert.ok(error instanceof ApiError);
+      assert.equal(error.status, 401);
+      assert.match(error.hint, /hibana login/);
+      return true;
+    });
+    assert.ok(canceled);
+    assert.equal(calls.length, 1);
+  },
+);
+
+test("an unreadable error body cannot mask its HTTP status or leak response values", async (t) => {
+  const body = new ReadableStream({
+    start(controller) {
+      controller.error(new Error("private-server-value"));
+    },
+  });
+  const { api } = await fixture(t, () => new Response(body, { status: 503 }));
+  await assert.rejects(api.request("/components"), (error) => {
+    assert.ok(error instanceof ApiError);
+    assert.equal(error.status, 503);
+    assert.match(error.hint, /unavailable/);
+    assert.doesNotMatch(error.message, /private-server-value/);
+    return true;
+  });
+});
+
+test("HTTP 204 remains a successful response without JSON", async (t) => {
+  const { api } = await fixture(t, () => new Response(null, { status: 204 }));
+  assert.equal(
+    await api.request("/components/cmp_fixture", { method: "DELETE" }),
+    undefined,
+  );
+});

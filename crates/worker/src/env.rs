@@ -22,15 +22,12 @@ use hibana_shared::{
 };
 
 /// 組み立て結果と、落としたものの内訳（観測用）。
-#[derive(Debug, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct BuiltEnv {
     /// `WasiCtxBuilder::envs` へそのまま渡すペア列（キー名昇順）。
     pub pairs: Vec<(String, String)>,
     /// 許可リスト外で落としたキー数。
     pub dropped_unapproved: usize,
-    /// secret 由来のキーが 1 つ以上含まれるか。`true` のとき呼び出し側はゲスト stderr を
-    /// 共有ログへ流さない（`inherit_stderr` を使わない）。
-    pub has_secret: bool,
 }
 
 /// 平文 config と復号済み secret を許可リストで畳んで、注入するペア列を作る。
@@ -46,16 +43,16 @@ pub fn build_env(
     let mut out = BuiltEnv::default();
 
     // secret 優先でマージする（同名は secret が勝つ）。
-    let mut merged: BTreeMap<&str, (&str, bool)> = BTreeMap::new();
+    let mut merged: BTreeMap<&str, &str> = BTreeMap::new();
     for (k, v) in config {
-        merged.insert(k.as_str(), (v.as_str(), false));
+        merged.insert(k.as_str(), v.as_str());
     }
     for (k, v) in secrets {
-        merged.insert(k.as_str(), (v.expose().as_str(), true));
+        merged.insert(k.as_str(), v.expose().as_str());
     }
 
     let mut total = 0usize;
-    for (key, (value, is_secret)) in merged {
+    for (key, value) in merged {
         // (1) 許可リスト（admin 承認）が権威。
         if !allowed.contains(key) {
             out.dropped_unapproved += 1;
@@ -71,7 +68,6 @@ pub fn build_env(
             return Err("Vars and Secrets together exceed the environment size limit");
         }
         total = next_total;
-        out.has_secret |= is_secret;
         out.pairs.push((key.to_string(), value.to_string()));
     }
 
@@ -130,7 +126,6 @@ mod tests {
         )
         .unwrap();
         assert!(built.pairs.is_empty());
-        assert!(!built.has_secret);
         assert_eq!(built.dropped_unapproved, 2);
     }
 
@@ -147,26 +142,6 @@ mod tests {
         assert_eq!(keys, vec!["ALPHA", "MIKE", "ZULU"]);
     }
 
-    /// secret が 1 つでも入れば `has_secret` が立つ（stderr 封じ込めの判断材料）。
-    #[test]
-    fn has_secret_tracks_secret_presence() {
-        let only_config = build_env(
-            &cfg(&[("LOG_LEVEL", "debug")]),
-            &BTreeMap::new(),
-            &allow(&["LOG_LEVEL"]),
-        )
-        .unwrap();
-        assert!(!only_config.has_secret);
-
-        let with_secret = build_env(
-            &cfg(&[("LOG_LEVEL", "debug")]),
-            &sec(&[("API_KEY", "x")]),
-            &allow(&["LOG_LEVEL", "API_KEY"]),
-        )
-        .unwrap();
-        assert!(with_secret.has_secret);
-    }
-
     /// 同名衝突は secret が勝つ（CP が 409 で防いでいるが防御的に固定する）。
     #[test]
     fn secret_wins_on_key_collision() {
@@ -177,7 +152,6 @@ mod tests {
         )
         .unwrap();
         assert_eq!(built.pairs, vec![("API_KEY".into(), "from-secret".into())]);
-        assert!(built.has_secret);
     }
 
     /// 上限超過時は、残りの設定だけで実行を続けない。

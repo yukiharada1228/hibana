@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from "react";
-import { Api, errorMessage } from "./api";
-import type { Component, Session } from "./types";
+import { errorMessage } from "./api";
+import type { Component } from "./types";
+import type { Connection } from "./oidc";
 import { Login } from "./Login";
 import { Applications, Application } from "./Applications";
 import { Usage } from "./Usage";
@@ -8,12 +9,6 @@ import { Deploy } from "./Deploy";
 import { Brand, Icon, Notice, date } from "./components/common";
 import { Button } from "./components/ui/button";
 
-type Connection = {
-  api: Api;
-  session: Session;
-  expires: string;
-  email: string;
-};
 export function App() {
   const [connection, setConnection] = useState<Connection | null>(null),
     [message, setMessage] = useState("");
@@ -41,9 +36,9 @@ export function App() {
     return (
       <Login
         message={message}
-        onLogin={(api, session, expires, email) => {
+        onLogin={(connection) => {
           setMessage("");
-          setConnection({ api, session, expires, email });
+          setConnection(connection);
         }}
       />
     );
@@ -51,7 +46,7 @@ export function App() {
 }
 
 function Console({
-  connection: { api, session, email },
+  connection: { api, session },
   onLogout,
 }: {
   connection: Connection;
@@ -130,7 +125,7 @@ function Console({
         </a>
         <div className="header-account">
           <details className="account-menu">
-            <summary>{email}</summary>
+            <summary>{session.email || "ログイン中"}</summary>
             <div>
               <strong>{session.tenant_name}</strong>
               <p>

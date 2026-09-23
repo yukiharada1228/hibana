@@ -23,7 +23,6 @@ const DEFAULT_METRICS_INCLUDE_TENANT_LABEL: bool = true;
 
 const SECRETS_MASTER_KEY_PLACEHOLDER: &str = "CHANGE_ME_REPLACE_WITH_32_BYTE_KEY_BEFORE_USE";
 
-#[derive(Clone)]
 pub struct Config {
     pub auth: crate::oidc::config::OidcConfig,
     pub database_url: String,
@@ -138,6 +137,10 @@ impl Config {
             !env_bool("TRUST_PROXY_HEADERS", false),
             "TRUST_PROXY_HEADERS=true is no longer supported; configure TRUSTED_PROXY_CIDRS"
         );
+        anyhow::ensure!(
+            env_optional("INGRESS_BASE_DOMAIN").is_none(),
+            "INGRESS_BASE_DOMAIN was removed; configure APP_PUBLIC_ORIGIN"
+        );
         let cfg = Self {
             auth: crate::oidc::config::OidcConfig::from_env()?,
             database_url,
@@ -188,26 +191,11 @@ impl Config {
                 DEFAULT_METRICS_INCLUDE_TENANT_LABEL,
             ),
             public_apps: crate::public_apps::PublicApps::parse(
-                env_optional("APP_PUBLIC_ORIGIN")
-                    .or_else(|| {
-                        // Compatibility with existing sites; new sites configure one full origin.
-                        env_optional("INGRESS_BASE_DOMAIN")
-                            .map(|domain| format!("https://{}", domain.trim().trim_matches('.')))
-                    })
-                    .as_deref(),
+                env_optional("APP_PUBLIC_ORIGIN").as_deref(),
             )?,
         };
 
         Ok(cfg)
-    }
-
-    /// Wall-clock execution limit plus time for cold compilation and result persistence.
-    pub fn token_exp_offset_secs(&self, wall_time_ms: u64) -> i64 {
-        wall_time_ms
-            .div_ceil(1000)
-            .saturating_add(self.token_margin_secs)
-            .saturating_add(120)
-            .min(i64::MAX as u64) as i64
     }
 
     pub fn admission(&self) -> crate::state::AdmissionConfig {
@@ -301,7 +289,7 @@ pub(crate) fn parse_secret_keyring(
 mod tests {
     use super::*;
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn admitted_default_traffic_can_redeem_secrets() {
         use crate::store::{InProcStore, RateLimitParams, Store};
         let store = InProcStore::new();
@@ -316,18 +304,15 @@ mod tests {
         // Initial public burst, then two minutes at the admitted steady rate.
         // The previous 600/min internal default exhausted while public admission
         // still succeeded, turning otherwise valid Secret-backed HTTP into 502s.
+        let mut previous = 0;
         for now in
             std::iter::repeat_n(0, DEFAULT_INVOKE_BURST as usize).chain((20..=120_000).step_by(20))
         {
-            assert!(
-                store
-                    .rate_limit("public", public, now)
-                    .await
-                    .unwrap()
-                    .allowed
-            );
+            tokio::time::advance(std::time::Duration::from_millis(now - previous)).await;
+            previous = now;
+            assert!(store.rate_limit("public", public).await.unwrap().allowed);
             for key in ["env-peer", "env-tenant"] {
-                assert!(store.rate_limit(key, internal, now).await.unwrap().allowed);
+                assert!(store.rate_limit(key, internal).await.unwrap().allowed);
             }
         }
     }

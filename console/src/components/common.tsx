@@ -89,18 +89,19 @@ export function Empty({
     </div>
   );
 }
-export const date = (value: string) =>
-  new Intl.DateTimeFormat("ja-JP", {
-    dateStyle: "medium",
-    timeStyle: "short",
-  }).format(new Date(value));
+const dateFormatter = new Intl.DateTimeFormat("ja-JP", {
+  dateStyle: "medium",
+  timeStyle: "short",
+});
+const numberFormatter = new Intl.NumberFormat("ja-JP");
+
+export const date = (value: string) => dateFormatter.format(new Date(value));
 // Keep user-supplied versions intact; shorten only the CLI's automatic format.
 export function versionLabel(version: string) {
   const automatic = /^0\.0\.0-dev\.\d+\.([a-f0-9]{8})$/.exec(version);
   return automatic ? `自動 ${automatic[1]}` : version;
 }
-export const number = (value: number) =>
-  new Intl.NumberFormat("ja-JP").format(value);
+export const number = (value: number) => numberFormatter.format(value);
 export const bytes = (value: number) =>
   value >= 1048576
     ? `${(value / 1048576).toFixed(1)} MiB`

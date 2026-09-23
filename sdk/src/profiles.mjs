@@ -194,20 +194,17 @@ export async function connection(options = {}) {
       "No Hibana server selected. Run hibana login --url https://API_HOST, or set HIBANA_URL",
     );
   const url = serverUrl(endpoint);
-  const selected = saved?.url && serverUrl(saved.url) === url ? saved : {};
-  const matches = selected.url && serverUrl(selected.url) === url;
+  const matches = saved?.url && serverUrl(saved.url) === url;
   return {
     url,
-    profile:
-      explicitProfile ||
-      (saved?.url && serverUrl(saved.url) === url ? name : "default"),
+    profile: explicitProfile || (matches ? name : "default"),
     token:
       options.token ||
       process.env.HIBANA_TOKEN ||
-      (matches ? selected.token : undefined),
+      (matches ? saved.token : undefined),
     tenant:
       options.tenant ||
       process.env.HIBANA_TENANT ||
-      (matches ? selected.tenant : undefined),
+      (matches ? saved.tenant : undefined),
   };
 }

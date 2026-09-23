@@ -63,10 +63,8 @@ export async function testBuildMetadata({
       stored.wasm_sha256,
       createHash("sha256").update(bytes).digest("hex"),
     );
-    assert.deepEqual(stored.net_allow_outbound, []);
     assert.deepEqual(Object.keys(stored).sort(), [
       "build_metadata",
-      "net_allow_outbound",
       "version_id",
       "wasm_sha256",
     ]);

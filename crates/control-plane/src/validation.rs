@@ -15,7 +15,7 @@ use sha2::{Digest, Sha256};
 use tokio::sync::Semaphore;
 use wasmparser::{ComponentTypeRef, Parser, Payload, Validator, WasmFeatures};
 
-use hibana_shared::FaasError;
+use hibana_shared::{subprocess, FaasError};
 
 /// 同時に走る検証の上限（DoS 緩和, §6.2）。
 const MAX_CONCURRENT_VALIDATIONS: usize = 4;
@@ -52,8 +52,6 @@ fn validation_semaphore() -> &'static Semaphore {
 /// **ワイヤ形式**でもある（子が JSON で stdout に書き、親が読む）。
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct Validated {
-    /// コンポーネントが要求する host import 名（`namespace:package/interface`）。観測用。
-    pub imports: Vec<String>,
     /// §4.4: 承認集合との strict matching を通過した capability import 集合（型のみは除く）。
     /// 呼び出し側はこれ（クライアント宣言値ではなく）を `component_versions.capabilities` に保存する。
     pub approved_imports: Vec<String>,
@@ -67,8 +65,7 @@ pub struct Validated {
 /// 検証子プロセスの wall-clock timeout（秒）。超過で SIGKILL する。
 const DEFAULT_VALIDATION_TIMEOUT_SECS: u64 = 5;
 /// 検証子プロセスのメモリ上限（MiB, Linux の `RLIMIT_AS`）。
-/// macOS では `RLIMIT_AS` を張らないため参照されない（timeout で縛る, [`set_memory_limit`]）。
-#[cfg(target_os = "linux")]
+/// macOS では `RLIMIT_AS` を張らず、時間・出力上限で縛る。
 const DEFAULT_VALIDATION_MEM_LIMIT_MB: u64 = 256;
 /// 子プロセスが返してよい JSON の最大バイト数（想定外に巨大な出力を読み込まない保険）。
 const VALIDATION_MAX_OUTPUT_BYTES: usize = 64 * 1024;
@@ -82,108 +79,44 @@ pub const VALIDATE_STDIN_FLAG: &str = "--validate-stdin";
 enum ValidationOutcome {
     /// 検証通過。
     Ok(Validated),
-    /// wasm 自体が不正 / 未承認（= 422 相当）。子は exit 0 でこれを返す。
+    /// wasm 自体が不正 / 未承認。子は exit 0 でこれを返す。
     Rejected { message: String },
 }
 
-/// 本体を検証し capability を強制する（§6.2 / §4.4）。
-///
-/// **M9b (§6.2)**: 検証は **別プロセス**で行う。悪意ある巨大 / 深ネスト wasm が wasmparser の
-/// メモリ / CPU を食い潰しても、被害は子プロセス 1 個に限局し、control-plane 本体は生き続ける
-/// （子は `RLIMIT_AS` + wall-clock timeout で二重に縛る）。M8 まではインプロセスの
-/// `spawn_blocking` だったため、検証 DoS が CP を道連れにできた。
-///
-/// 同時に走る子プロセス数は従来どおり static セマフォで縛る（rlimit は 1 プロセスの資源、
-/// セマフォは総数、の 2 軸）。
-///
-/// - 子が「wasm が不正」と判定 → `InvalidRequest`（422 相当）。
-/// - 子が timeout / OOM kill / クラッシュ / 不正な出力 → **wasm が原因**なので `InvalidRequest`。
-/// - 子の spawn 自体が失敗（fork 上限等） → 基盤側の一時障害なので `Internal`（503 相当・retryable）。
-///
+/// Validate in a bounded, credential-free subprocess. Keep the concurrency
+/// permit until the child is reaped, including cancelled or timed-out uploads.
 pub async fn validate_wasm(bytes: &[u8]) -> Result<Validated, FaasError> {
     let permit = validation_semaphore()
         .try_acquire()
         .map_err(|_| FaasError::Unavailable)?;
 
-    let result = spawn_validation_child(bytes).await;
-
-    drop(permit);
-    result
-}
-
-/// 検証子プロセスを起動し、結果を回収する。
-async fn spawn_validation_child(bytes: &[u8]) -> Result<Validated, FaasError> {
-    use tokio::io::AsyncWriteExt as _;
-    use tokio::process::Command;
-
-    let timeout_secs = env_u64("VALIDATION_TIMEOUT_SECS", DEFAULT_VALIDATION_TIMEOUT_SECS);
-
-    // 自分自身のバイナリを `--validate-stdin` で起動する（別バイナリを配らずに済む）。
     let exe = std::env::current_exe()
         .map_err(|e| FaasError::Internal(format!("cannot resolve own exe for validation: {e}")))?;
-
-    let mut child = Command::new(exe)
-        .arg(VALIDATE_STDIN_FLAG)
-        .stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::null())
-        // 子は DB接続は不要。余計な env / fd を渡さないため kill_on_drop で確実に始末する。
-        .kill_on_drop(true)
-        .spawn()
-        // spawn 失敗は「基盤が詰まっている」= 一時障害。wasm が悪いのではないので 503 相当。
-        .map_err(|e| FaasError::Internal(format!("failed to spawn validation subprocess: {e}")))?;
-
-    // stdin へ wasm を書き込む。子が先に死ぬと write が EPIPE になるが、その場合は
-    // 下の wait 側で timeout/kill として観測されるので、ここでの write エラーは無視してよい。
-    if let Some(mut stdin) = child.stdin.take() {
-        let _ = stdin.write_all(bytes).await;
-        let _ = stdin.shutdown().await;
-    }
-
-    // wall-clock timeout。超過したら kill して「wasm が重すぎる」= 422 相当にする。
-    let output = match tokio::time::timeout(
-        std::time::Duration::from_secs(timeout_secs.max(1)),
-        child.wait_with_output(),
+    let mut command = subprocess::isolated_command(exe);
+    command.arg(VALIDATE_STDIN_FLAG).env(
+        "VALIDATION_MEM_LIMIT_MB",
+        env_u64("VALIDATION_MEM_LIMIT_MB", DEFAULT_VALIDATION_MEM_LIMIT_MB)
+            .max(16)
+            .to_string(),
+    );
+    let output = subprocess::output(
+        command,
+        bytes,
+        std::time::Duration::from_secs(
+            env_u64("VALIDATION_TIMEOUT_SECS", DEFAULT_VALIDATION_TIMEOUT_SECS).max(1),
+        ),
+        VALIDATION_MAX_OUTPUT_BYTES,
+        permit,
     )
     .await
-    {
-        Ok(Ok(o)) => o,
-        Ok(Err(e)) => {
-            return Err(FaasError::Internal(format!(
-                "validation subprocess io error: {e}"
-            )))
+    .map_err(|error| match error {
+        subprocess::Error::Spawn(_) | subprocess::Error::Io(_) | subprocess::Error::Stopped => {
+            FaasError::Internal(format!("validation {error}"))
         }
-        Err(_elapsed) => {
-            // timeout。kill_on_drop があるので child は drop で殺されるが、ここで明示ログ。
-            tracing::warn!(
-                timeout_secs,
-                "validation subprocess exceeded time budget; rejecting upload"
-            );
-            return Err(FaasError::InvalidRequest(format!(
-                "wasm validation timed out after {timeout_secs}s (component too large or deeply nested)"
-            )));
-        }
-    };
+        _ => FaasError::InvalidRequest(format!("wasm validation failed: {error}")),
+    })?;
 
-    if !output.status.success() {
-        // OOM kill（RLIMIT_AS 超過 → SIGKILL）/ クラッシュ / 非ゼロ終了。すべて wasm 起因として 422。
-        tracing::warn!(
-            status = ?output.status,
-            "validation subprocess exited abnormally; rejecting upload (likely resource-exhausting wasm)"
-        );
-        return Err(FaasError::InvalidRequest(
-            "wasm validation failed (component exhausted validator resources or is malformed)"
-                .into(),
-        ));
-    }
-
-    if output.stdout.len() > VALIDATION_MAX_OUTPUT_BYTES {
-        return Err(FaasError::InvalidRequest(
-            "wasm validation produced an oversized result".into(),
-        ));
-    }
-
-    match serde_json::from_slice::<ValidationOutcome>(&output.stdout) {
+    match serde_json::from_slice::<ValidationOutcome>(&output) {
         Ok(ValidationOutcome::Ok(v)) => Ok(v),
         Ok(ValidationOutcome::Rejected { message }) => Err(FaasError::InvalidRequest(message)),
         Err(e) => Err(FaasError::Internal(format!(
@@ -195,8 +128,8 @@ async fn spawn_validation_child(bytes: &[u8]) -> Result<Validated, FaasError> {
 /// 子プロセス側の入口（`--validate-stdin`）。main.rs のサブコマンド分岐から呼ぶ。
 ///
 /// stdin から wasm を読み、[`validate_blocking`] を走らせ、[`ValidationOutcome`] を stdout へ
-/// 1 つ書いて **常に exit 0** で終わる（「wasm が不正」も正常な結果なので 0）。異常終了するのは
-/// 「stdin が読めない」等の基盤エラーのときだけ（親はそれを 503 として扱う）。
+/// 1 つ書いて exit 0 で終わる（「wasm が不正」も検証結果として返す）。
+/// メモリ制限の設定失敗やstdin/stdoutのI/O失敗では異常終了する。
 ///
 /// **プロセスの先頭でメモリ上限を張る**（Linux の `RLIMIT_AS`）。これが本スライスの主目的で、
 /// wasmparser が悪性 wasm でメモリを食い潰しても、この子プロセスが OOM で死ぬだけで
@@ -204,7 +137,7 @@ async fn spawn_validation_child(bytes: &[u8]) -> Result<Validated, FaasError> {
 pub fn run_validate_stdin() -> anyhow::Result<()> {
     use std::io::Read as _;
 
-    set_memory_limit();
+    set_memory_limit()?;
 
     let mut bytes = Vec::new();
     std::io::stdin()
@@ -214,8 +147,7 @@ pub fn run_validate_stdin() -> anyhow::Result<()> {
     let outcome = match validate_blocking(&bytes) {
         Ok(v) => ValidationOutcome::Ok(v),
         Err(FaasError::InvalidRequest(m)) => ValidationOutcome::Rejected { message: m },
-        // baseline 検証で InvalidRequest 以外は原理的に出ないが、出たら Rejected に倒す
-        // （親に 422 を返させる。子から 503 を誘発させない）。
+        // 未知の検証エラーも成功として扱わない。
         Err(other) => ValidationOutcome::Rejected {
             message: format!("validation failed: {other}"),
         },
@@ -236,7 +168,7 @@ pub fn run_validate_stdin() -> anyhow::Result<()> {
 /// wall-clock timeout + 出力サイズ上限だけで縛る（macOS はローカル開発専用という前提, §4.2）。
 /// 本番 Linux ではこの rlimit が「1 検証あたりのメモリ」を hard に縛る本体である。
 #[cfg(target_os = "linux")]
-fn set_memory_limit() {
+fn set_memory_limit() -> anyhow::Result<()> {
     let mb = env_u64("VALIDATION_MEM_LIMIT_MB", DEFAULT_VALIDATION_MEM_LIMIT_MB).max(16);
     let bytes = mb.saturating_mul(1024 * 1024);
     let limit = libc::rlimit {
@@ -244,15 +176,16 @@ fn set_memory_limit() {
         rlim_max: bytes,
     };
     // SAFETY: setrlimit は resource と rlimit ポインタを取る単純な syscall。
-    // 失敗しても検証は timeout で守られるので、ここでは best-effort（結果を無視）。
-    unsafe {
-        libc::setrlimit(libc::RLIMIT_AS, &limit);
+    if unsafe { libc::setrlimit(libc::RLIMIT_AS, &limit) } != 0 {
+        return Err(std::io::Error::last_os_error().into());
     }
+    Ok(())
 }
 
 #[cfg(not(target_os = "linux"))]
-fn set_memory_limit() {
+fn set_memory_limit() -> anyhow::Result<()> {
     // macOS 等は RLIMIT_AS が効かない。timeout + 出力上限で縛る（上のコメント参照）。
+    Ok(())
 }
 
 /// u64 の任意 env。欠損 / 不正は default（子プロセスでも使うので独立実装）。
@@ -282,10 +215,9 @@ fn validate_blocking(bytes: &[u8]) -> Result<Validated, FaasError> {
     // (4) sha256 算出・サイズ確定。
     let mut hasher = Sha256::new();
     hasher.update(bytes);
-    let sha256 = hex_lower(&hasher.finalize());
+    let sha256 = hex::encode(hasher.finalize());
 
     Ok(Validated {
-        imports: imports.into_iter().map(|i| i.name).collect(),
         approved_imports,
         sha256,
         size_bytes: bytes.len() as u64,
@@ -371,34 +303,6 @@ fn collect_component_imports(bytes: &[u8]) -> Result<Vec<ComponentImport>, FaasE
     Ok(imports)
 }
 
-/// バイト列を小文字 16 進へ。
-fn hex_lower(bytes: &[u8]) -> String {
-    use std::fmt::Write as _;
-    let mut s = String::with_capacity(bytes.len() * 2);
-    for b in bytes {
-        let _ = write!(s, "{b:02x}");
-    }
-    s
-}
-
-/// `upload_version` の multipart `capabilities` に `env` キーが含まれていないことを検査する。
-///
-/// `Err`は400に写像する。生のcapabilities.envによる利用許可の迂回を拒否し、
-/// varsと承認済みSecretの選択からのみサーバーが環境を構成する。
-pub fn reject_env_in_declared_capabilities(declared: &serde_json::Value) -> Result<(), FaasError> {
-    let has_env = match declared {
-        serde_json::Value::Object(map) => map.contains_key("env"),
-        _ => false,
-    };
-    if has_env {
-        return Err(FaasError::InvalidRequest(
-            "capabilities.env is server-managed; use vars and secrets deployment fields after Secret deploy-access approval"
-                .into(),
-        ));
-    }
-    Ok(())
-}
-
 /// バージョンへ注入する環境変数名の形式と件数を検証する純関数。
 ///
 /// 重複は集合化で吸収する。名前の形式・件数の上限は `hibana_shared` の定数を使う
@@ -472,8 +376,6 @@ mod tests {
         assert_eq!(validation_semaphore().available_permits(), 4);
     }
 
-    use hibana_shared::capabilities::{parse_capabilities, CapabilitySet};
-
     /// §4.4: baseline 承認集合は標準 WASI と標準 handler world 契約を承認する。
     #[test]
     fn baseline_approves_wasi_http_contract() {
@@ -515,18 +417,6 @@ mod tests {
     fn baseline_allows_sockets_import_but_runtime_gates_egress() {
         assert!(is_supported_import("wasi:sockets/tcp@0.2.6"));
         assert!(is_supported_import("wasi:sockets/ip-name-lookup@0.2.6"));
-        // upload は egress allowlist を常に空で保存する（= runtime で deny-all）。
-        let stored = CapabilitySet {
-            imports: vec!["wasi:sockets/tcp@0.2.6".to_string()],
-            env: BTreeSet::new(),
-            net_allow_outbound: BTreeSet::new(),
-        };
-        assert!(
-            parse_capabilities(&stored.to_json())
-                .net_allow_outbound
-                .is_empty(),
-            "the deploy path must persist an empty egress allowlist (runtime denies all)"
-        );
     }
 
     /// §4.4: baseline が承認する WASI Preview2 サブインターフェース（stdio/clocks/random）。
@@ -605,47 +495,6 @@ mod tests {
         let resolved = match_capabilities(&imports).expect("type-only must not be rejected");
         // 型のみは承認結果に含めない。capability import のみが解決される。
         assert_eq!(resolved, vec!["wasi:http/types@0.2.3".to_string()]);
-    }
-
-    /// **権限昇格の回帰ガード**: upload 経路（Deploy スコープ）で `capabilities.env` が
-    /// 非空になる入力は存在しない。`env` キーを含む宣言は 400 で弾かれ、含まない宣言からは
-    /// 空の許可リストしか生まれない。
-    #[test]
-    fn upload_path_can_never_produce_a_non_empty_env_allowlist() {
-        // (a) env を含む宣言は拒否される。
-        for declared in [
-            serde_json::json!({"env": ["PROD_API_KEY"]}),
-            serde_json::json!({"imports": ["wasi:cli/environment@0.2.0"], "env": []}),
-        ] {
-            assert!(
-                reject_env_in_declared_capabilities(&declared).is_err(),
-                "declaring capabilities.env on the deploy path must be refused: {declared}"
-            );
-        }
-        // (b) env を含まない宣言は通り、保存形の env は必ず空になる。
-        for declared in [
-            serde_json::json!({}),
-            serde_json::json!({"imports": ["wasi:cli/environment@0.2.0"]}),
-            serde_json::json!(["wasi:cli/environment@0.2.0"]),
-            serde_json::Value::Null,
-        ] {
-            assert!(reject_env_in_declared_capabilities(&declared).is_ok());
-            // upload_version が保存するのは approved_imports のみ（env は常に空）。
-            let stored = CapabilitySet {
-                imports: vec!["wasi:cli/environment@0.2.0".to_string()],
-                env: BTreeSet::new(),
-                net_allow_outbound: BTreeSet::new(),
-            };
-            let parsed = parse_capabilities(&stored.to_json());
-            assert!(
-                parsed.env.is_empty(),
-                "the deploy path must always persist an empty env allowlist"
-            );
-            assert!(
-                parsed.net_allow_outbound.is_empty(),
-                "the deploy path must always persist an empty egress allowlist (M9c)"
-            );
-        }
     }
 
     /// admin 承認リストのバリデーション（形式・件数の境界）。

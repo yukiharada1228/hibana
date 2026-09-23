@@ -36,28 +36,28 @@ export async function testApplicationEgress({
       method: "PUT",
       body: { allow_outbound },
     });
-  assert.deepEqual(await read(`${base}/egress`), { allow_outbound: null });
+  assert.deepEqual(await read(`${base}/egress`), { allow_outbound: [] });
   assert.equal(
     (await upload(id, token, "one", wasm, 0, { vars: { GREETING: "keep" } }))
       .status,
     201,
   );
-  assert.equal((await legacy(["legacy.example:443"])).status, 200);
+  assert.equal((await legacy(["legacy.example:443"])).status, 404);
   assert.equal((await upload(id, token, "two", wasm)).status, 201);
   assert.deepEqual((await caps("two")).net_allow_outbound, []);
 
   const restricted = [];
   for (const scopes of [["read"], ["read", "deploy"]]) {
     const login = await issueFixtureToken(sql, {
-        tenant_slug: "upload",
-        email: "test@example.invalid",
-        scopes,
-      });
+      tenant_slug: "upload",
+      email: "test@example.invalid",
+      scopes,
+    });
     assert.equal(login.status, 201);
     const { token: limited } = await login.json();
     restricted.push(limited);
     assert.deepEqual(await read(`${base}/egress`, limited), {
-      allow_outbound: null,
+      allow_outbound: [],
     });
     assert.equal(
       (await change({ allow: ["db.example:5432"] }, limited)).status,
@@ -76,8 +76,9 @@ export async function testApplicationEgress({
   ]) {
     assert.equal((await change(body)).status, 400, JSON.stringify(body));
   }
-  assert.deepEqual(await read(`${base}/egress`), { allow_outbound: null });
-  // Exercise both current object capabilities and the supported legacy import array.
+  assert.deepEqual(await read(`${base}/egress`), { allow_outbound: [] });
+  // Changes must not rewrite immutable version metadata. Stale version grants
+  // cannot override the application policy, even if an old writer inserts one.
   const original = JSON.parse(
     (
       await sql(
@@ -86,7 +87,7 @@ export async function testApplicationEgress({
     ).trim(),
   );
   await sql(
-    `UPDATE component_versions SET capabilities='["wasi:cli/environment@0.2.0"]' WHERE component_id='${id}' AND version='two'`,
+    `UPDATE component_versions SET capabilities='{"imports":["wasi:cli/environment@0.2.0"],"env":[],"net_allow_outbound":["stale.example:443"]}' WHERE component_id='${id}' AND version='two'`,
   );
   const first = await change({
     allow: ["DB.Example.:05432", "[2606:4700:4700::1111]:443"],
@@ -103,10 +104,16 @@ export async function testApplicationEgress({
       )
     ).trim(),
   );
-  assert.deepEqual(rows[0].caps.imports, original.imports);
+  assert.deepEqual(rows[0].caps, original);
+  assert.equal(original.net_allow_outbound, undefined);
   assert.deepEqual(rows[0].caps.env, ["GREETING"]);
-  assert.deepEqual(rows[1].caps.imports, ["wasi:cli/environment@0.2.0"]);
-  assert.equal((await legacy(["bypass.example:443"])).status, 409);
+  assert.deepEqual(rows[1].caps, {
+    imports: ["wasi:cli/environment@0.2.0"],
+    env: [],
+    net_allow_outbound: ["stale.example:443"],
+  });
+  assert.deepEqual((await read(`${base}/config`)).net_allow_outbound, approved);
+  assert.equal((await legacy(["bypass.example:443"])).status, 404);
 
   assert.equal(
     (
@@ -114,8 +121,11 @@ export async function testApplicationEgress({
         capabilities: { net_allow_outbound: ["unapproved.example:443"] },
       })
     ).status,
-    201,
+    400,
   );
+  assert.ok(!(await read(`${base}/versions`)).some(v => v.version === "three"));
+  assert.deepEqual((await read(`${base}/egress`)).allow_outbound, approved);
+  assert.equal((await upload(id, restricted[1], "three", wasm)).status, 201);
   assert.deepEqual((await caps("three")).net_allow_outbound, approved);
   // Incremental edits from independent clients must both survive serialization.
   const concurrent = await Promise.all([
@@ -170,7 +180,7 @@ export async function testApplicationEgress({
           slug: "egress-other",
           name: "Other",
           admin_email: "other@example.invalid",
-          admin_oidc_subject: 'fixture-admin',
+          admin_oidc_subject: "fixture-admin",
         },
       })
     ).status,
@@ -178,9 +188,9 @@ export async function testApplicationEgress({
   );
   const other = await (
     await issueFixtureToken(sql, {
-        tenant_slug: "egress-other",
-        email: "other@example.invalid",
-        })
+      tenant_slug: "egress-other",
+      email: "other@example.invalid",
+    })
   ).json();
   assert.equal(
     (await api(`${base}/egress`, { token: other.token })).status,
@@ -206,12 +216,12 @@ export async function testApplicationEgress({
   const recreated = await create();
   assert.notEqual(recreated, id);
   assert.deepEqual(await read(`/components/${recreated}/egress`), {
-    allow_outbound: null,
+    allow_outbound: [],
   });
   await api(`/components/${recreated}`, { token, method: "DELETE" });
   for (const token of restricted)
     await api("/auth/logout", { token, method: "POST" });
   console.log(
-    "PASS application egress: admin-only, tenant isolation, legacy migration, inheritance, revocation, rollback, concurrent edits and deployment race",
+    "PASS application egress: admin-only, tenant isolation, single application policy, inheritance, revocation, rollback, concurrent edits and deployment race",
   );
 }

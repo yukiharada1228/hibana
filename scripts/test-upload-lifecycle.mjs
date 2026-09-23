@@ -16,6 +16,7 @@ import {testEnvironmentLimits} from './test-environment-limits.mjs';
 import {testDeletionAudit} from './test-deletion-audit.mjs';
 import {testManagementAudit} from './test-management-audit.mjs';
 import {testSecretRekey} from './test-secret-rekey.mjs';
+import {testSecretMetadata} from './test-secret-metadata.mjs';
 import {testSecretSnapshot} from './test-secret-snapshot.mjs';
 import {testSecretKeyRetention} from './test-secret-key-retention.mjs';
 import {testFirstDeploy} from './test-first-deploy.mjs';
@@ -200,6 +201,7 @@ try {
   // bootstrap::run treats presence of APP_BIND_ADDR as enabled; remove it entirely.
   delete process.env.APP_BIND_ADDR;
   await start();
+  await testSecretMetadata({api, sql});
   await testJsonReception({url, operator});
   await testHttpMetrics({api});
   await startWorker();
@@ -240,8 +242,8 @@ try {
   console.log('PASS slow upload leaves no idle transaction; duplicate version preserves accepted artifact and removes failed upload');
 
   assert.equal((await sql(`BEGIN;
-    INSERT INTO component_versions(id,tenant_id,component_id,version,storage_uri,wasm_sha256,status)
-      SELECT 'retention-version',tenant_id,id,'retention-fixture','unused',repeat('b',64),'active' FROM components WHERE id='${id}';
+    INSERT INTO component_versions(id,tenant_id,component_id,version,storage_uri,wasm_sha256)
+      SELECT 'retention-version',tenant_id,id,'retention-fixture','unused',repeat('b',64) FROM components WHERE id='${id}';
     INSERT INTO executions(id,tenant_id,component_id,version_id,status,http_request)
       SELECT 'retention-execution',tenant_id,id,'retention-version','running',true FROM components WHERE id='${id}';
     INSERT INTO artifact_reservations(id,tenant_id,version_id,storage_uri,wasm_sha256,expires_at)
@@ -288,28 +290,24 @@ try {
   assert.equal((await api('/components',{token})).status,503);
   assert.equal((await api('/healthz')).status,200);
   async function drainUnderTraffic(accepted) {
-    let running = true, replies = 0;
-    const errors = [];
-    const traffic = Array.from({length:128}, async () => {
-      while (running) {
-        try {
+    // A fixed request budget keeps 128 clients without an unbounded busy loop
+    // starving probes until the held S3 upload reaches its transport deadline.
+    const requests = 20, clients = 128;
+    await Promise.all([
+      ...Array.from({length:clients}, async () => {
+        for (let sent=0; sent<requests; sent++) {
           const response = await api('/components', {token});
           await response.arrayBuffer();
           assert.equal(response.status,503);
-          replies++;
-        } catch (error) { errors.push(error); running = false; }
-      }
-    });
-    try {
-      await sleep(150);
-      for (let sample=0; sample<20; sample++) {
-        assert.deepEqual(await (await maintenance()).json(), {active_requests:accepted,inflight_executions:0});
-        await sleep(25);
-      }
-    } finally { running = false; await Promise.all(traffic); }
-    assert.equal(errors.length,0);
-    assert.ok(replies > 128);
-    console.log(`PASS drain tracks ${accepted} admitted request(s) during 128 concurrent rejected clients (${replies} HTTP 503 responses)`);
+        }
+      }),
+      (async () => {
+        for (let sample=0; sample<20; sample++) {
+          assert.deepEqual(await (await maintenance()).json(), {active_requests:accepted,inflight_executions:0});
+        }
+      })(),
+    ]);
+    console.log(`PASS drain tracks ${accepted} admitted request(s) during ${clients} concurrent rejected clients (${requests*clients} HTTP 503 responses)`);
   }
   await drainUnderTraffic(1);
   // SIGTERM must stop new public connections while internal preparation and
@@ -461,6 +459,11 @@ try {
   await testSecretRekey({api, sql, pg, restart:async env => { await stop(); await start(env); }});
   await testExecutionShutdown({api, token, wasm, upload, url, internal, metricsUrl:`http://127.0.0.1:${metricsPort}`, startWorker, stopWorker:() => stop(worker)});
   await testRuntimeBoundaries({api, token, wasm, upload, url, internal, metricsUrl:`http://127.0.0.1:${metricsPort}`, startWorker, stopWorker:() => stop(worker)});
+} catch (error) {
+  // Preserve diagnostics before the disposable fixture and its log are removed.
+  const details = await readFile(join(folder, 'cp.log'), 'utf8');
+  console.error(details.slice(-16000));
+  throw error;
 } finally {
   releaseGet?.(); releasePut?.(); await stop(worker); await stop(); s3.closeAllConnections(); await new Promise(done => s3.close(done)); await log.close();
   await rm(folder,{recursive:true,force:true});

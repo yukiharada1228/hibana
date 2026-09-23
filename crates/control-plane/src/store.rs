@@ -1,5 +1,3 @@
-use std::time::{SystemTime, UNIX_EPOCH};
-
 use async_trait::async_trait;
 
 #[cfg(test)]
@@ -51,18 +49,17 @@ pub struct RateLimitParams {
 /// invoke admission（レート制限）と OIDC stateを集約する。RedisStore が
 /// 本実装、`InProcStore` がテスト用スタブ、`FailingStore` が fail-mode 検証用。
 ///
-/// すべての操作は冪等／原子的であること（同一往復で read-modify-write）。
+/// 状態更新は原子的に行う。枠の消費とstateの取得は冪等ではなく、自動再送しない。
 #[async_trait]
 pub trait Store: Send + Sync {
     /// token-bucket からトークンを 1 つ消費しようとする（per-tenant レート制限, §8）。
     ///
-    /// `now_ms` は呼び出し側（Rust）の壁時計（ms）。バケットの最終補充時刻からの経過で
-    /// トークンを補充してから 1 つ消費を試みる。拒否時は `Retry-After`（秒）を返す。
+    /// ストア自身の時刻で補充し、拒否時は `Retry-After`（秒）を返す。
+    /// 呼び出し元の時計やリクエストの到着順で補充量を増やしてはならない。
     async fn rate_limit(
         &self,
         tenant: &str,
         params: RateLimitParams,
-        now_ms: u64,
     ) -> Result<RateDecision, StoreError>;
 
     async fn ping(&self) -> Result<(), StoreError>;
@@ -88,16 +85,8 @@ pub trait Store: Send + Sync {
     }
 }
 
-/// 現在の壁時計（UNIX ms）。token-bucket の `now_ms` 引数に使うヘルパ。
-pub fn now_unix_millis() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_millis() as u64)
-        .unwrap_or(0)
-}
-
 // ============================================================================
-// 起動時 Redis 不通フォールバック用の縮退ストア（fail-mode を壊さない）
+// Redis implementation
 // ============================================================================
 
 pub use redis_impl::RedisStore;
@@ -118,7 +107,7 @@ mod redis_impl {
     /// Redis バックエンドの [`Store`] 実装（§8）。
     ///
     /// `ConnectionManager` は自動再接続するマルチプレクス接続（pure-Rust, tokio-comp）。
-    /// 全 read-modify-write は `Script`（EVALSHA, 単一往復）で原子実行し TOCTOU を避ける。
+    /// レート制限は `Script`（EVALSHA）で原子実行し TOCTOU を避ける。
     ///
     /// キーレイアウト（テナント境界をキー空間で明示）:
     /// - レート: `rl:{tenant}` （HASH: tokens, last_ms）
@@ -168,19 +157,20 @@ mod redis_impl {
 
     // --- Lua スクリプト（すべて単一往復・サーバ側原子実行） ---
 
-    /// token-bucket: `KEYS[1]`=hash key, `ARGV`=[now_ms, refill_per_sec, capacity]。
+    /// token-bucket: `KEYS[1]`=hash key, `ARGV`=[refill_per_sec, capacity]。
     /// 戻り値 `[allowed(0/1), retry_after_secs]`。
-    /// 経過時間ぶん補充 → 1 トークン消費を試行。now が過去より小さい場合は 0 経過。
+    /// RedisのTIMEを使い、時計が戻っても保存済みの補充時刻を巻き戻さない。
     const RATE_LUA: &str = r#"
-local now = tonumber(ARGV[1])
-local rate = tonumber(ARGV[2])
-local cap = tonumber(ARGV[3])
+local clock = redis.call('TIME')
+local now = tonumber(clock[1]) * 1000 + math.floor(tonumber(clock[2]) / 1000)
+local rate = tonumber(ARGV[1])
+local cap = tonumber(ARGV[2])
 local tokens = tonumber(redis.call('HGET', KEYS[1], 'tokens'))
 local last = tonumber(redis.call('HGET', KEYS[1], 'last'))
 if tokens == nil then tokens = cap end
 if last == nil then last = now end
+now = math.max(now, last)
 local elapsed = now - last
-if elapsed < 0 then elapsed = 0 end
 tokens = math.min(cap, tokens + (elapsed / 1000.0) * rate)
 local allowed = 0
 local retry = 0
@@ -241,13 +231,11 @@ return {allowed, retry}
             &self,
             tenant: &str,
             params: RateLimitParams,
-            now_ms: u64,
         ) -> Result<RateDecision, StoreError> {
             let mut conn = self.conn.clone();
             let res: (i64, i64) = self
                 .rate_script
                 .key(rate_key(tenant))
-                .arg(now_ms)
                 .arg(params.refill_per_sec)
                 .arg(params.capacity)
                 .invoke_async(&mut conn)
@@ -296,75 +284,71 @@ mod tests {
     }
 
     /// token-bucket: 容量ぶんは即時許可、その後は枯渇して 429（Retry-After 付き）。
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn token_bucket_consumes_capacity_then_denies() {
         let s = InProcStore::new();
-        let p = rl(10.0, 5.0); // 5 burst, 10/s 補充
-        let t0 = 1_000_000;
+        let p = rl(10.0, 5.0);
         // 容量 5 ぶんは許可。
         for i in 0..5 {
-            let d = s.rate_limit("t", p, t0).await.unwrap();
+            let d = s.rate_limit("t", p).await.unwrap();
             assert!(d.allowed, "token {i} should be allowed");
             assert_eq!(d.retry_after_secs, 0);
         }
         // 6 個目は枯渇 → 拒否 + Retry-After >= 1。
-        let d = s.rate_limit("t", p, t0).await.unwrap();
+        let d = s.rate_limit("t", p).await.unwrap();
         assert!(!d.allowed);
         assert!(d.retry_after_secs >= 1);
     }
 
     /// token-bucket: 時間経過でトークンが補充される（refill）。
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn token_bucket_refills_over_time() {
         let s = InProcStore::new();
         let p = rl(10.0, 5.0);
-        let t0 = 1_000_000;
         // 容量を使い切る。
         for _ in 0..5 {
-            assert!(s.rate_limit("t", p, t0).await.unwrap().allowed);
+            assert!(s.rate_limit("t", p).await.unwrap().allowed);
         }
-        assert!(!s.rate_limit("t", p, t0).await.unwrap().allowed);
+        assert!(!s.rate_limit("t", p).await.unwrap().allowed);
         // 200ms 経過 → 10/s で 2 トークン補充されるはず。
-        let t1 = t0 + 200;
-        assert!(s.rate_limit("t", p, t1).await.unwrap().allowed);
-        assert!(s.rate_limit("t", p, t1).await.unwrap().allowed);
+        tokio::time::advance(std::time::Duration::from_millis(200)).await;
+        assert!(s.rate_limit("t", p).await.unwrap().allowed);
+        assert!(s.rate_limit("t", p).await.unwrap().allowed);
         // 3 個目は再び枯渇。
-        assert!(!s.rate_limit("t", p, t1).await.unwrap().allowed);
+        assert!(!s.rate_limit("t", p).await.unwrap().allowed);
     }
 
     /// token-bucket: 補充は容量で頭打ち（長時間アイドルでも capacity 超にならない）。
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn token_bucket_caps_at_capacity() {
         let s = InProcStore::new();
         let p = rl(10.0, 5.0);
-        let t0 = 1_000_000;
         // 1 つ消費して残 4 → 1 時間アイドル後でも最大 5 までしか貯まらない。
-        assert!(s.rate_limit("t", p, t0).await.unwrap().allowed);
-        let t1 = t0 + 3_600_000;
+        assert!(s.rate_limit("t", p).await.unwrap().allowed);
+        tokio::time::advance(std::time::Duration::from_secs(3600)).await;
         for _ in 0..5 {
-            assert!(s.rate_limit("t", p, t1).await.unwrap().allowed);
+            assert!(s.rate_limit("t", p).await.unwrap().allowed);
         }
-        assert!(!s.rate_limit("t", p, t1).await.unwrap().allowed);
+        assert!(!s.rate_limit("t", p).await.unwrap().allowed);
     }
 
     /// token-bucket: テナントごとにバケットが独立している。
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn token_bucket_is_per_tenant() {
         let s = InProcStore::new();
         let p = rl(1.0, 1.0);
-        let t0 = 1_000_000;
-        assert!(s.rate_limit("a", p, t0).await.unwrap().allowed);
-        assert!(!s.rate_limit("a", p, t0).await.unwrap().allowed);
+        assert!(s.rate_limit("a", p).await.unwrap().allowed);
+        assert!(!s.rate_limit("a", p).await.unwrap().allowed);
         // 別テナントは別バケット → 許可。
-        assert!(s.rate_limit("b", p, t0).await.unwrap().allowed);
+        assert!(s.rate_limit("b", p).await.unwrap().allowed);
     }
 
     /// fail-mode 分類: FailingStore は常に Unavailable を返し、is_unavailable で識別できる。
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn failing_store_reports_unavailable() {
         let s = FailingStore;
         let rp = rl(50.0, 50.0);
-        let err = s.rate_limit("t", rp, 0).await.unwrap_err();
+        let err = s.rate_limit("t", rp).await.unwrap_err();
         assert!(err.is_unavailable());
     }
 }

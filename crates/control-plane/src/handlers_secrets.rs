@@ -38,11 +38,6 @@ use crate::extract::JsonBody;
 use crate::secrets;
 use crate::state::AppState;
 
-/// `sec_*` の採番（`hibana_shared` の ID 採番作法に合わせた不透明 ID）。
-fn new_secret_id() -> String {
-    hibana_shared::new_secret_id()
-}
-
 /// 値の受け取り。**`Debug` を derive しない**（`JsonBody` の rejection ログ等に載せないため）。
 #[derive(Deserialize)]
 pub struct PutSecretRequest {
@@ -64,15 +59,6 @@ pub struct SecretMeta {
     /// 値が設定されているか。`false` になるのは版台帳が壊れている異常時のみ。
     pub has_value: bool,
     pub updated_at: chrono::DateTime<chrono::Utc>,
-}
-
-/// `GET /secrets/keys`（admin）で返す運用情報。`kek_kid` / `value_len` は**ここだけ**。
-#[derive(Debug, Serialize)]
-pub struct SecretKeyInfo {
-    pub name: String,
-    pub version: i32,
-    pub kek_kid: String,
-    pub value_len: i32,
 }
 
 /// componentの生存確認とロック。Secret操作を同じアプリの配備・削除と直列化する。
@@ -122,8 +108,7 @@ async fn reject_config_key_collision(
     component_id: &str,
     name: &str,
 ) -> Result<(), AppError> {
-    let configs = db::list_function_configs(tx, tenant, component_id).await?;
-    if configs.iter().any(|c| c.key == name) {
+    if db::function_config_key_exists(tx, tenant, component_id, name).await? {
         return Err(FaasError::Conflict(format!(
             "config key '{name}' already exists for this component; \
              deploy without this var first (a name must be either config or secret, never both)"
@@ -137,6 +122,7 @@ async fn reject_config_key_collision(
 ///
 /// 新規なら version=1 で `function_secrets` を作り、既存なら `current_version + 1` を追記して
 /// ポインタを前進させる。**版台帳は追記専用**なので更新は常に INSERT になる。
+/// `existing` は同じトランザクションで component をロックした後に取得する。
 async fn write_secret_version(
     state: &AppState,
     tx: &sea_orm::DatabaseTransaction,
@@ -144,16 +130,14 @@ async fn write_secret_version(
     component_id: &str,
     name: &str,
     value: &str,
-    reason: &str,
+    existing: Option<db::SecretMetaRow>,
 ) -> Result<(i32, bool), AppError> {
     let tenant = &principal.tenant_id;
     let keyring = state.secret_keyring();
 
-    let existing = db::find_live_secret_by_name(tx, tenant, component_id, name).await?;
-
-    let (secret_id, version, created) = match &existing {
-        Some(meta) => (meta.id.clone(), meta.current_version + 1, false),
-        None => (new_secret_id(), 1, true),
+    let (secret_id, version, created) = match existing {
+        Some(meta) => (meta.id, next_secret_version(meta.current_version)?, false),
+        None => (hibana_shared::new_secret_id(), 1, true),
     };
 
     // 封筒暗号化。AAD に (tenant, component, name) と (tenant, secret_id, version, kid) を束縛する。
@@ -177,7 +161,7 @@ async fn write_secret_version(
         &secret_id,
         version,
         &envelope,
-        reason,
+        if created { "create" } else { "rotate" },
         principal.user_id.as_deref(),
     )
     .await?;
@@ -193,6 +177,12 @@ async fn write_secret_version(
     }
 
     Ok((version, created))
+}
+
+fn next_secret_version(current: i32) -> Result<i32, FaasError> {
+    current
+        .checked_add(1)
+        .ok_or_else(|| FaasError::Conflict("Secret version limit reached".into()))
 }
 
 /// `SecretError` を HTTP へ写像する。**ボディには理由も値も出さない**（一律 500）。
@@ -270,12 +260,7 @@ pub async fn put_secret(
     require_component(&tx, tenant, &component_id).await?;
     reject_config_key_collision(&tx, tenant, &component_id, &name).await?;
 
-    // 新規かどうかを先に確定して監査 reason を決める（write_secret_version も同じ判定を行うが、
-    // 判定は同一 tx 内の同一スナップショットなので食い違わない）。
-    let is_new = db::find_live_secret_by_name(&tx, tenant, &component_id, &name)
-        .await?
-        .is_none();
-    let reason = if is_new { "create" } else { "rotate" };
+    let existing = db::find_live_secret_by_name(&tx, tenant, &component_id, &name).await?;
 
     let (version, created) = write_secret_version(
         &state,
@@ -284,7 +269,7 @@ pub async fn put_secret(
         &component_id,
         &name,
         &req.value,
-        reason,
+        existing,
     )
     .await?;
 
@@ -332,14 +317,11 @@ pub async fn rotate_secret(
     require_component(&tx, tenant, &component_id).await?;
 
     // rotate は既存が前提（不在は 404）。
-    if db::find_live_secret_by_name(&tx, tenant, &component_id, &name)
+    let existing = db::find_live_secret_by_name(&tx, tenant, &component_id, &name)
         .await?
-        .is_none()
-    {
-        return Err(
-            FaasError::NotFound(format!("secret '{name}' of component '{component_id}'")).into(),
-        );
-    }
+        .ok_or_else(|| {
+            FaasError::NotFound(format!("secret '{name}' of component '{component_id}'"))
+        })?;
 
     let (version, _) = write_secret_version(
         &state,
@@ -348,7 +330,7 @@ pub async fn rotate_secret(
         &component_id,
         &name,
         &req.value,
-        "rotate",
+        Some(existing),
     )
     .await?;
 
@@ -453,19 +435,7 @@ pub async fn list_secret_keys(
     db::set_tenant_guc(&tx, tenant).await?;
     require_component(&tx, tenant, &component_id).await?;
 
-    let metas = db::list_secrets_meta(&tx, tenant, &component_id).await?;
-    let mut out = Vec::with_capacity(metas.len());
-    for m in metas {
-        // 版台帳から現行世代の暗号材料メタだけを引く（**平文は復号しない**）。
-        if let Some(env) = db::find_secret_version(&tx, tenant, &m.id, m.current_version).await? {
-            out.push(SecretKeyInfo {
-                name: m.name,
-                version: m.current_version,
-                kek_kid: env.kek_kid,
-                value_len: env.value_len,
-            });
-        }
-    }
+    let out = db::list_secret_keys(&tx, tenant, &component_id).await?;
     tx.commit().await?;
 
     Ok(Json(json!({ "secrets": out })))
@@ -537,7 +507,6 @@ pub async fn job_env(
 ) -> Result<impl IntoResponse, AppError> {
     // --- 1) per-IP レート制限（無認証面のグローバル保護。**最初に**行う） ---
     let ip = peer.ip().to_string();
-    let now_ms = std::cmp::max(chrono::Utc::now().timestamp_millis(), 0) as u64;
     let per_min = state.job_env_exchange_rate_per_min() as f64;
     let ip_params = crate::store::RateLimitParams {
         refill_per_sec: per_min / 60.0,
@@ -547,7 +516,7 @@ pub async fn job_env(
     // 実質的な認証は env-token の署名（手順 2）と行の突き合わせ（手順 6）が担う。
     if let Ok(d) = state
         .store()
-        .rate_limit(&env_ip_rate_key(&ip), ip_params, now_ms)
+        .rate_limit(&env_ip_rate_key(&ip), ip_params)
         .await
     {
         if !d.allowed {
@@ -559,7 +528,6 @@ pub async fn job_env(
     // job_token を渡しても署名ドメインタグが違うので通らない。aud はさらにその二重確認。
     let claims = state
         .signer()
-        .verifier()
         .verify_env(&req.env_token)
         .map_err(|_| FaasError::Unauthorized)?;
     if claims.aud != hibana_shared::ENV_TOKEN_AUDIENCE {
@@ -623,7 +591,7 @@ pub async fn job_env(
     // HTTP受付とは独立した内部API保護。実行の状態・版・署名による認可は常に必須。
     if let Ok(d) = state
         .store()
-        .rate_limit(&env_tenant_rate_key(&tenant), ip_params, now_ms)
+        .rate_limit(&env_tenant_rate_key(&tenant), ip_params)
         .await
     {
         if !d.allowed {
@@ -635,7 +603,7 @@ pub async fn job_env(
     let capabilities = db::version_capabilities(&tx, &tenant, &claims.version_id)
         .await?
         .unwrap_or(serde_json::Value::Null);
-    let allowed = hibana_shared::capabilities::parse_capabilities(&capabilities).env;
+    let allowed = hibana_shared::capabilities::allowed_env(&capabilities);
 
     // --- 9) 許可リストで絞って復号（**execution 基準の世代**, §4.7.1） ---
     let resolved = secrets::resolve_for_injection(
@@ -756,7 +724,7 @@ pub async fn rekey_secrets(
             continue; // 既に現行 kid（並行実行での二重処理）。
         }
 
-        let next_version = meta.current_version + 1;
+        let next_version = next_secret_version(meta.current_version)?;
         // **値の平文をメモリに載せない**: DEK を旧 KEK で unwrap → 新 KEK で wrap するだけで、
         // ciphertext / nonce / value_len はそのままコピーされる。
         let rewrapped_env = secrets::rewrap(

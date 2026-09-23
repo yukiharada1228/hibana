@@ -9,6 +9,7 @@ name = "hibana-control-plane"
 path = "src/main.rs"
 
 [dependencies]
+hex = { workspace = true }
 hibana-shared = { workspace = true }
 hibana-database = { workspace = true }
 sea-orm = { workspace = true }
@@ -18,7 +19,7 @@ hibana-migration = { workspace = true }
 axum = { workspace = true, features = ["multipart"] }
 tokio = { workspace = true }
 tower-http = { workspace = true }
-ipnet = "2"
+ipnet = { workspace = true }
 
 # Object Storage（MinIO/S3 互換。本体保存 + presigned GET URL。§3.4）
 aws-sdk-s3 = { workspace = true }
@@ -37,7 +38,8 @@ ed25519-dalek = { workspace = true }
 # Opaque Hibana credentials; OIDC protocol and ID-token validation use openidconnect.
 rand = { workspace = true }
 openidconnect = { version = "4.0.1", default-features = false, features = ["reqwest", "rustls-tls"] }
-base64 = "0.22"
+base64 = { workspace = true }
+cookie = "0.18.2"
 async-trait = { workspace = true }
 
 # M7-0 / M7c (§5.1 / §4): 秘密素材（KEK / DEK / 復号済み平文）を Drop でゼロ化する。

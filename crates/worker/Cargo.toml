@@ -9,6 +9,7 @@ name = "hibana-worker"
 path = "src/main.rs"
 
 [dependencies]
+hex = { workspace = true }
 hibana-shared = { workspace = true }
 hibana-database = { workspace = true }
 sea-orm = { workspace = true }
@@ -27,6 +28,7 @@ reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"
 sha2 = { workspace = true }
 # --- in-memory Component キャッシュ (§3.6)。
 lru = "0.18.4"
+tempfile = "3.27"
 libc = "0.2"
 wasmtime = { workspace = true }
 wasmtime-wasi = { workspace = true }

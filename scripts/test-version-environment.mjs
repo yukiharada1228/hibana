@@ -5,6 +5,11 @@ import {apiClient, deploy, rollback} from '../sdk/src/api.mjs';
 export async function testVersionEnvironment(h) {
   const {api, sql, token, id, wasm, upload, app, holdStorage, releaseStorage, url, root, artifact} = h;
   const base = `/components/${id}`;
+  const secretBindings = async () => {
+    const response = await api(`${base}/config`, {token});
+    assert.equal(response.status,200);
+    return (await response.json()).secrets;
+  };
   const tenant = (await sql(`SELECT tenant_id FROM components WHERE id='${id}'`)).trim();
   const user = await (await api(`/tenants/${tenant}/users`, {token, method:'POST', body:{email:'deploy@example.invalid',oidc_subject:'fixture-deployer',role:'member'}})).json();
   const minted = await api('/tokens', {token,method:'POST',body:{user_id:user.user_id,scopes:['read','deploy']}});
@@ -24,17 +29,66 @@ export async function testVersionEnvironment(h) {
   assert.equal((await api(`${base}/config/GREETING`, {token:limited,method:'DELETE'})).status,404);
   assert.equal((await api(`${base}/versions/atomic-one/capabilities`, {token,method:'PUT',body:{env:['RESTORE_TOKEN']}})).status,405);
   assert.equal((await api(`${base}/secrets/RESTORE_TOKEN/deploy-access`, {token:limited,method:'PUT',body:{allowed:true}})).status,403);
-  assert.equal((await api(`${base}/secrets/UNSELECTED`, {token,method:'PUT',body:{value:'never-injected'}})).status,201);
+  // Name collisions need only keys, never plaintext vars or their timestamps.
+  const columns = 'tenant_id,component_id,version_id,key';
+  await sql(`REVOKE SELECT ON version_configs FROM faas_app;
+    GRANT SELECT (${columns}) ON version_configs TO faas_app`);
+  try {
+    assert.equal((await api(`${base}/secrets/GREETING`, {token,method:'PUT',body:{value:'blocked'}})).status,409,
+      'an active var blocks the same Secret name without reading its value');
+    assert.equal((await api(`${base}/secrets/UNSELECTED`, {token,method:'PUT',body:{value:'never-injected'}})).status,201,
+      'an unrelated Secret can be created without reading vars');
+  } finally {
+    await sql(`GRANT SELECT ON version_configs TO faas_app;
+      REVOKE SELECT (${columns}) ON version_configs FROM faas_app`);
+  }
   assert.equal((await api(`${base}/secrets/UNSELECTED/deploy-access`, {token,method:'PUT',body:{allowed:true}})).status,200);
   const before = (await api(`${base}/config`, {token:limited}));
   assert.deepEqual((await before.json()).env,{GREETING:'one'});
+  assert.deepEqual(await secretBindings(),[], 'unselected Secrets are not part of the version');
   await assert.rejects(deploy(client,{...config,vars:{GREETING:'denied'},secrets:['RESTORE_TOKEN']},artifact,'denied'), /HTTP 403/);
   assert.equal((await sql(`SELECT count(*) FROM component_versions WHERE component_id='${id}' AND version='denied'`)).trim(),'0');
   assert.deepEqual(await app('upload'),expected('one'));
   assert.equal((await api(`${base}/secrets/RESTORE_TOKEN/deploy-access`, {token,method:'PUT',body:{allowed:true}})).status,200);
   await deploy(client,{...config,vars:{GREETING:'two'},secrets:['RESTORE_TOKEN']},artifact,'atomic-two');
   assert.deepEqual(await app('upload'),expected('two',true));
+  assert.deepEqual(await secretBindings(),[{name:'RESTORE_TOKEN',available:true}]);
   console.log('PASS Read+Deploy publishes HTTP code/vars; admin-only explicit Secret authorization; unselected Secrets stay absent');
+
+  // Multiple entries are published together; a rejected batch cannot replace them.
+  const batch = await api('/components', {token:limited,method:'POST',body:{name:'batch-environment'}});
+  assert.equal(batch.status,201);
+  const batchId = (await batch.json()).component_id;
+  const batchBase = `/components/${batchId}`;
+  for (const name of ['FIRST','SECOND','BLOCKED']) {
+    assert.equal((await api(`${batchBase}/secrets/${name}`, {token,method:'PUT',body:{value:`fixture-${name}`}})).status,201);
+    if (name !== 'BLOCKED')
+      assert.equal((await api(`${batchBase}/secrets/${name}/deploy-access`, {token,method:'PUT',body:{allowed:true}})).status,200);
+  }
+  const batchConfig = async () => {
+    const response = await api(`${batchBase}/config`, {token:limited});
+    assert.equal(response.status,200);
+    return response.json();
+  };
+  const vars = {GREETING:'batch',EMPTY:'',UNICODE:'雪 🔥'};
+  const publishedBatch = await upload(batchId,limited,'batch',wasm,0,{vars,secrets:['FIRST','SECOND']});
+  assert.equal(publishedBatch.status,201);
+  const savedBatch = await batchConfig();
+  assert.equal(savedBatch.version_id,publishedBatch.data.version_id);
+  assert.deepEqual(savedBatch.env,vars);
+  assert.deepEqual(savedBatch.secrets,[{name:'FIRST',available:true},{name:'SECOND',available:true}]);
+  const deniedBatch = await upload(batchId,limited,'batch-denied',wasm,0,{vars:{GREETING:'denied'},secrets:['FIRST','BLOCKED']});
+  assert.equal(deniedBatch.status,403);
+  assert.equal((await sql(`SELECT count(*) FROM component_versions WHERE component_id='${batchId}' AND version='batch-denied'`)).trim(),'0');
+  assert.deepEqual(await batchConfig(),savedBatch);
+  const emptyBatch = await upload(batchId,limited,'batch-empty',wasm,0,{vars:{},secrets:[]});
+  assert.equal(emptyBatch.status,201);
+  const clearedBatch = await batchConfig();
+  assert.equal(clearedBatch.version_id,emptyBatch.data.version_id);
+  assert.deepEqual(clearedBatch.env,{});
+  assert.deepEqual(clearedBatch.secrets,[]);
+  assert.equal(clearedBatch.updated_at,null);
+  console.log('PASS multiple vars/Secret bindings, empty batches and rejected publication preserve atomic environment snapshots');
 
   // Reject after external I/O and after version INSERT. All publication changes roll back.
   const snapshot = () => sql(`SELECT json_build_object('active',active_version_id,'previous',previous_active_version_id,'ingress',ingress_enabled) FROM components WHERE id='${id}'`);
@@ -58,6 +112,7 @@ export async function testVersionEnvironment(h) {
   assert.deepEqual(await app('upload'),expected('two',false,true), 'rollback must not rewind Secret values');
   assert.equal((await api(`${base}/secrets/RESTORE_TOKEN`, {token,method:'DELETE'})).status,204);
   assert.equal((await api(`${base}/secrets/RESTORE_TOKEN`, {token,method:'PUT',body:{value:'restore-test-value'}})).status,201);
+  assert.deepEqual(await secretBindings(),[{name:'RESTORE_TOKEN',available:false}], 'availability follows Secret identity, not a recreated name');
   assert.deepEqual(await app('upload'),expected('two'), 'same-name recreated Secret must not bind to an old version');
   assert.equal((await api(`${base}/secrets/RESTORE_TOKEN/deploy-access`, {token,method:'PUT',body:{allowed:true}})).status,200);
   assert.deepEqual(await app('upload'),expected('two'), 'approval of a new identity cannot change old bindings');

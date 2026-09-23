@@ -196,7 +196,7 @@ const commands = {
         [...projectRemote, "json"],
         {
           notes:
-            "allow_outbound: null means unconfigured (legacy version permissions remain); [] denies all outbound access.\n" +
+            "An empty allow_outbound list denies all outbound access.\n" +
             connectionHelp,
         },
       ),
@@ -212,7 +212,7 @@ const commands = {
               max: 64,
               examples: [`hibana egress ${action} db.example.com:5432`],
               notes:
-                "Requires administrator credentials. Applies to past, current and future versions.\nThe first change replaces legacy version-specific permissions with this shared policy.\nSpecify destinations without a URL, password or wildcard. IPv6: [address]:port.\n" +
+                "Requires administrator credentials. Applies to past, current and future versions.\nSpecify destinations without a URL, password or wildcard. IPv6: [address]:port.\n" +
                 connectionHelp,
             },
           ),

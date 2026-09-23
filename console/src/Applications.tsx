@@ -459,12 +459,10 @@ export function Application({
                         >
                           {version.version_id === component.active_version_id
                             ? "現在のバージョン"
-                            : ["ready", "active"].includes(version.status)
-                              ? version.deletion_blocked_reason ===
+                            : version.deletion_blocked_reason ===
                                 "rollback_target"
-                                ? "切り戻し先"
-                                : "未選択"
-                              : "利用不可"}
+                              ? "切り戻し先"
+                              : "未選択"}
                         </Badge>
                       </TableCell>
                       <TableCell className="nowrap muted">
@@ -474,8 +472,7 @@ export function Application({
                         <div className="version-actions">
                           {canDeploy &&
                             version.version_id !==
-                              component.active_version_id &&
-                            ["ready", "active"].includes(version.status) && (
+                              component.active_version_id && (
                               <Button
                                 size="sm"
                                 variant="outline"

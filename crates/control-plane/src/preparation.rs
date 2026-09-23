@@ -40,7 +40,6 @@ pub(crate) async fn redeem(
         .ok_or(FaasError::Unauthorized)?;
     let claims = state
         .signer()
-        .verifier()
         .verify_preparation(token)
         .map_err(|_| FaasError::Unauthorized)?;
     if !claims.valid_at(chrono::Utc::now().timestamp()) {

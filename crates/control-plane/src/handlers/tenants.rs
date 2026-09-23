@@ -49,16 +49,7 @@ pub async fn create_tenant(
     headers: HeaderMap,
     JsonBody(req): JsonBody<CreateTenantRequest>,
 ) -> Result<impl IntoResponse, AppError> {
-    // bootstrap トークン照合（system-admin gate）。
-    let provided = headers
-        .get(AUTHORIZATION)
-        .and_then(|v| v.to_str().ok())
-        .and_then(|v| v.strip_prefix("Bearer "))
-        .map(str::trim)
-        .unwrap_or("");
-    if !bootstrap_token_matches(provided, state.bootstrap_admin_token()) {
-        return Err(FaasError::Unauthorized.into());
-    }
+    require_bootstrap_admin(&headers, &state)?;
 
     if req.slug.trim().is_empty() || req.name.trim().is_empty() {
         return Err(FaasError::InvalidRequest("slug and name must not be empty".into()).into());
@@ -116,9 +107,9 @@ pub async fn create_tenant(
         Json(CreateTenantResponse {
             tenant_id,
             slug: slug.to_owned(),
-            name: req.name,
+            name: req.name.trim().to_owned(),
             admin_user_id,
-            admin_email: req.admin_email,
+            admin_email: req.admin_email.trim().to_owned(),
         }),
     )
         .into_response())

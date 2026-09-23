@@ -135,13 +135,9 @@ class LocalCluster(KubernetesTarget):
     def pause_admission(self):
         maintenance = Maintenance(self)
         try:
-            maintenance.control_plane()
-            supported = maintenance.supports_protocol()
+            maintenance.require_protocol()
         except NoControlPlane:
             print("No Control Plane is running. The owned local cluster will stop using container termination grace periods.")
-            return
-        if not supported:
-            print("Legacy Control Plane detected. Stopping with container termination grace periods; fleet drain is unavailable.")
             return
         path = self.state / "maintenance.json"
         if path.exists():
@@ -156,11 +152,7 @@ class LocalCluster(KubernetesTarget):
 
     def resume_admission(self):
         maintenance = Maintenance(self)
-        if not maintenance.supports_protocol():
-            # Retain any owner left by an older CLI or a failed upgrade. A later
-            # compatible install must still be able to reopen that same gate.
-            print("Legacy Control Plane detected. Workloads are ready; application preparation is unavailable.")
-            return
+        maintenance.require_protocol()
         path = self.state / "maintenance.json"
         if not path.exists():
             maintenance.prepare()
@@ -313,7 +305,8 @@ class LocalCluster(KubernetesTarget):
                 with urllib.request.urlopen(request, timeout=15) as response:
                     return response.status
             except urllib.error.HTTPError as error:
-                return error.code
+                with error:
+                    return error.code
 
         subject = env.get("HIBANA_ADMIN_OIDC_SUBJECT", "")
         if not subject:
@@ -525,7 +518,8 @@ def wait_http(url, expected, headers=None):
             with urllib.request.urlopen(urllib.request.Request(url, headers=headers or {}), timeout=5) as response:
                 status = response.status
         except urllib.error.HTTPError as error:
-            status = error.code
+            with error:
+                status = error.code
         except (OSError, urllib.error.URLError):
             status = None
         if status == expected:

@@ -80,7 +80,6 @@ pub struct UploadVersionResponse {
     pub public_url: Option<String>,
     pub version_id: String,
     pub version: String,
-    pub status: &'static str,
 }
 
 /// POST /components/{component_id}/versions — アップロード+検証+デプロイ (§6.2)。
@@ -89,7 +88,7 @@ pub struct UploadVersionResponse {
 /// - `version` (必須): 1..=128 ASCII characters, starting with a letter or digit;
 ///   remaining characters may also include '.', '_', '+', '-'.
 /// - `wasm` (必須): wasm component バイナリ
-/// - `capabilities` (任意): JSON。M2 は受理して検証結果と整合確認するのみ（列保存は §4.4）
+/// - `signature` (任意): Wasm本体のsha256に対するdetached Ed25519署名（base64url）。
 /// - `resource_limits` (任意): JSON (hibana_shared::ResourceLimits)
 /// - `vars` (任意): 平文環境変数のJSONマップ。既定は空。
 /// - `secrets` (任意): 管理者が配備利用を許可したSecret名のJSON配列。既定は空。
@@ -101,7 +100,7 @@ pub struct UploadVersionResponse {
 /// 2. validation.rs で隔離検証（Component Model 妥当性）
 /// 3. import 許可リスト照合（validation 内）
 /// 4. sha256 算出・サイズ確定（validation 内）
-/// 5. 検証通過まで status=pending → 通過後に MinIO 保存 → INSERT(active) → active 化
+/// 5. 検証・保存・Worker準備を完了してからversionを登録し、activate=trueなら公開先を更新
 pub async fn upload_version(
     State(state): State<AppState>,
     principal: Principal,
@@ -132,7 +131,6 @@ pub async fn upload_version(
     let super::upload::Upload {
         version,
         wasm_bytes,
-        capabilities,
         signature,
         resource_limits,
         activate,
@@ -154,15 +152,11 @@ pub async fn upload_version(
     // declarations cannot add host functions or grant runtime permissions.
     let validated = validation::validate_wasm(&wasm_bytes).await?;
 
-    if let Some(caps) = &capabilities {
-        // 宣言値は監査・観測用にログするのみ（保存・付与には使わない, §4.4）。
-        tracing::debug!(declared = ?caps, imports = ?validated.imports, "client-declared capabilities (not trusted; persisting resolved approved set)");
-    }
     // §4.4 MUST: クライアント宣言値ではなく、承認集合と照合して解決した import を保存する。
     //
     // Plain vars and selected, separately authorized Secrets form the environment.
 
-    // (5) 検証通過 → MinIO 保存 → INSERT(active) → active 化。
+    // (5) 検証通過後に保存・準備し、versionと公開先を同一トランザクションで登録。
     let version_id = new_version_id();
     // Immutable identity: retries and recreated names must never overwrite an accepted artifact.
     let object_key = format!("{tenant}/versions/{version_id}.wasm");
@@ -248,15 +242,10 @@ pub async fn upload_version(
         }
     }
 
-    // Read after the parent lock: deployments cannot race an administrator's
-    // approval/revocation or grant permissions supplied by the uploaded artifact.
-    let current = db::find_component_by_id(&tx, tenant, &component_id).await?
-        .ok_or_else(|| FaasError::NotFound("component".into()))?;
-    let capabilities_json = hibana_shared::capabilities::CapabilitySet {
-        imports: validated.approved_imports.clone(),
-        env: allowed_env,
-        net_allow_outbound: super::egress::policy(&current)?.unwrap_or_default(),
-    }.to_json();
+    let capabilities_json = json!({
+        "imports": validated.approved_imports,
+        "env": allowed_env,
+    });
 
     let limits_json = serde_json::to_value(resource_limits)?;
     let build_metadata = validated.build_metadata.as_ref().map(serde_json::to_value).transpose()?;
@@ -272,7 +261,6 @@ pub async fn upload_version(
         validated.size_bytes as i64,
         &capabilities_json,
         &limits_json,
-        "active",
         build_metadata.as_ref(),
     )
     .await
@@ -313,7 +301,6 @@ pub async fn upload_version(
             public_url,
             version_id,
             version,
-            status: "active",
         }),
     ))
     }.await;
@@ -347,26 +334,6 @@ pub async fn list_components(
     let tx = state.pool().begin().await?;
     db::set_tenant_guc(&tx, tenant).await?;
     let items = db::list_components(&tx, tenant).await?;
-    let active_ids: Vec<_> = items
-        .iter()
-        .filter_map(|c| c.active_version_id.clone())
-        .collect();
-    let active: std::collections::HashMap<_, _> = component_versions::Entity::find()
-        .select_only()
-        .columns([
-            component_versions::Column::Id,
-            component_versions::Column::Version,
-            component_versions::Column::CreatedAt,
-        ])
-        .filter(component_versions::Column::TenantId.eq(tenant))
-        .filter(component_versions::Column::Id.is_in(active_ids))
-        .filter(component_versions::Column::DeletedAt.is_null())
-        .into_tuple::<(String, String, chrono::DateTime<chrono::Utc>)>()
-        .all(&tx)
-        .await?
-        .into_iter()
-        .map(|(id, version, created)| (id, (version, created)))
-        .collect();
     let tenant_info = db::session_tenant(&tx, tenant)
         .await?
         .ok_or(FaasError::Unauthorized)?;
@@ -379,16 +346,10 @@ pub async fn list_components(
             } else {
                 None
             },
-            active_version: c
-                .active_version_id
-                .as_ref()
-                .and_then(|id| active.get(id))
-                .map(|v| v.0.clone()),
+            active_version: c.active_version,
             active_version_created_at: c
-                .active_version_id
-                .as_ref()
-                .and_then(|id| active.get(id))
-                .map(|v| v.1.to_rfc3339()),
+                .active_version_created_at
+                .map(|created| created.to_rfc3339()),
             component_id: c.component_id,
             name: c.name,
             active_version_id: c.active_version_id,
@@ -408,7 +369,6 @@ pub async fn list_components(
 pub struct VersionListItemResponse {
     pub version_id: String,
     pub version: String,
-    pub status: String,
     pub size_bytes: i64,
     pub wasm_sha256: String,
     pub created_at: String,
@@ -457,7 +417,6 @@ pub async fn list_versions(
             },
             version_id: v.version_id,
             version: v.version,
-            status: v.status,
             size_bytes: v.size_bytes,
             wasm_sha256: v.wasm_sha256,
             created_at: v.created_at.to_rfc3339(),

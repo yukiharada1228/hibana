@@ -10,7 +10,7 @@ export async function egress(
   const component = await findComponent(api, config.name);
   if (!component)
     throw new Error("Deploy this application before managing egress");
-  const path = `/components/${encodeURIComponent(component.component_id || component.id)}/egress`;
+  const path = `/components/${encodeURIComponent(component.component_id)}/egress`;
   const policy = await api.request(
     path,
     action === "list"

@@ -19,7 +19,7 @@ pub(crate) fn build_internal_router(state: AppState) -> Router {
         )
         .route("/internal/direct-job", post(direct_http::redeem))
         .route("/internal/artifact", post(crate::preparation::redeem))
-        .route("/internal/direct-result", post(direct_http::complete))
+        .route("/internal/direct-result", post(crate::completion::complete))
         .route("/internal/job-env", post(handlers_secrets::job_env))
         .with_state(state)
 }
@@ -138,14 +138,6 @@ pub(crate) fn build_router(state: AppState) -> Router {
             "/tokens/{token_id}",
             delete(handlers::identity::revoke_token),
         )
-        // --- M9c: capability の egress allowlist 承認 (§4.4 / §15 M9) ---
-        // PUT /components/{id}/versions/{version}/capabilities/egress:
-        // 許可する outbound 先（host:port）を承認する。Secret利用許可と同じく admin 専用経路
-        // （deploy トークンが自分で外部到達を承認できてはならない）。
-        .route(
-            "/components/{component_id}/versions/{version}/capabilities/egress",
-            put(handlers::capabilities::approve_capability_egress),
-        )
         // --- M9a: Component 署名鍵の管理 + 署名必須ポリシー (§6.2 / §15 M9) ---
         // 供給網検証: deploy トークンが漏れても、テナント登録鍵で署名された wasm でなければ
         // active にできない。鍵管理とポリシーは admin 専用（deploy から分離）。
@@ -234,7 +226,7 @@ pub(crate) fn build_router(state: AppState) -> Router {
         )
         .merge(protected)
         // M11 (§4.2): 公開 HTTP ingress gateway。API ルートにマッチしなかったリクエストのうち
-        // Host が `<app>.<tenant>.<INGRESS_BASE_DOMAIN>` のものだけを gateway として処理する
+        // APP_PUBLIC_ORIGIN のホストに `<app>.<tenant>` を付けたものだけを gateway として処理する
         // （それ以外は 404）。deny-by-default（ingress_enabled な component だけ到達可能）。
         .fallback(
             |state: axum::extract::State<AppState>, req: axum::extract::Request| async move {

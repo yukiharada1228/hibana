@@ -19,14 +19,11 @@ export async function deleteApplication(args, options) {
     return;
   }
   const api = await inventoryClient(options);
-  const inventory = options.all
+  const components = options.all
     ? await api.request(
         options["all-tenants"] ? "/admin/components" : "/components",
       )
     : [await findComponent(api, name)].filter(Boolean);
-  const components = Array.isArray(inventory)
-    ? inventory
-    : inventory.components;
   if (!components.length) {
     console.log("No matching applications are deployed.");
     return;
@@ -54,10 +51,9 @@ export async function deleteApplication(args, options) {
     const base = options["all-tenants"]
       ? `/admin/tenants/${encodeURIComponent(component.tenant_id)}/components`
       : "/components";
-    await api.request(
-      `${base}/${encodeURIComponent(component.component_id || component.id)}`,
-      { method: "DELETE" },
-    );
+    await api.request(`${base}/${encodeURIComponent(component.component_id)}`, {
+      method: "DELETE",
+    });
     console.log(
       `Deleted application ${component.tenant_slug ? component.tenant_slug + "/" : ""}${component.name}.`,
     );

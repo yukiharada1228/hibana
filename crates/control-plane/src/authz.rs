@@ -95,23 +95,19 @@ mod tests {
     #[test]
     fn requested_within_caller_and_ceiling_is_granted() {
         let got = resolve_token_scopes(
-            &[Scope::Read, Scope::Invoke],
-            &[Scope::Read, Scope::Invoke, Scope::Deploy, Scope::Admin],
+            &[Scope::Read, Scope::Deploy],
+            &[Scope::Read, Scope::Deploy, Scope::Admin],
             Role::Admin,
         )
         .unwrap();
-        assert_eq!(got, vec![Scope::Read, Scope::Invoke]);
+        assert_eq!(got, vec![Scope::Read, Scope::Deploy]);
     }
 
     #[test]
     fn requested_above_caller_is_forbidden() {
         // 呼び出し主体は admin を持たない → admin 要求は昇格になり拒否。
-        let err = resolve_token_scopes(
-            &[Scope::Admin],
-            &[Scope::Read, Scope::Invoke, Scope::Deploy],
-            Role::Admin,
-        )
-        .unwrap_err();
+        let err = resolve_token_scopes(&[Scope::Admin], &[Scope::Read, Scope::Deploy], Role::Admin)
+            .unwrap_err();
         assert!(matches!(err, FaasError::Forbidden));
     }
 
@@ -120,7 +116,7 @@ mod tests {
         // 対象ユーザは member（admin 不可）→ caller が admin を持っていても拒否。
         let err = resolve_token_scopes(
             &[Scope::Admin],
-            &[Scope::Read, Scope::Invoke, Scope::Deploy, Scope::Admin],
+            &[Scope::Read, Scope::Deploy, Scope::Admin],
             Role::Member,
         )
         .unwrap_err();
@@ -132,11 +128,11 @@ mod tests {
         // caller は全権、対象は member → admin は落ちる。
         let got = resolve_token_scopes(
             &[],
-            &[Scope::Read, Scope::Invoke, Scope::Deploy, Scope::Admin],
+            &[Scope::Read, Scope::Deploy, Scope::Admin],
             Role::Member,
         )
         .unwrap();
-        assert_eq!(got, vec![Scope::Read, Scope::Invoke, Scope::Deploy]);
+        assert_eq!(got, vec![Scope::Read, Scope::Deploy]);
     }
 
     #[test]
@@ -157,11 +153,11 @@ mod tests {
     fn login_scopes_default_to_full_ceiling() {
         assert_eq!(
             resolve_login_scopes(&[], Role::Member),
-            vec![Scope::Read, Scope::Invoke, Scope::Deploy]
+            vec![Scope::Read, Scope::Deploy]
         );
         assert_eq!(
             resolve_login_scopes(&[], Role::Admin),
-            vec![Scope::Read, Scope::Invoke, Scope::Deploy, Scope::Admin]
+            vec![Scope::Read, Scope::Deploy, Scope::Admin]
         );
     }
 

@@ -27,7 +27,23 @@ export async function testJsonReception({url, operator}) {
     // Observe errors immediately while the maintenance calls below are pending.
     const completed = Promise.all(responses);
     completed.catch(() => {});
-    await delay(500);
+    // Wait for actual saturation: connection setup and the DB-backed admission
+    // gate can take longer than a fixed sleep on a busy machine.
+    const deadline = Date.now() + 5000;
+    for (;;) {
+      const response = await fetch(url + '/auth/oidc/start', {
+        method: 'POST', headers: {'Content-Type': 'application/json'},
+        body: '{', signal: AbortSignal.timeout(3000),
+      });
+      const body = await response.json();
+      if (response.status === 429) {
+        assert.equal(body.error.code, 'json_capacity');
+        break;
+      }
+      assert.equal(response.status, 400);
+      assert.ok(Date.now() < deadline, 'eight incomplete JSON requests must occupy the reception slots');
+      await delay(20);
+    }
     const excess = await Promise.all(Array.from({length: 120}, async (_, index) => {
       const response = await fetch(url + (index % 2 ? '/auth/oidc/start' : '/admin/tenants'), {
         method: 'POST', headers: {'Content-Type': index % 2 ? 'application/json' : 'application/problem+json'},

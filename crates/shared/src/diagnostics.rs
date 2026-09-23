@@ -14,19 +14,13 @@ pub fn format_error(message: impl fmt::Display) -> String {
     };
     let _ = write!(writer, "{message}");
     if writer.truncated {
-        let end = char_boundary(&writer.text, MAX_DIAGNOSTIC_BYTES - TRUNCATED.len());
+        let end = writer
+            .text
+            .floor_char_boundary(MAX_DIAGNOSTIC_BYTES - TRUNCATED.len());
         writer.text.truncate(end);
         writer.text.push_str(TRUNCATED);
     }
     writer.text
-}
-
-fn char_boundary(text: &str, limit: usize) -> usize {
-    let mut end = text.len().min(limit);
-    while !text.is_char_boundary(end) {
-        end -= 1;
-    }
-    end
 }
 
 struct DiagnosticWriter {
@@ -39,7 +33,7 @@ impl DiagnosticWriter {
         if self.truncated {
             return Err(fmt::Error);
         }
-        let end = char_boundary(text, MAX_DIAGNOSTIC_BYTES - self.text.len());
+        let end = text.floor_char_boundary(MAX_DIAGNOSTIC_BYTES - self.text.len());
         self.text.push_str(&text[..end]);
         if end < text.len() {
             self.truncated = true;

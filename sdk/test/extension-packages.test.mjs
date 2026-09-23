@@ -50,9 +50,9 @@ async function fixture(t, manifestFields = {}) {
 }
 
 test('managed sources are explicit and frozen mode is exposed only on build/dev/deploy',()=>{
-  for(const source of ['1.2.3','1.2.3-rc.1','./vendor/extension.tgz','https://example.com/pkg.tgz'])assert.doesNotThrow(()=>validateExtensionList({'@fixture/extension':source}));
+  for(const source of ['1.2.3','1.2.3-rc.1','1.2.3+build.01','1.2.3-0.alpha+linux','./vendor/extension.tgz','https://example.com/pkg.tgz'])assert.doesNotThrow(()=>validateExtensionList({'@fixture/extension':source}));
   assert.doesNotThrow(()=>validateExtensionList({}));
-  for(const source of ['latest','^1.0.0','../pkg.tgz','/tmp/pkg.tgz','file:./pkg.tgz','./a/../pkg.tgz','https://user:pass@example.com/pkg.tgz','https://example.com/pkg.tgz?token=x','http://example.com/pkg.tgz','git+https://example.com/a.git',null])
+  for(const source of ['latest','^1.0.0','1.2.3-01','1.2.3-rc.01','9007199254740992.0.0','v1.2.3','01.2.3','1.2.3+','1.2.3+build..1','../pkg.tgz','/tmp/pkg.tgz','file:./pkg.tgz','./a/../pkg.tgz','https://user:pass@example.com/pkg.tgz','https://example.com/pkg.tgz?token=x','http://example.com/pkg.tgz','git+https://example.com/a.git',null])
     assert.throws(()=>validateExtensionList({'@fixture/extension':source}));
   for(const command of ['build','dev','deploy'])assert.equal(parseCommand([command,'--frozen-lockfile']).values['frozen-lockfile'],true);
   assert.throws(()=>parseCommand(['rollback','--frozen-lockfile']));

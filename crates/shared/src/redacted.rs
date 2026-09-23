@@ -17,18 +17,22 @@ use serde::Serialize;
 /// 平文の取り出しは [`Redacted::expose`] の 1 経路だけ（`scripts/rls-lint.sh` の検査 (4) が
 /// 呼び出しファイルを allowlist に限定する）。
 ///
-/// 境界を**構造体宣言側**に書いているのは Rust の制約による: `Drop` の実装には構造体宣言と
-/// 同一の境界が要求されるため、`pub struct Redacted<T>(T);` + `impl<T: Zeroize> Drop` は
-/// E0367 でコンパイルできない。`String` / `Vec<u8>` / `[u8; 32]` は `Zeroize` 実装済み。
+/// 破棄時の消去は `zeroize::Zeroizing` に委ねる。平文の取り出し口は
+/// `expose(&self) -> &T` だけに限定し、値をムーブアウトする API は提供しない。
+/// Deserialize は秘密値を直接包み、途中の解析失敗でも読み込み済みの値を消去する。
+/// Serialize は明示的な `expose_once` 経由だけに限定する。
 ///
-/// `Drop` を実装すると値のムーブアウトができなくなるため `into_inner()` は提供しない
-/// （`expose(&self) -> &T` のみ）。これは意図した制約であり、平文の取り出し口を 1 本に保つ。
-#[derive(Clone)]
-pub struct Redacted<T: zeroize::Zeroize>(T);
+/// ```compile_fail
+/// let secret = hibana_shared::Redacted::new(String::from("secret"));
+/// serde_json::to_string(&secret).unwrap();
+/// ```
+#[derive(Clone, serde::Deserialize)]
+#[serde(transparent)]
+pub struct Redacted<T: zeroize::Zeroize>(zeroize::Zeroizing<T>);
 
 impl<T: zeroize::Zeroize> Redacted<T> {
     pub fn new(v: T) -> Self {
-        Self(v)
+        Self(zeroize::Zeroizing::new(v))
     }
 
     /// 平文を取り出す。**呼び出しは allowlist ファイルのみ**（rls-lint の検査 (4)）。
@@ -46,12 +50,6 @@ impl<T: zeroize::Zeroize> std::fmt::Debug for Redacted<T> {
 impl<T: zeroize::Zeroize> std::fmt::Display for Redacted<T> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str("<redacted>")
-    }
-}
-
-impl<T: zeroize::Zeroize> Drop for Redacted<T> {
-    fn drop(&mut self) {
-        self.0.zeroize();
     }
 }
 
@@ -119,6 +117,46 @@ mod tests {
         let r = Redacted::new("dup".to_string());
         let c = r.clone();
         assert_eq!(c.expose(), r.expose());
+    }
+
+    #[test]
+    fn deserialized_values_remain_redacted() {
+        let values: std::collections::BTreeMap<String, Redacted<String>> =
+            serde_json::from_str(r#"{"TOKEN":"private-秘密","EMPTY":""}"#).unwrap();
+        assert!(values["TOKEN"].expose() == "private-秘密");
+        assert!(values["EMPTY"].expose().is_empty());
+        let debug = format!("{values:?}");
+        assert!(debug.contains("<redacted>"));
+        assert!(!debug.contains("private-秘密"));
+    }
+
+    #[test]
+    fn failed_deserialization_zeroizes_already_read_values() {
+        use std::cell::Cell;
+
+        thread_local! {
+            static ZEROIZED: Cell<usize> = const { Cell::new(0) };
+        }
+        #[derive(serde::Deserialize)]
+        #[serde(transparent)]
+        struct Spy(String);
+        impl Zeroize for Spy {
+            fn zeroize(&mut self) {
+                self.0.zeroize();
+                ZEROIZED.with(|count| count.set(count.get() + 1));
+            }
+        }
+
+        for input in [
+            r#"{"first":"private-fixture","second":123}"#,
+            r#"{"first":"private-fixture","second":"#,
+        ] {
+            ZEROIZED.with(|count| count.set(0));
+            let result =
+                serde_json::from_str::<std::collections::BTreeMap<String, Redacted<Spy>>>(input);
+            assert!(result.is_err());
+            assert_eq!(ZEROIZED.with(Cell::get), 1);
+        }
     }
 
     /// Drop で zeroize が呼ばれること。`Zeroize` を実装したテスト用型で観測する

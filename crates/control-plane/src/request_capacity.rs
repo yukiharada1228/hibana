@@ -1,28 +1,29 @@
 //! Local capacity guards shared by public requests and deployment uploads.
-use std::{
-    collections::HashMap,
-    sync::{Arc, Mutex},
-};
-use tokio::sync::{OwnedSemaphorePermit, Semaphore};
+use std::{collections::HashMap, sync::Mutex};
+use tokio::sync::{Semaphore, SemaphorePermit};
 
 pub(crate) struct RequestCapacity {
-    slots: Arc<Semaphore>,
+    slots: Semaphore,
     tenants: Mutex<HashMap<String, usize>>,
 }
 
 impl RequestCapacity {
     pub(crate) fn new(max: usize) -> Self {
         Self {
-            slots: Arc::new(Semaphore::new(max)),
+            slots: Semaphore::new(max),
             tenants: Mutex::default(),
         }
     }
 
-    pub(crate) fn reserve(&self) -> Option<OwnedSemaphorePermit> {
-        self.slots.clone().try_acquire_owned().ok()
+    pub(crate) fn reserve(&self) -> Option<SemaphorePermit<'_>> {
+        self.slots.try_acquire().ok()
     }
 
-    pub(crate) fn reserve_tenant(&self, tenant: &str, max: usize) -> Option<TenantRequest<'_>> {
+    pub(crate) fn reserve_tenant<'a>(
+        &'a self,
+        tenant: &'a str,
+        max: usize,
+    ) -> Option<TenantRequest<'a>> {
         let mut tenants = self.tenants.lock().expect("request capacity lock");
         if tenants.get(tenant).copied().unwrap_or(0) >= max {
             return None;
@@ -30,23 +31,23 @@ impl RequestCapacity {
         *tenants.entry(tenant.into()).or_default() += 1;
         Some(TenantRequest {
             capacity: self,
-            tenant: tenant.into(),
+            tenant,
         })
     }
 }
 
 pub(crate) struct TenantRequest<'a> {
     capacity: &'a RequestCapacity,
-    tenant: String,
+    tenant: &'a str,
 }
 
 impl Drop for TenantRequest<'_> {
     fn drop(&mut self) {
         let mut tenants = self.capacity.tenants.lock().expect("request capacity lock");
-        let count = tenants.get_mut(&self.tenant).expect("reserved tenant");
+        let count = tenants.get_mut(self.tenant).expect("reserved tenant");
         *count -= 1;
         if *count == 0 {
-            tenants.remove(&self.tenant);
+            tenants.remove(self.tenant);
         }
     }
 }
@@ -54,6 +55,7 @@ impl Drop for TenantRequest<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Arc;
     #[tokio::test]
     async fn capacity_is_shared_and_cancelled_receivers_release_their_slots() {
         let capacity = Arc::new(RequestCapacity::new(8));

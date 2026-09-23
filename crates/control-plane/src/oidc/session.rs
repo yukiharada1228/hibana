@@ -1,6 +1,7 @@
 //! Console-only cookies. Protocol tokens remain on the server; CLI uses Bearer.
 use super::config::OidcConfig;
 use axum::http::{header, HeaderMap, HeaderValue, Method};
+use cookie::{time::Duration, Cookie, SameSite};
 use hibana_shared::FaasError;
 
 pub const CONSOLE_HEADER: &str = "x-hibana-console";
@@ -24,13 +25,14 @@ pub fn cookie_name(config: &OidcConfig) -> String {
 }
 
 pub fn cookie(config: &OidcConfig, secret: &str, ttl: i64) -> HeaderValue {
-    // Only generated hexadecimal secrets and fixed attributes reach this header.
-    HeaderValue::from_str(&format!(
-        "{}={secret}; Path=/; HttpOnly; SameSite=Strict; Max-Age={ttl}{}",
-        cookie_name(config),
-        if secure(config) { "; Secure" } else { "" }
-    ))
-    .expect("generated session cookie")
+    let cookie = Cookie::build((cookie_name(config), secret))
+        .path("/")
+        .http_only(true)
+        .same_site(SameSite::Strict)
+        .max_age(Duration::seconds(ttl))
+        .secure(secure(config))
+        .build();
+    HeaderValue::from_str(&cookie.to_string()).expect("generated session cookie")
 }
 
 pub fn credential(config: &OidcConfig, headers: &HeaderMap) -> Result<Option<String>, FaasError> {
@@ -38,13 +40,13 @@ pub fn credential(config: &OidcConfig, headers: &HeaderMap) -> Result<Option<Str
     let mut found = None;
     for header in headers.get_all(header::COOKIE) {
         let value = header.to_str().map_err(|_| FaasError::Unauthorized)?;
-        for entry in value.split(';') {
-            let Some((key, value)) = entry.trim().split_once('=') else {
-                continue;
-            };
-            if key != name {
+        // Do not use a CookieJar: duplicate session cookies must not be collapsed.
+        for entry in Cookie::split_parse(value) {
+            let entry = entry.map_err(|_| FaasError::Unauthorized)?;
+            if entry.name() != name {
                 continue;
             }
+            let value = entry.value();
             if found.is_some()
                 || value.len() != 64
                 || !value
@@ -133,12 +135,32 @@ mod tests {
             credential(&cfg, &headers).unwrap().as_deref(),
             Some(secret.as_str())
         );
+        // Cookie syntax/whitespace is parsed by the library. Check duplicates
+        // after normalization, including pairs carried in one header.
+        headers.insert(
+            header::COOKIE,
+            format!("other=x; {name} = {secret}").parse().unwrap(),
+        );
+        assert_eq!(
+            credential(&cfg, &headers).unwrap().as_deref(),
+            Some(secret.as_str())
+        );
+        headers.insert(
+            header::COOKIE,
+            format!("{name}={secret}; {name} = {secret}")
+                .parse()
+                .unwrap(),
+        );
+        assert!(credential(&cfg, &headers).is_err());
+        headers.insert(header::COOKIE, format!("{name}={secret}").parse().unwrap());
         headers.append(header::COOKIE, format!("{name}={secret}").parse().unwrap());
         assert!(credential(&cfg, &headers).is_err());
         for bad in ["short".to_owned(), "A".repeat(64), "a".repeat(65)] {
             headers.insert(header::COOKIE, format!("{name}={bad}").parse().unwrap());
             assert!(credential(&cfg, &headers).is_err());
         }
+        headers.insert(header::COOKIE, "malformed".parse().unwrap());
+        assert!(credential(&cfg, &headers).is_err());
     }
 
     #[test]

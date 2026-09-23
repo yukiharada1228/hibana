@@ -1,134 +1,50 @@
-//! M9c (§4.4 / §15 M9): egress allowlist の**セキュリティ核**。
-//!
-//! outbound を承認された宛先だけに絞るとき、最大の敵は **DNS rebinding / SSRF** である。
-//! `wasmtime-wasi` の `socket_addr_check` は接続時に**解決後の `SocketAddr`（IP:port）**だけを
-//! 受け取り、元のホスト名は渡ってこない。したがって「ホスト名の allowlist」を素朴に信じると、
-//! allowlist に載ったホスト名が内部 IP（`169.254.169.254` のクラウドメタデータや `10.x` の
-//! 内部ネット）へ解決されると、名前で allowlist を通り実 IP は内部、という到達が起きる。
-//!
-//! これを防ぐ核が [`hard_denied_reason`] である。**allowlist に何が書いてあっても優先して拒否する
-//! IP の集合**を、解決後の IP に対して機械的に判定する。これは純関数なので網羅的に単体テストでき、
-//! 本番でしか壊れないことが無い（M9 の設計方針: セキュリティ核は全列挙で固める）。
-//!
-//! 実際の allowlist 照合（解決後 IP が承認集合に入っているか）は worker 側が担い、
-//! 本モジュールは「絶対に触らせない IP か」の判定と、`host:port` のパースだけを持つ。
-
+//! Resolved-address egress policy shared by HTTP and WASI sockets.
+//! Destination approval never permits private/special addresses. Operators may
+//! separately approve exact RFC1918 TCP endpoints; local dev has its own policy.
+use ipnet::{Ipv4Net, Ipv6Net};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
-/// 解決後の IP が **allowlist より優先して拒否すべき**ものなら、その理由を返す。
-///
-/// 返り値が `Some` の宛先へは、たとえ allowlist に載っていても接続させてはならない。
-/// これが SSRF / DNS rebinding に対する最後の砦である。
-///
-/// # 何を拒否するか（そしてなぜ）
-///
-/// - **ループバック / 未指定 / ブロードキャスト**: ホスト自身や無効宛先。
-/// - **プライベート（RFC1918）/ CGNAT（100.64/10）**: 内部ネットワーク。
-/// - **リンクローカル（169.254/16）**: **クラウドメタデータ `169.254.169.254` を含む**。
-///   ここが SSRF の最重要ターゲット（IAM 資格情報の窃取）なので、範囲ごと拒否する。
-/// - **マルチキャスト / ドキュメント用 / ベンチマーク用 / 予約**: 正当な egress 先ではない。
-/// - **IPv6**: ループバック / 未指定 / ユニークローカル（fc00::/7）/ リンクローカル（fe80::/10）/
-///   マルチキャスト、および **IPv4-mapped（::ffff:a.b.c.d）は中の IPv4 を取り出して再判定**
-///   （マップ経由で上の IPv4 制限をすり抜けさせない）。
-///
-/// パブリックにルーティング可能な IP だけが `None`（= allowlist 照合へ進んでよい）を返す。
-pub fn hard_denied_reason(ip: IpAddr) -> Option<&'static str> {
-    match ip {
-        IpAddr::V4(v4) => hard_denied_v4(v4),
-        IpAddr::V6(v6) => hard_denied_v6(v6),
-    }
-}
+// Policy data stays here; CIDR arithmetic belongs to ipnet. Keep in sync with
+// IANA's IPv4 special-purpose registry and IPv6 address-space assignments.
+const DENIED_V4: &[Ipv4Net] = &[
+    Ipv4Net::new_assert(Ipv4Addr::new(0, 0, 0, 0), 8), // this network / unspecified
+    Ipv4Net::new_assert(Ipv4Addr::new(10, 0, 0, 0), 8),
+    Ipv4Net::new_assert(Ipv4Addr::new(100, 64, 0, 0), 10), // shared / CGNAT
+    Ipv4Net::new_assert(Ipv4Addr::new(127, 0, 0, 0), 8),
+    Ipv4Net::new_assert(Ipv4Addr::new(169, 254, 0, 0), 16), // includes cloud metadata
+    Ipv4Net::new_assert(Ipv4Addr::new(172, 16, 0, 0), 12),
+    Ipv4Net::new_assert(Ipv4Addr::new(192, 0, 0, 0), 24), // protocol assignments
+    Ipv4Net::new_assert(Ipv4Addr::new(192, 0, 2, 0), 24), // documentation
+    Ipv4Net::new_assert(Ipv4Addr::new(192, 88, 99, 0), 24), // deprecated 6to4 relay
+    Ipv4Net::new_assert(Ipv4Addr::new(192, 168, 0, 0), 16),
+    Ipv4Net::new_assert(Ipv4Addr::new(198, 18, 0, 0), 15), // benchmarking
+    Ipv4Net::new_assert(Ipv4Addr::new(198, 51, 100, 0), 24),
+    Ipv4Net::new_assert(Ipv4Addr::new(203, 0, 113, 0), 24),
+    Ipv4Net::new_assert(Ipv4Addr::new(224, 0, 0, 0), 4), // multicast
+    Ipv4Net::new_assert(Ipv4Addr::new(240, 0, 0, 0), 4), // reserved / broadcast
+];
 
-/// [`hard_denied_reason`] の bool 版。
+// Native IPv6 egress uses the currently assigned global-unicast space only.
+// Translation/tunnel ranges are deliberately unsupported: their encoded IPv4
+// destination could otherwise bypass the private-address gate.
+const GLOBAL_V6: Ipv6Net = Ipv6Net::new_assert(Ipv6Addr::new(0x2000, 0, 0, 0, 0, 0, 0, 0), 3);
+const DENIED_V6: &[Ipv6Net] = &[
+    Ipv6Net::new_assert(Ipv6Addr::new(0x2001, 0, 0, 0, 0, 0, 0, 0), 23), // protocol assignments, including Teredo
+    Ipv6Net::new_assert(Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 0), 32),
+    Ipv6Net::new_assert(Ipv6Addr::new(0x2002, 0, 0, 0, 0, 0, 0, 0), 16), // 6to4
+    Ipv6Net::new_assert(Ipv6Addr::new(0x3ffe, 0, 0, 0, 0, 0, 0, 0), 16), // retired 6bone
+    Ipv6Net::new_assert(Ipv6Addr::new(0x3fff, 0, 0, 0, 0, 0, 0, 0), 20), // documentation
+];
+
+/// Reject local/special destinations before checking the application's allowlist.
+/// IPv4-mapped IPv6 addresses have exactly the same policy as their IPv4 address.
 pub fn is_hard_denied(ip: IpAddr) -> bool {
-    hard_denied_reason(ip).is_some()
-}
-
-fn hard_denied_v4(ip: Ipv4Addr) -> Option<&'static str> {
-    let [a, b, _, _] = ip.octets();
-
-    if ip.is_unspecified() {
-        return Some("unspecified (0.0.0.0)");
-    }
-    if ip.is_loopback() {
-        return Some("loopback (127.0.0.0/8)");
-    }
-    if ip.is_broadcast() {
-        return Some("broadcast (255.255.255.255)");
-    }
-    if ip.is_private() {
-        return Some("private (RFC1918)");
-    }
-    if ip.is_link_local() {
-        // 169.254.0.0/16。クラウドメタデータ 169.254.169.254 を含む最重要拒否。
-        return Some("link-local incl. cloud metadata (169.254.0.0/16)");
-    }
-    if ip.is_multicast() {
-        return Some("multicast (224.0.0.0/4)");
-    }
-    if ip.is_documentation() {
-        return Some("documentation (192.0.2/198.51.100/203.0.113)");
-    }
-    // 以下は std が安定 API を持たない範囲。オクテットで判定する。
-    // CGNAT / shared address space（100.64.0.0/10）。
-    if a == 100 && (64..=127).contains(&b) {
-        return Some("shared/CGNAT (100.64.0.0/10)");
-    }
-    // ベンチマーク（198.18.0.0/15）。
-    if a == 198 && (b == 18 || b == 19) {
-        return Some("benchmarking (198.18.0.0/15)");
-    }
-    // IETF プロトコル割当（192.0.0.0/24）。
-    if a == 192 && b == 0 && ip.octets()[2] == 0 {
-        return Some("IETF protocol assignments (192.0.0.0/24)");
-    }
-    // 予約（240.0.0.0/4, 実質ルーティング不可）。
-    if a >= 240 {
-        return Some("reserved (240.0.0.0/4)");
-    }
-    None
-}
-
-fn hard_denied_v6(ip: Ipv6Addr) -> Option<&'static str> {
-    // IPv4-mapped（::ffff:a.b.c.d）は中の v4 を取り出して v4 の制限で再判定する。
-    // これをしないと、マップ表記で v4 の内部 IP へ到達できてしまう。
-    if let Some(v4) = ip.to_ipv4_mapped() {
-        return hard_denied_v4(v4);
-    }
-    // 互換表記（::a.b.c.d、非推奨だが存在しうる）も同様に扱う。
-    if let Some(v4) = ip.to_ipv4() {
-        // to_ipv4 は mapped と compat の両方を拾うが、mapped は上で処理済み。
-        // ループバック ::1 が 0.0.0.1 に化けるのを避けるため、::1 は先に弾く。
-        if !ip.is_loopback() && !ip.is_unspecified() {
-            if let Some(r) = hard_denied_v4(v4) {
-                return Some(r);
-            }
+    match ip.to_canonical() {
+        IpAddr::V4(ip) => DENIED_V4.iter().any(|network| network.contains(&ip)),
+        IpAddr::V6(ip) => {
+            !GLOBAL_V6.contains(&ip) || DENIED_V6.iter().any(|network| network.contains(&ip))
         }
     }
-
-    if ip.is_unspecified() {
-        return Some("unspecified (::)");
-    }
-    if ip.is_loopback() {
-        return Some("loopback (::1)");
-    }
-    if ip.is_multicast() {
-        return Some("multicast (ff00::/8)");
-    }
-    let seg0 = ip.segments()[0];
-    // ユニークローカル fc00::/7。
-    if (seg0 & 0xfe00) == 0xfc00 {
-        return Some("unique-local (fc00::/7)");
-    }
-    // リンクローカル fe80::/10。
-    if (seg0 & 0xffc0) == 0xfe80 {
-        return Some("link-local (fe80::/10)");
-    }
-    // ドキュメント用 2001:db8::/32。
-    if ip.segments()[0] == 0x2001 && ip.segments()[1] == 0x0db8 {
-        return Some("documentation (2001:db8::/32)");
-    }
-    None
 }
 
 /// allowlist の 1 エントリ（`host:port`）。ホスト名 or IP リテラル + ポート。
@@ -217,6 +133,8 @@ mod tests {
     fn denies_all_internal_ranges() {
         for s in [
             "0.0.0.0",
+            "0.0.0.1",
+            "0.255.255.255",
             "127.0.0.1",
             "127.5.5.5",
             "10.0.0.1",
@@ -234,10 +152,14 @@ mod tests {
             "192.0.2.1",       // documentation
             "198.51.100.1",
             "203.0.113.1",
+            "192.0.0.8",
+            "192.88.99.1",
             "240.0.0.1", // reserved
             "255.0.0.0",
         ] {
             assert!(is_hard_denied(v4(s)), "must deny {s}");
+            let mapped = s.parse::<Ipv4Addr>().unwrap().to_ipv6_mapped();
+            assert!(is_hard_denied(mapped.into()), "must deny mapped {s}");
         }
         for s in [
             "::",
@@ -247,6 +169,20 @@ mod tests {
             "fe80::1",     // link-local
             "ff02::1",     // multicast
             "2001:db8::1", // documentation
+            "2001:db8:ffff:ffff:ffff:ffff:ffff:ffff",
+            "3fff::1",
+            "3fff:fff:ffff:ffff:ffff:ffff:ffff:ffff",
+            "fec0::1",            // deprecated site-local
+            "::8.8.8.8",          // deprecated IPv4-compatible encoding
+            "64:ff9b::a9fe:a9fe", // NAT64 encoding of cloud metadata
+            "64:ff9b:1::a9fe:a9fe",
+            "2002:a9fe:a9fe::1", // 6to4 encoding of cloud metadata
+            "2001::1",           // Teredo
+            "2001:2::1",         // benchmarking
+            "3ffe::1",           // retired 6bone
+            "100::1",            // discard-only
+            "5f00::1",           // segment routing
+            "4000::1",           // reserved
         ] {
             assert!(is_hard_denied(v6(s)), "must deny {s}");
         }
@@ -266,15 +202,19 @@ mod tests {
             "100.128.0.1",    // CGNAT の直後
             "198.17.255.255", // benchmarking の直前
             "198.20.0.1",     // benchmarking の直後
-            "239.0.0.0",      // ← これは multicast なので実は拒否。下で確認するため除外
         ] {
-            if s == "239.0.0.0" {
-                assert!(is_hard_denied(v4(s)), "239.0.0.0 は multicast なので拒否");
-                continue;
-            }
             assert!(!is_hard_denied(v4(s)), "must allow public {s}");
+            let mapped = s.parse::<Ipv4Addr>().unwrap().to_ipv6_mapped();
+            assert!(!is_hard_denied(mapped.into()), "must allow mapped {s}");
         }
-        for s in ["2606:4700:4700::1111", "2001:4860:4860::8888"] {
+        for s in [
+            "2606:4700:4700::1111",
+            "2001:4860:4860::8888",
+            "2001:200::1",
+            "2001:db7:ffff::1",
+            "2001:db9::1",
+            "3fff:1000::1",
+        ] {
             assert!(!is_hard_denied(v6(s)), "must allow public {s}");
         }
     }

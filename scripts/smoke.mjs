@@ -70,20 +70,20 @@ for (const path of ["/cron-jobs", "/triggers", "/client/v4/accounts/local/worker
 console.log("PASS CLI deployment, Hono HTTP, binary POST, trusted environment, Secrets, SSE and removed API routes");
 
 const components = await api.request("/components");
-const component = (Array.isArray(components) ? components : components.components).find(c => c.name === "hello-hono");
-const id = component.component_id || component.id;
+const component = components.find(c => c.name === "hello-hono");
+const id = component.component_id;
 for (const [path, method] of [["/invoke", "POST"], ["/uploads", "POST"], [`/components/${id}/traffic`, "GET"], [`/components/${id}/traffic`, "PUT"], [`/components/${id}/promote`, "POST"]]) {
   await assert.rejects(api.request(path, { method, ...(method === "GET" ? {} : { body: {} }) }), /HTTP 404/);
 }
 const before = component.active_version_id;
 hibana(["rollback"]);
 const rolled = await api.request("/components");
-const rolledComponent = (Array.isArray(rolled) ? rolled : rolled.components).find(c => c.name === "hello-hono");
+const rolledComponent = rolled.find(c => c.name === "hello-hono");
 assert.notEqual(rolledComponent.active_version_id, before, "rollback must change the active version");
 assert.deepEqual(await (await app("/")).json(), { message: "Hello from Hono on Hibana 🔥" });
 // Switch back to the previously active version using the API's version name.
 const versions = await api.request(`/components/${id}/versions`);
-const version = (Array.isArray(versions) ? versions : versions.versions).find(v => (v.version_id || v.id) === before).version;
+const version = versions.find(v => v.version_id === before).version;
 hibana(["rollback", "--version", version]);
 assert.deepEqual(await (await app("/secret")).json(), { configured: true });
 console.log("PASS HTTP-only API surface / CLI rollback / explicit version rollback");

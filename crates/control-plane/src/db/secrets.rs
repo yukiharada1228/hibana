@@ -1,5 +1,6 @@
 //! Secrets persistence.
 use hibana_database::prelude::*;
+use sea_orm::DerivePartialModel;
 
 // ---------------------------------------------------------------------------
 // M7c: Secrets Manager（function_secrets / function_secret_versions）
@@ -11,7 +12,8 @@ use hibana_database::prelude::*;
 // ---------------------------------------------------------------------------
 
 /// `function_secrets` のメタデータ 1 行（**値は含まない**）。
-#[derive(Debug, Clone, FromQueryResult)]
+#[derive(Debug, Clone, DerivePartialModel)]
+#[sea_orm(entity = "function_secrets::Entity")]
 pub struct SecretMetaRow {
     pub id: String,
     pub component_id: String,
@@ -20,10 +22,16 @@ pub struct SecretMetaRow {
     pub updated_at: chrono::DateTime<chrono::Utc>,
 }
 
+fn live_secrets(tenant_id: &str) -> sea_orm::Select<function_secrets::Entity> {
+    function_secrets::Entity::find()
+        .filter(function_secrets::Column::TenantId.eq(tenant_id))
+        .filter(function_secrets::Column::DeletedAt.is_null())
+}
+
 /// secret メタ行を作成する（版行は別途 `insert_secret_version` で INSERT する）。
 ///
-/// 生存行の同名重複は部分 UNIQUE index 違反（23505）。呼び出し側が捕捉して
-/// 「既存 → rotate」へ倒す。
+/// 呼び出し側は component の排他ロック下で既存行を確認し、新規の場合だけ作成する。
+/// 生存行の同名重複は部分 UNIQUE index でも拒否する（23505）。
 pub async fn insert_secret_meta(
     executor: &impl ConnectionTrait,
     tenant_id: &str,
@@ -40,7 +48,7 @@ pub async fn insert_secret_meta(
         current_version: Set(current_version),
         ..Default::default()
     })
-    .exec(executor)
+    .exec_without_returning(executor)
     .await?;
     Ok(())
 }
@@ -52,20 +60,10 @@ pub async fn find_live_secret_by_name(
     component_id: &str,
     name: &str,
 ) -> Result<Option<SecretMetaRow>, DbErr> {
-    function_secrets::Entity::find()
-        .select_only()
-        .columns([
-            function_secrets::Column::Id,
-            function_secrets::Column::ComponentId,
-            function_secrets::Column::Name,
-            function_secrets::Column::CurrentVersion,
-            function_secrets::Column::UpdatedAt,
-        ])
-        .filter(function_secrets::Column::TenantId.eq(tenant_id))
-        .filter(function_secrets::Column::DeletedAt.is_null())
+    live_secrets(tenant_id)
         .filter(function_secrets::Column::ComponentId.eq(component_id))
         .filter(function_secrets::Column::Name.eq(name))
-        .into_model::<SecretMetaRow>()
+        .into_partial_model::<SecretMetaRow>()
         .one(executor)
         .await
 }
@@ -76,20 +74,51 @@ pub async fn list_secrets_meta(
     tenant_id: &str,
     component_id: &str,
 ) -> Result<Vec<SecretMetaRow>, DbErr> {
-    function_secrets::Entity::find()
-        .select_only()
-        .columns([
-            function_secrets::Column::Id,
-            function_secrets::Column::ComponentId,
-            function_secrets::Column::Name,
-            function_secrets::Column::CurrentVersion,
-            function_secrets::Column::UpdatedAt,
-        ])
-        .filter(function_secrets::Column::TenantId.eq(tenant_id))
-        .filter(function_secrets::Column::DeletedAt.is_null())
+    live_secrets(tenant_id)
         .filter(function_secrets::Column::ComponentId.eq(component_id))
         .order_by_asc(function_secrets::Column::Name)
-        .into_model::<SecretMetaRow>()
+        .into_partial_model::<SecretMetaRow>()
+        .all(executor)
+        .await
+}
+
+/// Admin-only key inventory. Never load the encrypted payload or wrapped key.
+#[derive(Debug, serde::Serialize, DerivePartialModel)]
+#[sea_orm(entity = "function_secrets::Entity")]
+pub struct SecretKeyInfo {
+    pub name: String,
+    #[sea_orm(from_col = "current_version")]
+    pub version: i32,
+    #[sea_orm(from_expr = "function_secret_versions::Column::KekKid")]
+    pub kek_kid: String,
+    #[sea_orm(from_expr = "function_secret_versions::Column::ValueLen")]
+    pub value_len: i32,
+}
+
+pub async fn list_secret_keys(
+    executor: &impl ConnectionTrait,
+    tenant_id: &str,
+    component_id: &str,
+) -> Result<Vec<SecretKeyInfo>, DbErr> {
+    live_secrets(tenant_id)
+        .filter(function_secrets::Column::ComponentId.eq(component_id))
+        .join(
+            JoinType::InnerJoin,
+            function_secrets::Entity::belongs_to(function_secret_versions::Entity)
+                .from((
+                    function_secrets::Column::TenantId,
+                    function_secrets::Column::Id,
+                    function_secrets::Column::CurrentVersion,
+                ))
+                .to((
+                    function_secret_versions::Column::TenantId,
+                    function_secret_versions::Column::SecretId,
+                    function_secret_versions::Column::Version,
+                ))
+                .into(),
+        )
+        .order_by_asc(function_secrets::Column::Name)
+        .into_partial_model::<SecretKeyInfo>()
         .all(executor)
         .await
 }
@@ -131,7 +160,7 @@ pub async fn insert_secret_version(
         created_by: Set(created_by.map(str::to_owned)),
         created_at: Set(created_at),
     })
-    .exec(executor)
+    .exec_without_returning(executor)
     .await?;
     Ok(())
 }
@@ -181,24 +210,23 @@ pub async fn version_has_live_secrets(
     component_id: &str,
     version_id: &str,
 ) -> Result<bool, DbErr> {
-    Ok(function_secrets::Entity::find()
-        .filter(function_secrets::Column::TenantId.eq(tenant_id))
-        .filter(function_secrets::Column::ComponentId.eq(component_id))
-        .filter(function_secrets::Column::DeletedAt.is_null())
-        .filter(
-            function_secrets::Column::Id.in_subquery(
-                version_secret_bindings::Entity::find()
-                    .select_only()
-                    .column(version_secret_bindings::Column::SecretId)
-                    .filter(version_secret_bindings::Column::TenantId.eq(tenant_id))
-                    .filter(version_secret_bindings::Column::ComponentId.eq(component_id))
-                    .filter(version_secret_bindings::Column::VersionId.eq(version_id))
-                    .into_query(),
+    hibana_database::queries::exists(
+        executor,
+        live_secrets(tenant_id)
+            .filter(function_secrets::Column::ComponentId.eq(component_id))
+            .filter(
+                function_secrets::Column::Id.in_subquery(
+                    version_secret_bindings::Entity::find()
+                        .select_only()
+                        .column(version_secret_bindings::Column::SecretId)
+                        .filter(version_secret_bindings::Column::TenantId.eq(tenant_id))
+                        .filter(version_secret_bindings::Column::ComponentId.eq(component_id))
+                        .filter(version_secret_bindings::Column::VersionId.eq(version_id))
+                        .into_query(),
+                ),
             ),
-        )
-        .count(executor)
-        .await?
-        > 0)
+    )
+    .await
 }
 
 /// 現行 kid でない current 世代を持つ secret の id を引く（M7c-4: rekey 対象）。
@@ -242,19 +270,9 @@ pub async fn find_secret_meta_by_id(
     tenant_id: &str,
     secret_id: &str,
 ) -> Result<Option<SecretMetaRow>, DbErr> {
-    function_secrets::Entity::find()
-        .select_only()
-        .columns([
-            function_secrets::Column::Id,
-            function_secrets::Column::ComponentId,
-            function_secrets::Column::Name,
-            function_secrets::Column::CurrentVersion,
-            function_secrets::Column::UpdatedAt,
-        ])
-        .filter(function_secrets::Column::TenantId.eq(tenant_id))
-        .filter(function_secrets::Column::DeletedAt.is_null())
+    live_secrets(tenant_id)
         .filter(function_secrets::Column::Id.eq(secret_id))
-        .into_model::<SecretMetaRow>()
+        .into_partial_model::<SecretMetaRow>()
         .one(executor)
         .await
 }

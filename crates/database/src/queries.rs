@@ -1,5 +1,23 @@
-//! Shared immutable version identity joins. All three identity columns matter.
+//! Shared ORM queries. Tenant and immutable version identities remain explicit.
 use crate::prelude::*;
+
+/// Ask the database for existence without counting or loading matching rows.
+pub async fn exists<E: EntityTrait>(
+    db: &impl ConnectionTrait,
+    query: sea_orm::Select<E>,
+) -> Result<bool, DbErr> {
+    db.query_one(
+        &Query::select()
+            .expr_as(
+                Expr::exists(query.select_only().expr(Expr::val(1)).into_query()),
+                "exists",
+            )
+            .to_owned(),
+    )
+    .await?
+    .ok_or_else(|| DbErr::Custom("existence query returned no row".into()))?
+    .try_get("", "exists")
+}
 
 pub fn pinned_execution(tenant: &str, id: &str) -> sea_orm::Select<executions::Entity> {
     executions::Entity::find()

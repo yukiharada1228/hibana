@@ -72,6 +72,7 @@ export class Api {
       );
     }
     if (!response.ok) {
+      await response.body?.cancel().catch(() => {});
       if (response.status === 401 && this.sessionId) {
         this.close();
         this.onExpired();
@@ -142,10 +143,6 @@ export class Api {
   }
   async logout() {
     await this.request("/auth/logout", "POST");
-    this.close();
-  }
-  async logoutAll() {
-    await this.request("/auth/logout-all", "POST");
     this.close();
   }
   components() {

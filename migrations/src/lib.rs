@@ -10,6 +10,10 @@ mod m20260917_000005_execution_input_cleanup;
 mod m20260918_000006_secret_key_retention;
 mod m20260920_000007_oidc;
 mod m20260920_000008_oidc_only;
+mod m20260922_000009_oidc_profile;
+mod m20260922_000010_management_scopes;
+mod m20260922_000011_application_egress;
+mod m20260922_000012_version_publication;
 
 pub struct Migrator;
 
@@ -70,6 +74,10 @@ impl MigratorTrait for Migrator {
             Box::new(m20260918_000006_secret_key_retention::Migration),
             Box::new(m20260920_000007_oidc::Migration),
             Box::new(m20260920_000008_oidc_only::Migration),
+            Box::new(m20260922_000009_oidc_profile::Migration),
+            Box::new(m20260922_000010_management_scopes::Migration),
+            Box::new(m20260922_000011_application_egress::Migration),
+            Box::new(m20260922_000012_version_publication::Migration),
         ]
     }
 }

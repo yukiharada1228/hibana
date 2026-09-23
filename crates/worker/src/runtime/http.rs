@@ -133,56 +133,33 @@ impl ResponseReceiver {
 }
 type ReqBody = http_body_util::combinators::BoxBody<Bytes, hyper::Error>;
 pub(super) fn into_request(input: HttpRequest) -> anyhow::Result<hyper::Request<ReqBody>> {
-    let body = input.body_bytes().map_err(|e| anyhow!(e))?;
     anyhow::ensure!(
         matches!(input.scheme.as_str(), "http" | "https"),
         "invalid HTTP scheme"
     );
-    // Older envelopes have no authority field. Preserve their Host header when
-    // draining requests accepted before a rolling update.
-    let authority = if input.authority.is_empty() {
-        input
-            .headers
-            .get("host")
-            .map(String::as_str)
-            .unwrap_or("localhost")
-    } else {
-        input.authority.as_str()
-    };
     let uri = hyper::Uri::builder()
         .scheme(input.scheme.as_str())
-        .authority(authority)
+        .authority(input.authority.as_str())
         .path_and_query(format!("{}{}", input.path, input.query))
         .build()?;
-    let mut builder = hyper::Request::builder()
+    let mut request = hyper::Request::builder()
         .method(input.method.as_str())
-        .uri(uri);
-    for (name, value) in input.headers {
-        builder = builder.header(name, value);
-    }
-    for (name, values) in input.additional_headers {
-        for value in values {
-            builder = builder.header(&name, value);
-        }
-    }
-    let mut request = builder
-        .body(Full::new(Bytes::from(body)).map_err(|e| match e {}).boxed())
+        .uri(uri)
+        .body(())
         .map_err(|e| anyhow!("failed to build request: {e}"))?;
-    for (name, values) in input.encoded_headers {
+    for (name, values) in &input.headers {
         let name = hyper::header::HeaderName::from_bytes(name.as_bytes())?;
-        anyhow::ensure!(!values.is_empty(), "empty encoded HTTP header list");
-        // Replace all legacy values for this name, including case variants.
-        // Encoding only the non-ASCII values would lose their interleaving.
-        request.headers_mut().remove(&name);
+        anyhow::ensure!(!values.is_empty(), "empty HTTP header list");
         for value in values {
-            let bytes = hibana_shared::b64url_decode(&value)
+            let bytes = hibana_shared::b64url_decode(value)
                 .ok_or_else(|| anyhow!("invalid base64 HTTP header"))?;
             request
                 .headers_mut()
                 .append(&name, hyper::header::HeaderValue::from_bytes(&bytes)?);
         }
     }
-    Ok(request)
+    let body = input.into_body_bytes().map_err(|e| anyhow!(e))?;
+    Ok(request.map(|()| Full::new(Bytes::from(body)).map_err(|e| match e {}).boxed()))
 }
 
 #[cfg(test)]
@@ -192,40 +169,63 @@ mod tests {
     use std::time::Duration;
 
     #[test]
-    fn reconstructs_repeated_headers_in_order_and_accepts_old_envelopes() {
-        for wire in [
-            r#"{"headers":{"host":"app.example","accept":"text/plain","cookie":"session=first"},"additional_headers":{"accept":["application/json","text/html"],"cookie":["csrf=second"]}}"#,
-            r#"{"headers":{"host":"app.example","accept":"text/plain","cookie":"session=first"}}"#,
+    fn reconstructs_repeated_headers_in_order() {
+        let (parts, ()) = hyper::Request::builder()
+            .uri("http://app.example/")
+            .header("accept", "text/plain")
+            .header("accept", "application/json")
+            .header("accept", "text/html")
+            .header("cookie", "session=first")
+            .header("cookie", "csrf=second")
+            .body(())
+            .unwrap()
+            .into_parts();
+        let envelope = HttpRequest::from_parts(&parts, &[]);
+        let wire = serde_json::to_vec(&envelope).unwrap();
+        let request = into_request(serde_json::from_slice(&wire).unwrap()).unwrap();
+        let values = |name| {
+            request
+                .headers()
+                .get_all(name)
+                .iter()
+                .map(|v| v.to_str().unwrap())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            values("accept"),
+            ["text/plain", "application/json", "text/html"]
+        );
+        assert_eq!(values("cookie"), ["session=first", "csrf=second"]);
+        assert_eq!(request.uri().authority().unwrap(), "app.example");
+    }
+
+    #[tokio::test]
+    async fn restores_text_and_binary_request_bodies() {
+        for body in [
+            b"".as_slice(),
+            b"text body",
+            "雪".as_bytes(),
+            &[0, 255, 128, 10],
         ] {
-            let envelope: HttpRequest = serde_json::from_str(wire).unwrap();
-            let multiple = !envelope.additional_headers.is_empty();
-            let request = into_request(envelope).unwrap();
-            let values = |name| {
-                request
-                    .headers()
-                    .get_all(name)
-                    .iter()
-                    .map(|v| v.to_str().unwrap())
-                    .collect::<Vec<_>>()
-            };
+            let (parts, ()) = hyper::Request::builder()
+                .method("POST")
+                .uri("https://app.example/echo")
+                .body(())
+                .unwrap()
+                .into_parts();
+            let wire = serde_json::to_vec(&HttpRequest::from_parts(&parts, body)).unwrap();
+            let request = into_request(serde_json::from_slice(&wire).unwrap()).unwrap();
             assert_eq!(
-                values("accept"),
-                if multiple {
-                    vec!["text/plain", "application/json", "text/html"]
-                } else {
-                    vec!["text/plain"]
-                }
+                request.into_body().collect().await.unwrap().to_bytes(),
+                body
             );
-            assert_eq!(
-                values("cookie"),
-                if multiple {
-                    vec!["session=first", "csrf=second"]
-                } else {
-                    vec!["session=first"]
-                }
-            );
-            assert_eq!(request.uri().authority().unwrap(), "app.example");
         }
+        assert!(into_request(HttpRequest {
+            body: "%invalid".into(),
+            body_base64: true,
+            ..Default::default()
+        })
+        .is_err());
     }
 
     #[test]
@@ -247,7 +247,7 @@ mod tests {
             .collect();
         assert_eq!(
             actual, values,
-            "encoded values replace legacy values, without duplicating them"
+            "all raw values must survive in order, without duplication"
         );
         assert_eq!(request.headers()["accept"], "text/plain");
     }
@@ -262,7 +262,7 @@ mod tests {
             ("x-tag", vec![hibana_shared::b64url_encode(b"x\0y")]),
         ] {
             let mut envelope = HttpRequest::default();
-            envelope.encoded_headers.insert(name.into(), values);
+            envelope.headers.insert(name.into(), values);
             assert!(into_request(envelope).is_err());
         }
     }
@@ -281,17 +281,8 @@ mod tests {
             "https://hello.team.example:8443//other/path%2Fsegment?next=%2F&x=1"
         );
         request.authority.clear();
-        request
-            .headers
-            .insert("host".into(), "localhost:8787".into());
-        assert_eq!(
-            into_request(request.clone())
-                .unwrap()
-                .uri()
-                .authority()
-                .unwrap(),
-            "localhost:8787"
-        );
+        assert!(into_request(request.clone()).is_err());
+        request.authority = "hello.team.example:8443".into();
         request.scheme = "file".into();
         assert!(into_request(request).is_err());
     }

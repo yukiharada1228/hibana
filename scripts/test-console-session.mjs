@@ -1,7 +1,8 @@
 import assert from "node:assert/strict";
+import { holdTransaction } from "./oidc-test-transaction.mjs";
 
 // Real Keycloak, PostgreSQL, and browser cookies, through the console proxy.
-export async function testConsoleSession({ page, context, consoleUrl, secondary, grant, sql }) {
+export async function testConsoleSession({ page, context, consoleUrl, secondary, grant, sql, pg }) {
   const origin = new URL(consoleUrl).origin;
   const session = await page.evaluate(async () => (await fetch("/api/auth/session", {
     headers: { "x-hibana-console": "1" },
@@ -25,8 +26,8 @@ export async function testConsoleSession({ page, context, consoleUrl, secondary,
   assert.equal(page.url(), route);
   assert.equal((await context.cookies()).find(value => value.name === cookie.name).expires, cookie.expires);
 
-  const request = (path, { method = "GET", body, headers = {} } = {}) => fetch(secondary + path, {
-    method,
+  const request = (path, { method = "GET", body, headers = {}, signal } = {}) => fetch(secondary + path, {
+    method, signal,
     headers: { cookie: `${cookie.name}=${cookie.value}`, origin, "x-hibana-console": "1", "x-hibana-session": session.token_id,
       "content-type": "application/json", ...headers },
     body: body === undefined ? undefined : JSON.stringify(body),
@@ -46,6 +47,17 @@ export async function testConsoleSession({ page, context, consoleUrl, secondary,
   assert.equal(restored.status, 200, "denied requests never revoke the session");
   assert.equal(restored.headers.get("cache-control"), "no-store");
   assert.equal((await restored.json()).expires_at, session.expires_at);
+
+  // Session restoration must not wait for the lock used by credential writes.
+  assert.match(session.user_id, /^usr_[a-f0-9]+$/);
+  const unlock = await holdTransaction(pg, `SELECT id FROM users WHERE id='${session.user_id}' FOR UPDATE;`);
+  try {
+    const readable = await request("/auth/session", { signal: AbortSignal.timeout(2000) });
+    assert.equal(readable.status, 200);
+    assert.equal((await readable.json()).email, session.email);
+  } finally {
+    await unlock();
+  }
 
   const tab = await context.newPage();
   assert.match(session.tenant_id, /^ten_[a-f0-9]+$/);

@@ -46,7 +46,6 @@ function version(id, name) {
   return {
     version_id: id,
     version: name,
-    status: "active",
     size_bytes: 12_400_000,
     wasm_sha256: "a".repeat(64),
     created_at: "2026-09-15T00:00:00Z",
@@ -231,7 +230,7 @@ createServer(async (req, res) => {
       for (const value of body.deny || []) approved.delete(value);
       egress[id] = [...approved].sort();
     }
-    return send(200, { allow_outbound: egress[id] ?? null });
+    return send(200, { allow_outbound: egress[id] ?? [] });
   }
   if (req.method === "DELETE") {
     if (!scopes.includes("admin")) return send(403, {});
@@ -288,9 +287,7 @@ createServer(async (req, res) => {
                   extensions: [],
                 }
               : null,
-        net_allow_outbound:
-          egress[id] ??
-          (v.version === "2.0.0" ? ["db.example.internal:5432"] : []),
+
       });
     }
     if (req.method === "POST") {
@@ -345,7 +342,7 @@ createServer(async (req, res) => {
         max_wall_time_ms: 1000,
         max_execution_time_ms: 5000,
       },
-      net_allow_outbound: egress[id] ?? ["db.example.internal:5432"],
+      net_allow_outbound: egress[id] ?? [],
     });
   if (action === "rollback") {
     if (!scopes.includes("deploy")) return send(403, {});

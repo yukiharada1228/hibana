@@ -23,6 +23,17 @@ export async function testSignatureAudit({api, sql, token, wasm, upload, url, ob
   };
   const audit = async version => JSON.parse((await sql(`SELECT coalesce(json_agg(json_build_object('actor',actor,'detail',detail)), '[]') FROM audit_logs WHERE action='component_signature_rejected' AND target='${id}' AND detail->>'version'='${version}'`)).trim());
   try {
+    const identity = Buffer.alloc(32); identity[0] = 1;
+    for (const [index,bytes] of [Buffer.alloc(32),identity].entries()) {
+      const keyId = `audit-weak-${index}`;
+      const rejected = await api(`/admin/signing-keys/${keyId}`, {
+        token,method:'PUT',body:{public_key:bytes.toString('base64url')},
+      });
+      assert.equal(rejected.status,400,'keys rejected by strict verification must not be registered');
+      await rejected.text();
+      assert.equal((await sql(`SELECT count(*) FROM component_signing_keys WHERE key_id='${keyId}'`)).trim(),'0');
+      assert.equal((await sql(`SELECT count(*) FROM audit_logs WHERE action='signing_key_registered' AND target='${keyId}'`)).trim(),'0');
+    }
     for (const [version,signature,reason] of [
       ['missing',undefined,'signature_required'],
       ['no-key',Buffer.alloc(64).toString('base64url'),'no_signing_keys_registered'],
@@ -53,5 +64,5 @@ export async function testSignatureAudit({api, sql, token, wasm, upload, url, ob
     await api('/admin/signing-keys/audit-fixture',{token,method:'DELETE'});
     await api(`/components/${id}`,{token,method:'DELETE'});
   }
-  console.log('PASS missing, unavailable-key, malformed and mismatched signatures persist audits without publication; valid signatures deploy');
+  console.log('PASS weak keys rejected without writes; missing, unavailable-key, malformed and mismatched signatures persist audits without publication; valid signatures deploy');
 }

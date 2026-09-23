@@ -4,7 +4,6 @@ use chrono::DateTime;
 use chrono::Utc;
 use hibana_database::prelude::*;
 use hibana_shared::Role;
-use hibana_shared::Scope;
 
 pub async fn session_tenant(
     executor: &impl ConnectionTrait,
@@ -25,8 +24,9 @@ pub async fn session_tenant(
 /// `api_tokens` の照合結果行（認証ホットパス）。
 ///
 /// 失効/期限の判定は `into_principal`（純関数化のため `is_token_valid` に委譲）で行う。
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, FromQueryResult)]
 pub struct TokenRow {
+    #[sea_orm(from_alias = "id")]
     pub token_id: String,
     pub tenant_id: String,
     pub user_id: Option<String>,
@@ -48,19 +48,6 @@ pub fn is_token_valid(
     now: DateTime<Utc>,
 ) -> bool {
     revoked_at.is_none() && expires_at > now
-}
-
-/// 文字列スコープ集合を `Scope` ベクタへパースする。未知の文字列は破棄する。
-pub fn parse_scopes(raw: &[String]) -> Vec<Scope> {
-    raw.iter()
-        .filter_map(|s| match s.as_str() {
-            "read" => Some(Scope::Read),
-            "invoke" => Some(Scope::Invoke),
-            "deploy" => Some(Scope::Deploy),
-            "admin" => Some(Scope::Admin),
-            _ => None,
-        })
-        .collect()
 }
 
 /// 文字列ロールを `Role` へパースする。未知/欠損は `None`。
@@ -91,9 +78,17 @@ impl TokenRow {
             (Some(_), Some(role)) => parse_role(Some(role))?,
             _ => return None,
         };
-        let scopes = parse_scopes(&self.scopes)
-            .into_iter()
-            .filter(|scope| role.ceiling().contains(scope))
+        // Resolve only scopes allowed by the role, using their shared DB names.
+        // Unknown scopes are discarded along with scopes above the role ceiling.
+        let scopes = self
+            .scopes
+            .iter()
+            .filter_map(|raw| {
+                role.ceiling()
+                    .iter()
+                    .copied()
+                    .find(|scope| scope.as_str() == raw)
+            })
             .collect();
         Some(Principal {
             tenant_id: self.tenant_id,
@@ -125,19 +120,7 @@ pub async fn find_token_by_hash(
     )
     .await?
     .first()
-    .map(|r| {
-        Ok(TokenRow {
-            token_id: r.try_get("", "id")?,
-            tenant_id: r.try_get("", "tenant_id")?,
-            user_id: r.try_get("", "user_id")?,
-            scopes: r.try_get("", "scopes")?,
-            expires_at: r.try_get("", "expires_at")?,
-            revoked_at: r.try_get("", "revoked_at")?,
-            user_role: r.try_get("", "user_role")?,
-            auth_method: r.try_get("", "auth_method")?,
-            user_oidc_issuer: r.try_get("", "user_oidc_issuer")?,
-        })
-    })
+    .map(|row| TokenRow::from_query_result(row, ""))
     .transpose()
 }
 
@@ -170,7 +153,7 @@ pub async fn bootstrap_tenant(
         status: Set("active".into()),
         ..Default::default()
     })
-    .exec(conn)
+    .exec_without_returning(conn)
     .await?;
     create_user(
         conn,
@@ -203,7 +186,7 @@ pub async fn create_user(
         oidc_subject: Set(Some(subject.into())),
         ..Default::default()
     })
-    .exec(executor)
+    .exec_without_returning(executor)
     .await?;
     Ok(())
 }
@@ -340,7 +323,7 @@ pub async fn create_token(
         auth_method: Set(auth_method.as_str().into()),
         ..Default::default()
     })
-    .exec(executor)
+    .exec_without_returning(executor)
     .await?;
     Ok(())
 }
@@ -370,12 +353,13 @@ pub async fn token_exists(
     tenant_id: &str,
     token_id: &str,
 ) -> Result<bool, DbErr> {
-    Ok(api_tokens::Entity::find()
-        .filter(api_tokens::Column::TenantId.eq(tenant_id))
-        .filter(api_tokens::Column::Id.eq(token_id))
-        .count(executor)
-        .await?
-        > 0)
+    hibana_database::queries::exists(
+        executor,
+        api_tokens::Entity::find()
+            .filter(api_tokens::Column::TenantId.eq(tenant_id))
+            .filter(api_tokens::Column::Id.eq(token_id)),
+    )
+    .await
 }
 
 /// Call inside the caller's tenant transaction. Serializes issuance with revocation.
@@ -388,6 +372,22 @@ pub async fn lock_user(
         .filter(users::Column::TenantId.eq(tenant_id))
         .filter(users::Column::DeletedAt.is_null())
         .lock_exclusive()
+        .one(executor)
+        .await
+}
+
+/// Session display is read-only; it must not wait for credential-changing locks.
+pub async fn user_email(
+    executor: &impl ConnectionTrait,
+    tenant_id: &str,
+    user_id: &str,
+) -> Result<Option<String>, DbErr> {
+    users::Entity::find_by_id(user_id)
+        .select_only()
+        .column(users::Column::Email)
+        .filter(users::Column::TenantId.eq(tenant_id))
+        .filter(users::Column::DeletedAt.is_null())
+        .into_tuple()
         .one(executor)
         .await
 }
@@ -423,6 +423,23 @@ pub async fn bind_oidc_user(
         )
         .filter(users::Column::TenantId.eq(tenant))
         .filter(users::Column::Id.eq(user))
+        .exec(executor)
+        .await?;
+    Ok(())
+}
+
+/// Update display metadata in the login transaction after locking the user.
+pub async fn update_user_email(
+    executor: &impl ConnectionTrait,
+    tenant: &str,
+    user: &str,
+    email: &str,
+) -> Result<(), DbErr> {
+    users::Entity::update_many()
+        .col_expr(users::Column::Email, Expr::value(email))
+        .filter(users::Column::TenantId.eq(tenant))
+        .filter(users::Column::Id.eq(user))
+        .filter(users::Column::DeletedAt.is_null())
         .exec(executor)
         .await?;
     Ok(())
@@ -479,6 +496,7 @@ pub async fn list_users(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use hibana_shared::Scope;
 
     fn row(user: Option<&str>, role: Option<&str>) -> TokenRow {
         TokenRow {
@@ -486,7 +504,9 @@ mod tests {
             tenant_id: "tenant".into(),
             user_id: user.map(str::to_owned),
             user_role: role.map(str::to_owned),
-            scopes: vec!["read".into(), "admin".into()],
+            scopes: ["admin", "unknown", "read", "deploy", "invoke"]
+                .map(String::from)
+                .to_vec(),
             expires_at: Utc::now() + chrono::Duration::hours(1),
             revoked_at: None,
             auth_method: "api".into(),
@@ -505,9 +525,30 @@ mod tests {
     }
 
     #[test]
-    fn role_downgrade_removes_stale_admin_scope() {
-        let principal = row(Some("user"), Some("member")).into_principal().unwrap();
-        assert!(!principal.has_scope(Scope::Admin));
-        assert!(principal.has_scope(Scope::Read));
+    fn scopes_preserve_order_and_respect_roles_without_granting_unknown_scopes() {
+        for (user, role, expected_role, expected_scopes) in [
+            (
+                Some("user"),
+                Some("member"),
+                Role::Member,
+                vec![Scope::Read, Scope::Deploy],
+            ),
+            (
+                Some("user"),
+                Some("admin"),
+                Role::Admin,
+                vec![Scope::Admin, Scope::Read, Scope::Deploy],
+            ),
+            (
+                None,
+                None,
+                Role::Admin,
+                vec![Scope::Admin, Scope::Read, Scope::Deploy],
+            ),
+        ] {
+            let principal = row(user, role).into_principal().unwrap();
+            assert_eq!(principal.role, expected_role);
+            assert_eq!(principal.scopes, expected_scopes);
+        }
     }
 }

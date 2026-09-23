@@ -30,7 +30,7 @@ impl Reservation {
             wasm_sha256: Set(sha256.into()),
             ..Default::default()
         })
-        .exec(&tx)
+        .exec_without_returning(&tx)
         .await?;
         tx.commit().await?;
         Ok(Self {

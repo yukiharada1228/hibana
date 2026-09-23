@@ -32,12 +32,11 @@ impl TrustedProxies {
     }
 
     pub fn client_ip(&self, headers: &HeaderMap, peer: SocketAddr) -> String {
-        let mut current = canonical(peer.ip());
+        let mut current = peer.ip().to_canonical();
         // Each trusted proxy must append its immediate peer, or overwrite XFF
         // at the outside boundary. Stop at the first untrusted address, so an
         // attacker-controlled prefix (including malformed text) has no effect.
-        let values: Vec<_> = headers.get_all("x-forwarded-for").iter().collect();
-        for value in values.into_iter().rev() {
+        for value in headers.get_all("x-forwarded-for").iter().rev() {
             if !self.contains(current) {
                 break;
             }
@@ -46,23 +45,13 @@ impl TrustedProxies {
                 if !self.contains(current) {
                     return current.to_string();
                 }
-                let Ok(ip) = entry.trim().parse() else {
+                let Ok(ip) = entry.trim().parse::<IpAddr>() else {
                     return current.to_string();
                 };
-                current = canonical(ip);
+                current = ip.to_canonical();
             }
         }
         current.to_string()
-    }
-}
-
-fn canonical(ip: IpAddr) -> IpAddr {
-    match ip {
-        IpAddr::V6(ip) => ip
-            .to_ipv4_mapped()
-            .map(IpAddr::V4)
-            .unwrap_or(IpAddr::V6(ip)),
-        ip => ip,
     }
 }
 

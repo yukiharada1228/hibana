@@ -3,16 +3,19 @@ use hibana_database::prelude::*;
 
 use chrono::DateTime;
 use chrono::Utc;
+use sea_orm::DerivePartialModel;
 use serde_json::Value;
+use std::collections::BTreeSet;
 
 /// `components` の 1 行 (API 応答に必要な範囲)。
-#[derive(Debug, Clone, FromQueryResult)]
+#[derive(Debug, Clone, DerivePartialModel)]
+#[sea_orm(entity = "components::Entity")]
 pub struct ComponentRow {
     pub id: String,
     pub name: String,
     pub active_version_id: Option<String>,
     pub previous_active_version_id: Option<String>,
-    pub egress_policy: Option<Value>,
+    pub egress_policy: Value,
 }
 
 /// Component メタデータのみを作成する (§6.2 M2)。
@@ -31,7 +34,7 @@ pub async fn create_component(
         name: Set(name.into()),
         ..Default::default()
     })
-    .exec(executor)
+    .exec_without_returning(executor)
     .await?;
     Ok(())
 }
@@ -43,18 +46,10 @@ pub async fn find_component_by_id(
     component_id: &str,
 ) -> Result<Option<ComponentRow>, DbErr> {
     components::Entity::find()
-        .select_only()
-        .columns([
-            components::Column::Id,
-            components::Column::Name,
-            components::Column::ActiveVersionId,
-            components::Column::PreviousActiveVersionId,
-            components::Column::EgressPolicy,
-        ])
         .filter(components::Column::TenantId.eq(tenant_id))
         .filter(components::Column::Id.eq(component_id))
         .filter(components::Column::DeletedAt.is_null())
-        .into_model::<ComponentRow>()
+        .into_partial_model::<ComponentRow>()
         .one(executor)
         .await
 }
@@ -79,16 +74,13 @@ pub async fn lock_component(
         .is_some())
 }
 
-/// Caller holds the parent lock. Keep the Worker's per-version capability
-/// document authoritative, including for rollback targets, in this transaction.
+/// Caller holds the parent lock. Workers read this application policy directly.
 pub async fn set_component_egress(
     tx: &DatabaseTransaction,
     tenant_id: &str,
     component_id: &str,
-    approved: &[String],
+    approved: &BTreeSet<String>,
 ) -> Result<(), DbErr> {
-    use sea_orm::sea_query::{extension::postgres::PgExpr, CaseStatement};
-
     components::Entity::update_many()
         .col_expr(
             components::Column::EgressPolicy,
@@ -100,35 +92,14 @@ pub async fn set_component_egress(
         .exec(tx)
         .await?;
 
-    let column = component_versions::Column::Capabilities;
-    let kind = || Func::cust("jsonb_typeof").arg(Expr::col(column));
-    let document = CaseStatement::new()
-        .case(Expr::expr(kind()).eq("object"), Expr::col(column))
-        .case(
-            Expr::expr(kind()).eq("array"),
-            Func::cust("jsonb_build_object").args([Expr::val("imports"), Expr::col(column)]),
-        )
-        .finally(Expr::val(serde_json::json!({})));
-    component_versions::Entity::update_many()
-        .col_expr(
-            column,
-            Expr::expr(document).concat(Expr::val(
-                serde_json::json!({"net_allow_outbound": approved}),
-            )),
-        )
-        .filter(component_versions::Column::TenantId.eq(tenant_id))
-        .filter(component_versions::Column::ComponentId.eq(component_id))
-        .filter(component_versions::Column::DeletedAt.is_null())
-        .exec(tx)
-        .await?;
     Ok(())
 }
 
 /// 検証通過した version を登録する (§6.2)。
 ///
 /// 同一 (component_id, version) の重複は UNIQUE 違反（呼び出し側で 409/422 へ）。
-/// `storage_uri` は Object Storage 上のオブジェクトキー。`status` は 'active' を渡す
-/// （検証通過後に active 化する。pending→active の遷移は M2 では即時）。
+/// `storage_uri` は Object Storage 上のオブジェクトキー。
+/// 公開先は親componentのactive_version_idで管理する。
 /// `size_bytes` は検証で確定した本体サイズ (§6.2)、`capabilities` は §4.4 strict matching を
 /// 通過した **承認済み import 集合**（クライアント宣言値ではない）で、DBの
 /// 列に対応する。呼び出し側（handlers）は `Validated::approved_imports` を渡すこと。
@@ -144,7 +115,6 @@ pub async fn insert_version(
     size_bytes: i64,
     capabilities: &Value,
     resource_limits: &Value,
-    status: &str,
     build_metadata: Option<&Value>,
 ) -> Result<(), DbErr> {
     component_versions::Entity::insert(component_versions::ActiveModel {
@@ -157,11 +127,10 @@ pub async fn insert_version(
         size_bytes: Set(size_bytes),
         capabilities: Set(capabilities.clone()),
         resource_limits: Set(resource_limits.clone()),
-        status: Set(status.into()),
         build_metadata: Set(build_metadata.cloned()),
         ..Default::default()
     })
-    .exec(executor)
+    .exec_without_returning(executor)
     .await?;
     Ok(())
 }
@@ -233,7 +202,8 @@ pub async fn rollback_active_version(
 
 /// M11 (§4.2): 公開 ingress gateway 用の component 解決結果。
 /// gateway は「到達可否」だけ判定し、実際の起動は名前で通常 invoke に委ねる（id は不要）。
-#[derive(FromQueryResult)]
+#[derive(DerivePartialModel)]
+#[sea_orm(entity = "components::Entity")]
 pub struct IngressComponentRow {
     /// 公開 URL から到達を許すか（deny-by-default）。
     pub ingress_enabled: bool,
@@ -249,15 +219,10 @@ pub async fn find_ingress_component(
     name: &str,
 ) -> Result<Option<IngressComponentRow>, DbErr> {
     components::Entity::find()
-        .select_only()
-        .columns([
-            components::Column::IngressEnabled,
-            components::Column::ActiveVersionId,
-        ])
         .filter(components::Column::TenantId.eq(tenant_id))
         .filter(components::Column::Name.eq(name))
         .filter(components::Column::DeletedAt.is_null())
-        .into_model::<IngressComponentRow>()
+        .into_partial_model::<IngressComponentRow>()
         .one(executor)
         .await
 }
@@ -313,6 +278,8 @@ pub struct ComponentListItem {
     pub component_id: String,
     pub name: String,
     pub active_version_id: Option<String>,
+    pub active_version: Option<String>,
+    pub active_version_created_at: Option<DateTime<Utc>>,
     pub ingress_enabled: bool,
     pub created_at: DateTime<Utc>,
 }
@@ -323,8 +290,31 @@ pub async fn list_components(
     tenant_id: &str,
 ) -> Result<Vec<ComponentListItem>, DbErr> {
     components::Entity::find()
+        .join(
+            JoinType::LeftJoin,
+            components::Entity::belongs_to(component_versions::Entity)
+                .from((
+                    components::Column::TenantId,
+                    components::Column::Id,
+                    components::Column::ActiveVersionId,
+                ))
+                .to((
+                    component_versions::Column::TenantId,
+                    component_versions::Column::ComponentId,
+                    component_versions::Column::Id,
+                ))
+                .on_condition(|_, _| {
+                    Condition::all().add(component_versions::Column::DeletedAt.is_null())
+                })
+                .into(),
+        )
         .select_only()
         .column_as(components::Column::Id, "component_id")
+        .column_as(component_versions::Column::Version, "active_version")
+        .column_as(
+            component_versions::Column::CreatedAt,
+            "active_version_created_at",
+        )
         .columns([
             components::Column::Name,
             components::Column::ActiveVersionId,
@@ -344,7 +334,6 @@ pub async fn list_components(
 pub struct VersionListItem {
     pub version_id: String,
     pub version: String,
-    pub status: String,
     pub size_bytes: i64,
     pub wasm_sha256: String,
     pub created_at: DateTime<Utc>,
@@ -361,7 +350,6 @@ pub async fn list_versions(
         .column_as(component_versions::Column::Id, "version_id")
         .columns([
             component_versions::Column::Version,
-            component_versions::Column::Status,
             component_versions::Column::SizeBytes,
             component_versions::Column::WasmSha256,
             component_versions::Column::CreatedAt,
@@ -375,12 +363,14 @@ pub async fn list_versions(
         .await
 }
 
-#[derive(Debug, FromQueryResult)]
+/// Read-only API projection. Environment values and storage references are excluded.
+#[derive(Debug, serde::Serialize, DerivePartialModel)]
+#[sea_orm(entity = "component_versions::Entity")]
 pub struct VersionDetails {
+    #[sea_orm(from_col = "id")]
     pub version_id: String,
     pub wasm_sha256: String,
     pub build_metadata: Option<Value>,
-    pub capabilities: Value,
 }
 
 /// Explicit selectors keep legacy names distinct from immutable version IDs.
@@ -404,19 +394,10 @@ pub async fn version_details(
     component_id: &str,
     version: VersionRef<'_>,
 ) -> Result<Option<VersionDetails>, DbErr> {
-    component_versions::Entity::find()
-        .select_only()
-        .column_as(component_versions::Column::Id, "version_id")
-        .columns([
-            component_versions::Column::WasmSha256,
-            component_versions::Column::BuildMetadata,
-            component_versions::Column::Capabilities,
-        ])
-        .filter(component_versions::Column::TenantId.eq(tenant_id))
+    hibana_database::queries::live_versions(tenant_id)
         .filter(component_versions::Column::ComponentId.eq(component_id))
         .filter(version.condition())
-        .filter(component_versions::Column::DeletedAt.is_null())
-        .into_model::<VersionDetails>()
+        .into_partial_model::<VersionDetails>()
         .one(executor)
         .await
 }
@@ -485,29 +466,6 @@ pub async fn version_capabilities(
         .into_tuple::<Value>()
         .one(executor)
         .await
-}
-
-/// Replace a version's capability document when an administrator changes egress.
-/// The caller preserves imports and the environment fixed at deployment.
-/// Returns false if the version does not exist or has been deleted.
-pub async fn set_version_capabilities(
-    executor: &impl ConnectionTrait,
-    tenant_id: &str,
-    version_id: &str,
-    capabilities: &Value,
-) -> Result<bool, DbErr> {
-    Ok(component_versions::Entity::update_many()
-        .col_expr(
-            component_versions::Column::Capabilities,
-            Expr::val(capabilities.clone()),
-        )
-        .filter(component_versions::Column::TenantId.eq(tenant_id))
-        .filter(component_versions::Column::Id.eq(version_id))
-        .filter(component_versions::Column::DeletedAt.is_null())
-        .exec(executor)
-        .await?
-        .rows_affected
-        > 0)
 }
 
 /// version を soft delete する (deleted_at=now(), §6.7)。

@@ -84,15 +84,12 @@ impl Host for HostState {
             .resolve(&name)
             .map(|addr| addr.ip())
             .filter(|ip| seen.insert(*ip))
+            .map(Into::into)
             .collect();
         if addresses.is_empty() {
             return Err(ErrorCode::NameUnresolvable.into());
         }
-        let stream = ResolveAddressStream::Done(Ok(addresses
-            .into_iter()
-            .map(Into::into)
-            .collect::<Vec<_>>()
-            .into_iter()));
+        let stream = ResolveAddressStream::Done(Ok(addresses.into_iter()));
         Ok(self.table.push(stream)?)
     }
 }

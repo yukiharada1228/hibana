@@ -14,7 +14,7 @@ use axum::{
     Json,
 };
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
-use hibana_shared::{FaasError, Redacted, Scope};
+use hibana_shared::{FaasError, Redacted, Role, Scope};
 use openidconnect::{
     core::{CoreAuthenticationFlow, CoreClient, CoreClientAuthMethod, CoreProviderMetadata},
     AccessTokenHash, AuthType, AuthorizationCode, ClientId, ClientSecret, CsrfToken, IssuerUrl,
@@ -53,7 +53,7 @@ type Client = CoreClient<
 >;
 
 impl config::OidcConfig {
-    async fn client(&self) -> Result<(Client, http::Http), AppError> {
+    async fn client(&self) -> Result<(Client, http::Http, bool), AppError> {
         let http = http::Http::new(self).map_err(|_| FaasError::Unavailable)?;
         // Discovery is repeated for each bounded login step so signing-key rotation
         // never requires restarting the platform. Only operator-configured issuers.
@@ -63,6 +63,11 @@ impl config::OidcConfig {
         )
         .await
         .map_err(|_| FaasError::Unavailable)?;
+        // Email is optional. Do not break an openid-only provider with an
+        // unsupported scope; it can still honor the voluntary claims request.
+        let email_scope = metadata
+            .scopes_supported()
+            .is_some_and(|scopes| scopes.iter().any(|scope| scope.as_str() == "email"));
         for endpoint in [
             Some(metadata.authorization_endpoint().url()),
             metadata.token_endpoint().map(|u| u.url()),
@@ -92,7 +97,7 @@ impl config::OidcConfig {
         .set_redirect_uri(
             RedirectUrl::new(self.callback_url.clone()).map_err(|_| FaasError::Unavailable)?,
         );
-        Ok((client, http))
+        Ok((client, http, email_scope))
     }
 }
 
@@ -138,6 +143,8 @@ struct Grant {
     subject: String,
     scopes: Vec<Scope>,
     console: bool,
+    // Optional display metadata from the verified ID token, never an identity key.
+    email: Option<String>,
 }
 
 fn opaque(value: &str, min: usize, max: usize) -> bool {
@@ -162,7 +169,6 @@ async fn throttle(state: &AppState, headers: &HeaderMap, peer: SocketAddr) -> Re
                     refill_per_sec: rate,
                     capacity,
                 },
-                crate::store::now_unix_millis(),
             )
             .await
             .map_err(|_| FaasError::Unavailable)?;
@@ -184,7 +190,7 @@ pub async fn start(
     if !opaque(&req.state, 32, 128)
         || !opaque(&req.code_challenge, 43, 43)
         || URL_SAFE_NO_PAD.decode(&req.code_challenge).is_err()
-        || req.scopes.len() > 4
+        || req.scopes.len() > Role::Admin.ceiling().len()
         || !crate::public_apps::valid_label(&req.tenant_slug)
     {
         return Err(FaasError::InvalidRequest("invalid login request".into()).into());
@@ -195,14 +201,18 @@ pub async fn start(
     let tenant = db::find_tenant_id_by_slug(state.pool(), &req.tenant_slug)
         .await?
         .ok_or(FaasError::Unauthorized)?;
-    let (client, _) = cfg.client().await?;
+    let (client, _, email_scope) = cfg.client().await?;
     let (challenge, verifier) = PkceCodeChallenge::new_random_sha256();
-    let (url, csrf, nonce) = client
-        .authorize_url(
-            CoreAuthenticationFlow::AuthorizationCode,
-            CsrfToken::new_random,
-            Nonce::new_random,
-        )
+    let mut authorization = client.authorize_url(
+        CoreAuthenticationFlow::AuthorizationCode,
+        CsrfToken::new_random,
+        Nonce::new_random,
+    );
+    if email_scope {
+        authorization = authorization.add_scope(openidconnect::Scope::new("email".into()));
+    }
+    let (url, csrf, nonce) = authorization
+        .add_extra_param("claims", r#"{"id_token":{"email":null}}"#)
         .set_pkce_challenge(challenge)
         .url();
     let flow = Flow {
@@ -298,7 +308,7 @@ async fn finish_provider(
     let code = code
         .filter(|c| !c.is_empty() && c.len() <= 8192)
         .ok_or(FaasError::Unauthorized)?;
-    let (client, http) = cfg.client().await?;
+    let (client, http, _) = cfg.client().await?;
     let response = client
         .exchange_code(AuthorizationCode::new(code))
         .map_err(|_| FaasError::Unavailable)?
@@ -345,6 +355,7 @@ async fn finish_provider(
         subject: subject.into(),
         scopes: flow.scopes.clone(),
         console: flow.redirect_uri == cfg.console_url,
+        email: display_email(claims.email().map(|email| email.as_str())).map(str::to_owned),
     };
     state
         .store()
@@ -417,6 +428,21 @@ async fn exchange_grant(
     }
     let role = db::parse_role(Some(&user.role)).ok_or(FaasError::Unauthorized)?;
     let scopes = resolve_login_scopes(&grant.scopes, role);
+    // The PKCE handoff, current membership and revocation generation have all
+    // been checked under the user lock. Failed/abandoned logins cannot mutate
+    // the profile, and profile changes never rebind identities or revoke tokens.
+    if let Some(email) = grant.email.as_deref().filter(|email| *email != user.email) {
+        db::update_user_email(&tx, &grant.tenant, &user.id, email).await?;
+        db::insert_audit_log(
+            &tx,
+            &grant.tenant,
+            Some(&user.id),
+            "user_profile_updated",
+            Some(&user.id),
+            Some(&serde_json::json!({ "via": "oidc", "fields": ["email"] })),
+        )
+        .await?;
+    }
     let scope_names: Vec<String> = scopes.iter().map(|s| s.as_str().into()).collect();
     let secret = generate_secret();
     let token_id = hibana_shared::new_token_id();
@@ -481,4 +507,36 @@ pub(crate) fn no_store(mut response: Response) -> Response {
         .headers_mut()
         .insert(header::REFERRER_POLICY, "no-referrer".parse().unwrap());
     response
+}
+
+/// A bounded display label, not proof of mailbox ownership. `email_verified`
+/// deliberately does not affect login, authorization, or this display cache.
+fn display_email(email: Option<&str>) -> Option<&str> {
+    email.filter(|value| {
+        !value.trim().is_empty() && value.len() <= 320 && !value.chars().any(char::is_control)
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::display_email;
+
+    #[test]
+    fn optional_display_email_is_bounded_without_normalizing_identity() {
+        for email in ["Alice@Example.test", "利用者@example.test"] {
+            assert_eq!(display_email(Some(email)), Some(email));
+        }
+        assert_eq!(display_email(None), None);
+        for email in [
+            "",
+            "   ",
+            "alice\n@example.test",
+            "alice\0@example.test",
+            "\u{0085}",
+        ] {
+            assert_eq!(display_email(Some(email)), None);
+        }
+        assert_eq!(display_email(Some(&"a".repeat(321))), None);
+        assert_eq!(display_email(Some(&"あ".repeat(107))), None);
+    }
 }

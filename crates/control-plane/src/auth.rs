@@ -71,17 +71,7 @@ fn extract_bearer(req_headers: &axum::http::HeaderMap) -> Option<String> {
 pub fn hash_token(secret: &str) -> String {
     use sha2::{Digest, Sha256};
     let digest = Sha256::digest(secret.as_bytes());
-    hex_lower(&digest)
-}
-
-/// バイト列を小文字 hex 文字列に変換する。
-fn hex_lower(bytes: &[u8]) -> String {
-    let mut s = String::with_capacity(bytes.len() * 2);
-    for b in bytes {
-        s.push(char::from_digit((b >> 4) as u32, 16).unwrap());
-        s.push(char::from_digit((b & 0xf) as u32, 16).unwrap());
-    }
-    s
+    hex::encode(digest)
 }
 
 /// 認証 middleware。Bearer/Cookieのsecretをハッシュ照合し `Principal` を確立する。
@@ -116,7 +106,6 @@ pub async fn authenticate(State(state): State<AppState>, req: Request, next: Nex
 
 #[derive(Clone)]
 pub struct TokenMetadata {
-    pub id: String,
     pub expires_at: chrono::DateTime<chrono::Utc>,
 }
 
@@ -154,7 +143,6 @@ async fn authenticate_request(
         return Err(FaasError::Unauthorized.into());
     }
     req.extensions_mut().insert(TokenMetadata {
-        id: row.token_id.clone(),
         expires_at: row.expires_at,
     });
 

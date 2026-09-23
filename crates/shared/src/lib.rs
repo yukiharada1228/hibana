@@ -1,5 +1,6 @@
 use std::time::Duration;
 
+use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use uuid::Uuid;
@@ -14,6 +15,7 @@ pub mod http;
 pub mod metrics;
 pub mod otel;
 pub mod preparation;
+pub mod subprocess;
 
 // ============================================================================
 // ID 採番ヘルパ（uuid 由来の不透明文字列）
@@ -116,9 +118,7 @@ impl std::fmt::Display for ExecutionStatus {
 pub enum Scope {
     /// 読み取り（一覧・取得）。
     Read,
-    /// 関数の invoke。
-    Invoke,
-    /// component / version のデプロイ・削除。
+    /// component / version のデプロイ・公開設定・ロールバック。
     Deploy,
     /// テナント管理（トークン・ユーザ管理）。
     Admin,
@@ -129,7 +129,6 @@ impl Scope {
     pub fn as_str(&self) -> &'static str {
         match self {
             Scope::Read => "read",
-            Scope::Invoke => "invoke",
             Scope::Deploy => "deploy",
             Scope::Admin => "admin",
         }
@@ -149,7 +148,7 @@ impl std::fmt::Display for Scope {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Role {
-    /// 一般メンバー（read / invoke / deploy）。
+    /// 一般メンバー（read / deploy）。
     Member,
     /// テナント管理者（member + admin）。
     Admin,
@@ -166,12 +165,12 @@ impl Role {
 
     /// このロールが付与しうるスコープ上限。
     ///
-    /// member => read, invoke, deploy
-    /// admin  => read, invoke, deploy, admin
+    /// member => read, deploy
+    /// admin  => read, deploy, admin
     pub fn ceiling(&self) -> &'static [Scope] {
         match self {
-            Role::Member => &[Scope::Read, Scope::Invoke, Scope::Deploy],
-            Role::Admin => &[Scope::Read, Scope::Invoke, Scope::Deploy, Scope::Admin],
+            Role::Member => &[Scope::Read, Scope::Deploy],
+            Role::Admin => &[Scope::Read, Scope::Deploy, Scope::Admin],
         }
     }
 }
@@ -187,12 +186,7 @@ pub struct JobMessage {
     pub execution_id: String,
     pub tenant_id: String,
     pub component: String,
-    pub version: String,
     pub wasm_sha256: String,
-    /// Retained for mixed-version rollouts. HTTP jobs send an empty string;
-    /// artifact download credentials are issued only by the preparation endpoint.
-    #[serde(default)]
-    pub wasm_url: String,
     pub input: Value,
     #[serde(default)]
     pub job_token: String,
@@ -276,27 +270,12 @@ const JOB_TOKEN_DOMAIN: &[u8] = b"faas-job-token-v1";
 /// signer と verifier は **必ず同じこの関数** を呼ぶ。どちらか一方でも再実装
 /// したり serde_json を使うと検証が黙って失敗するか、最悪偽造可能になる。
 pub fn job_claims_signing_bytes(c: &JobClaims) -> Vec<u8> {
-    // 事前に概算容量を確保（厳密でなくてよい）。
-    let mut out = Vec::with_capacity(
-        4 + JOB_TOKEN_DOMAIN.len()
-            + 4 * 4
-            + c.execution_id.len()
-            + c.tenant_id.len()
-            + c.version_id.len()
-            + c.kid.len()
-            + 16,
-    );
-
-    // ドメインタグ（文字列フィールドと同じ規則: 長さ前置）。
-    write_len_prefixed(&mut out, JOB_TOKEN_DOMAIN);
-    // 6 フィールドを固定順で。
-    write_len_prefixed(&mut out, c.execution_id.as_bytes());
-    write_len_prefixed(&mut out, c.tenant_id.as_bytes());
-    write_len_prefixed(&mut out, c.version_id.as_bytes());
-    write_len_prefixed(&mut out, c.kid.as_bytes());
-    out.extend_from_slice(&c.iat.to_be_bytes());
-    out.extend_from_slice(&c.exp.to_be_bytes());
-    out
+    claims_signing_bytes(
+        JOB_TOKEN_DOMAIN,
+        &[&c.execution_id, &c.tenant_id, &c.version_id, &c.kid],
+        c.iat,
+        c.exp,
+    )
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -331,26 +310,31 @@ const ENV_TOKEN_DOMAIN: &[u8] = b"faas-env-token-v1";
 /// `job_claims_signing_bytes` と同じ作法（ドメインタグ + 4 バイト BE 長さ前置 + 固定順）。
 /// serde_json を使わない理由も同じ（map/key 順序が非正準でドリフトすると検証が黙って壊れる）。
 pub fn env_claims_signing_bytes(c: &EnvClaims) -> Vec<u8> {
+    claims_signing_bytes(
+        ENV_TOKEN_DOMAIN,
+        &[
+            &c.execution_id,
+            &c.tenant_id,
+            &c.version_id,
+            &c.component_id,
+            &c.aud,
+            &c.kid,
+        ],
+        c.iat,
+        c.exp,
+    )
+}
+
+fn claims_signing_bytes(domain: &[u8], fields: &[&str], iat: i64, exp: i64) -> Vec<u8> {
     let mut out = Vec::with_capacity(
-        4 + ENV_TOKEN_DOMAIN.len()
-            + 5 * 4
-            + c.execution_id.len()
-            + c.tenant_id.len()
-            + c.version_id.len()
-            + c.component_id.len()
-            + c.aud.len()
-            + c.kid.len()
-            + 16,
+        4 + domain.len() + fields.iter().map(|field| 4 + field.len()).sum::<usize>() + 16,
     );
-    write_len_prefixed(&mut out, ENV_TOKEN_DOMAIN);
-    write_len_prefixed(&mut out, c.execution_id.as_bytes());
-    write_len_prefixed(&mut out, c.tenant_id.as_bytes());
-    write_len_prefixed(&mut out, c.version_id.as_bytes());
-    write_len_prefixed(&mut out, c.component_id.as_bytes());
-    write_len_prefixed(&mut out, c.aud.as_bytes());
-    write_len_prefixed(&mut out, c.kid.as_bytes());
-    out.extend_from_slice(&c.iat.to_be_bytes());
-    out.extend_from_slice(&c.exp.to_be_bytes());
+    write_len_prefixed(&mut out, domain);
+    for field in fields {
+        write_len_prefixed(&mut out, field.as_bytes());
+    }
+    out.extend_from_slice(&iat.to_be_bytes());
+    out.extend_from_slice(&exp.to_be_bytes());
     out
 }
 
@@ -363,82 +347,18 @@ fn write_len_prefixed(out: &mut Vec<u8>, bytes: &[u8]) {
 }
 
 // ----------------------------------------------------------------------------
-// base64url (RFC 4648 §5) パディングなし。pure-Rust 手実装（外部依存なし）。
+// base64url (RFC 4648 §5) パディングなし。
 // ----------------------------------------------------------------------------
-
-const B64URL_ALPHABET: &[u8; 64] =
-    b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
 
 /// 任意バイト列を base64url（パディングなし）に符号化する。
 pub fn b64url_encode(input: &[u8]) -> String {
-    let mut out = String::with_capacity(input.len().div_ceil(3) * 4);
-    // 3 バイト固定長で切り出す。`as_chunks::<3>()` は配列参照 `&[u8; 3]` を返すので、
-    // 添字アクセスの境界チェックがコンパイル時に消える（`chunks_exact` はスライスを返すため
-    // 残らざるを得ない）。第 2 要素が端数。
-    let (chunks, rem) = input.as_chunks::<3>();
-    for chunk in chunks {
-        let n = (u32::from(chunk[0]) << 16) | (u32::from(chunk[1]) << 8) | u32::from(chunk[2]);
-        out.push(B64URL_ALPHABET[((n >> 18) & 0x3f) as usize] as char);
-        out.push(B64URL_ALPHABET[((n >> 12) & 0x3f) as usize] as char);
-        out.push(B64URL_ALPHABET[((n >> 6) & 0x3f) as usize] as char);
-        out.push(B64URL_ALPHABET[(n & 0x3f) as usize] as char);
-    }
-    match rem.len() {
-        1 => {
-            let n = u32::from(rem[0]) << 16;
-            out.push(B64URL_ALPHABET[((n >> 18) & 0x3f) as usize] as char);
-            out.push(B64URL_ALPHABET[((n >> 12) & 0x3f) as usize] as char);
-        }
-        2 => {
-            let n = (u32::from(rem[0]) << 16) | (u32::from(rem[1]) << 8);
-            out.push(B64URL_ALPHABET[((n >> 18) & 0x3f) as usize] as char);
-            out.push(B64URL_ALPHABET[((n >> 12) & 0x3f) as usize] as char);
-            out.push(B64URL_ALPHABET[((n >> 6) & 0x3f) as usize] as char);
-        }
-        _ => {}
-    }
-    out
+    URL_SAFE_NO_PAD.encode(input)
 }
 
 /// base64url（パディングなし）を復号する。
-///
-/// パディング文字 `=` は受け付けない（no-pad 前提）。不正な文字・不正な長さは
-/// `None` を返す（検証側が drop+audit できるよう全失敗を一様に表す）。
+/// 不正な文字・長さ・余剰ビットは `None` を返す。
 pub fn b64url_decode(input: &str) -> Option<Vec<u8>> {
-    let bytes = input.as_bytes();
-    // base64 の最終グループは 1 文字だけ（= 端数 6bit のみ）にはならない。
-    if bytes.len() % 4 == 1 {
-        return None;
-    }
-    let mut out = Vec::with_capacity(bytes.len() / 4 * 3 + 2);
-    let mut acc: u32 = 0;
-    let mut nbits: u32 = 0;
-    for &b in bytes {
-        let v = b64url_decode_char(b)?;
-        acc = (acc << 6) | u32::from(v);
-        nbits += 6;
-        if nbits >= 8 {
-            nbits -= 8;
-            out.push((acc >> nbits) as u8);
-        }
-    }
-    // 末尾に残るビット（< 8）はすべて 0 でなければならない（正準性）。
-    if nbits > 0 && (acc & ((1 << nbits) - 1)) != 0 {
-        return None;
-    }
-    Some(out)
-}
-
-/// base64url 1 文字 -> 6bit 値。無効文字は `None`。
-fn b64url_decode_char(c: u8) -> Option<u8> {
-    match c {
-        b'A'..=b'Z' => Some(c - b'A'),
-        b'a'..=b'z' => Some(c - b'a' + 26),
-        b'0'..=b'9' => Some(c - b'0' + 52),
-        b'-' => Some(62),
-        b'_' => Some(63),
-        _ => None,
-    }
+    URL_SAFE_NO_PAD.decode(input).ok()
 }
 
 // ============================================================================
@@ -568,7 +488,7 @@ impl ResourceLimits {
     /// 実行不能な構成として拒否する（既定 0 はサーバが許可しない）。max_fuel は `None` を
     /// 既定とし、`Some(0)` は「即 fuel 切れ」になるため拒否する（仕様の上限は無いので
     /// 上限チェックは行わない）。
-    pub fn validate(&self) -> Result<()> {
+    pub fn validate(&self) -> Result<(), FaasError> {
         if self.max_memory_bytes == 0 {
             return Err(FaasError::InvalidRequest(
                 "max_memory_bytes must be > 0".into(),
@@ -625,16 +545,11 @@ impl ResourceLimits {
 // エラー
 // ============================================================================
 
-/// 共有エラー型。両 bin がこれを横断的に使用する。
-/// TODO(§6.5): M3/M4 でエラー分類を拡張する（リトライ可否など）。
+/// 入力検証と管理APIのエラー。実行結果はExecutionStatusで表す。
 #[derive(Debug, thiserror::Error)]
 pub enum FaasError {
     #[error("service temporarily unavailable")]
     Unavailable,
-    /// メッセージの (de)serialize 失敗。
-    #[error("serialization error: {0}")]
-    Serialization(#[from] serde_json::Error),
-
     /// 認証失敗（トークン欠損・不一致・失効・期限切れ）。
     #[error("unauthorized")]
     Unauthorized,
@@ -655,20 +570,10 @@ pub enum FaasError {
     #[error("conflict: {0}")]
     Conflict(String),
 
-    /// ハンドラ実行失敗。
-    #[error("execution failed: {0}")]
-    Execution(String),
-
-    /// 実行が wall-time を超過した。
-    #[error("execution timed out")]
-    Timeout,
-
     /// その他内部エラー。
     #[error("internal error: {0}")]
     Internal(String),
 }
-
-pub type Result<T> = std::result::Result<T, FaasError>;
 
 #[cfg(test)]
 mod tests {
@@ -779,9 +684,7 @@ mod tests {
             execution_id: "exec_1".into(),
             tenant_id: "default".into(),
             component: "echo".into(),
-            version: "1.0.0".into(),
             wasm_sha256: "abc123".into(),
-            wasm_url: "http://localhost:9000/faas-components/x?sig".into(),
             input: serde_json::json!({"k": "v"}),
 
             job_token: "payload.sig".into(),
@@ -791,7 +694,6 @@ mod tests {
         let json = serde_json::to_string(&job).unwrap();
         let back: JobMessage = serde_json::from_str(&json).unwrap();
         assert_eq!(back.wasm_sha256, "abc123");
-        assert_eq!(back.wasm_url, "http://localhost:9000/faas-components/x?sig");
         assert_eq!(back.job_token, "payload.sig");
         // M7c: env_token も同様（secret を持たない component では wire に一切現れない）。
         assert!(!json.contains("env_token"));
@@ -821,6 +723,15 @@ mod tests {
         };
         let jb = job_claims_signing_bytes(&job);
         let eb = env_claims_signing_bytes(&env);
+        // Fixed wire vectors catch changes shared by both signer and verifier.
+        assert_eq!(
+            b64url_encode(&jb),
+            "AAAAEWZhYXMtam9iLXRva2VuLXYxAAAABmV4ZWNfMQAAAAV0ZW5fYQAAAAV2ZXJfMQAAAAJrMQAAAAAAAAABAAAAAAAAAAI"
+        );
+        assert_eq!(
+            b64url_encode(&eb),
+            "AAAAEWZhYXMtZW52LXRva2VuLXYxAAAABmV4ZWNfMQAAAAV0ZW5fYQAAAAV2ZXJfMQAAAAVjbXBfMQAAAAdqb2ItZW52AAAAAmsxAAAAAAAAAAEAAAAAAAAAAg"
+        );
         assert_ne!(jb, eb);
         // ドメインタグは先頭に長さ前置で入る。
         assert!(eb.windows(17).any(|w| w == b"faas-env-token-v1"));
@@ -848,7 +759,7 @@ mod tests {
 
     #[test]
     fn messages_decode_without_job_token_field() {
-        let job_json = r#"{"execution_id":"exec_1","tenant_id":"default","component":"echo","version":"1.0.0","wasm_sha256":"abc","wasm_url":"http://x","input":{}}"#;
+        let job_json = r#"{"execution_id":"exec_1","tenant_id":"default","component":"echo","wasm_sha256":"abc","input":{}}"#;
         let job: JobMessage = serde_json::from_str(job_json).unwrap();
         assert_eq!(job.job_token, "");
 
@@ -1172,7 +1083,8 @@ mod tests {
 
     #[test]
     fn scope_snake_case_and_as_str() {
-        assert_eq!(serde_json::to_string(&Scope::Invoke).unwrap(), "\"invoke\"");
+        assert_eq!(serde_json::to_string(&Scope::Deploy).unwrap(), "\"deploy\"");
+        assert!(serde_json::from_str::<Scope>("\"invoke\"").is_err());
         let s: Scope = serde_json::from_str("\"deploy\"").unwrap();
         assert_eq!(s, Scope::Deploy);
         assert_eq!(Scope::Admin.as_str(), "admin");
@@ -1182,13 +1094,10 @@ mod tests {
     #[test]
     fn role_ceiling() {
         assert_eq!(serde_json::to_string(&Role::Member).unwrap(), "\"member\"");
-        assert_eq!(
-            Role::Member.ceiling(),
-            &[Scope::Read, Scope::Invoke, Scope::Deploy]
-        );
+        assert_eq!(Role::Member.ceiling(), &[Scope::Read, Scope::Deploy]);
         assert_eq!(
             Role::Admin.ceiling(),
-            &[Scope::Read, Scope::Invoke, Scope::Deploy, Scope::Admin]
+            &[Scope::Read, Scope::Deploy, Scope::Admin]
         );
         // member の上限に admin は含まれない。
         assert!(!Role::Member.ceiling().contains(&Scope::Admin));

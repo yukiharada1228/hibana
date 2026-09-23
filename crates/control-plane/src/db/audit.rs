@@ -23,7 +23,7 @@ pub async fn insert_audit_log(
         detail: Set(detail.cloned()),
         ..Default::default()
     })
-    .exec(executor)
+    .exec_without_returning(executor)
     .await?;
     Ok(())
 }

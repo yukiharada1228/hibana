@@ -2,20 +2,22 @@
 //!
 //! control-plane だけが Ed25519 署名鍵を持つ（worker は鍵なし）。invoke handler が
 //! ジョブごとの [`JobClaims`] を署名して不透明な `job_token` を mint し、worker が
-//! result に verbatim に echo、subscriber がここで kid を選んで検証する。
+//! result に verbatim に echo、Control Plane がここで kid と署名を検証する。
 //!
 //! 設計上の最重要点:
 //! - 署名対象バイトは **必ず** `hibana_shared::job_claims_signing_bytes` が組み立てる
 //!   正準形（長さ前置・固定順・ドメイン分離）を使う。搬送 JSON のキー順・空白には
-//!   一切依存しない（[`Verifier::verify`] は受け取った JSON を一度 [`JobClaims`] に
+//!   一切依存しない（[`Signer::verify`] は受け取った JSON を一度 [`JobClaims`] に
 //!   パースしてから正準バイトを **再導出** する）。
 //! - 検証は `verify_strict`（Ed25519 の弱鍵/非正準 S を弾く厳格版）を使う。
-//! - kid -> 公開鍵のマップで鍵を選ぶ（rotation-ready。現状は 1 エントリ）。
+//! - kid は設定済みの鍵 ID と照合し、未知の鍵は拒否する。
 //!
 //! wire 形: `job_token = b64url_nopad(json(JobClaims)) "." b64url_nopad(sig_64)`。
 
-use std::collections::HashMap;
-
+use base64::{
+    engine::general_purpose::{STANDARD, STANDARD_NO_PAD},
+    Engine as _,
+};
 use ed25519_dalek::{Signature, Signer as _, SigningKey, VerifyingKey};
 
 use hibana_shared::{
@@ -32,11 +34,11 @@ pub enum VerifyError {
     MalformedToken,
     /// payload セグメントの base64url 復号に失敗。
     PayloadDecode,
-    /// payload JSON を JobClaims にパースできない。
+    /// payload JSON を要求された用途の claim にパースできない。
     PayloadJson,
     /// signature セグメントの base64url 復号に失敗、または 64 バイトでない。
     SignatureDecode,
-    /// claim の kid が検証鍵マップに無い（未知 kid）。
+    /// claim の kid が設定済みの鍵 ID と一致しない。
     UnknownKid,
     /// Ed25519 署名検証に失敗（改竄・別鍵）。
     BadSignature,
@@ -62,71 +64,39 @@ impl std::fmt::Display for VerifyError {
     }
 }
 
-/// Ed25519 署名器。単一の署名鍵と、それに紐づく active kid を持つ。
-///
-/// `verify` も兼ねられるよう、内部に [`Verifier`]（kid -> 公開鍵マップ）を保持する。
-/// 現状はマップに 1 エントリ（active kid -> 自鍵の公開鍵）だけ入る（rotation-ready）。
+/// Internal token signing and verification with the configured key and key ID.
+/// The library's SigningKey already contains its corresponding verifying key.
 pub struct Signer {
     key: SigningKey,
     kid: String,
-    verifier: Verifier,
 }
 
 impl Signer {
-    /// 32 バイトの Ed25519 seed と kid から署名器を構築する。
-    ///
-    /// seed から導出した公開鍵を `kid` で検証マップに登録する。
     pub fn from_seed(seed: [u8; 32], kid: String) -> Self {
-        let key = SigningKey::from_bytes(&seed);
-        let verifying = key.verifying_key();
-        let mut map = HashMap::new();
-        map.insert(kid.clone(), verifying);
-        Signer {
-            key,
+        Self {
+            key: SigningKey::from_bytes(&seed),
             kid,
-            verifier: Verifier { keys: map },
         }
     }
 
-    /// active kid。
     pub fn kid(&self) -> &str {
         &self.kid
     }
 
-    /// claim を署名し、不透明な `job_token` 文字列を返す。
-    ///
-    /// 署名対象は **正準バイト**（`job_claims_signing_bytes`）。wire には JSON を
-    /// 載せるが、検証側はその JSON 順序を信用せず正準バイトを再導出する。
     pub fn sign(&self, claims: &JobClaims) -> String {
-        let signing_bytes = job_claims_signing_bytes(claims);
-        let sig: Signature = self.key.sign(&signing_bytes);
-        // 搬送 JSON。serde_json の出力順は検証に影響しない（再正準化するため）。
-        let payload = serde_json::to_vec(claims).expect("JobClaims serialize never fails");
-        format!(
-            "{}.{}",
-            b64url_encode(&payload),
-            b64url_encode(&sig.to_bytes())
-        )
+        self.sign_token(claims, &job_claims_signing_bytes(claims))
     }
 
-    /// env-token（secret 引き換え専用）を署名する (M7c, §4.6)。
-    ///
-    /// 鍵は job_token と同じ Ed25519 鍵を流用するが、署名バイトの**ドメインタグが異なる**ため
-    /// （`faas-env-token-v1` vs `faas-job-token-v1`）、両者を相互に使い回すことはできない。
-    /// 用途の取り違えは `aud` の検査でも二重に防ぐ。
     pub fn sign_env(&self, claims: &EnvClaims) -> String {
-        let signing_bytes = env_claims_signing_bytes(claims);
-        let sig: Signature = self.key.sign(&signing_bytes);
-        let payload = serde_json::to_vec(claims).expect("EnvClaims serialize never fails");
-        format!(
-            "{}.{}",
-            b64url_encode(&payload),
-            b64url_encode(&sig.to_bytes())
-        )
+        self.sign_token(claims, &env_claims_signing_bytes(claims))
     }
 
     pub fn sign_preparation(&self, claims: &hibana_shared::preparation::Claims) -> String {
-        let signature: Signature = self.key.sign(&claims.signing_bytes());
+        self.sign_token(claims, &claims.signing_bytes())
+    }
+
+    fn sign_token(&self, claims: &impl serde::Serialize, signing_bytes: &[u8]) -> String {
+        let signature: Signature = self.key.sign(signing_bytes);
         format!(
             "{}.{}",
             b64url_encode(&serde_json::to_vec(claims).expect("claims serialize")),
@@ -134,105 +104,52 @@ impl Signer {
         )
     }
 
-    /// 検証器への参照（subscriber が `state.verifier()` 経由で使う）。
-    pub fn verifier(&self) -> &Verifier {
-        &self.verifier
+    /// Verify authenticity only. Callers enforce expiry and execution provenance;
+    /// admitted work can still complete after its admission token has expired.
+    pub fn verify(&self, token: &str) -> Result<JobClaims, VerifyError> {
+        self.verify_token(token, |claims: &JobClaims| {
+            (&claims.kid, job_claims_signing_bytes(claims))
+        })
     }
-}
 
-/// kid -> 公開鍵のマップで `job_token` を検証する（rotation-ready）。
-pub struct Verifier {
-    keys: HashMap<String, VerifyingKey>,
-}
+    pub fn verify_env(&self, token: &str) -> Result<EnvClaims, VerifyError> {
+        self.verify_token(token, |claims: &EnvClaims| {
+            (&claims.kid, env_claims_signing_bytes(claims))
+        })
+    }
 
-impl Verifier {
     pub fn verify_preparation(
         &self,
         token: &str,
     ) -> Result<hibana_shared::preparation::Claims, VerifyError> {
-        let (payload, signature) = token.split_once('.').ok_or(VerifyError::MalformedToken)?;
+        self.verify_token(token, |claims: &hibana_shared::preparation::Claims| {
+            (&claims.kid, claims.signing_bytes())
+        })
+    }
+
+    // The three typed entry points select distinct canonical signing domains.
+    // JSON transports claims; its whitespace/key order is never signed directly.
+    fn verify_token<C: serde::de::DeserializeOwned>(
+        &self,
+        token: &str,
+        signing_input: fn(&C) -> (&str, Vec<u8>),
+    ) -> Result<C, VerifyError> {
+        let (payload, signature) = token
+            .split_once('.')
+            .filter(|(_, signature)| !signature.contains('.'))
+            .ok_or(VerifyError::MalformedToken)?;
         let payload = b64url_decode(payload).ok_or(VerifyError::PayloadDecode)?;
-        let claims: hibana_shared::preparation::Claims =
-            serde_json::from_slice(&payload).map_err(|_| VerifyError::PayloadJson)?;
+        let claims: C = serde_json::from_slice(&payload).map_err(|_| VerifyError::PayloadJson)?;
         let signature = b64url_decode(signature).ok_or(VerifyError::SignatureDecode)?;
         let signature =
             Signature::from_slice(&signature).map_err(|_| VerifyError::SignatureDecode)?;
-        let key = self.keys.get(&claims.kid).ok_or(VerifyError::UnknownKid)?;
-        key.verify_strict(&claims.signing_bytes(), &signature)
-            .map_err(|_| VerifyError::BadSignature)?;
-        Ok(claims)
-    }
-    /// `job_token` を検証し、成功時に正準パース済みの [`JobClaims`] を返す。
-    ///
-    /// 手順（§3.3）:
-    /// 1. `.` で 2 セグメントに分割。
-    /// 2. seg0 を b64url 復号 -> JSON -> [`JobClaims`]。
-    /// 3. `job_claims_signing_bytes(&claims)` で **正準バイトを再導出**（JSON 順序非依存）。
-    /// 4. seg1 を b64url 復号 -> 64 バイト署名。
-    /// 5. claims.kid で公開鍵を選び `verify_strict`。
-    ///
-    /// claim 内容（execution_id / tenant_id / version_id の行突き合わせ・exp 判定）は
-    /// 署名検証の **後** に subscriber 側で行う（ここは署名の真正性のみ判定する）。
-    pub fn verify(&self, token: &str) -> Result<JobClaims, VerifyError> {
-        let mut parts = token.split('.');
-        let seg0 = parts.next().ok_or(VerifyError::MalformedToken)?;
-        let seg1 = parts.next().ok_or(VerifyError::MalformedToken)?;
-        if parts.next().is_some() {
-            return Err(VerifyError::MalformedToken);
+        let (kid, signing_bytes) = signing_input(&claims);
+        if kid != self.kid {
+            return Err(VerifyError::UnknownKid);
         }
-
-        let payload = b64url_decode(seg0).ok_or(VerifyError::PayloadDecode)?;
-        let claims: JobClaims =
-            serde_json::from_slice(&payload).map_err(|_| VerifyError::PayloadJson)?;
-
-        let sig_bytes = b64url_decode(seg1).ok_or(VerifyError::SignatureDecode)?;
-        let sig_arr: [u8; 64] = sig_bytes
-            .as_slice()
-            .try_into()
-            .map_err(|_| VerifyError::SignatureDecode)?;
-        let signature = Signature::from_bytes(&sig_arr);
-
-        let key = self.keys.get(&claims.kid).ok_or(VerifyError::UnknownKid)?;
-
-        // 検証も signer と同一の正準バイトを再導出して行う（JSON 順序を信用しない）。
-        let signing_bytes = job_claims_signing_bytes(&claims);
-        key.verify_strict(&signing_bytes, &signature)
+        self.key
+            .verify_strict(&signing_bytes, &signature)
             .map_err(|_| VerifyError::BadSignature)?;
-
-        Ok(claims)
-    }
-
-    /// env-token を検証し、成功時に正準パース済みの [`EnvClaims`] を返す (M7c, §4.6)。
-    ///
-    /// `verify` と同じ手順（b64url 2 セグメント → JSON → **正準バイト再導出** → kid で鍵選択 →
-    /// `verify_strict`）だが、署名バイトのドメインタグが異なるため job_token を渡しても通らない。
-    /// `aud` の検査は呼び出し側（引き換えハンドラ）が行う（claim 内容の検査は署名検証の後、
-    /// という `verify` の分業と揃える）。
-    pub fn verify_env(&self, token: &str) -> Result<EnvClaims, VerifyError> {
-        let mut parts = token.split('.');
-        let seg0 = parts.next().ok_or(VerifyError::MalformedToken)?;
-        let seg1 = parts.next().ok_or(VerifyError::MalformedToken)?;
-        if parts.next().is_some() {
-            return Err(VerifyError::MalformedToken);
-        }
-
-        let payload = b64url_decode(seg0).ok_or(VerifyError::PayloadDecode)?;
-        let claims: EnvClaims =
-            serde_json::from_slice(&payload).map_err(|_| VerifyError::PayloadJson)?;
-
-        let sig_bytes = b64url_decode(seg1).ok_or(VerifyError::SignatureDecode)?;
-        let sig_arr: [u8; 64] = sig_bytes
-            .as_slice()
-            .try_into()
-            .map_err(|_| VerifyError::SignatureDecode)?;
-        let signature = Signature::from_bytes(&sig_arr);
-
-        let key = self.keys.get(&claims.kid).ok_or(VerifyError::UnknownKid)?;
-
-        let signing_bytes = env_claims_signing_bytes(&claims);
-        key.verify_strict(&signing_bytes, &signature)
-            .map_err(|_| VerifyError::BadSignature)?;
-
         Ok(claims)
     }
 }
@@ -264,14 +181,8 @@ pub fn decode_key32(raw: &str, env_name: &str) -> anyhow::Result<[u8; 32]> {
     // 1. hex（64 文字）。
     if raw.len() == 64 && raw.bytes().all(|b| b.is_ascii_hexdigit()) {
         let mut out = [0u8; 32];
-        for (i, byte) in out.iter_mut().enumerate() {
-            let hi = hex_val(raw.as_bytes()[i * 2]);
-            let lo = hex_val(raw.as_bytes()[i * 2 + 1]);
-            match (hi, lo) {
-                (Some(h), Some(l)) => *byte = (h << 4) | l,
-                _ => anyhow::bail!("{env_name}: invalid hex"),
-            }
-        }
+        hex::decode_to_slice(raw, &mut out)
+            .map_err(|_| anyhow::anyhow!("{env_name}: invalid hex"))?;
         return Ok(out);
     }
 
@@ -280,8 +191,11 @@ pub fn decode_key32(raw: &str, env_name: &str) -> anyhow::Result<[u8; 32]> {
         return to_seed32(bytes, env_name);
     }
 
-    // 3. 標準 base64（'+'/'/' と '=' パディング）。手実装（外部 base64 依存を避ける）。
-    if let Some(bytes) = std_base64_decode(raw) {
+    // 3. 標準 base64（'+'/'/'、パディングあり/なし）。不正な余剰ビットや末尾は拒否する。
+    if let Ok(bytes) = STANDARD
+        .decode(raw)
+        .or_else(|_| STANDARD_NO_PAD.decode(raw))
+    {
         return to_seed32(bytes, env_name);
     }
 
@@ -296,43 +210,6 @@ fn to_seed32(bytes: Vec<u8>, env_name: &str) -> anyhow::Result<[u8; 32]> {
     Ok(arr)
 }
 
-fn hex_val(b: u8) -> Option<u8> {
-    match b {
-        b'0'..=b'9' => Some(b - b'0'),
-        b'a'..=b'f' => Some(b - b'a' + 10),
-        b'A'..=b'F' => Some(b - b'A' + 10),
-        _ => None,
-    }
-}
-
-/// 標準 base64（RFC 4648 §4、`+`/`/`、`=` パディング許容）の最小デコーダ。
-/// dev 用の seed 受理のためだけに使う（厳密な正準性検査はしない）。
-fn std_base64_decode(input: &str) -> Option<Vec<u8>> {
-    let mut acc: u32 = 0;
-    let mut nbits: u32 = 0;
-    let mut out = Vec::with_capacity(input.len() / 4 * 3 + 3);
-    for &b in input.as_bytes() {
-        if b == b'=' {
-            break;
-        }
-        let v = match b {
-            b'A'..=b'Z' => b - b'A',
-            b'a'..=b'z' => b - b'a' + 26,
-            b'0'..=b'9' => b - b'0' + 52,
-            b'+' => 62,
-            b'/' => 63,
-            _ => return None,
-        };
-        acc = (acc << 6) | u32::from(v);
-        nbits += 6;
-        if nbits >= 8 {
-            nbits -= 8;
-            out.push((acc >> nbits) as u8);
-        }
-    }
-    Some(out)
-}
-
 // ---------------------------------------------------------------------------
 // M9a: Component 署名検証（§6.2 / §15 M9）
 // ---------------------------------------------------------------------------
@@ -342,7 +219,7 @@ fn std_base64_decode(input: &str) -> Option<Vec<u8>> {
 pub enum ComponentSigError {
     /// 署名（base64url）が復号できない / 64 バイトでない。
     BadSignatureEncoding,
-    /// 登録公開鍵が復号できない / 32 バイトでない。
+    /// 登録公開鍵が不正、または厳格な署名検証で拒否される弱い鍵。
     BadPublicKey,
     /// どの登録鍵でも検証に通らなかった。
     NoMatchingKey,
@@ -381,25 +258,16 @@ pub fn verify_component_signature(
 ) -> Result<(), ComponentSigError> {
     let sig_bytes =
         b64url_decode(signature_b64url).ok_or(ComponentSigError::BadSignatureEncoding)?;
-    let sig_arr: [u8; 64] = sig_bytes
-        .as_slice()
-        .try_into()
-        .map_err(|_| ComponentSigError::BadSignatureEncoding)?;
-    let signature = Signature::from_bytes(&sig_arr);
+    let signature =
+        Signature::from_slice(&sig_bytes).map_err(|_| ComponentSigError::BadSignatureEncoding)?;
 
     let message = sha256_hex.as_bytes();
 
-    // 公開鍵の復号に失敗した鍵は「壊れた登録」なので、その鍵だけスキップして他を試す。
-    // 1 つも登録鍵が復号できなければ BadPublicKey、復号はできたが全て検証失敗なら NoMatchingKey。
+    // 不正・弱い鍵をスキップし、有効な登録鍵をすべて試す。
+    // 有効な鍵が無ければ BadPublicKey、署名が一致しなければ NoMatchingKey。
     let mut any_usable_key = false;
     for (_key_id, pk_b64) in keys {
-        let Some(pk_bytes) = b64url_decode(pk_b64) else {
-            continue;
-        };
-        let Ok(pk_arr): Result<[u8; 32], _> = pk_bytes.as_slice().try_into() else {
-            continue;
-        };
-        let Ok(vk) = VerifyingKey::from_bytes(&pk_arr) else {
+        let Ok(vk) = decode_public_key(pk_b64) else {
             continue;
         };
         any_usable_key = true;
@@ -417,15 +285,19 @@ pub fn verify_component_signature(
 /// 登録用の公開鍵文字列（base64url, パディング無し, 32 バイト）を検証する。
 ///
 /// admin が鍵を登録するときの入力バリデーション。復号できて 32 バイトかつ Ed25519 の
-/// 妥当な点であることまで確認する（後で検証時に確実に使える鍵だけを DB に入れる）。
+/// 妥当な点であり弱い鍵でないことを確認する（署名検証に使える鍵だけを DB に入れる）。
 pub fn validate_public_key_b64url(public_key: &str) -> Result<(), ComponentSigError> {
+    decode_public_key(public_key).map(|_| ())
+}
+
+fn decode_public_key(public_key: &str) -> Result<VerifyingKey, ComponentSigError> {
     let bytes = b64url_decode(public_key).ok_or(ComponentSigError::BadPublicKey)?;
-    let arr: [u8; 32] = bytes
-        .as_slice()
-        .try_into()
-        .map_err(|_| ComponentSigError::BadPublicKey)?;
-    VerifyingKey::from_bytes(&arr).map_err(|_| ComponentSigError::BadPublicKey)?;
-    Ok(())
+    let key =
+        VerifyingKey::try_from(bytes.as_slice()).map_err(|_| ComponentSigError::BadPublicKey)?;
+    if key.is_weak() {
+        return Err(ComponentSigError::BadPublicKey);
+    }
+    Ok(key)
 }
 
 #[cfg(test)]
@@ -443,15 +315,12 @@ mod tests {
             exp: 1120,
         };
         let token = signer.sign_preparation(&claims);
-        assert_eq!(
-            signer.verifier().verify_preparation(&token).unwrap(),
-            claims
-        );
+        assert_eq!(signer.verify_preparation(&token).unwrap(), claims);
         assert!(claims.valid_at(1000));
         assert!(!claims.valid_at(1120));
         assert!(!claims.valid_at(994));
-        assert!(signer.verifier().verify(&token).is_err());
-        assert!(signer.verifier().verify_env(&token).is_err());
+        assert!(signer.verify(&token).is_err());
+        assert!(signer.verify_env(&token).is_err());
         let job = hibana_shared::JobClaims {
             execution_id: "exec".into(),
             tenant_id: "tenant".into(),
@@ -460,10 +329,7 @@ mod tests {
             iat: 1000,
             exp: 1120,
         };
-        assert!(signer
-            .verifier()
-            .verify_preparation(&signer.sign(&job))
-            .is_err());
+        assert!(signer.verify_preparation(&signer.sign(&job)).is_err());
         let (_, signature) = token.split_once('.').unwrap();
         for changed in [
             Claims {
@@ -484,7 +350,7 @@ mod tests {
                 hibana_shared::b64url_encode(&serde_json::to_vec(&changed).unwrap()),
                 signature
             );
-            assert!(signer.verifier().verify_preparation(&forged).is_err());
+            assert!(signer.verify_preparation(&forged).is_err());
         }
     }
     use super::*;
@@ -582,13 +448,109 @@ mod tests {
         assert!(validate_public_key_b64url(&b64url_encode(&[0u8; 10])).is_err());
     }
 
+    #[test]
+    fn weak_public_keys_are_rejected_before_registration() {
+        let mut identity = [0; 32];
+        identity[0] = 1;
+        for bytes in [[0; 32], identity] {
+            assert!(VerifyingKey::from_bytes(&bytes).unwrap().is_weak());
+            let encoded = b64url_encode(&bytes);
+            assert_eq!(
+                validate_public_key_b64url(&encoded),
+                Err(ComponentSigError::BadPublicKey)
+            );
+        }
+    }
+
+    #[test]
+    fn token_domains_stay_distinct_even_when_the_payload_fits_every_claim_type() {
+        let s = signer();
+        let job = claims(1_700_000_120);
+        let env = EnvClaims {
+            execution_id: job.execution_id.clone(),
+            tenant_id: job.tenant_id.clone(),
+            version_id: job.version_id.clone(),
+            component_id: "cmp_1".into(),
+            aud: hibana_shared::ENV_TOKEN_AUDIENCE.into(),
+            kid: job.kid.clone(),
+            iat: job.iat,
+            exp: job.exp,
+        };
+        let preparation = hibana_shared::preparation::Claims {
+            tenant_id: job.tenant_id.clone(),
+            storage_uri: "ten_xyz/versions/ver_123.wasm".into(),
+            sha256: "a".repeat(64),
+            kid: job.kid.clone(),
+            iat: job.iat,
+            exp: job.exp,
+        };
+        let mut combined = serde_json::Map::new();
+        for value in [
+            serde_json::to_value(&job).unwrap(),
+            serde_json::to_value(&env).unwrap(),
+            serde_json::to_value(&preparation).unwrap(),
+        ] {
+            combined.extend(value.as_object().unwrap().clone());
+        }
+        // A hybrid object fits all schemas. Only the signing domain can reject
+        // substitution; JSON key order and whitespace must not affect it.
+        let payload = b64url_encode(&serde_json::to_vec_pretty(&combined).unwrap());
+        fn verify_all(s: &Signer, token: &str) -> [Result<(), VerifyError>; 3] {
+            [
+                s.verify(token).map(|_| ()),
+                s.verify_env(token).map(|_| ()),
+                s.verify_preparation(token).map(|_| ()),
+            ]
+        }
+        for (domain, token) in [
+            s.sign(&job),
+            s.sign_env(&env),
+            s.sign_preparation(&preparation),
+        ]
+        .iter()
+        .enumerate()
+        {
+            let (original_payload, signature) = token.split_once('.').unwrap();
+            let hybrid = format!("{payload}.{signature}");
+            for (checked_domain, outcome) in verify_all(&s, &hybrid).into_iter().enumerate() {
+                assert_eq!(
+                    outcome,
+                    if checked_domain == domain {
+                        Ok(())
+                    } else {
+                        Err(VerifyError::BadSignature)
+                    }
+                );
+            }
+            assert_eq!(
+                verify_all(&Signer::from_seed([8; 32], "k1".into()), &hybrid)[domain],
+                Err(VerifyError::BadSignature)
+            );
+            assert_eq!(
+                verify_all(&Signer::from_seed([7; 32], "other".into()), &hybrid)[domain],
+                Err(VerifyError::UnknownKid)
+            );
+            for (bad, expected) in [
+                ("nodot".into(), VerifyError::MalformedToken),
+                (format!("{token}.extra"), VerifyError::MalformedToken),
+                (format!("a+b.{signature}"), VerifyError::PayloadDecode),
+                (
+                    format!("{original_payload}.{}", b64url_encode(&[0; 63])),
+                    VerifyError::SignatureDecode,
+                ),
+            ] {
+                assert_eq!(verify_all(&s, &bad)[domain], Err(expected));
+            }
+        }
+    }
+
     /// sign -> verify の往復が一致する。
     #[test]
     fn sign_verify_roundtrip() {
         let s = signer();
         let c = claims(1_700_000_210);
         let token = s.sign(&c);
-        let back = s.verifier().verify(&token).expect("verify ok");
+        let back = s.verify(&token).expect("verify ok");
         assert_eq!(back, c);
     }
 
@@ -598,7 +560,7 @@ mod tests {
         let s = signer();
         let c = claims(1_700_000_210);
         let token = s.sign(&c);
-        let back = s.verifier().verify(&token).unwrap();
+        let back = s.verify(&token).unwrap();
         assert_eq!(back.kid, s.kid());
     }
 
@@ -614,10 +576,7 @@ mod tests {
         *last = if *last == 'A' { 'B' } else { 'A' };
         let bad: String = sig_chars.into_iter().collect();
         let tampered = format!("{payload}.{bad}");
-        assert_eq!(
-            s.verifier().verify(&tampered),
-            Err(VerifyError::BadSignature)
-        );
+        assert_eq!(s.verify(&tampered), Err(VerifyError::BadSignature));
     }
 
     /// payload(claim) を差し替えると、署名は元 claim に対するものなので BadSignature。
@@ -633,10 +592,7 @@ mod tests {
         };
         let forged_payload = b64url_encode(&serde_json::to_vec(&forged).unwrap());
         let tampered = format!("{forged_payload}.{sig}");
-        assert_eq!(
-            s.verifier().verify(&tampered),
-            Err(VerifyError::BadSignature)
-        );
+        assert_eq!(s.verify(&tampered), Err(VerifyError::BadSignature));
     }
 
     /// 別鍵で署名されたトークンは（同じ kid でも）BadSignature。
@@ -647,10 +603,7 @@ mod tests {
         let attacker = Signer::from_seed([9u8; 32], "k1".to_string());
         let token = attacker.sign(&claims(1_700_000_210));
         // verifier は signer_a の公開鍵を kid "k1" に持つので検証は失敗する。
-        assert_eq!(
-            signer_a.verifier().verify(&token),
-            Err(VerifyError::BadSignature)
-        );
+        assert_eq!(signer_a.verify(&token), Err(VerifyError::BadSignature));
     }
 
     /// 未知 kid は UnknownKid。
@@ -661,23 +614,17 @@ mod tests {
             kid: "k99".into(),
             ..claims(1_700_000_210)
         };
-        // claim を直接署名（kid=k99）するが、verifier マップには k1 しか無い。
+        // claim を直接署名（kid=k99）するが、設定済みの鍵 ID は k1。
         let token = s.sign(&c);
-        assert_eq!(s.verifier().verify(&token), Err(VerifyError::UnknownKid));
+        assert_eq!(s.verify(&token), Err(VerifyError::UnknownKid));
     }
 
     /// 形が壊れたトークンは MalformedToken。
     #[test]
     fn malformed_token_rejected() {
         let s = signer();
-        assert_eq!(
-            s.verifier().verify("nodot"),
-            Err(VerifyError::MalformedToken)
-        );
-        assert_eq!(
-            s.verifier().verify("a.b.c"),
-            Err(VerifyError::MalformedToken)
-        );
+        assert_eq!(s.verify("nodot"), Err(VerifyError::MalformedToken));
+        assert_eq!(s.verify("a.b.c"), Err(VerifyError::MalformedToken));
     }
 
     /// 不正な base64url payload / signature。
@@ -685,31 +632,27 @@ mod tests {
     fn bad_segments_rejected() {
         let s = signer();
         // payload が不正 base64url（'+' は url-safe では無効）。
-        assert_eq!(
-            s.verifier().verify("a+b.AAAA"),
-            Err(VerifyError::PayloadDecode)
-        );
+        assert_eq!(s.verify("a+b.AAAA"), Err(VerifyError::PayloadDecode));
         // payload は復号できるが JSON でない。
         let not_json = b64url_encode(b"not json");
-        let r = s.verifier().verify(&format!("{not_json}.AAAA"));
+        let r = s.verify(&format!("{not_json}.AAAA"));
         assert_eq!(r, Err(VerifyError::PayloadJson));
         // payload は正しい JobClaims JSON だが、署名が 64 バイトでない。
         let payload = b64url_encode(&serde_json::to_vec(&claims(1)).unwrap());
         let short_sig = b64url_encode(&[0u8; 10]);
         assert_eq!(
-            s.verifier().verify(&format!("{payload}.{short_sig}")),
+            s.verify(&format!("{payload}.{short_sig}")),
             Err(VerifyError::SignatureDecode)
         );
     }
 
-    /// expired なトークンも署名自体は有効（検証は通る）。exp は subscriber が
-    /// 「pending/running なら受理」の判定に使うのであって、ここでは弾かない。
+    /// 期限切れでも署名自体は有効。受付の期限と受付済み実行の完了条件は呼び出し側が判断する。
     #[test]
     fn expired_token_still_verifies_signature() {
         let s = signer();
         let c = claims(1); // 大昔の exp。
         let token = s.sign(&c);
-        let back = s.verifier().verify(&token).expect("signature still valid");
+        let back = s.verify(&token).expect("signature still valid");
         assert_eq!(back.exp, 1);
     }
 
@@ -731,6 +674,26 @@ mod tests {
             format!("{raw}=")
         };
         assert_eq!(decode_seed(&std_b64).unwrap(), [0u8; 32]);
+        // Both standard alphabet characters, with and without padding.
+        let seed = [0xfb; 32];
+        let encoded = STANDARD.encode(seed);
+        assert!(encoded.contains('+') && encoded.contains('/'));
+        assert_eq!(decode_seed(&encoded).unwrap(), seed);
+        assert_eq!(decode_seed(encoded.trim_end_matches('=')).unwrap(), seed);
+    }
+
+    #[test]
+    fn decode_seed_rejects_malformed_base64() {
+        let raw = "A".repeat(43); // 32 zero bytes, before padding.
+        for invalid in [
+            format!("{raw}=garbage"),
+            format!("{raw}=="),
+            format!("{raw}A="), // Wrong padding after a complete group.
+            format!("{}B=", "A".repeat(42)), // Nonzero trailing bits.
+            format!("{}B", "A".repeat(42)),
+        ] {
+            assert!(decode_seed(&invalid).is_err());
+        }
     }
 
     /// 32 バイトにならない seed は拒否。
@@ -753,6 +716,6 @@ mod tests {
             ..claims(0)
         };
         let token = s.sign(&c);
-        assert_eq!(s.verifier().verify(&token).unwrap().exp, exp);
+        assert_eq!(s.verify(&token).unwrap().exp, exp);
     }
 }

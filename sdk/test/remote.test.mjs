@@ -58,7 +58,7 @@ async function fixture(t) {
     { tls, redirect, scopes = ["read", "deploy", "admin"] } = {},
   ) {
     let components = [];
-    let egress = null;
+    let egress = [];
     const grants = new Map();
     const handler = async (req, res) => {
       const chunks = [];
@@ -117,7 +117,7 @@ async function fixture(t) {
       } else if (req.url.endsWith("/egress")) {
         if (req.method === "PATCH") {
           const change = JSON.parse(body),
-            next = new Set(egress || []);
+            next = new Set(egress);
           for (const value of change.allow || []) next.add(value);
           for (const value of change.deny || []) next.delete(value);
           egress = [...next].sort();
@@ -217,11 +217,11 @@ test("remote login, deploy, rollback, secrets and deletion work across directori
       assert.doesNotMatch(r.output, /old-version/);
     }
   }
-  assert.match((await f.invoke(["egress", "list"])).output, /No shared policy/);
+  assert.match((await f.invoke(["egress", "list"])).output, /No destinations allowed/);
   assert.deepEqual(
     JSON.parse((await f.invoke(["egress", "list", "--json"])).output),
     {
-      allow_outbound: null,
+      allow_outbound: [],
     },
   );
   const approved = await f.invoke([

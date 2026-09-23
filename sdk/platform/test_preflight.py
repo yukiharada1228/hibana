@@ -159,6 +159,32 @@ class ClusterFixture(unittest.TestCase):
 
 
 class PreflightTests(ClusterFixture):
+    def test_public_origin_is_required_without_a_legacy_domain_fallback(self):
+        settings = self.cluster.docs[1]["data"]
+        origin = settings.pop("APP_PUBLIC_ORIGIN")
+        settings["INGRESS_BASE_DOMAIN"] = "apps.test"
+        with self.assertRaisesRegex(ValueError, "APP_PUBLIC_ORIGIN"):
+            Preflight(self.cluster).settings(self.cluster.docs)
+        settings["APP_PUBLIC_ORIGIN"] = origin
+        with self.assertRaisesRegex(ValueError, "INGRESS_BASE_DOMAIN was removed"):
+            Preflight(self.cluster).settings(self.cluster.docs)
+        del settings["INGRESS_BASE_DOMAIN"]
+        Preflight(self.cluster).settings(self.cluster.docs)
+        self.assert_read_only()
+
+    def test_unlabelled_resource_is_not_adopted_from_apply_annotation(self):
+        namespace = deepcopy(self.cluster.docs[0])
+        self.cluster.live[resource_id(namespace)] = namespace
+        current = deepcopy(self.cluster.docs[-1])
+        metadata = current["metadata"]
+        metadata["labels"] = {}
+        metadata["annotations"] = {"kubectl.kubernetes.io/last-applied-configuration": json.dumps({
+            "metadata": {"name": metadata["name"], "namespace": "hibana"}})}
+        self.cluster.live[resource_id(current)] = current
+        with self.assertRaisesRegex(ValueError, "Resource belongs to another installation"):
+            self.output(self.cluster.prepare_install)
+        self.assert_read_only()
+
     def test_oidc_configuration_is_required_by_default(self):
         settings = self.cluster.docs[1]["data"]
         issuer = settings.pop("OIDC_ISSUER_URL")

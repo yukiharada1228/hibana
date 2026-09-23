@@ -17,8 +17,7 @@ const MAX_ENDPOINTS: usize = 64;
 
 #[derive(Serialize)]
 pub struct EgressPolicy {
-    // None retains legacy version-specific permissions; [] explicitly denies all.
-    allow_outbound: Option<BTreeSet<String>>,
+    allow_outbound: BTreeSet<String>,
 }
 
 #[derive(Deserialize)]
@@ -30,13 +29,8 @@ pub struct ChangeEgress {
     deny: Vec<String>,
 }
 
-pub fn policy(component: &db::ComponentRow) -> Result<Option<BTreeSet<String>>, AppError> {
-    component
-        .egress_policy
-        .clone()
-        .map(serde_json::from_value)
-        .transpose()
-        .map_err(Into::into)
+pub fn policy(component: &db::ComponentRow) -> Result<BTreeSet<String>, AppError> {
+    BTreeSet::deserialize(&component.egress_policy).map_err(Into::into)
 }
 
 pub(crate) fn normalize(endpoints: &[String]) -> Result<BTreeSet<String>, FaasError> {
@@ -122,7 +116,7 @@ pub async fn update(
         .await?
         .ok_or_else(|| FaasError::NotFound("component".into()))?;
     let before = policy(&component)?;
-    let mut approved = before.clone().unwrap_or_default();
+    let mut approved = before.clone();
     approved.extend(allow);
     approved.retain(|endpoint| !deny.contains(endpoint));
     if approved.len() > MAX_ENDPOINTS {
@@ -130,13 +124,7 @@ pub async fn update(
             FaasError::InvalidRequest("At most 64 egress destinations are allowed".into()).into(),
         );
     }
-    db::set_component_egress(
-        &tx,
-        tenant,
-        &id,
-        &approved.iter().cloned().collect::<Vec<_>>(),
-    )
-    .await?;
+    db::set_component_egress(&tx, tenant, &id, &approved).await?;
     db::insert_audit_log(
         &tx,
         tenant,
@@ -148,7 +136,7 @@ pub async fn update(
     .await?;
     tx.commit().await?;
     Ok(Json(EgressPolicy {
-        allow_outbound: Some(approved),
+        allow_outbound: approved,
     }))
 }
 

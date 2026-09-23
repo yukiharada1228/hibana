@@ -12,58 +12,6 @@ use axum::{
 use hibana_database::prelude::*;
 use hibana_shared::FaasError;
 
-/// Reuse the signed, idempotent finalizer over HTTP. NATS is not on the
-/// synchronous response path; transient retries repeat the result, never the guest.
-pub async fn complete(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-    Json(result): Json<hibana_shared::ResultMessage>,
-) -> Result<StatusCode, AppError> {
-    // Suspension and token expiry stop new work, but must not strand an
-    // admitted execution or reject a retry of its already-persisted result.
-    let claims = crate::job_auth::verified_claims(&state, &headers)?;
-    if claims.tenant_id != result.tenant_id
-        || claims.execution_id != result.execution_id
-        || headers
-            .get("x-hibana-job-token")
-            .and_then(|v| v.to_str().ok())
-            != Some(result.job_token.as_str())
-        || !result.status.is_terminal()
-    {
-        return Err(FaasError::Unauthorized.into());
-    }
-    let tx = state.pool().begin().await?;
-    db::set_tenant_guc(&tx, &claims.tenant_id).await?;
-    let status = executions::Entity::find()
-        .select_only()
-        .column(executions::Column::Status)
-        .filter(executions::Column::TenantId.eq(&claims.tenant_id))
-        .filter(executions::Column::Id.eq(&claims.execution_id))
-        .filter(executions::Column::VersionId.eq(&claims.version_id))
-        .filter(executions::Column::HttpRequest.eq(true))
-        .into_tuple::<String>()
-        .one(&tx)
-        .await?
-        .ok_or(FaasError::Unauthorized)?;
-    if status == result.status.as_str() {
-        return Ok(StatusCode::NO_CONTENT);
-    }
-    tx.commit().await?;
-    let payload = serde_json::to_vec(&result).map_err(FaasError::Serialization)?;
-    crate::completion::handle_message(&state, &claims.tenant_id, &payload)
-        .await
-        .map_err(|_| FaasError::Internal("HTTP result finalization failed".into()))?;
-    let tx = state.pool().begin().await?;
-    db::set_tenant_guc(&tx, &claims.tenant_id).await?;
-    let saved = db::get_execution(&tx, &claims.tenant_id, &claims.execution_id)
-        .await?
-        .ok_or(FaasError::Unauthorized)?;
-    tx.commit().await?;
-    if saved.status != result.status.as_str() {
-        return Err(FaasError::Conflict("HTTP result rejected".into()).into());
-    }
-    Ok(StatusCode::NO_CONTENT)
-}
 use serde_json::Value;
 
 pub async fn redeem(
@@ -85,13 +33,6 @@ pub async fn redeem(
         .column_as(
             Expr::col((
                 component_versions::Entity,
-                component_versions::Column::Version,
-            )),
-            "version",
-        )
-        .column_as(
-            Expr::col((
-                component_versions::Entity,
                 component_versions::Column::WasmSha256,
             )),
             "wasm_sha256",
@@ -107,10 +48,9 @@ pub async fn redeem(
         .one(&tx)
         .await?
         .ok_or(FaasError::Unauthorized)?;
-    let limits: hibana_shared::ResourceLimits =
-        serde_json::from_value(row.resource_limits).map_err(FaasError::Serialization)?;
+    let limits: hibana_shared::ResourceLimits = serde_json::from_value(row.resource_limits)?;
     let iat = chrono::Utc::now().timestamp();
-    let exp = iat + state.token_exp_offset_secs(limits.max_wall_time_ms);
+    let exp = iat.saturating_add(state.token_exp_offset_secs(limits.max_wall_time_ms));
     let component_id: String = row.component_id;
     let needs_env =
         db::version_has_live_secrets(&tx, &claims.tenant_id, &component_id, &claims.version_id)
@@ -137,9 +77,7 @@ pub async fn redeem(
         execution_id: claims.execution_id,
         tenant_id: claims.tenant_id,
         component: row.name,
-        version: row.version,
         wasm_sha256: row.wasm_sha256,
-        wasm_url: String::new(),
         input: row.input,
         job_token,
         env_token,
@@ -253,9 +191,7 @@ pub async fn accept(
         return Err(FaasError::Unauthorized.into());
     }
     let resolved = state.admission().resolve_for_tenant(tenant, &quotas);
-    if let Decision::Rejected(r) =
-        admission::check_rate_limit(state, tenant, &resolved, crate::store::now_unix_millis()).await
-    {
+    if let Decision::Rejected(r) = admission::check_rate_limit(state, tenant, &resolved).await {
         state
             .metrics()
             .admission_rejections_total
@@ -332,13 +268,13 @@ pub async fn accept(
         component_id: Set(component_id),
         version_id: Set(version_id.clone()),
         status: Set("pending".into()),
-        input: Set(Some(input.clone())),
+        input: Set(Some(input)),
         job_token_kid: Set(Some(state.signer().kid().into())),
         http_request: Set(true),
         created_at: Set(accepted_at),
         ..Default::default()
     })
-    .exec(&tx)
+    .exec_without_returning(&tx)
     .await?;
     tx.commit().await?;
     let guard = PendingDispatch {
@@ -435,7 +371,6 @@ struct RedeemedExecution {
     component_id: String,
     input: Value,
     name: String,
-    version: String,
     wasm_sha256: String,
     resource_limits: Value,
 }

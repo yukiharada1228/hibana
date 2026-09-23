@@ -57,11 +57,24 @@ class StartupTests(unittest.TestCase):
         conflict = k8s.urllib.error.HTTPError("", 409, "", {}, None)
         with patch("kubernetes.urllib.request.urlopen", side_effect=conflict) as request:
             self.cluster.bootstrap()
+        self.assertTrue(conflict.closed)
         self.assertEqual(request.call_count, 1)
         self.assertTrue(request.call_args.args[0].full_url.endswith("/admin/tenants"))
         body = json.loads(request.call_args.args[0].data)
         self.assertEqual(body["admin_oidc_subject"], "fixture-admin")
         self.assertNotIn("admin_password", body)
+
+    def test_readiness_closes_http_errors_before_retrying_or_returning(self):
+        unavailable = k8s.urllib.error.HTTPError("", 503, "", {}, None)
+        expected = k8s.urllib.error.HTTPError("", 401, "", {}, None)
+        def retry(_):
+            self.assertTrue(unavailable.closed)
+        with patch("kubernetes.urllib.request.urlopen", side_effect=[unavailable, expected]) as request, \
+                patch("kubernetes.time.sleep", side_effect=retry) as sleep:
+            k8s.wait_http("http://localhost/readyz", 401)
+        self.assertTrue(expected.closed)
+        self.assertEqual(request.call_count, 2)
+        sleep.assert_called_once_with(1)
 
     def test_new_tenant_uses_external_subject_without_password_login(self):
         self.cluster.credentials()
@@ -345,7 +358,7 @@ class StartupTests(unittest.TestCase):
 
 
 class MaintenanceCompatibilityTests(unittest.TestCase):
-    def test_probe_reads_binary_without_executing_legacy_server(self):
+    def test_probe_reads_binary_without_executing_unknown_server(self):
         target = MagicMock()
         maintenance = Maintenance(target)
         pods = {"cp": cp("cp")}
@@ -361,17 +374,18 @@ class MaintenanceCompatibilityTests(unittest.TestCase):
             # Neither fixture can be executed: the probe must inspect bytes only.
             with patch.object(maintenance, "pods", return_value=pods):
                 binary.write_bytes(b"\x7fELF\0original server\0")
-                self.assertFalse(maintenance.supports_protocol())
+                with self.assertRaisesRegex(ValueError, "protocol is unsupported"):
+                    maintenance.require_protocol()
                 binary.write_bytes(b"\x7fELF\0Usage: --maintenance close|open OWNER | status | prepare OWNER WORKER_IPS\0")
-                self.assertTrue(maintenance.supports_protocol())
+                maintenance.require_protocol()
                 binary.write_bytes(b"\x7fELF\0Usage: --maintenance different-protocol\0")
-                with self.assertRaisesRegex(ValueError, "Could not determine"):
-                    maintenance.supports_protocol()
+                with self.assertRaisesRegex(ValueError, "protocol is unsupported"):
+                    maintenance.require_protocol()
                 binary.unlink()
                 with self.assertRaises(subprocess.CalledProcessError):
-                    maintenance.supports_protocol()
+                    maintenance.require_protocol()
 
-    def test_probe_errors_are_never_treated_as_legacy(self):
+    def test_probe_errors_prevent_maintenance(self):
         for error in [subprocess.CalledProcessError(1, "kubectl"), subprocess.TimeoutExpired("kubectl", 15)]:
             with self.subTest(error=type(error).__name__):
                 target = MagicMock()
@@ -379,26 +393,26 @@ class MaintenanceCompatibilityTests(unittest.TestCase):
                 maintenance = Maintenance(target)
                 with patch.object(maintenance, "pods", return_value={"cp": cp("cp")}):
                     with self.assertRaises(type(error)):
-                        maintenance.supports_protocol()
+                        maintenance.require_protocol()
         maintenance = Maintenance(MagicMock())
         maintenance.target.kube.return_value = ""
         with patch.object(maintenance, "pods", return_value={"cp": cp("cp")}):
-            with self.assertRaisesRegex(ValueError, "Could not determine"):
-                maintenance.supports_protocol()
+            with self.assertRaisesRegex(ValueError, "protocol is unsupported"):
+                maintenance.require_protocol()
 
-    def test_mixed_or_replaced_control_planes_cannot_select_legacy_mode(self):
+    def test_mixed_or_replaced_control_planes_prevent_maintenance(self):
         target = MagicMock()
         maintenance = Maintenance(target)
         pods = {"old": cp("old"), "new": cp("new")}
-        target.kube.side_effect = ["legacy", "supported"]
+        target.kube.side_effect = ["supported", "unsupported"]
         with patch.object(maintenance, "pods", return_value=pods):
-            with self.assertRaisesRegex(ValueError, "mixes maintenance protocols"):
-                maintenance.supports_protocol()
+            with self.assertRaisesRegex(ValueError, "protocol is unsupported"):
+                maintenance.require_protocol()
         target.kube.side_effect = None
-        target.kube.return_value = "legacy"
+        target.kube.return_value = "supported"
         with patch.object(maintenance, "pods", side_effect=[{"old": cp("old")}, {"new": cp("new")}]):
             with self.assertRaisesRegex(ValueError, "Control Plane changed"):
-                maintenance.supports_protocol()
+                maintenance.require_protocol()
 
 
 class LifecycleTests(unittest.TestCase):
@@ -504,21 +518,22 @@ class LifecycleTests(unittest.TestCase):
         drain.assert_called_once()
         command.assert_called_once_with("docker", "stop", "--timeout", "60", "owned-a")
 
-    def test_local_legacy_stop_uses_grace_period_without_creating_pause_owner(self):
+    def test_local_unsupported_protocol_cannot_stop_nodes_or_create_pause_owner(self):
         with tempfile.TemporaryDirectory() as directory:
             cluster = k8s.LocalCluster("hibana-check")
             cluster.state = Path(directory)
             nodes = [{"Id": "owned", "State": {"Running": True}}]
             stopped = [{"Id": "owned", "State": {"Running": False}}]
             with patch.object(cluster, "owned_nodes", side_effect=[nodes, stopped]), patch("kubernetes.Maintenance") as maintenance, patch("kubernetes.run") as command:
-                maintenance.return_value.supports_protocol.return_value = False
-                cluster.stop()
+                maintenance.return_value.require_protocol.side_effect = ValueError("protocol is unsupported")
+                with self.assertRaisesRegex(ValueError, "protocol is unsupported"):
+                    cluster.stop()
                 maintenance.return_value.close.assert_not_called()
                 maintenance.return_value.drain.assert_not_called()
-                command.assert_called_once_with("docker", "stop", "--timeout", "60", "owned")
+                command.assert_not_called()
             self.assertFalse((cluster.state / "maintenance.json").exists())
 
-    def test_local_legacy_start_preserves_existing_owner_without_running_maintenance(self):
+    def test_local_unsupported_protocol_start_fails_and_preserves_existing_owner(self):
         with tempfile.TemporaryDirectory() as directory:
             cluster = k8s.LocalCluster("hibana-check")
             cluster.state = Path(directory)
@@ -526,8 +541,9 @@ class LifecycleTests(unittest.TestCase):
             before = '{"owner":"old-cli-owner"}'
             path.write_text(before)
             with patch.object(cluster, "owned_nodes", return_value=[{"Id": "owned", "Name": "/hibana-check-control-plane", "State": {"Running": False}}]), patch("kubernetes.run") as command, patch.object(cluster, "kube"), patch.object(cluster, "wait_workloads") as ready, patch("kubernetes.Maintenance") as maintenance:
-                maintenance.return_value.supports_protocol.return_value = False
-                cluster.start()
+                maintenance.return_value.require_protocol.side_effect = ValueError("protocol is unsupported")
+                with self.assertRaisesRegex(ValueError, "protocol is unsupported"):
+                    cluster.start()
                 ready.assert_called_once()
                 command.assert_called_once_with("docker", "start", "owned")
                 for action in ("close", "prepare", "open"):
@@ -535,7 +551,6 @@ class LifecycleTests(unittest.TestCase):
             self.assertEqual(path.read_text(), before)
             # After an upgrade, reopen the saved owner and remove it only on success.
             with patch("kubernetes.Maintenance") as maintenance:
-                maintenance.return_value.supports_protocol.return_value = True
                 cluster.resume_admission()
                 maintenance.return_value.close.assert_called_once_with("old-cli-owner")
                 maintenance.return_value.prepare.assert_called_once_with("old-cli-owner")
@@ -547,7 +562,7 @@ class LifecycleTests(unittest.TestCase):
             cluster = k8s.LocalCluster("hibana-check")
             cluster.state = Path(directory)
             with patch.object(cluster, "owned_nodes", return_value=[{"Id": "owned", "State": {"Running": True}}]), patch("kubernetes.Maintenance") as maintenance, patch("kubernetes.run") as command:
-                maintenance.return_value.supports_protocol.side_effect = subprocess.CalledProcessError(1, "kubectl")
+                maintenance.return_value.require_protocol.side_effect = subprocess.CalledProcessError(1, "kubectl")
                 with self.assertRaises(subprocess.CalledProcessError):
                     cluster.stop()
                 command.assert_not_called()
@@ -559,7 +574,6 @@ class LifecycleTests(unittest.TestCase):
             cluster = k8s.LocalCluster("hibana-check")
             cluster.state = Path(directory)
             with patch("kubernetes.Maintenance") as maintenance:
-                maintenance.return_value.supports_protocol.return_value = True
                 maintenance.return_value.close.side_effect = subprocess.TimeoutExpired("kubectl", 25)
                 with self.assertRaises(subprocess.TimeoutExpired):
                     cluster.pause_admission()

@@ -119,6 +119,7 @@ mod tests {
     #[tokio::test]
     async fn invalid_json_values_are_never_logged_even_at_debug_level() {
         use std::sync::{Arc, Mutex};
+        use tracing::instrument::WithSubscriber;
         struct Capture(Arc<Mutex<Vec<u8>>>);
         impl std::io::Write for Capture {
             fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
@@ -137,17 +138,20 @@ mod tests {
             .without_time()
             .with_writer(move || Capture(writer.clone()))
             .finish();
-        let _guard = tracing::subscriber::set_default(subscriber);
         let request = Request::builder()
             .header(header::CONTENT_TYPE, "application/json")
             .body(axum::body::Body::from(r#"{"a":"fixture-private-secret"}"#))
             .unwrap();
         let rejected = JsonBody::<Dummy>::from_request(request, &())
+            .with_subscriber(subscriber)
             .await
             .unwrap_err();
         assert_eq!(rejected.status(), StatusCode::BAD_REQUEST);
         let logs = String::from_utf8(output.lock().unwrap().clone()).unwrap();
-        assert!(logs.contains("rejected request body"));
+        assert!(
+            logs.contains("rejected request body"),
+            "captured logs: {logs}"
+        );
         assert!(!logs.contains("fixture-private-secret"));
     }
 

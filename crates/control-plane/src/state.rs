@@ -1,6 +1,6 @@
 use crate::db::TenantQuotaOverrides;
 use crate::metrics::Metrics;
-use crate::signing::{Signer, Verifier};
+use crate::signing::Signer;
 use crate::storage::Storage;
 use crate::store::{RateLimitParams, Store};
 use sea_orm::DatabaseConnection;
@@ -114,7 +114,7 @@ struct Inner {
     presign_ttl: Duration,
     bootstrap_admin_token: String,
     signer: Arc<Signer>,
-    token_exp_offset_secs: Box<dyn Fn(u64) -> i64 + Send + Sync>,
+    token_margin_secs: u64,
     store: Arc<dyn Store>,
     admission: AdmissionConfig,
     metrics: Arc<Metrics>,
@@ -132,7 +132,7 @@ impl AppState {
         presign_ttl_secs: u64,
         bootstrap_admin_token: String,
         signer: Arc<Signer>,
-        token_exp_offset_secs: Box<dyn Fn(u64) -> i64 + Send + Sync>,
+        token_margin_secs: u64,
         store: Arc<dyn Store>,
         admission: AdmissionConfig,
         metrics: Arc<Metrics>,
@@ -163,7 +163,7 @@ impl AppState {
                 presign_ttl: Duration::from_secs(presign_ttl_secs),
                 bootstrap_admin_token,
                 signer,
-                token_exp_offset_secs,
+                token_margin_secs,
                 store,
                 admission,
                 metrics,
@@ -236,13 +236,13 @@ impl AppState {
         &self.inner.signer
     }
 
-    pub fn verifier(&self) -> &Verifier {
-        self.inner.signer.verifier()
-    }
-
-    /// 壁時計上限（ms）から token exp オフセット秒数を計算する (§3.3)。
+    /// Wall-clock execution limit plus time for cold compilation and result persistence.
     pub fn token_exp_offset_secs(&self, wall_time_ms: u64) -> i64 {
-        (self.inner.token_exp_offset_secs)(wall_time_ms)
+        wall_time_ms
+            .div_ceil(1000)
+            .saturating_add(self.inner.token_margin_secs)
+            .saturating_add(120)
+            .min(i64::MAX as u64) as i64
     }
 
     /// Object Storage クライアント（本体保存 / presign, §3.4）。
@@ -377,20 +377,13 @@ mod tests {
         assert!(resolved.rate.capacity < c.rate.capacity);
 
         let store = InProcStore::new();
-        let now_ms = 1_000_000u64;
         // 1 度目は burst 内で許可。
-        let d1 = store
-            .rate_limit("ten_a", resolved.rate, now_ms)
-            .await
-            .unwrap();
+        let d1 = store.rate_limit("ten_a", resolved.rate).await.unwrap();
         assert!(d1.allowed);
         // 2 度目は burst (1) 越え → 上書き値が効いていれば拒否（Retry-After > 0）。
         // グローバル既定（50rps / burst 500）が効いていたら 2 度目も通ってしまうため、
         // ここが本テストの核心アサート。
-        let d2 = store
-            .rate_limit("ten_a", resolved.rate, now_ms)
-            .await
-            .unwrap();
+        let d2 = store.rate_limit("ten_a", resolved.rate).await.unwrap();
         assert!(
             !d2.allowed,
             "tenant override (burst=1) must clamp below the global default (burst=500)"

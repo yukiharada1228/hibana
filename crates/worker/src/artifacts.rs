@@ -285,7 +285,7 @@ impl ArtifactCache {
     fn verify_sha256(&self, bytes: &[u8], expected: &str) -> std::result::Result<(), ExecError> {
         let mut hasher = Sha256::new();
         hasher.update(bytes);
-        let actual = hex_encode(&hasher.finalize());
+        let actual = hex::encode(hasher.finalize());
         if actual.eq_ignore_ascii_case(expected) {
             Ok(())
         } else {
@@ -295,15 +295,6 @@ impl ArtifactCache {
         }
     }
 }
-fn hex_encode(bytes: &[u8]) -> String {
-    use std::fmt::Write as _;
-    let mut s = String::with_capacity(bytes.len() * 2);
-    for b in bytes {
-        let _ = write!(s, "{b:02x}");
-    }
-    s
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

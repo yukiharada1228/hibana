@@ -5,14 +5,17 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+base64 = { workspace = true }
+ipnet = { workspace = true }
 prometheus = { workspace = true }
 http = "1"
 serde = { workspace = true }
 serde_json = { workspace = true }
 uuid = { workspace = true }
 thiserror = { workspace = true }
+tokio = { workspace = true }
 # M7-0 (§5.1): Redacted<T> の Drop 時ゼロ化。
-zeroize = { workspace = true }
+zeroize = { workspace = true, features = ["serde"] }
 
 # M10 (§3.8): トレーシングの初期化を CP / worker で共有する
 # （両 bin で init_tracing がほぼ同一だったのを 1 箇所へ集約）。OTel は opt-in で、
@@ -23,3 +26,6 @@ opentelemetry = { workspace = true }
 opentelemetry_sdk = { workspace = true }
 opentelemetry-otlp = { workspace = true }
 tracing-opentelemetry = { workspace = true }
+
+[dev-dependencies]
+tempfile = "3.27"

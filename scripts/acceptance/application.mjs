@@ -4,7 +4,6 @@ import {resolve, join} from 'node:path';
 import {randomBytes, createHash} from 'node:crypto';
 import http from 'node:http';
 import {setTimeout as sleep} from 'node:timers/promises';
-import {apiClient} from '../../sdk/src/api.mjs';
 import {runCommand} from '../bounded-process.mjs';
 import {issueAcceptanceToken} from './credentials.mjs';
 
@@ -40,10 +39,10 @@ async function checkHealthy(release) {
   // Compare only a boolean so a regression cannot print Secret plaintext in CI.
   assert.ok(r.body === JSON.stringify(expected),'inventory response must match the public contract');
 }
-async function approve(version) {
+async function approve() {
   const origin=new URL(state.upstream);
-  await api(`/components/${state.component}/versions/${version}/capabilities/egress`,{
-    method:'PUT',body:{allow_outbound:[`${origin.hostname}:${origin.port || (origin.protocol==='https:' ? '443' : '80')}`]},
+  await api(`/components/${state.component}/egress`,{
+    method:'PATCH',body:{allow:[`${origin.hostname}:${origin.port || (origin.protocol==='https:' ? '443' : '80')}`]},
   });
 }
 if (process.argv[2] === '--verify-restored') {
@@ -95,7 +94,7 @@ if (process.argv[2] === '--verify-restored') {
     await cli(['delete','--all','--yes'],state.adminToken);
     result.phase='verify-deleted';
     const inventory=await api('/components');
-    assert.equal((Array.isArray(inventory) ? inventory : inventory.components).length,0,'active applications remain after deletion');
+    assert.equal(inventory.length,0,'active applications remain after deletion');
     assert.equal((await request('/health',null)).status,404,'deleted application is still reachable');
     result.passed=true;result.phase='complete';
   } finally {
@@ -139,7 +138,7 @@ if (process.argv[2] === '--verify-restored') {
   assert.equal((await request('/items/PEN-001','wrong')).status,401);
   assert.equal((await request('/items/invalid!')).status,400);
   assert.equal((await request('/items/PEN-001')).status,502,'outbound must stay denied before admin approval');
-  await approve('mvp-v1');
+  await approve();
   await checkHealthy('v1');
   const spoof=await request('/items/PEN-001?url=http://169.254.169.254',state.apiToken,{'x-hibana-env':Buffer.from('{"UPSTREAM_TOKEN":"forged"}').toString('base64url')});
   assert.equal(spoof.status,200);
@@ -160,7 +159,7 @@ if (process.argv[2] === '--verify-restored') {
   assert.notEqual(secondDigest,digest,'source update must produce a different artifact');
   delete config.main;config.component=artifact;await savePrivate('hibana.json',config);
   await cli(['deploy','--version','mvp-v2']);
-  await approve('mvp-v2');await checkHealthy('v2');
+  await checkHealthy('v2');
   await cli(['rollback','--version','mvp-v1']);await checkHealthy('v1');
   await cli(['rollback','--version','mvp-v2']);await checkHealthy('v2');
   await savePrivate('client.json',state);

@@ -139,88 +139,63 @@ impl Worker {
         // the runtime's own timeout starts. Persist the timeout outside this scope.
         let outcome = tokio::time::timeout_at(
             deadline,
-            self.execute(&job, resolved, component, stream, deadline)
+            self.execute(job, resolved, component, stream, deadline)
                 .instrument(tracing::debug_span!(target: "hibana_latency", "invocation", execution_id = %execution_id)),
         )
         .await
         .unwrap_or(Err(ExecError::Timeout));
-        let execution_succeeded = outcome.is_ok();
         let exec_elapsed = exec_started.elapsed();
         // wall_time_ms covers the DB claim, environment and runtime; it excludes
         // admission/configuration lookup, artifact preparation and result persistence.
-        // 成功経路は run_http が組んだ usage の
-        // wall_time_ms をこの値で上書きし、失敗/timeout 経路は wall のみ判る部分計量を組む。
-        let wall_time_ms = duration_to_millis(exec_elapsed);
-
-        let (status_label, result) = match outcome {
-            Ok((output, mut usage)) => {
+        let (status, output, error, mut usage) = match outcome {
+            Ok((output, usage)) => {
                 info!(%execution_id, "job succeeded");
-                // ランタイム実行前の準備時間も含める。
-                usage.wall_time_ms = wall_time_ms;
                 (
-                    "succeeded",
-                    ResultMessage {
-                        execution_id: execution_id.clone(),
-                        tenant_id: tenant_id.clone(),
-                        status: ExecutionStatus::Succeeded,
-                        output: Some(
-                            serde_json::json!({"status": output.status, "streamed": true}),
-                        ),
-                        error: None,
-                        job_token: job_token.clone(),
-                        usage: Some(usage),
-                    },
+                    ExecutionStatus::Succeeded,
+                    Some(serde_json::json!({"status": output.status, "streamed": true})),
+                    None,
+                    usage,
                 )
             }
             Err(ExecError::Timeout) => {
                 warn!(%execution_id, "job timed out");
                 (
-                    "timeout",
-                    ResultMessage {
-                        execution_id: execution_id.clone(),
-                        tenant_id: tenant_id.clone(),
-                        status: ExecutionStatus::Timeout,
-                        output: None,
-                        error: Some("execution timed out".to_string()),
-                        job_token: job_token.clone(),
-                        // M5 (§15): timeout/failed 経路は run_component が Err を返すため fuel/peak/
-                        // output は判らない。判る計量（wall_time_ms）のみ載せ、残りは 0（未計測）。
-                        usage: Some(UsageMetrics {
-                            wall_time_ms,
-                            ..UsageMetrics::default()
-                        }),
-                    },
+                    ExecutionStatus::Timeout,
+                    None,
+                    Some("execution timed out".to_string()),
+                    UsageMetrics::default(),
                 )
             }
             Err(ExecError::Failed(msg)) => {
                 warn!(%execution_id, "job failed (diagnostic retained in the tenant execution record)");
                 (
-                    "failed",
-                    ResultMessage {
-                        execution_id: execution_id.clone(),
-                        tenant_id: tenant_id.clone(),
-                        status: ExecutionStatus::Failed,
-                        output: None,
-                        error: Some(msg),
-                        job_token: job_token.clone(),
-                        // M5 (§15): 同上。失敗経路は wall_time_ms のみ確定。
-                        usage: Some(UsageMetrics {
-                            wall_time_ms,
-                            ..UsageMetrics::default()
-                        }),
-                    },
+                    ExecutionStatus::Failed,
+                    None,
+                    Some(msg),
+                    UsageMetrics::default(),
                 )
             }
+        };
+        // Errors carry only known wall time; success retains the runtime's other measurements.
+        usage.wall_time_ms = duration_to_millis(exec_elapsed);
+        let result = ResultMessage {
+            execution_id: execution_id.clone(),
+            tenant_id,
+            status,
+            output,
+            error,
+            job_token,
+            usage: Some(usage),
         };
 
         // M4a (§3.8): outcome 別に duration histogram + executions_total を更新する。
         self.metrics
             .wasmtime_execution_duration_seconds
-            .with_label_values(&[status_label])
+            .with_label_values(&[status.as_str()])
             .observe(exec_elapsed.as_secs_f64());
         self.metrics
             .executions_total
-            .with_label_values(&[status_label])
+            .with_label_values(&[status.as_str()])
             .inc();
 
         let persistence_started = std::time::Instant::now();
@@ -232,13 +207,13 @@ impl Worker {
             claim_us = claimed.duration_since(exec_started).as_micros() as u64,
             execute_us = exec_elapsed.saturating_sub(claimed.duration_since(exec_started)).as_micros() as u64,
             persist_us = persistence_started.elapsed().as_micros() as u64, "HTTP phase timing");
-        execution_succeeded
+        status == ExecutionStatus::Succeeded
     }
 
     /// Component を解決して handle を呼び出す。Timeout / Failed / 出力を返す。
     async fn execute(
         &self,
-        job: &JobMessage,
+        job: JobMessage,
         resolved: repository::ResolvedVersion,
         component: Arc<crate::runtime::PreparedComponent>,
         stream: crate::runtime::ResponseSender,
@@ -264,7 +239,7 @@ impl Worker {
             );
         }
 
-        let request = serde_json::from_value(job.input.clone())
+        let request = serde_json::from_value(job.input)
             .map_err(|_| ExecError::Failed("Invalid HTTP request envelope".into()))?;
 
         let approved_egress = self

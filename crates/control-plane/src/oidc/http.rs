@@ -124,7 +124,11 @@ mod tests {
         let mut config = super::super::config::tests::config();
         config.issuer = origin;
         config.allow_insecure_http = true;
-        let (client, http) = config.client().await.unwrap();
+        let (client, http, email_scope) = config.client().await.unwrap();
+        assert!(
+            !email_scope,
+            "missing email scope advertisement keeps openid-only login usable"
+        );
         let (authorization, _, _) = client
             .authorize_url(
                 CoreAuthenticationFlow::AuthorizationCode,

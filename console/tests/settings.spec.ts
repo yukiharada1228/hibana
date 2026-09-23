@@ -273,7 +273,7 @@ test("initial settings failures show no retained data or assumed egress policy",
   ).toHaveCount(0);
   await expect(page.getByLabel("通信先（ホスト名:ポート）")).toHaveCount(0);
   await expect(
-    page.getByText(/共通設定は未設定|なし（外部通信は拒否）/),
+    page.getByText("なし（外部通信は拒否）"),
   ).toHaveCount(0);
   await page.unroute("**/api/components/cmp_api/config");
   await page.unroute("**/api/components/cmp_api/egress");

@@ -31,7 +31,8 @@ struct Settings {
 struct DevState {
     runtime: Runtime,
     component: Arc<crate::runtime::PreparedComponent>,
-    settings: Settings,
+    resources: ResourceLimits,
+    built_env: env::BuiltEnv,
     outbound: Vec<EgressEndpoint>,
     slots: Arc<Semaphore>,
     shutdown: CancellationToken,
@@ -61,7 +62,7 @@ pub async fn run(args: &[String]) -> Result<()> {
     )?;
     settings.resources.validate()?;
     let outbound = parse_outbound(&settings.net_allow_outbound)?;
-    env::build_env(
+    let built_env = env::build_env(
         &settings.vars,
         &BTreeMap::new(),
         &settings.vars.keys().cloned().collect(),
@@ -73,12 +74,14 @@ pub async fn run(args: &[String]) -> Result<()> {
     let state = Arc::new(DevState {
         runtime: Runtime::new(engine, metrics::Metrics::init())?,
         component: Arc::new(crate::runtime::PreparedComponent::new(component)?),
-        settings,
+        resources: settings.resources,
+        built_env,
         outbound,
         slots: Arc::new(Semaphore::new(8)),
         shutdown: CancellationToken::new(),
         executions: TaskTracker::new(),
     });
+    drop(settings);
     let listener = tokio::net::TcpListener::bind(bind).await?;
     println!("Hibana (Wasmtime): http://{}", listener.local_addr()?);
     let listener = listener.tap_io(|stream| {
@@ -91,7 +94,7 @@ pub async fn run(args: &[String]) -> Result<()> {
     let executions = state.executions.clone();
     // Let admitted handlers finish, with one second to flush the response. The
     // validated execution limit is at most 60s, below the CLI's 65s kill timer.
-    let drain_timeout = state.settings.resources.max_execution_time() + Duration::from_secs(1);
+    let drain_timeout = state.resources.max_execution_time() + Duration::from_secs(1);
     let server = async move {
         axum::serve(listener, Router::new().fallback(invoke).with_state(state))
             .with_graceful_shutdown(async move {
@@ -159,18 +162,7 @@ async fn invoke(State(state): State<Arc<DevState>>, request: Request<Body>) -> R
     let (stream, response, completed) = crate::runtime::response_channel();
     state.executions.clone().spawn(async move {
         let _slot = slot;
-        let env = match env::build_env(
-            &state.settings.vars,
-            &BTreeMap::new(),
-            &state.settings.vars.keys().cloned().collect(),
-        ) {
-            Ok(env) => env,
-            Err(message) => {
-                tracing::warn!(reason = message, "invalid development environment");
-                return;
-            }
-        };
-        let deadline = Instant::now() + state.settings.resources.max_execution_time();
+        let deadline = Instant::now() + state.resources.max_execution_time();
         let approved_egress = resolve_outbound(&state.runtime, &state.outbound, deadline).await;
         let result = state
             .runtime
@@ -178,8 +170,8 @@ async fn invoke(State(state): State<Arc<DevState>>, request: Request<Body>) -> R
                 crate::runtime::Invocation {
                     component: state.component.clone(),
                     request,
-                    limits: state.settings.resources,
-                    built_env: env,
+                    limits: state.resources,
+                    built_env: state.built_env.clone(),
                     approved_egress,
                     deadline,
                 },
@@ -306,11 +298,8 @@ mod tests {
         Arc::new(DevState {
             runtime: Runtime::new(engine, metrics::Metrics::init()).unwrap(),
             component: Arc::new(crate::runtime::PreparedComponent::new(component).unwrap()),
-            settings: Settings {
-                vars: BTreeMap::new(),
-                resources: ResourceLimits::default(),
-                net_allow_outbound: Vec::new(),
-            },
+            resources: ResourceLimits::default(),
+            built_env: env::BuiltEnv::default(),
             outbound: Vec::new(),
             slots: Arc::new(Semaphore::new(8)),
             shutdown: CancellationToken::new(),

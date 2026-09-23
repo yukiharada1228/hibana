@@ -1,6 +1,5 @@
 //! Bounded multipart reception. No database transaction is held while receiving.
 use super::{deployment::VersionEnvironment, AppError};
-use crate::validation;
 use axum::{
     extract::{multipart::Field, Multipart},
     http::StatusCode,
@@ -8,17 +7,15 @@ use axum::{
     Json,
 };
 use hibana_shared::{FaasError, ResourceLimits};
-use serde_json::{json, Value};
+use serde_json::json;
 use std::time::Duration;
 
 const RECEIVE_TIMEOUT: Duration = Duration::from_secs(60);
 const MAX_METADATA_BYTES: usize = 256 * 1024;
-const MAX_FIELDS: usize = 16;
 
 pub(super) struct Upload {
     pub version: String,
     pub wasm_bytes: Vec<u8>,
-    pub capabilities: Option<Value>,
     pub signature: Option<String>,
     pub resource_limits: ResourceLimits,
     pub activate: bool,
@@ -43,7 +40,6 @@ async fn parse(mut multipart: Multipart, max_bytes: u64) -> Result<Upload, AppEr
     // --- multipart フィールドを収集 ---
     let mut version: Option<String> = None;
     let mut wasm_bytes: Option<Vec<u8>> = None;
-    let mut capabilities: Option<Value> = None;
     // M9a: 本体 sha256 に対する detached Ed25519 署名（base64url）。任意フィールド。
     let mut signature: Option<String> = None;
     let mut resource_limits: ResourceLimits = ResourceLimits::default();
@@ -51,20 +47,13 @@ async fn parse(mut multipart: Multipart, max_bytes: u64) -> Result<Upload, AppEr
     let mut ingress: Option<bool> = None;
     let mut environment = super::deployment::VersionEnvironment::default();
     let mut fields = std::collections::BTreeSet::new();
-    let mut field_count = 0;
 
     while let Some(mut field) = multipart
         .next_field()
         .await
         .map_err(|e| FaasError::InvalidRequest(format!("malformed multipart: {e}")))?
     {
-        field_count += 1;
-        if field_count > MAX_FIELDS || field.name().is_some_and(|name| name.len() > 128) {
-            return Err(FaasError::InvalidRequest(
-                "too many multipart fields or field name too long".into(),
-            )
-            .into());
-        }
+        // Only eight named fields are supported; rejecting duplicates bounds their count.
         if let Some(name) = field.name() {
             if !fields.insert(name.to_owned()) {
                 return Err(FaasError::InvalidRequest("duplicate multipart field".into()).into());
@@ -74,15 +63,6 @@ async fn parse(mut multipart: Multipart, max_bytes: u64) -> Result<Upload, AppEr
             Some("version") => {
                 let v = text(field).await?;
                 version = Some(v);
-            }
-            Some("capabilities") => {
-                let text = text(field).await?;
-                let parsed: Value = serde_json::from_str(&text).map_err(|e| {
-                    FaasError::InvalidRequest(format!("capabilities is not valid JSON: {e}"))
-                })?;
-                // envはvarsと承認済みSecret参照から構築する。生のcapabilities.envは拒否。
-                validation::reject_env_in_declared_capabilities(&parsed)?;
-                capabilities = Some(parsed);
             }
             Some("resource_limits") => {
                 let text = text(field).await?;
@@ -138,14 +118,8 @@ async fn parse(mut multipart: Multipart, max_bytes: u64) -> Result<Upload, AppEr
                     signature = Some(v);
                 }
             }
-            // 未知フィールドは無視（前方互換）。
             _ => {
-                while field
-                    .chunk()
-                    .await
-                    .map_err(|_| FaasError::InvalidRequest("invalid multipart field".into()))?
-                    .is_some()
-                {}
+                return Err(FaasError::InvalidRequest("unsupported multipart field".into()).into());
             }
         }
     }
@@ -174,7 +148,6 @@ async fn parse(mut multipart: Multipart, max_bytes: u64) -> Result<Upload, AppEr
     Ok(Upload {
         version,
         wasm_bytes,
-        capabilities,
         signature,
         resource_limits,
         activate,
@@ -210,6 +183,7 @@ mod tests {
         http::Request,
     };
     use futures::StreamExt;
+    use serde_json::Value;
 
     async fn multipart(body: Body) -> Multipart {
         Multipart::from_request(
@@ -224,6 +198,26 @@ mod tests {
     }
     fn field(name: &str, value: &str) -> String {
         format!("--fixture\r\nContent-Disposition: form-data; name=\"{name}\"\r\n\r\n{value}\r\n")
+    }
+
+    #[tokio::test]
+    async fn unsupported_fields_are_rejected_without_echoing_values() {
+        for name in ["capabilities", "resource_limit", "env", ""] {
+            let body = field(name, r#"{"env":["PRIVATE_FIXTURE"]}"#)
+                + &field("version", "1")
+                + &field("wasm", "wasm")
+                + "--fixture--\r\n";
+            let Err(response) = receive(multipart(Body::from(body)).await, 4).await else {
+                panic!("unsupported field accepted: {name:?}");
+            };
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+            let body = axum::body::to_bytes(response.into_body(), 1024)
+                .await
+                .unwrap();
+            let body = std::str::from_utf8(&body).unwrap();
+            assert!(body.contains("unsupported multipart field"));
+            assert!(!body.contains("PRIVATE_FIXTURE"));
+        }
     }
 
     #[tokio::test]
@@ -295,13 +289,8 @@ mod tests {
         for invalid in [
             valid.clone() + &field("version", "duplicate") + "--fixture--\r\n",
             valid.clone() + &field("vars", &"x".repeat(MAX_METADATA_BYTES + 1)) + "--fixture--\r\n",
-            valid.clone()
-                + &(0..MAX_FIELDS)
-                    .map(|i| field(&format!("ignored-{i}"), ""))
-                    .collect::<String>()
-                + "--fixture--\r\n",
             valid
-                + "--fixture\r\nContent-Disposition: form-data; name=\"ignored\"\r\n\r\ntruncated",
+                + "--fixture\r\nContent-Disposition: form-data; name=\"signature\"\r\n\r\ntruncated",
         ] {
             let Err(response) = receive(multipart(Body::from(invalid)).await, 4).await else {
                 panic!("invalid multipart accepted")

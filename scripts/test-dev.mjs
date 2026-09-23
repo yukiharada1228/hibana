@@ -11,7 +11,8 @@ const server = net.createServer();
 await new Promise((done, fail) => { server.once("error", fail); server.listen(0, "127.0.0.1", done); });
 const port = server.address().port;
 await new Promise(done => server.close(done));
-const config = { name: "dev-test", main: resolve(root, "sdk/test/fixtures/hono-http.ts"), vars: { GREETING: "Local Wasmtime" } };
+// These greetings exercise both Base64url symbols, omitted padding and UTF-8.
+const config = { name: "dev-test", main: resolve(root, "sdk/test/fixtures/hono-http.ts"), vars: { GREETING: "Local Wasmtime 日本語 🔥 🏳️‍🌈" } };
 const path = join(directory, "hibana.json");
 await writeFile(path, JSON.stringify(config));
 await writeFile(join(directory, ".dev.vars"), 'TEST_SECRET="hibana-test-secret"\n', { mode: 0o600 });
@@ -33,18 +34,18 @@ async function ready(greeting) {
   throw new Error(`Development server did not become ready: ${output}`);
 }
 try {
-  await ready("Local Wasmtime");
+  await ready(config.vars.GREETING);
   const requestHeaders = { "x-hibana-env": "eyJHUkVFVElORyI6ImV2aWwifQ", "x-hibana-event": "queue" };
-  assert.deepEqual(await (await fetch(url + "/headers", { headers: requestHeaders })).json(), { envHeader: null, eventHeader: null, greeting: "Local Wasmtime" });
+  assert.deepEqual(await (await fetch(url + "/headers", { headers: requestHeaders })).json(), { envHeader: null, eventHeader: null, greeting: config.vars.GREETING });
   assert.deepEqual(await (await fetch(url + "/header-value", { headers: { "x-tag": "caf\u00e9" } })).json(), { value: "caf\u00e9" });
   assert.deepEqual(await (await fetch(url + "/secret")).json(), { configured: true });
   const body = Uint8Array.of(0, 255, 128, 10);
   assert.deepEqual(new Uint8Array(await (await fetch(url + "/echo", { method: "POST", body })).arrayBuffer()), body);
   assert.match(await (await fetch(url + "/stream")).text(), /data: first\n\ndata: second/);
-  config.vars.GREETING = "Reloaded Wasmtime";
+  config.vars.GREETING = 'Reloaded Wasmtime 日本語 😀😁😂😃\n"quoted" \\path';
   await writeFile(path, JSON.stringify(config));
-  await ready("Reloaded Wasmtime");
-  console.log("PASS hibana dev: Wasmtime, local Secrets, header isolation, non-ASCII header, binary POST, stream and watched rebuild");
+  await ready(config.vars.GREETING);
+  console.log("PASS hibana dev: Wasmtime, Unicode environment, local Secrets, header isolation, non-ASCII header, binary POST, stream and watched rebuild");
 } finally {
   if (child.exitCode === null && child.signalCode === null) {
     await new Promise(done => {

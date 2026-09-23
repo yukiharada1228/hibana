@@ -15,7 +15,8 @@ import {
   stat,
   writeFile,
 } from "node:fs/promises";
-import { dirname, join, relative, resolve, isAbsolute } from "node:path";
+import { dirname, join, resolve } from "node:path";
+import { isInside } from "./paths.mjs";
 import {
   isExtensionArchive,
   managesExtensions,
@@ -34,15 +35,6 @@ const manifest = (dependencies) => ({
   private: true,
   dependencies,
 });
-const inside = (root, path) => {
-  const part = relative(root, path);
-  return (
-    part !== ".." &&
-    !part.startsWith("../") &&
-    !part.startsWith("..\\") &&
-    !isAbsolute(part)
-  );
-};
 
 async function readLock(path) {
   try {
@@ -182,14 +174,12 @@ export async function installExtensionPackages(
   for (const [name, source] of Object.entries(sources)) {
     if (isExtensionArchive(source)) {
       const path = await realpath(resolve(project, source));
-      if (!inside(project, path))
+      if (!isInside(project, path))
         throw new Error(
           "Extension archives must stay inside the project, including symlinks",
         );
-      if (
-        !(await stat(path)).isFile() ||
-        (await stat(path)).size > 128 * 1024 * 1024
-      )
+      const info = await stat(path);
+      if (!info.isFile() || info.size > 128 * 1024 * 1024)
         throw new Error("Extension archives must be files of at most 128 MiB");
       const bytes = await readFile(path);
       const digest = hash(bytes);

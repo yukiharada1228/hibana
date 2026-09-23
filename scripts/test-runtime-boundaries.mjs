@@ -50,8 +50,11 @@ export async function testRuntimeBoundaries({api, token, wasm, upload, url, inte
     const trapped = await waitForTerminal();
     assert.equal(trapped.status,'failed');
     assert.match(JSON.stringify(trapped.error),/wasm trap/);
+    assert.doesNotMatch(JSON.stringify(trapped.error),/runtime regression fixture/);
     assert.ok(performance.now()-trapStart < 1000,'an immediate trap must not wait for the execution deadline');
-    console.log('PASS guest trap is immediately recorded as failed, not timeout');
+    const trapMetrics = await (await fetch(metricsUrl+'/metrics')).text();
+    assert.match(trapMetrics,/^faas_guest_stderr_dropped_bytes_total [1-9][0-9]*$/m,'stderr is captured even without Secrets');
+    console.log('PASS guest trap is immediately recorded as failed, not timeout; guest stderr is discarded even without Secrets');
 
     for (const path of ['/header-limit', '/header-resources']) {
       assert.equal((await invoke('GET', path)).status,502);
@@ -94,7 +97,9 @@ export async function testRuntimeBoundaries({api, token, wasm, upload, url, inte
     const approved = JSON.parse((await invoke('GET', '/dns-approved')).body);
     assert.deepEqual(approved, {ok:true, addresses:['1.1.1.1:443']});
     assert.equal(JSON.parse((await invoke('GET', '/dns-blocked')).body).ok, false);
-    console.log('PASS real Wasm DNS: approved snapshot resolves, unrelated localhost remains blocked');
+    assert.equal((await api(`/components/${id}/egress`, {token, method:'PATCH', body:{deny:['1.1.1.1:443']}})).status, 200);
+    assert.equal(JSON.parse((await invoke('GET', '/dns-approved')).body).ok, false, 'cached Wasm must read revoked application permissions on its next execution');
+    console.log('PASS real Wasm DNS: application approval resolves, unrelated localhost stays blocked, revocation denies the next execution');
 
     const cases = [['HEAD', '/', 200], ['GET', '/empty', 204], ['GET', '/unchanged', 304]];
     for (const [method, path, status] of cases) {

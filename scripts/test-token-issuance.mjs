@@ -61,7 +61,7 @@ export async function testTokenIssuance({ api, sql, url, tenant, user, subject, 
   };
   const restoreRole = () => sql(`UPDATE users SET role='admin' WHERE id='${user}'`);
   const callerHash = () => createHash("sha256").update(token).digest("hex");
-  const restoreScopes = () => sql(`UPDATE api_tokens SET scopes=ARRAY['read','invoke','deploy','admin'] WHERE token_hash='${callerHash()}'`);
+  const restoreScopes = () => sql(`UPDATE api_tokens SET scopes=ARRAY['read','deploy','admin'] WHERE token_hash='${callerHash()}'`);
   const cases = [
     { name: "logout-all / same user", target: user, change: () => mutate("/auth/logout-all"), status: 401 },
     { name: "logout-all / other user", target: other, change: () => mutate("/auth/logout-all"), status: 401 },

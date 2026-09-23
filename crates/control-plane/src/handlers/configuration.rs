@@ -24,7 +24,7 @@ pub struct FunctionConfigResponse {
     pub updated_at: Option<chrono::DateTime<chrono::Utc>>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, FromQueryResult)]
 pub struct SecretBindingResponse {
     pub name: String,
     pub available: bool,
@@ -96,50 +96,44 @@ pub async fn get_function_config(
     let rows = db::list_function_configs(&tx, tenant, &component_id).await?;
     let mut secrets = Vec::new();
     let mut resource_limits = None;
-    let mut net_allow_outbound = Vec::new();
+    let net_allow_outbound = serde_json::from_value(component.egress_policy)?;
     if let Some(id) = &component.active_version_id {
-        let version = component_versions::Entity::find_by_id(id)
-            .filter(component_versions::Column::TenantId.eq(tenant))
-            .filter(component_versions::Column::ComponentId.eq(&component_id))
-            .filter(component_versions::Column::DeletedAt.is_null())
-            .one(&tx)
-            .await?
-            .ok_or_else(|| FaasError::NotFound("active version".into()))?;
-        resource_limits = Some(version.resource_limits);
-        net_allow_outbound = hibana_shared::capabilities::parse_capabilities(&version.capabilities)
-            .net_allow_outbound
-            .into_iter()
-            .collect();
-        let available: std::collections::BTreeSet<String> = function_secrets::Entity::find()
+        resource_limits = Some(
+            component_versions::Entity::find_by_id(id)
+                .select_only()
+                .column(component_versions::Column::ResourceLimits)
+                .filter(component_versions::Column::TenantId.eq(tenant))
+                .filter(component_versions::Column::ComponentId.eq(&component_id))
+                .filter(component_versions::Column::DeletedAt.is_null())
+                .into_tuple::<serde_json::Value>()
+                .one(&tx)
+                .await?
+                .ok_or_else(|| FaasError::NotFound("active version".into()))?,
+        );
+        let live_secret = function_secrets::Entity::find()
             .select_only()
             .column(function_secrets::Column::Id)
             .filter(function_secrets::Column::TenantId.eq(tenant))
             .filter(function_secrets::Column::ComponentId.eq(&component_id))
             .filter(function_secrets::Column::DeletedAt.is_null())
-            .into_tuple::<String>()
-            .all(&tx)
-            .await?
-            .into_iter()
-            .collect();
+            .filter(
+                Expr::col((function_secrets::Entity, function_secrets::Column::Id)).equals((
+                    version_secret_bindings::Entity,
+                    version_secret_bindings::Column::SecretId,
+                )),
+            )
+            .into_query();
         secrets = version_secret_bindings::Entity::find()
             .select_only()
-            .columns([
-                version_secret_bindings::Column::Name,
-                version_secret_bindings::Column::SecretId,
-            ])
+            .column(version_secret_bindings::Column::Name)
+            .column_as(Expr::exists(live_secret), "available")
             .filter(version_secret_bindings::Column::TenantId.eq(tenant))
             .filter(version_secret_bindings::Column::ComponentId.eq(&component_id))
             .filter(version_secret_bindings::Column::VersionId.eq(id))
             .order_by_asc(version_secret_bindings::Column::Name)
-            .into_tuple::<(String, String)>()
+            .into_model::<SecretBindingResponse>()
             .all(&tx)
-            .await?
-            .into_iter()
-            .map(|(name, id)| SecretBindingResponse {
-                name,
-                available: available.contains(&id),
-            })
-            .collect();
+            .await?;
     }
     tx.commit().await?;
     let updated_at = rows.iter().map(|r| r.updated_at).max();

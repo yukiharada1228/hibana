@@ -136,9 +136,8 @@ pub async fn check_rate_limit(
     state: &AppState,
     tenant: &str,
     params: &ResolvedAdmissionParams,
-    now_ms: u64,
 ) -> Decision {
-    match state.store().rate_limit(tenant, params.rate, now_ms).await {
+    match state.store().rate_limit(tenant, params.rate).await {
         Ok(d) if d.allowed => Decision::Admitted,
         Ok(d) => Decision::Rejected(RateLimited::rate(d.retry_after_secs)),
         Err(e) => {

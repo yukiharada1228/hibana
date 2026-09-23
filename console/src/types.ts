@@ -22,7 +22,6 @@ export type Component = {
 export type Version = {
   version_id: string;
   version: string;
-  status: string;
   size_bytes: number;
   wasm_sha256: string;
   created_at: string;
@@ -47,7 +46,6 @@ export type VersionDetails = {
     roots: string[];
     extensions: Extension[];
   } | null;
-  net_allow_outbound: string[];
 };
 export type Totals = {
   invocation_count: number;
@@ -87,5 +85,5 @@ export type Execution = {
 };
 export type ExecutionsPage = { items: Execution[]; next_cursor: string | null };
 export interface EgressPolicy {
-  allow_outbound: string[] | null;
+  allow_outbound: string[];
 }
