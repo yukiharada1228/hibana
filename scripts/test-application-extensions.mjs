@@ -188,7 +188,7 @@ try {
     {
       async request(path, options) {
         if (path === "/components" && !options)
-          return [{ name: config.name, id: "example-id" }];
+          return [{ name: config.name, component_id: "example-id" }];
         assert.equal(path, "/components/example-id/versions");
         assert.equal(options.method, "POST");
         assert.deepEqual([...options.body.keys()].sort(), [
