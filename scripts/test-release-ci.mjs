@@ -1,8 +1,50 @@
 import assert from "node:assert/strict";
 import test from "node:test";
+import { execFileSync, spawnSync } from "node:child_process";
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { delimiter, join } from "node:path";
+import { fileURLToPath } from "node:url";
 import { requireReleaseChecks } from "./check-release-ci.mjs";
 
 const sha = "a".repeat(40);
+
+test("npm verification retries installation lag, bounds failures and rejects a wrong version", () => {
+  const root = fileURLToPath(new URL("../", import.meta.url));
+  const workflow = readFileSync(join(root, ".github/workflows/release.yml"), "utf8");
+  const blocks = [...workflow.matchAll(/      - name: Verify npx against the public registry\n        run: \|\n((?:          .*\n)+)/g)]
+    .map(match => match[1].replace(/^          /gm, ""));
+  assert.equal(blocks.length, 2);
+  assert.equal(blocks[0], blocks[1], "publish and resume must verify installation the same way");
+  assert.match(workflow, /name: Publish the verified tarball using npm trusted publishing\n        if: \$\{\{ !inputs\.verify_only \}\}/);
+  const directory = mkdtempSync(join(tmpdir(), "hibana-npm-verification-"));
+  const version = execFileSync(process.execPath, ["scripts/release.mjs", "version"], { cwd: root, encoding: "utf8" }).trim();
+  try {
+    writeFileSync(join(directory, "npx"), `#!${process.execPath}
+const fs = require('node:fs');
+const count = Number(fs.readFileSync(process.env.HIBANA_TEST_ATTEMPTS, 'utf8')) + 1;
+fs.writeFileSync(process.env.HIBANA_TEST_ATTEMPTS, String(count));
+if (!process.argv.includes('--prefer-online')) process.exit(2);
+if (process.env.HIBANA_TEST_MODE === 'unavailable' || process.env.HIBANA_TEST_MODE === 'lag' && count === 1) process.exit(1);
+console.log(process.env.HIBANA_TEST_MODE === 'wrong' ? 'hibana 0.0.0' : 'hibana ' + process.env.HIBANA_TEST_VERSION);
+`, { mode: 0o700 });
+    writeFileSync(join(directory, "sleep"), "#!/bin/sh\nexit 0\n", { mode: 0o700 });
+    for (const [mode, expectedAttempts, success] of [["lag", 2, true], ["unavailable", 45, false], ["wrong", 1, false]]) {
+      const attempts = join(directory, "attempts");
+      writeFileSync(attempts, "0");
+      const result = spawnSync("bash", ["-e", "-o", "pipefail", "-c", blocks[0]], {
+        cwd: root, encoding: "utf8", timeout: 15000,
+        env: { ...process.env, PATH: directory + delimiter + process.env.PATH,
+          HIBANA_TEST_ATTEMPTS: attempts, HIBANA_TEST_MODE: mode, HIBANA_TEST_VERSION: version },
+      });
+      assert.equal(result.error, undefined);
+      assert.equal(result.status === 0, success, result.stderr);
+      assert.equal(Number(readFileSync(attempts, "utf8")), expectedAttempts);
+    }
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
 const successful = ["ci", "security"].map((name, index) => ({
   id: index + 1,
   path: `.github/workflows/${name}.yml`,

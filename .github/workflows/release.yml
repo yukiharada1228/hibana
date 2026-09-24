@@ -9,6 +9,11 @@ on:
         required: false
         default: ''
         type: string
+      verify_only:
+        description: 'With publish_tag, verify an already published npm version without publishing again'
+        required: false
+        default: false
+        type: boolean
   push:
     branches: ["release/**"]
     tags: ["v*"]
@@ -233,11 +238,10 @@ jobs:
           version=$(node scripts/release.mjs version)
           available=false
           for attempt in {1..45}; do
-            if published=$(npm view "@yukiharada1228/hibana@$version" version --prefer-online --fetch-retries=0 --fetch-timeout=15000); then
-              if [[ "$published" == "$version" ]]; then
-                available=true
-                break
-              fi
+            if result=$(npx --yes --prefer-online --fetch-retries=0 --fetch-timeout=15000 "@yukiharada1228/hibana@$version" --version); then
+              test "$result" = "hibana $version"
+              available=true
+              break
             fi
             echo "Waiting for npm publish-time scanning ($attempt/45)..."
             sleep 20
@@ -246,11 +250,9 @@ jobs:
             echo 'The published CLI is not installable yet. Check npm before retrying; do not republish the same version.' >&2
             exit 1
           fi
-          result=$(npx --yes "@yukiharada1228/hibana@$version" --version)
-          test "$result" = "hibana $version"
 
   resume-npm:
-    name: Verify existing Release and resume npm publishing
+    name: Verify existing Release and optionally publish to npm
     if: github.event_name == 'workflow_dispatch' && inputs.publish_tag != ''
     runs-on: ubuntu-22.04
     timeout-minutes: 30
@@ -304,6 +306,7 @@ jobs:
           npm ci --prefix sdk --omit=dev --omit=optional --ignore-scripts
           npm run test:package --prefix sdk
       - name: Publish the verified tarball using npm trusted publishing
+        if: ${{ !inputs.verify_only }}
         run: |
           version=$(node scripts/release.mjs version)
           dist_tag=latest
@@ -314,11 +317,10 @@ jobs:
           version=$(node scripts/release.mjs version)
           available=false
           for attempt in {1..45}; do
-            if published=$(npm view "@yukiharada1228/hibana@$version" version --prefer-online --fetch-retries=0 --fetch-timeout=15000); then
-              if [[ "$published" == "$version" ]]; then
-                available=true
-                break
-              fi
+            if result=$(npx --yes --prefer-online --fetch-retries=0 --fetch-timeout=15000 "@yukiharada1228/hibana@$version" --version); then
+              test "$result" = "hibana $version"
+              available=true
+              break
             fi
             echo "Waiting for npm publish-time scanning ($attempt/45)..."
             sleep 20
@@ -327,5 +329,3 @@ jobs:
             echo 'The published CLI is not installable yet. Check npm before retrying; do not republish the same version.' >&2
             exit 1
           fi
-          result=$(npx --yes "@yukiharada1228/hibana@$version" --version)
-          test "$result" = "hibana $version"

@@ -88,9 +88,11 @@ node scripts/release.mjs checksums .local/release
 
 公開後は `npm view @yukiharada1228/hibana@VERSION version` と `npx --yes @yukiharada1228/hibana@VERSION --version` で確認します。npm は公開済みの同じバージョンを上書きできないため、変更した候補は新しいバージョン番号で配布します。コンソールも同じ版を取得できることを確認してから更新してください。
 
-npm は[公開時の自動検査](https://github.blog/changelog/2026-07-28-npm-publish-time-malware-scanning-and-dual-use-metadata/)を行うため、公開成功後も通常約5分、混雑時などは15分以上インストールできない場合があります。CI はパッケージを取得できるまで20秒間隔で最大45回確認してから `npx` を検証します。待機が時間切れになった場合は公開状態を確認し、同じ版を再公開しないでください。
+npm は[公開時の自動検査](https://github.blog/changelog/2026-07-28-npm-publish-time-malware-scanning-and-dual-use-metadata/)を行うため、公開成功後も通常約5分、混雑時などは15分以上インストールできない場合があります。CI は `npx --prefer-online` によるインストールとバージョン確認を20秒間隔で最大45回試みます。メタデータが先に反映されても、実際に取得・実行できるまで待ちます。待機が時間切れになった場合は公開状態を確認し、同じ版を再公開しないでください。
 
 GitHub Release公開後、npm公開前の検証や設定不足で止まった場合は、原因を修正し、npmにその版が未公開であることを確認してから、Hibana releaseの手動実行で`publish_tag`に既存タグを指定します。元のコミットのCI・依存監査、全配布物のチェックサム、公開URLからのCLI・ランタイム導入を再検証して、同じtarballをnpmへ公開します。タグや公開済み配布物は置き換えません。通常の候補ビルドではこの入力を空欄にします。
+
+npm公開後の取得確認だけが失敗した場合は、`publish_tag`と`verify_only: true`を指定します。公開済みのReleaseとnpm版を検証し、`npm publish`は実行しません。
 
 候補ブランチでは通常CIと依存監査も実行します。全OS/CPUの成果物を集めた`hibana-release-candidate`を14日間保存します。バージョンに`-rc.1`などの接尾辞があるタグは、GitHubのprereleaseとして公開する設定です。
 
