@@ -7,7 +7,7 @@ Hibana用Keycloakを専用namespace `hibana-identity`へ配備する、検証環
 この機能は`0.2.0-rc.6`から含まれます。公開後はNode.js 24以上で次を実行します。
 
 ```sh
-npx --yes @yukiharada1228/hibana@0.2.0-rc.9 platform init my-site --with-keycloak
+npx --yes @yukiharada1228/hibana@0.2.0-rc.10 platform init my-site --with-keycloak
 ```
 
 チェックアウトから実行する場合は次を使います。
@@ -75,7 +75,7 @@ Discoveryの`issuer`が`site.yaml`と完全一致し、authorization・token・J
 2. H2などから移す場合は、停止した移行元と同じDB設定・ボリューム・イメージで`/opt/keycloak/bin/kc.sh export --dir /secure/export --realm hibana --users realm_file`を実行します。実際のrealm名に置き換えてください。Admin ConsoleのPartial exportではユーザーやパスワードを移せません。エクスポートには資格情報が含まれます。[公式のimport/export仕様](https://www.keycloak.org/server/importExport)を確認してください。
 3. 新規環境の初回起動前に、出力された`hibana-realm.json`を`identity/imports/hibana-realm.json`へ0600でコピーします。ユーザーの`id`・`credentials`、realm名を維持し、パスワードを再設定しません。別realm名ならkustomizationのSecretキーと入力ファイル名を`REALM-realm.json`にし、issuerも合わせます。既存DBを復元した場合はこのJSON置換は不要です。
 4. 既存クライアントの秘密値を`control-plane.env`の`OIDC_CLIENT_SECRET`と一致させます。生成された`client.env`の値で既存の秘密値が自動更新されるわけではありません。必要なら移行先管理画面でHibana専用クライアントを追加し、そのID・秘密値・callbackを設定します。以前の接続先と並行する場合は別クライアントを使用します。issuer変更時はHibanaの認証設定も更新し、再ログインします。
-5. 移行前後のユーザーID、ユーザー数、資格情報の内容が一致することを、値をログへ出さず比較します。既存ユーザーの同じパスワードでのログインと、Hibanaのテナント所属・アプリへのアクセスを確認してから接続先を切り替えます。ユーザーIDが変わらなければ既存の`oidc_subject`を維持できます。
+5. 移行前後のユーザーID、ユーザー数、資格情報の内容が一致することを、値をログへ出さず比較します。ユーザーIDが変わらなければ既存の`oidc_subject`を維持できますが、issuerが変わる場合はHibana側の`oidc_issuer`も移行が必要です。[issuer変更時の紐付けとトークン更新](https://github.com/yukiharada1228/hibana/blob/develop/docs/authentication.md#既存環境のissuerをhttpからhttpsへ変更する場合)を確認してください。新しい接続先で既存ユーザーの同じパスワードによるログインと、Hibanaのテナント所属・アプリへのアクセスを確認してから利用を再開します。
 
 この簡易構成は1 MiB未満の単一realmファイルをSecretへ格納する方式です。大きいrealmや分割exportはSecretへ詰め込まず、別途インポート用ボリューム/Jobを用意します。realm exportはセッションやイベント等を含まないため完全なDBバックアップの代わりにはなりません。移行失敗時はHibanaのissuer・クライアント設定を元に戻し、保持した移行元を再開します。切替後の新規変更を失わないよう、書き込み再開前に復旧方針を決めてください。
 
