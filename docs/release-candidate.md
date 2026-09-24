@@ -1,13 +1,16 @@
-# Hibana 0.2.0-rc.8
+# Hibana 0.2.0-rc.9
 
-rc.8ではCLIのログ閲覧を`hibana tail`へ統一し、`logs`コマンドを削除しました。履歴はConsoleの実行履歴で確認できます。[アプリログ](application-logs.md)を参照してください。rc.7からの追加DBマイグレーションはありません。
+rc.9ではnpm配布物のJavaScriptコンパイラを検証済みの版へ固定し、新規インストールで脆弱な間接依存を取得する問題を修正しました。配布パッケージのインストール後にも依存監査を実行します。rc.7・rc.8からの追加DBマイグレーションはありません。
+
+rc.8ではCLIのログ閲覧を`hibana tail`へ統一し、`logs`コマンドを削除しました。履歴はConsoleの実行履歴で確認できます。[アプリログ](application-logs.md)を参照してください。
 
 新規導入は空DBで行います。0.2.0-rc.2のDBを更新する場合は、Control Planeを停止・バックアップして[OIDC専用版への切り替え](authentication.md#oidc専用版への切り替え)を実施します。v0.1.0の旧スキーマへの上書き更新は拒否するため、[DBの作成と切替](database.md)に従って別の検証先を指定してください。
 
-CLI・PC用Wasmtimeランタイム・Control Plane・Workerを`0.2.0-rc.8`に揃えた候補版です。npm 公開前はGitHub Actionsで作成した候補を取得し、検証環境へ導入します。公開後は `npx --yes @yukiharada1228/hibana@0.2.0-rc.8` を使用できます。正式なReleaseを公開するまで、候補版のGitHub Release URLによる自動取得は使えません。
+CLI・PC用Wasmtimeランタイム・Control Plane・Workerを`0.2.0-rc.9`に揃えた候補版です。npm 公開前はGitHub Actionsで作成した候補を取得し、検証環境へ導入します。公開後は `npx --yes @yukiharada1228/hibana@0.2.0-rc.9` を使用できます。正式なReleaseを公開するまで、候補版のGitHub Release URLによる自動取得は使えません。
 
 ## 含まれる変更
 
+- rc.9ではJavaScriptコンパイラの版を固定し、配布tarballからの新規インストールを依存監査します。npm公開直後のインストール待ちと、再公開せずに検証し直す手順も修正しました。
 - rc.8では`hibana tail`で開始後に完了した実行とそのログを監視できます。JSON/pretty形式、結果・文字列・版IDのフィルター、再接続と欠落警告に対応します。DB接続の保持・取得処理の重複・CLIの不要なビルド設定検証も整理しました。[実装レビュー](implementation-review-20260924.md)を参照してください。
 - rc.7からアプリの標準出力・標準エラーを収集します。rc.8では`hibana tail`・Consoleの実行詳細・ローカル開発端末で確認できます。完了から24時間、1実行合計16KiBまで保存します。異常終了・タイムアウト時も取得でき、テナントのRead権限で参照します。[アプリログ](application-logs.md)に制限と運用手順を記載しています。
 - rc.6では`platform init --with-keycloak`をnpm配布物に収録。専用namespace・永続PostgreSQL・HTTPS Ingress・OIDCクライアントと秘密値を生成し、既存ユーザーの移行手順も同梱します。[Keycloak導入手順](../deploy/keycloak/kubernetes/README.md)を参照してください。rc.6自体にはrc.5からのDBスキーマ変更はありません。
@@ -28,12 +31,12 @@ CLI・PC用Wasmtimeランタイム・Control Plane・Workerを`0.2.0-rc.8`に揃
 
 ## 配布物を取得する
 
-`develop`上の手動実行、または`release/v0.2.0-rc.8`ブランチの同じコミットに対して、CI、Security dependencies、Hibana releaseの全ジョブが成功した候補を選びます。`RUN_ID`はそのGitHub release実行のIDです。Actionsの成果物は14日間保持されます。
+`develop`上の手動実行、または`release/v0.2.0-rc.9`ブランチの同じコミットに対して、CI、Security dependencies、Hibana releaseの全ジョブが成功した候補を選びます。`RUN_ID`はそのGitHub release実行のIDです。Actionsの成果物は14日間保持されます。
 
 ```bash
 gh run download RUN_ID --repo yukiharada1228/hibana \
-  --name hibana-release-candidate --dir .local/release/0.2.0-rc.8
-cd .local/release/0.2.0-rc.8
+  --name hibana-release-candidate --dir .local/release/0.2.0-rc.9
+cd .local/release/0.2.0-rc.9
 shasum -a 256 -c SHA256SUMS
 ```
 
@@ -41,11 +44,11 @@ shasum -a 256 -c SHA256SUMS
 
 | 配布物 | ファイル |
 | --- | --- |
-| CLI | `hibana-cli-0.2.0-rc.8.tgz` |
-| Kubernetesマニフェスト | `hibana-kubernetes-0.2.0-rc.8.tar.gz` |
-| PC用ランタイム | `hibana-worker-0.2.0-rc.8-{darwin,linux}-{x64,arm64}`の4ファイル |
-| 基盤イメージ | `hibana-platform-0.2.0-rc.8-linux-{amd64,arm64}.tar`の2ファイル |
-| コンソールイメージ | `hibana-console-0.2.0-rc.8-linux-{amd64,arm64}.tar`の2ファイル |
+| CLI | `hibana-cli-0.2.0-rc.9.tgz` |
+| Kubernetesマニフェスト | `hibana-kubernetes-0.2.0-rc.9.tar.gz` |
+| PC用ランタイム | `hibana-worker-0.2.0-rc.9-{darwin,linux}-{x64,arm64}`の4ファイル |
+| 基盤イメージ | `hibana-platform-0.2.0-rc.9-linux-{amd64,arm64}.tar`の2ファイル |
+| コンソールイメージ | `hibana-console-0.2.0-rc.9-linux-{amd64,arm64}.tar`の2ファイル |
 
 候補の作成元はActions実行のcommit SHAで確認できます。異なる実行・バージョンのファイルを混在させず、ハッシュ確認後に社内へ搬入してください。
 
@@ -55,9 +58,9 @@ shasum -a 256 -c SHA256SUMS
 
 ```bash
 # 取得したファイルがあるディレクトリで実行
-npx --yes --package=./hibana-cli-0.2.0-rc.8.tgz hibana --version
-npx --yes --package=./hibana-cli-0.2.0-rc.8.tgz hibana runtime install --from ./hibana-worker-0.2.0-rc.8-darwin-arm64 --sha256 HASH
-npx --yes --package=./hibana-cli-0.2.0-rc.8.tgz hibana init hello --cli-package ./hibana-cli-0.2.0-rc.8.tgz
+npx --yes --package=./hibana-cli-0.2.0-rc.9.tgz hibana --version
+npx --yes --package=./hibana-cli-0.2.0-rc.9.tgz hibana runtime install --from ./hibana-worker-0.2.0-rc.9-darwin-arm64 --sha256 HASH
+npx --yes --package=./hibana-cli-0.2.0-rc.9.tgz hibana init hello --cli-package ./hibana-cli-0.2.0-rc.9.tgz
 cd hello
 npm run dev
 # 別ターミナルで curl http://127.0.0.1:8787/
@@ -71,9 +74,9 @@ npm run dev
 CPUに合うDocker archiveを読み込み、社内レジストリへ搬入します。`registry.example.internal`とkubeconfig/contextを実サイトのものへ変更してください。
 
 ```bash
-docker load --input hibana-platform-0.2.0-rc.8-linux-amd64.tar
-docker tag hibana-platform:0.2.0-rc.8-linux-amd64 registry.example.internal/hibana/platform:0.2.0-rc.8-amd64
-docker push registry.example.internal/hibana/platform:0.2.0-rc.8-amd64
+docker load --input hibana-platform-0.2.0-rc.9-linux-amd64.tar
+docker tag hibana-platform:0.2.0-rc.9-linux-amd64 registry.example.internal/hibana/platform:0.2.0-rc.9-amd64
+docker push registry.example.internal/hibana/platform:0.2.0-rc.9-amd64
 hibana platform init my-site
 # my-site/README.mdに沿ってDB・Redis・S3・DNS・TLSを設定
 hibana platform install --kubeconfig /secure/config --context staging \

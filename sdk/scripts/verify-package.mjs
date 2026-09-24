@@ -95,6 +95,12 @@ try {
   assert.deepEqual(projectPackage.scripts, { dev: "hibana dev", build: "hibana build", deploy: "hibana deploy" });
   assert.deepEqual(Object.keys(projectPackage.dependencies), ["hono"]);
   await run("npm", ["install", ...npmFlags], project);
+  // A repository lockfile is not shipped to consumers. Audit the dependency
+  // tree chosen by a fresh installation of the actual distributable package.
+  if (!process.env.HIBANA_PACKAGE_OFFLINE) {
+    await run("npm", ["audit", "--audit-level=low"], project);
+    console.log("Fresh package installation, including optional JS compilers, passed npm audit.");
+  }
   const projectCli = join(project, "node_modules", metadata.name, "src/cli.mjs");
   assert.equal((await run(process.execPath, [projectCli, "--version"])).trim(), `hibana ${metadata.version}`);
   const lock = JSON.parse(await readFile(join(project, "package-lock.json"), "utf8"));

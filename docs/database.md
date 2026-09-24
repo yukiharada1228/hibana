@@ -72,7 +72,7 @@ Secret名と現在のvarsの衝突は、キーの存在確認だけで判定し�
 
 ## 空DBでの検証
 
-`0.2.0-rc.7`・`0.2.0-rc.8`は`m20260923_000013_application_logs`まで適用します（rc.5・rc.6は`m20260922_000012_version_publication`まで）。`m20260922_000009_oidc_profile`は表示メールの一意制約を外します。`m20260922_000010_management_scopes`はトークンの旧`invoke`スコープだけを取り除き、DB制約を`read`・`deploy`・`admin`に限定します。行・有効な権限・期限・失効状態を保持します。削除した旧スコープは復元できないためdownは拒否します。
+`0.2.0-rc.7`〜`0.2.0-rc.9`は`m20260923_000013_application_logs`まで適用します（rc.5・rc.6は`m20260922_000012_version_publication`まで）。`m20260922_000009_oidc_profile`は表示メールの一意制約を外します。`m20260922_000010_management_scopes`はトークンの旧`invoke`スコープだけを取り除き、DB制約を`read`・`deploy`・`admin`に限定します。行・有効な権限・期限・失効状態を保持します。削除した旧スコープは復元できないためdownは拒否します。
 
 `m20260922_000012_version_publication`は、常に同じ値を保存していた`component_versions.status`を削除します。versionは検証・保存・Workerの準備が完了してから登録し、公開先と切り戻し先は`components.active_version_id`・`previous_active_version_id`だけで管理します。既存の公開先・成果物・設定・削除履歴を保持します。旧版は削除列を参照するため、Control Plane・Worker・Consoleを揃えて更新してください。この移行のdownは拒否します。
 
