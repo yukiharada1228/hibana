@@ -10,6 +10,7 @@ import { fileURLToPath } from "node:url";
 import { createHash } from "node:crypto";
 import { cliRelease, releaseBase } from "../src/package.mjs";
 import { incompleteRequest } from "./incomplete-request.mjs";
+import { verifyUpgrade } from "./verify-upgrade.mjs";
 
 const sdk = fileURLToPath(new URL("../", import.meta.url));
 const temporary = await mkdtemp(join(tmpdir(), "hibana-package-"));
@@ -117,6 +118,12 @@ app.use('*', async (_c, next) => {
   const wasm = await readFile(join(project, ".hibana/build/app.wasm"));
   assert.deepEqual(wasm.subarray(0, 8), Buffer.from([0, 97, 115, 109, 13, 0, 1, 0]));
   console.log(`npx init installed a pinned project-local CLI; npm run build succeeded without npx or a global CLI: ${wasm.length}-byte Wasm Component (SHA-256 ${createHash("sha256").update(wasm).digest("hex")}).`);
+
+  if (!process.env.HIBANA_PACKAGE_OFFLINE) {
+    await verifyUpgrade({ run, directory: join(temporary, "upgrade"), metadata, source: project });
+  } else {
+    console.log("Offline mode: skipping the published rc.8 upgrade fixture and dependency audit.");
+  }
 
   if (process.env.HIBANA_RUNTIME_BIN || github) {
     const listener = createServer();

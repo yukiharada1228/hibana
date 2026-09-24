@@ -6,9 +6,9 @@ Hibanaは、Hono・TypeScript・JavaScript・Rust・Goで書いたWeb APIを、�
 
 Cloudflare Workersのような短い開発・配備の流れを参考にしています。実行にはWasmtimeを使い、各言語のアプリを共通のWASI HTTP Componentとして扱います。
 
-GitHubから導入できるMVP v0.1.0です。2時間のHTTP負荷と、配備・復元・停止・削除の[自動受入結果](docs/pilot-validation.md)を公開しています。実オンプレでの本番利用の条件は[運用ガイド](docs/on-prem-production.md)にまとめています。
+現在の公開候補版は[`0.2.0-rc.9`](https://github.com/yukiharada1228/hibana/releases/tag/v0.2.0-rc.9)です。npmからCLIを導入でき、GitHub Releasesからランタイム・コンソール・基盤を取得できます。OIDC認証、KeycloakのKubernetes構成生成、アプリの外部通信設定、`tail`とコンソールでのログ閲覧に対応しています。[版ごとの変更と基盤の導入手順](docs/release-candidate.md)を確認し、各コンポーネントのバージョンを揃えてください。
 
-このソースは次期候補`0.2.0-rc.9`です。アプリログの収集・CLIとコンソールでの閲覧、Keycloakを含むKubernetes構成の生成、OIDCへの認証一本化、アプリ共通の外部通信設定、管理API・版の公開処理とランタイム内部の整理を含みます。[候補版の導入手順](docs/release-candidate.md)でCLI・コンソール・基盤を揃えてください。
+v0.1.0時点の2時間のHTTP負荷と、配備・復元・停止・削除の[自動受入結果](docs/pilot-validation.md)を公開しています。実オンプレでの本番利用の条件は[運用ガイド](docs/on-prem-production.md)にまとめています。
 
 初回の検証には空DBを使います。0.2.0-rc.2から更新する場合は[OIDCへの切り替え](docs/authentication.md#oidc専用版への切り替え)が必要です。v0.1.0の旧DBの扱いは[DB構成・マイグレーション](docs/database.md)を参照してください。
 
@@ -23,9 +23,16 @@ GitHubから導入できるMVP v0.1.0です。2時間のHTTP負荷と、配備�
 
 HTTPのバイナリ入出力と、SSEなどのレスポンスストリーミングにも対応しています。
 
-## ローカルで試す
+## 開発から配備まで
 
-Node.js 24以上とnpmが必要です。npm に公開した CLI は `npx` から実行でき、グローバルインストールは不要です。次の例は `0.2.0-rc.9` の公開後に利用できます。未公開の候補は[候補版の導入手順](docs/release-candidate.md)を使います。
+Node.js 24以上とnpmが必要です。グローバルインストールは不要です。管理者から管理APIのURL・テナント名・組織のアカウントを受け取り、ブラウザでログインします。次のURLとテナント名は自分の環境の値に置き換えてください。コンソールがある基盤では通常、同じホストの`/api`が管理APIです。
+
+```bash
+npx --yes @yukiharada1228/hibana@0.2.0-rc.9 login \
+  --url https://hibana.example.com/api --tenant team
+```
+
+ローカルで試すだけならログインは不要です。空のディレクトリにHonoアプリを作り、起動します。
 
 ```bash
 npx --yes @yukiharada1228/hibana@0.2.0-rc.9 init my-api
@@ -33,7 +40,7 @@ cd my-api
 npm run dev
 ```
 
-`init`は実行したCLIと同じバージョンをプロジェクトの`devDependencies`に固定してインストールします。生成した npm scripts は `hibana dev`・`hibana build`・`hibana deploy` としてプロジェクト内のCLIを使います。`package.json`と`package-lock.json`をGitに保存し、別のPCやCIでは`npm ci`で揃えます。グローバル導入や既存プロジェクトの移行は[CLIガイド](sdk/README.md#cliの導入とテンプレート)を参照してください。
+`init`は実行したCLIと同じバージョンをプロジェクトの`devDependencies`に固定してインストールします。生成したnpm scriptsはプロジェクト内のCLIを使います。`package.json`と`package-lock.json`をGitに保存し、別のPCやCIでは`npm ci`で揃えます。旧版を使っている場合は[既存プロジェクトの更新](sdk/README.md#既存プロジェクトの更新)を先に行ってください。
 
 初回の`dev`で同じバージョンのPC用ランタイムをGitHub Releasesから自動取得します。次回以降は保存済みのランタイムを再利用します。ソースからビルドする手順と閉域環境への搬入は[配布ガイド](docs/releases.md)を参照してください。
 
@@ -60,6 +67,21 @@ export default app
 
 アプリからNeonなど外部DBへ接続する場合は、`hibana.json`の`dev.allow_outbound`に`HOST:PORT`を指定し、接続文字列を`.dev.vars`へ保存します。[ローカルDB接続の設定](sdk/README.md#ローカルで外部dbへ接続する)を参照してください。
 
+ログイン済みなら、`my-api`ディレクトリで配備し、そのままログを監視できます。
+
+```bash
+npm run deploy
+npm exec -- hibana tail
+```
+
+別のターミナルから、`deploy`が表示したアプリURLを`curl`で呼び出してください。`tail`は**監視開始後に完了した実行**を表示し、`console.log`・`console.error`の出力も確認できます。過去の実行はコンソールの実行履歴で確認します。`Ctrl+C`で監視を終了します。詳細は[アプリログ](docs/application-logs.md)を参照してください。
+
+コードを変更してもう一度`npm run deploy`した後、直前の配備に戻す場合は次を実行します。切り戻しには以前の配備が必要です。
+
+```bash
+npm exec -- hibana rollback
+```
+
 ## 対応言語
 
 | テンプレート | アプリの書き方 | ビルドに使うもの |
@@ -84,21 +106,11 @@ npx --yes @yukiharada1228/hibana@0.2.0-rc.9 dev -c my-rust/hibana.json
 
 基盤管理者から、Hibanaの管理APIのURLとテナントの認証情報を受け取ります。アプリ開発者がKubernetesの資格情報を持つ必要はありません。
 
-対話ログインは開発環境も含め、組織のOIDC認証基盤を使用します。`hibana login --url https://hibana.example.com/api --tenant team`でブラウザが開きます。既存認証からの移行とKeycloakの接続例は[認証・OIDC](docs/authentication.md)を参照してください。
-
-先ほどの`my-api`ディレクトリで、接続先とトークンを自分の環境の値に置き換えて実行します。通常の配備には**Read・Deployスコープ**のトークンを使います。
-
-```bash
-export HIBANA_URL="https://api.hibana.example.com"
-export HIBANA_TOKEN="<Read・Deployスコープのトークン>"
-npm run deploy
-```
+対話ログインは開発環境も含め、組織のOIDC認証基盤を使用します。ログインした接続先はPCに保存され、プロジェクト作成後も使われます。通常の配備には**Read・Deployスコープ**が必要です。CIから配備するときは専用APIトークンを使います。[接続先とCIの設定](docs/remote-cli.md#開発者の操作)、[認証・OIDC](docs/authentication.md)を参照してください。
 
 `deploy`がアプリをビルドし、コード・環境変数・選択したSecretsの参照を一つのバージョンとして公開します。失敗時には稼働中のコードと設定を維持します。ビルドだけを行う場合は`npm run build`を使います。
 
 アプリのホスト名は`<アプリ名>.<テナントのスラッグ>.<アプリ用ドメイン>`です。たとえば`my-api.my-team.apps.example.com`のようになります。DNS・TLS・アプリ用ドメインは基盤管理者が設定します。
-
-トークンの代わりに、プロジェクト内で`npm exec -- hibana login`を実行してログインする方法もあります。認証方法とバージョンの指定は[CLIガイド](sdk/README.md)に記載しています。
 
 ## 設定・Secrets・rollback
 
@@ -161,7 +173,7 @@ flowchart LR
 
 PostgreSQLは配備・実行記録・テナント情報、Redisは共有の受付制限、S3/MinIOはWasm成果物の保管に使います。Worker群がアプリの実行を受け持つため、アプリごとにDockerfileやKubernetesマニフェストを書く必要はありません。
 
-CLIはGitHubのtarballからPCへ導入でき、`hibana login --profile onprem --url https://api.example.internal`でリモート基盤を選択できます。開発者のアプリ操作にDockerやKubernetes資格情報は不要です。[CLI配布・接続プロファイル・オンプレ構成](docs/remote-cli.md)を参照してください。
+CLIはnpmまたはGitHubのtarballからPCへ導入でき、`hibana login --profile onprem --url https://hibana.example.internal/api --tenant team`でリモート基盤を選択できます。開発者のアプリ操作にDockerやKubernetes資格情報は不要です。[CLI配布・接続プロファイル・オンプレ構成](docs/remote-cli.md)を参照してください。
 
 イントラネットのブラウザから使う[コンソール](docs/console.md)を`console/`に用意しています。Kubernetesが画面と管理APIを提供し、CLIで配備したアプリの一覧・バージョン・切り戻し・利用量を確認できます。アプリの実行・配信は基盤側で継続します。
 

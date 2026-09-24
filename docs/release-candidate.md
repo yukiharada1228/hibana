@@ -6,7 +6,7 @@ rc.8ではCLIのログ閲覧を`hibana tail`へ統一し、`logs`コマンドを
 
 新規導入は空DBで行います。0.2.0-rc.2のDBを更新する場合は、Control Planeを停止・バックアップして[OIDC専用版への切り替え](authentication.md#oidc専用版への切り替え)を実施します。v0.1.0の旧スキーマへの上書き更新は拒否するため、[DBの作成と切替](database.md)に従って別の検証先を指定してください。
 
-CLI・PC用Wasmtimeランタイム・Control Plane・Workerを`0.2.0-rc.9`に揃えた候補版です。npm 公開前はGitHub Actionsで作成した候補を取得し、検証環境へ導入します。公開後は `npx --yes @yukiharada1228/hibana@0.2.0-rc.9` を使用できます。正式なReleaseを公開するまで、候補版のGitHub Release URLによる自動取得は使えません。
+CLI・PC用Wasmtimeランタイム・コンソール・Control Plane・Workerを`0.2.0-rc.9`に揃えた公開候補版です。[GitHub Release](https://github.com/yukiharada1228/hibana/releases/tag/v0.2.0-rc.9)とnpmで公開済みです。通常の開発は[ログインから配備・tail・rollbackまでの手順](../README.md#開発から配備まで)、既存のアプリは[CLIの更新手順](../sdk/README.md#既存プロジェクトの更新)を使ってください。`dev`による同じ版のランタイムの自動取得も利用できます。
 
 ## 含まれる変更
 
@@ -31,11 +31,11 @@ CLI・PC用Wasmtimeランタイム・Control Plane・Workerを`0.2.0-rc.9`に揃
 
 ## 配布物を取得する
 
-`develop`上の手動実行、または`release/v0.2.0-rc.9`ブランチの同じコミットに対して、CI、Security dependencies、Hibana releaseの全ジョブが成功した候補を選びます。`RUN_ID`はそのGitHub release実行のIDです。Actionsの成果物は14日間保持されます。
+公開済みのrc.9はGitHub Releaseから取得します。
 
 ```bash
-gh run download RUN_ID --repo yukiharada1228/hibana \
-  --name hibana-release-candidate --dir .local/release/0.2.0-rc.9
+gh release download v0.2.0-rc.9 --repo yukiharada1228/hibana \
+  --dir .local/release/0.2.0-rc.9
 cd .local/release/0.2.0-rc.9
 shasum -a 256 -c SHA256SUMS
 ```
@@ -50,11 +50,11 @@ shasum -a 256 -c SHA256SUMS
 | 基盤イメージ | `hibana-platform-0.2.0-rc.9-linux-{amd64,arm64}.tar`の2ファイル |
 | コンソールイメージ | `hibana-console-0.2.0-rc.9-linux-{amd64,arm64}.tar`の2ファイル |
 
-候補の作成元はActions実行のcommit SHAで確認できます。異なる実行・バージョンのファイルを混在させず、ハッシュ確認後に社内へ搬入してください。
+作成元はReleaseのタグのcommit SHAで確認できます。異なる実行・バージョンのファイルを混在させず、ハッシュ確認後に社内へ搬入してください。未公開の次期候補を試す場合は、同じコミットのCI・Security dependencies・Hibana releaseが成功したActions実行の`hibana-release-candidate`を取得します。Actionsの成果物は14日間保持されます。[候補の作成手順](releases.md#ソースから候補を作る)を参照してください。
 
 ## 開発者のPCで試す
 
-以下はmacOS arm64の例です。OS/CPUに応じてランタイムのファイル名を変更し、`HASH`には`SHA256SUMS`の該当値を指定します。Node.js 24以上が必要です。
+通常はnpm版を使います。以下はtarballとランタイムを事前に搬入する場合のmacOS arm64の例です。OS/CPUに応じてランタイムのファイル名を変更し、`HASH`には`SHA256SUMS`の該当値を指定します。Node.js 24以上が必要です。
 
 ```bash
 # 取得したファイルがあるディレクトリで実行

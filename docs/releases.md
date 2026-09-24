@@ -2,9 +2,9 @@
 
 CLI は npm の `@yukiharada1228/hibana` と [GitHub Releases](https://github.com/yukiharada1228/hibana/releases) の tarball で配布します。PC用Wasmtimeランタイム、オンプレ用コンテナイメージとKubernetesマニフェストはGitHub Releasesで別々に配布します。初回作成はバージョンを指定した`npx`、作成後のHono・JavaScriptプロジェクトはローカルCLIをnpm scriptsから使用します。グローバルインストールは任意です。
 
-MVPではCLI・ローカルランタイム・Control Plane・Workerを同じバージョンに揃えます。異なる版の混在は検証対象外です。
+CLI・ローカルランタイム・コンソール・Control Plane・Workerを同じバージョンに揃えます。異なる版の混在は検証対象外です。
 
-現在のソース候補は`0.2.0-rc.9`です。以下のnpxの例は、その版のnpm公開後に使用できます。公開前は[候補版の導入手順](release-candidate.md)でtarballから取得・検証します。
+現在の公開候補版は[`0.2.0-rc.9`](https://github.com/yukiharada1228/hibana/releases/tag/v0.2.0-rc.9)です。以下のnpxの例をそのまま利用できます。npmの候補版は`next`で配布するため、バージョンを指定して取得してください。[基盤の更新条件と配布物](release-candidate.md)も確認してください。
 
 ## 開発者のPC
 
@@ -24,7 +24,7 @@ CLIの導入にリポジトリ、Rust、Docker、kubectlは不要です。`init`
 
 `dev`はランタイムが見つからなければ、CLIと同じバージョンのOS・CPUに合うファイルをHTTPSで取得し、Releaseの`SHA256SUMS`と照合してから保存します。次回以降は保存済みのランタイムを再利用します。`hibana runtime install`で事前に取得することもできます。
 
-管理APIへのログインと配備は[リモートCLI手順](remote-cli.md)を参照してください。リモート配備だけを行うPCにはローカルランタイムは不要です。
+初回のログインから配備・ログ監視・切り戻しまでの流れは[開発者向け手順](../README.md#開発から配備まで)、旧版からの更新は[既存プロジェクトの更新](../sdk/README.md#既存プロジェクトの更新)を参照してください。リモート配備だけを行うPCにはローカルランタイムは不要です。
 
 ## 閉域環境への搬入
 
@@ -63,7 +63,7 @@ hibana platform uninstall --kubeconfig FILE --context NAME --yes
 
 停止は新規受付を閉じ、処理と実行結果の保存が終わってからWorker・CPを停止します。再開は保存したレプリカ数を復元し、公開アプリの準備後にHPAと受付を戻します。撤去はCLIが管理するリソースを削除し、クラスタ・namespace・PVC・外部DB/Redis/S3を保持します。実サイトでの導入条件は[オンプレ運用ガイド](on-prem-production.md)を参照してください。
 
-このソース候補では、停止制御・回収・キャッシュ保護に必要なテーブルもSeaORMの新しい初期スキーマへ含めています。CLIと基盤イメージを同じ候補から用意し、[空DBへの初期化](database.md)を先に完了させます。公開済みv0.1.0のDBへの上書き更新は行いません。
+新規導入は[空DBへの初期化](database.md)を先に完了させます。既存の0.2.0系からは[版ごとの更新条件](release-candidate.md)に従います。公開済みv0.1.0のDBへの上書き更新は行いません。
 
 ## ソースから候補を作る
 
@@ -79,6 +79,8 @@ node scripts/release.mjs checksums .local/release
 ```
 
 ローカルで作るランタイムはそのPCのOS・CPU向けです。バージョンは`Cargo.toml`、`sdk/package.json`、`sdk/package-lock.json`で一致を検査します。
+
+`test:package`は、新規導入に加え、公開済みrc.8のlockfileとインストール済み依存を保持したまま候補版へ更新します。古いコンパイラが残る配置を再現し、`npm dedupe --prefer-dedupe`・依存監査・`npm ci`・Honoのビルドを検証します。アプリのソース・設定・独自scriptsも保持されることを確認します。この検証は通常CIとリリースの各OS/CPUジョブで実行します。ネットワークが必要で、`HIBANA_PACKAGE_OFFLINE=1`では更新検証と監査を省略します。
 
 ## GitHub Releaseとnpmパッケージを公開する
 
@@ -96,7 +98,7 @@ npm公開後の取得確認だけが失敗した場合は、`publish_tag`と`ver
 
 候補ブランチでは通常CIと依存監査も実行します。全OS/CPUの成果物を集めた`hibana-release-candidate`を14日間保存します。バージョンに`-rc.1`などの接尾辞があるタグは、GitHubのprereleaseとして公開する設定です。
 
-- Linux x64/arm64、macOS x64/arm64をネイティブビルド。各OSでtarballの独立インストール、HonoのWasm変換、ランタイム導入、実HTTP応答、Ctrl+C停止を検証。
+- Linux x64/arm64、macOS x64/arm64をネイティブビルド。各OSでtarballの新規導入・旧版からの更新・依存監査、HonoのWasm変換、ランタイム導入、実HTTP応答、Ctrl+C停止を検証。
 - Linux amd64/arm64の基盤イメージをDocker archiveで保存し、load後の起動とバージョンを確認。
 - CLI、Kubernetes archive、4つのランタイム、2つの基盤イメージ、2つのコンソールイメージの全10ファイルが揃った場合だけ`SHA256SUMS`を作成。コンソールはLinux amd64 / arm64それぞれのイメージを別に配布し、サイトの`console/kustomization.yaml`へ設定する。
 - タグとパッケージの版が一致した場合だけ、同じコミットの成果物をReleaseへ添付。公開後にGitHub URLからCLIを再インストールし、既定の`init → dev`によるランタイムの自動取得と`HTTP → 停止`を確認。

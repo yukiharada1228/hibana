@@ -1,6 +1,6 @@
 # Hibana CLI
 
-このソースは候補版`0.2.0-rc.9`です。npm に公開した版は `npx` で利用できます。未公開の候補を試す場合は[候補版の導入手順](../docs/release-candidate.md)を使ってください。
+公開候補版`0.2.0-rc.9`はnpmから利用できます。初めて使う場合は[ログイン・作成・開発・配備・tail・rollbackの手順](../README.md#開発から配備まで)から始めてください。このページはCLIの導入・更新と各機能のリファレンスです。
 
 Hibanaの実行契約はWebAssembly Componentです。Honoは対応するJavaScriptフレームワークの一つで、専用SDKのインポートは必要ありません。
 
@@ -38,7 +38,7 @@ export default app
 
 CLIはNode.js 24以上が必要です。ローカル実行ランタイムは初回の`dev`で自動取得し、Kubernetes基盤は管理者が別途導入します。開発者のPCに基盤のソースやDocker/kubectlは不要です。[リモートCLI構成・配布・オンプレ接続](../docs/remote-cli.md)に全手順があります。CLI は npm の `@yukiharada1228/hibana` と GitHub Releases の tarball で配布します。初回作成にはバージョンを指定した `npx` を使えます。作成後のHono・JavaScriptプロジェクトでは、プロジェクト内のCLIをnpm scriptsから実行します。
 
-[コンソール](../docs/console.md)のある基盤には`hibana login --url https://hibana.example.internal/api ...`で接続できます。ブラウザでは同じホストの`https://hibana.example.internal/`を開きます。CLIとコンソールは同じ管理APIを使い、配備済みアプリの実行・配信は接続先のKubernetesが担当します。
+[コンソール](../docs/console.md)のある基盤には`hibana login --url https://hibana.example.internal/api --tenant team`で接続できます。URLとテナント名は自分の環境に置き換えてください。ブラウザでは同じホストの`https://hibana.example.internal/`を開きます。CLIとコンソールは同じ管理APIを使い、配備済みアプリの実行・配信は接続先のKubernetesが担当します。
 
 ```bash
 npx --yes @yukiharada1228/hibana@0.2.0-rc.9 init my-app
@@ -46,7 +46,7 @@ cd my-app
 npm run dev
 ```
 
-`hibana init`や`hibana login`を直接実行したい場合は、グローバルインストールも利用できます。以下は指定した版のnpm公開後に実行します。
+`hibana init`や`hibana login`を直接実行したい場合は、グローバルインストールも利用できます。
 
 ```bash
 npm install -g @yukiharada1228/hibana@0.2.0-rc.9
@@ -72,12 +72,34 @@ npm run dev
 
 `npm run`はプロジェクト内のCLIを優先するため、グローバル版を更新しても各プロジェクトのCLIは変わりません。`package.json`と`package-lock.json`をGitに保存し、別のPCやCIでは`npm ci`で開発依存も導入してください。ビルド・配備にはCLIが必要です。
 
-既存のnpx形式のプロジェクトは、プロジェクト内で次のように移行できます。アプリの依存や`test`などのscriptsは維持されます。
+### 既存プロジェクトの更新
+
+プロジェクトのディレクトリで実行します。グローバルCLIを更新しても、プロジェクトに固定したCLIは更新されません。
 
 ```bash
 npm install --save-dev --save-exact @yukiharada1228/hibana@0.2.0-rc.9
+npm dedupe --prefer-dedupe
+npm audit
+npm exec -- hibana --version
+```
+
+rc.8以前のlockfileには古いJavaScriptコンパイラの間接依存が残る場合があります。`npm dedupe --prefer-dedupe`で、rc.9が固定する検証済みの依存へ揃えます。`npm audit`で指摘が残ったら依存元を確認してください。
+
+古いテンプレートでscriptsに`npx`を埋め込んでいる場合は、ビルド前に次も実行します。アプリの依存や`test`などのscriptsは維持されます。
+
+```bash
 npm pkg set 'scripts.dev=hibana dev' 'scripts.build=hibana build' 'scripts.deploy=hibana deploy'
 ```
+
+ビルドを確認してから、`package.json`と`package-lock.json`の差分を確認しGitへ保存します。別のPCやCIでは`npm ci`で再現します。
+
+```bash
+npm run build
+```
+
+配備先の基盤も同じバージョンに揃えてください。[基盤の更新・DB移行条件](../docs/release-candidate.md)は別途確認が必要です。
+
+### テンプレートと言語別ツール
 
 | `--template` | アプリの記述 | 必要なビルドツール |
 |---|---|---|
@@ -266,4 +288,4 @@ Wranglerを参考にするのは、この短い開発・配備の流れです。
 
 ソースの整形は `npm run format`、検査は `npm run format:check`、回帰テストは `npm test` です。設定・拡張の検証、ビルド計画、コンパイル、合成の順に処理し、入力設定に生成パスを混ぜません。
 
-JavaScriptコンパイラの依存は、配布時に動作確認・監査した版へ固定しています。リポジトリのlockfileだけでなく、npm配布物の新規インストールも依存監査します。
+配布検証は`npm run test:package`です。tarballからの新規導入と、公開済みrc.8のlockfile・インストール済み依存を保持した更新を検証します。更新では依存整理・監査・`npm ci`・HonoのWasmビルドと、ソース・設定・独自scriptsの保持を確認します。`HIBANA_RUNTIME_BIN`を指定すると実HTTPと終了処理も検証します。`HIBANA_PACKAGE_OFFLINE=1`では公開旧版を取得する更新検証と依存監査を省略するため、CI・リリース検証はオンラインで実行してください。

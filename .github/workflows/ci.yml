@@ -265,7 +265,7 @@ jobs:
         run: |
           cargo install wac-cli --version 0.11.0 --locked --no-default-features --features wit
 
-      - name: Verify distributable CLI outside the checkout
+      - name: Verify fresh CLI installation and existing project upgrade
         run: HIBANA_RUNTIME_BIN="$GITHUB_WORKSPACE/target/release/hibana-worker" npm run test:package --prefix sdk
 
       - name: Build optional packages and test separate TCP / TLS

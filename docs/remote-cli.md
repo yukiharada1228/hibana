@@ -1,6 +1,6 @@
 # 手元のCLIからオンプレHibanaを操作する
 
-このソースの候補版は`0.2.0-rc.9`です。公開済みv0.1.0への導入例と、今回の変更を含む[候補版の導入手順](release-candidate.md)を区別してください。新しい基盤操作には同じ候補版のCLIと基盤イメージが必要です。
+この手順は公開候補版`0.2.0-rc.9`向けです。CLI・ランタイム・コンソール・基盤イメージを同じ版に揃えます。[配布物と基盤の更新条件](release-candidate.md)、[既存プロジェクトのCLI更新](../sdk/README.md#既存プロジェクトの更新)も確認してください。
 
 CLIを導入すると、ローカル開発ランタイムは初回の`dev`で自動取得します。Kubernetes上の基盤は管理者が別途導入します。開発者のPCにはクラスタの資格情報を渡さず、Hibanaのテナント用認証でHTTPS管理APIを操作します。
 
@@ -68,49 +68,50 @@ CLIは`--url https://hibana.example.internal/api`のようにパス付きの管�
 Node.js 24以上が必要です。初回作成には `npx --yes @yukiharada1228/hibana@VERSION` を使えます。Hono・JavaScriptプロジェクトにはCLIが`devDependencies`として固定され、以降は`npm run dev`・`npm run build`・`npm run deploy`で実行します。グローバルインストールやHibanaリポジトリは不要です。直接`hibana`を使うための[グローバル導入](../sdk/README.md#cliの導入とテンプレート)も可能です。未公開の候補はtarballを `npx --package=/path/to/hibana-cli-VERSION.tgz hibana ...` で実行し、`init`時には`--cli-package`で同じtarballを指定します。
 
 ```bash
-# 配布担当者がリポジトリ内で実行
-npm ci --prefix sdk
-mkdir -p .local/dist
-node scripts/release.mjs cli .local/dist
-
-# 開発者のPC。配布したファイルを任意の場所に置く
+# 開発者のPCで実行
 npx --yes @yukiharada1228/hibana@0.2.0-rc.9 --version
 npx --yes @yukiharada1228/hibana@0.2.0-rc.9 --help
 ```
 
 パッケージに含めるのはCLI、言語テンプレート、WIT、既存クラスタを操作する小さな管理ツールとマイグレーションの公開マニフェストです。Control Plane/Workerのソース・バイナリ、Dockerfile、kind構築処理、開発用資格情報は含みません。アプリの配備・削除・Secrets操作でPython・Docker・kubectlを起動することはありません。
 
-JS/TSのビルドには同梱のoptionalDependenciesを使います。ビルド済みWasmだけを配備するPCでは`npm install -g /path/to/hibana-cli-0.1.0.tgz --omit=optional`でJSコンパイラーを省略できます。
+JS/TSのビルドにはoptionalDependenciesとして固定したコンパイラーを使います。ビルド済みWasmだけを配備するPCでは`npm install -g @yukiharada1228/hibana@0.2.0-rc.9 --omit=optional`でJSコンパイラーを省略できます。ソースからの作成や閉域環境への搬入は[配布ガイド](releases.md)を参照してください。
 
 ## 開発者の操作
 
-以下の `hibana ...` は、グローバル導入済みならそのまま実行できます。CLIを導入済みのプロジェクト内では `npm exec -- hibana ...`、作成前は `npx --yes @yukiharada1228/hibana@0.2.0-rc.9 ...` として実行します。コンソールの「CLI の接続」から、自分の接続先とバージョンを含む初回コマンドと、作成後の`npm run deploy`をコピーできます。
+次の例はグローバルCLIなしで実行できます。コンソールの「CLI の接続」から、自分の接続先とバージョンを含む初回コマンドと、作成後の`npm run deploy`をコピーできます。
 
 管理者から管理API URL・テナント名・組織のアカウントを受け取ります。公開 URL は基盤から自動取得します。ログイン時はブラウザで組織の認証基盤に接続します。CIでは専用APIトークンを`HIBANA_TOKEN`へ設定してください。ログインは開発環境もOIDCに統一しています。[認証と移行の詳細](authentication.md)を参照してください。
 
 ```bash
-hibana login \
-  --url https://api.example.internal \
+npx --yes @yukiharada1228/hibana@0.2.0-rc.9 login \
+  --url https://hibana.example.internal/api \
   --tenant team
 
-hibana init hello
+npx --yes @yukiharada1228/hibana@0.2.0-rc.9 init hello
 cd hello
+npm run dev
+# 別ターミナルで curl http://127.0.0.1:8787/ を確認し、Ctrl+Cで停止
 npm run deploy
-curl https://hello.team.apps.example.internal/
-hibana list
-hibana rollback
-# 削除はテナント管理者として別途ログインしたプロファイルで実行
-hibana delete hello --profile onprem-admin --yes
-hibana logout
+npm exec -- hibana tail
+# 別ターミナルでdeployの表示したURLを呼び出し、Ctrl+Cで監視を停止
 ```
 
-複数の接続先を使う場合だけ `hibana login --profile NAME ...` で名前を付け、`hibana profile use NAME` で切り替えます。`--version` も任意で、省略すると自動生成されます。
+`tail`は開始後に完了した実行とそのログを表示します。過去の実行はコンソールの実行履歴で確認します。ソースを編集して再配備した後、直前の版へ戻す例です。
+
+```bash
+npm run deploy
+npm exec -- hibana rollback
+npm exec -- hibana list
+```
+
+以降の`hibana ...`は、プロジェクト内では`npm exec -- hibana ...`として実行します。複数の接続先を使う場合だけ `hibana login --profile NAME ...` で名前を付け、`hibana profile use NAME` で切り替えます。`deploy --version`は任意で、省略すると自動生成されます。
 
 `init`は作成時のCLIバージョンを`devDependencies`に固定し、npm scriptsからプロジェクト内のCLIを実行します。別のPCでは`npm ci`で開発依存も導入すれば、グローバルCLIなしで同じ版を使えます。未公開の候補版では`--cli-package PATH`でtarballや開発用ディレクトリをCLIの取得元に指定してください。通常のHonoをWasm Componentへ変換してアップロードし、実行・配置・準備済みコードの管理はオンプレのWorker群が担当します。
 
-通常の配備はRead・Deploy、アプリ削除はRead・Adminのスコープが必要です。`onprem-admin`には同じテナントの管理者でログインしてください。
+通常の配備はRead・Deploy、アプリ削除はRead・Adminのスコープが必要です。削除する場合は同じテナントの管理者として別のプロファイルでログインし、`hibana delete hello --profile onprem-admin --yes`を実行します。
 
-`deploy`・`rollback`・`list`・`delete`・`secret`は共通の接続先解決を使います。CLIの接続先やプロファイルは`hibana.json`に含めず、同じアプリを複数の基盤へ配備できます。
+`deploy`・`tail`・`rollback`・`list`・`delete`・`secret`は共通の接続先解決を使います。CLIの接続先やプロファイルは`hibana.json`に含めず、同じアプリを複数の基盤へ配備できます。
 
 | 設定 | 動作 |
 |---|---|
