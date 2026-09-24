@@ -1,0 +1,341 @@
+{
+  "workflow_url": "https://github.com/yukiharada1228/hibana/actions/runs/35949260201",
+  "reports": [
+    {
+      "started_at": "2026-09-24T02:55:55.840352+00:00",
+      "cluster": "hibana-acceptance-smoke",
+      "source_commit": "3b66a0d67de545d499fabf85d4d90bee9d5ee2c2",
+      "version": "0.2.0-rc.10",
+      "requested_seconds": 120,
+      "passed": true,
+      "scope": "single-host kind; synthetic upstream; real PostgreSQL/Redis/MinIO",
+      "image": "hibana-platform:acceptance-10ad2fd292838c74820723e0cc2399a612ec27fc75835c2978f66328fa4363aa",
+      "image_id": "sha256:10ad2fd292838c74820723e0cc2399a612ec27fc75835c2978f66328fa4363aa",
+      "pod_images": [
+        {
+          "name": "hibana-control-plane-6f8969b58d-wf4pn",
+          "images": [
+            "docker.io/library/import-2026-09-24@sha256:5221be5c4932256d06d01b8959f7134ea248af4a9264733dc53fd206fd6c30ac"
+          ]
+        },
+        {
+          "name": "hibana-control-plane-6f8969b58d-x99v6",
+          "images": [
+            "docker.io/library/import-2026-09-24@sha256:5221be5c4932256d06d01b8959f7134ea248af4a9264733dc53fd206fd6c30ac"
+          ]
+        },
+        {
+          "name": "hibana-worker-6c6f674f5b-7jlf7",
+          "images": [
+            "docker.io/library/import-2026-09-24@sha256:5221be5c4932256d06d01b8959f7134ea248af4a9264733dc53fd206fd6c30ac"
+          ]
+        },
+        {
+          "name": "hibana-worker-6c6f674f5b-cnkt7",
+          "images": [
+            "docker.io/library/import-2026-09-24@sha256:5221be5c4932256d06d01b8959f7134ea248af4a9264733dc53fd206fd6c30ac"
+          ]
+        }
+      ],
+      "retention": {
+        "pending": 0,
+        "protected": 1,
+        "usage": 6000,
+        "audit": 1,
+        "seeded": 6000,
+        "cycles": 1,
+        "deleted": 6000,
+        "passed": true,
+        "max_observed_pending": 6000,
+        "max_observed_drain_seconds": 32.23516890399998
+      },
+      "execution_failure_classes": {},
+      "backup_restore": "custom dump restored to separate DB; runtime switched to restored DB; counts and actual Secret decryption verified; S3 backup hashes verified",
+      "post_maintenance_http": true,
+      "live_restored_database": true,
+      "recovery": {
+        "passed": true,
+        "phase": "complete",
+        "warmup_statuses": {
+          "200": 10
+        },
+        "warmup_seconds": 0.335120493,
+        "elapsed_seconds": 19.618205714
+      },
+      "application": {
+        "wasm_sha256": {
+          "v1": "f13b7086edca582e77e4e2864451d7271e77bdc2fc7b07d81e80efb0158833b8",
+          "v2": "ba4863e62a40c708bc144b326a0e75375374b3463db4a3b128a59fcdc17f3cc6"
+        },
+        "requested_seconds": 120,
+        "concurrency": 4,
+        "pause_ms": 100,
+        "checks": "auth, Secrets, egress, HTTP errors, vars update and rollback",
+        "elapsed_seconds": 120.16090457899999,
+        "count": 3624,
+        "failures": 0,
+        "statuses": {
+          "200": 3624
+        },
+        "max_ms": 68.33002199999464,
+        "final_probe_passed": true,
+        "passed": true
+      },
+      "version_code": {
+        "passed": true,
+        "component": "version-code-qzt5ie",
+        "finished_at": "2026-09-24T02:59:28.293Z",
+        "wasm_sha256": {
+          "one": "c255a2c179de3a85b237f5dd2afa83290803928f99a1d5d36ed63e8debb950ad",
+          "two": "d5db485d89cfdbf3e365ca13251b93f1d1c8766944d1d3cb821f71fd87289650"
+        },
+        "checks": "Read+Deploy CLI update and rollback; different code and vars independently asserted in HTTP body"
+      },
+      "tail": {
+        "passed": true,
+        "events": 3625,
+        "statuses": {
+          "200": 3624,
+          "404": 1
+        },
+        "saved_logs_verified": 10
+      },
+      "resource_samples": 4,
+      "resource_observation_errors": 0,
+      "worker_restarts": 0,
+      "resources": {
+        "samples": 4,
+        "observed_seconds": 95.154543,
+        "workers": [
+          {
+            "name": "hibana-worker-6c6f674f5b-7jlf7",
+            "memory_first_bytes": 532504576,
+            "memory_min_bytes": 532504576,
+            "memory_max_bytes": 532738048,
+            "cache_first_kib": 226924,
+            "cache_max_kib": 226924,
+            "memory_last_bytes": 532619264,
+            "cache_last_kib": 226924
+          },
+          {
+            "name": "hibana-worker-6c6f674f5b-cnkt7",
+            "memory_first_bytes": 560037888,
+            "memory_min_bytes": 560037888,
+            "memory_max_bytes": 561688576,
+            "cache_first_kib": 226924,
+            "cache_max_kib": 226924,
+            "memory_last_bytes": 560357376,
+            "cache_last_kib": 226924
+          }
+        ],
+        "worker_restarts": 0,
+        "worker_replacements": 0,
+        "database": {
+          "first": {
+            "bytes": 13196311,
+            "connections": 20,
+            "pending": 0,
+            "running": 2,
+            "executions": 6100
+          },
+          "last": {
+            "bytes": 18881559,
+            "connections": 24,
+            "pending": 0,
+            "running": 0,
+            "executions": 2950
+          },
+          "max_connections": 24,
+          "max_pending": 0,
+          "max_running": 3
+        }
+      },
+      "stop_inflight_http": {
+        "status": 200,
+        "body_valid": true,
+        "gate_closed_at_completion": true
+      },
+      "platform_stopped": true,
+      "reinstall_preserved_applications": true,
+      "lifecycle": {
+        "passed": true,
+        "startup_statuses": {
+          "200": 10
+        },
+        "phase": "complete",
+        "startup_seconds": 0.29215779499999994
+      },
+      "platform_uninstalled": true,
+      "cleanup_errors": [],
+      "finished_at": "2026-09-24T03:06:19.841255+00:00"
+    },
+    {
+      "started_at": "2026-09-24T03:06:19.991519+00:00",
+      "cluster": "hibana-acceptance-soak",
+      "source_commit": "3b66a0d67de545d499fabf85d4d90bee9d5ee2c2",
+      "version": "0.2.0-rc.10",
+      "requested_seconds": 7200,
+      "passed": true,
+      "scope": "single-host kind; synthetic upstream; real PostgreSQL/Redis/MinIO",
+      "image": "hibana-platform:acceptance-10ad2fd292838c74820723e0cc2399a612ec27fc75835c2978f66328fa4363aa",
+      "image_id": "sha256:10ad2fd292838c74820723e0cc2399a612ec27fc75835c2978f66328fa4363aa",
+      "pod_images": [
+        {
+          "name": "hibana-control-plane-58bb57d65d-l2465",
+          "images": [
+            "docker.io/library/import-2026-09-24@sha256:5221be5c4932256d06d01b8959f7134ea248af4a9264733dc53fd206fd6c30ac"
+          ]
+        },
+        {
+          "name": "hibana-control-plane-58bb57d65d-n2xhx",
+          "images": [
+            "docker.io/library/import-2026-09-24@sha256:5221be5c4932256d06d01b8959f7134ea248af4a9264733dc53fd206fd6c30ac"
+          ]
+        },
+        {
+          "name": "hibana-worker-58fd5bbc8f-7pn9j",
+          "images": [
+            "docker.io/library/import-2026-09-24@sha256:5221be5c4932256d06d01b8959f7134ea248af4a9264733dc53fd206fd6c30ac"
+          ]
+        },
+        {
+          "name": "hibana-worker-58fd5bbc8f-7tbj6",
+          "images": [
+            "docker.io/library/import-2026-09-24@sha256:5221be5c4932256d06d01b8959f7134ea248af4a9264733dc53fd206fd6c30ac"
+          ]
+        }
+      ],
+      "retention": {
+        "pending": 0,
+        "protected": 1,
+        "usage": 138000,
+        "audit": 1,
+        "seeded": 138000,
+        "cycles": 23,
+        "deleted": 138000,
+        "passed": true,
+        "max_observed_pending": 6000,
+        "max_observed_drain_seconds": 64.09556217599993
+      },
+      "execution_failure_classes": {},
+      "backup_restore": "custom dump restored to separate DB; runtime switched to restored DB; counts and actual Secret decryption verified; S3 backup hashes verified",
+      "post_maintenance_http": true,
+      "live_restored_database": true,
+      "recovery": {
+        "passed": true,
+        "phase": "complete",
+        "warmup_statuses": {
+          "200": 10
+        },
+        "warmup_seconds": 0.31626698999999997,
+        "elapsed_seconds": 19.416285320000004
+      },
+      "application": {
+        "wasm_sha256": {
+          "v1": "07a44c61350f7750c1eb9870c8c9ab5754711f2a9d1c993b2a3fd5e5fb86ee70",
+          "v2": "253e18d691a21c6619d37a7c525fc679b77e2aa65c919f1864822ea918452c9b"
+        },
+        "requested_seconds": 7200,
+        "concurrency": 4,
+        "pause_ms": 100,
+        "checks": "auth, Secrets, egress, HTTP errors, vars update and rollback",
+        "elapsed_seconds": 7200.204806584,
+        "count": 218383,
+        "failures": 0,
+        "statuses": {
+          "200": 218383
+        },
+        "max_ms": 150.9158189999871,
+        "final_probe_passed": true,
+        "passed": true
+      },
+      "version_code": {
+        "passed": true,
+        "component": "version-code-q0lee2",
+        "finished_at": "2026-09-24T03:09:31.549Z",
+        "wasm_sha256": {
+          "one": "1785a601f2c2b9c09009f9523e5b81a47592045392c257f8c80293fdeadf8cef",
+          "two": "0b97538679cedd4cf070c0136c3e93eb2ea0c42b731df2500cb95b39f7a8a565"
+        },
+        "checks": "Read+Deploy CLI update and rollback; different code and vars independently asserted in HTTP body"
+      },
+      "tail": {
+        "passed": true,
+        "events": 218374,
+        "statuses": {
+          "200": 218373,
+          "404": 1
+        },
+        "saved_logs_verified": 10
+      },
+      "resource_samples": 228,
+      "resource_observation_errors": 0,
+      "worker_restarts": 0,
+      "resources": {
+        "samples": 228,
+        "observed_seconds": 7170.253051,
+        "workers": [
+          {
+            "name": "hibana-worker-58fd5bbc8f-7pn9j",
+            "memory_first_bytes": 585125888,
+            "memory_min_bytes": 584523776,
+            "memory_max_bytes": 586248192,
+            "cache_first_kib": 226924,
+            "cache_max_kib": 226924,
+            "memory_last_bytes": 584744960,
+            "cache_last_kib": 226924
+          },
+          {
+            "name": "hibana-worker-58fd5bbc8f-7tbj6",
+            "memory_first_bytes": 584798208,
+            "memory_min_bytes": 583897088,
+            "memory_max_bytes": 587968512,
+            "cache_first_kib": 226924,
+            "cache_max_kib": 226924,
+            "memory_last_bytes": 586858496,
+            "cache_last_kib": 226924
+          }
+        ],
+        "worker_restarts": 0,
+        "worker_replacements": 0,
+        "database": {
+          "first": {
+            "bytes": 13261847,
+            "connections": 21,
+            "pending": 0,
+            "running": 0,
+            "executions": 6101
+          },
+          "last": {
+            "bytes": 414301207,
+            "connections": 23,
+            "pending": 0,
+            "running": 1,
+            "executions": 217549
+          },
+          "max_connections": 29,
+          "max_pending": 2,
+          "max_running": 2
+        }
+      },
+      "stop_inflight_http": {
+        "status": 200,
+        "body_valid": true,
+        "gate_closed_at_completion": true
+      },
+      "platform_stopped": true,
+      "reinstall_preserved_applications": true,
+      "lifecycle": {
+        "passed": true,
+        "startup_statuses": {
+          "200": 10
+        },
+        "phase": "complete",
+        "startup_seconds": 0.284663487
+      },
+      "platform_uninstalled": true,
+      "cleanup_errors": [],
+      "finished_at": "2026-09-24T05:14:33.592107+00:00"
+    }
+  ]
+}

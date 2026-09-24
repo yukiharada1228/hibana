@@ -28,6 +28,8 @@
 
 ## 自動試験とリリース候補
 
+最新のrc.10では[2時間の負荷・履歴清掃・復元試験](retention-validation.md)が合格しています。
+
 `scripts/acceptance/kubernetes.py`はポート固定なしの専用kindを作り、明示したKubernetesコンテキストへCLIで導入します。CPとWorkerは内容に基づく同じイメージタグを使い、実PodのimageIDと、アプリの更新前後のWasm SHA-256を記録します。
 
 コードに書いた値と環境変数を別々にHTTP応答へ返す小さなAPIも使い、更新と双方向のrollbackで両方が揃って切り替わることを確認します。Wasmのハッシュが異なるだけでは成功としません。
