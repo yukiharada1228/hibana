@@ -6,6 +6,7 @@ lets the real public-IP egress gate run unchanged without traffic to the Interne
 The address route exists only in the disposable node containers, not on the host.
 """
 import argparse
+import base64
 from contextlib import ExitStack
 from datetime import datetime, timezone
 import json
@@ -16,6 +17,7 @@ import sys
 import threading
 import time
 from urllib.request import Request, urlopen
+from urllib.parse import urlsplit, urlunsplit
 
 ROOT = Path(__file__).resolve().parents[2]
 sys.path[:0] = [str(ROOT / 'scripts'), str(ROOT / 'sdk/platform')]
@@ -23,6 +25,7 @@ from bounded_process import run
 from kubernetes import LocalCluster, LOCAL, write_private
 from k8s_resilience import Operations
 from results import summarize_resources
+from retention import RetentionProbe
 import yaml
 
 CLUSTER = 'hibana-mvp-check'
@@ -34,10 +37,43 @@ def command(*args, timeout=60, input=None):
     return run([str(a) for a in args], timeout=timeout, input=input).decode().strip()
 
 
-def observe(operations, folder, stop, endpoints, node):
+class AcceptanceOperations(Operations):
+    """Keep the original DB intact and serve requests from the verified restore."""
+    database = 'hibana'
+
+    def sql(self, query, database=None, timeout=30):
+        return super().sql(query, database or self.database, timeout)
+
+    def verify_restore(self, folder, manifest):
+        database = 'hibana_acceptance_restored'
+        self.sql(f'CREATE DATABASE {database}', 'postgres')
+        with (folder / 'postgres.dump').open('rb') as stream:
+            self.call('exec', '-i', 'deployment/hibana-postgres', '--', 'pg_restore', '-U', 'hibana_admin',
+                      '-d', database, '--exit-on-error', '--no-owner', stdin=stream, timeout=600)
+        for table, count in manifest['counts'].items():
+            if int(self.sql(f'SELECT count(*) FROM {table}', database)) != count:
+                raise ValueError(f'Restored row count mismatch: {table}')
+        self.verify_secrets(folder, manifest, database)
+        updates = []
+        for name, key in [('hibana-runtime', 'DATABASE_URL'), ('hibana-migration', 'MIGRATION_DATABASE_URL')]:
+            secret = json.loads(self.call('get', 'secret', name, '-o', 'json'))
+            url = urlsplit(base64.b64decode(secret['data'][key]).decode())
+            secret['data'][key] = base64.b64encode(urlunsplit(url._replace(path='/' + database)).encode()).decode()
+            updates.append({'apiVersion':'v1','kind':'Secret','type':'Opaque',
+                            'metadata':{'name':name,'namespace':'hibana'},'data':secret['data']})
+        self.cluster.apply(updates)
+        # stopped_apps resumes against this DB with the owner saved in the dump.
+        self.database = database
+
+
+def observe(operations, folder, stop, endpoints, node, retention, interval):
     while not stop.is_set():
+        if not (folder / 'load-start.json').exists():
+            stop.wait(1)
+            continue
         sample = {'at': datetime.now(timezone.utc).isoformat()}
         try:
+            sample['retention'] = retention.observe()
             pods = json.loads(operations.call('get', 'pods', '-l', 'app.kubernetes.io/name=hibana-worker', '-o', 'json'))['items']
             sample['workers'] = []
             for pod in pods:
@@ -60,9 +96,10 @@ def observe(operations, folder, stop, endpoints, node):
             sample['database'] = json.loads(operations.sql("SELECT json_build_object('bytes',pg_database_size(current_database()),'connections',(SELECT count(*) FROM pg_stat_activity),'pending',count(*) FILTER (WHERE status='pending'),'running',count(*) FILTER (WHERE status='running'),'executions',count(*)) FROM executions"))
         except Exception as error:
             sample['observation_error'] = type(error).__name__
+            (folder / 'acceptance-failure.json').write_text(json.dumps({'error':type(error).__name__}))
         with (folder / 'resources.jsonl').open('a') as output:
             output.write(json.dumps(sample) + '\n')
-        stop.wait(30)
+        stop.wait(interval)
 
 
 def main():
@@ -97,6 +134,7 @@ def main():
     config_path.write_text(yaml.safe_dump(kind_config))
     created = network = upstream = False
     report = {'started_at': datetime.now(timezone.utc).isoformat(), 'cluster': CLUSTER,
+              'source_commit': command('git', 'rev-parse', 'HEAD'), 'version': command('node', ROOT / 'scripts/release.mjs', 'version'),
               'requested_seconds': args.seconds, 'passed': False, 'scope': 'single-host kind; synthetic upstream; real PostgreSQL/Redis/MinIO'}
     try:
         print('Creating isolated kind cluster without fixed host ports', flush=True)
@@ -125,7 +163,8 @@ def main():
         print('Installing through hibana platform with an explicit Kubernetes context', flush=True)
         command('node', args.cli_entry, 'platform', 'install', '--kubeconfig', cluster.kubeconfig,
                 '--context', f'kind-{CLUSTER}', '--overlay', LOCAL, '--image', image, timeout=900)
-        operations = Operations(cluster)
+        operations = AcceptanceOperations(cluster)
+        retention = RetentionProbe(operations, folder)
         report['pod_images'] = json.loads(operations.call('get', 'pods', '-o', 'json'))['items']
         report['pod_images'] = [{'name': p['metadata']['name'], 'images': [c.get('imageID') for c in p.get('status', {}).get('containerStatuses', [])]}
                                 for p in report['pod_images'] if p['metadata']['labels'].get('app.kubernetes.io/name') in ('hibana-worker', 'hibana-control-plane')]
@@ -163,7 +202,7 @@ def main():
             previous = os.environ.copy()
             os.environ.update(client_env)
             stop_observer = threading.Event()
-            observer = threading.Thread(target=observe, args=(operations, folder, stop_observer, endpoints, CLUSTER + '-control-plane'), daemon=True)
+            observer = threading.Thread(target=observe, args=(operations, folder, stop_observer, endpoints, CLUSTER + '-control-plane', retention, min(30, args.seconds / 3)), daemon=True)
             observer.start()
             try:
                 print('Running CLI application acceptance and sustained HTTP load', flush=True)
@@ -185,6 +224,7 @@ def main():
                 os.environ.update(previous)
                 if observer.is_alive():
                     raise ValueError('Resource observer did not finish within its cleanup budget')
+            report['retention'] = retention.finish()
         # Capture stable failure categories before maintenance changes Pods or state.
         try:
             categories = operations.sql("SELECT coalesce(json_object_agg(reason,n),'{}'::json) FROM (SELECT CASE WHEN error::text LIKE '%secret material unavailable: timeout%' THEN 'secret_timeout' WHEN error::text LIKE '%secret material unavailable: connect%' THEN 'secret_connect' WHEN error::text LIKE '%secret material unavailable:%' THEN 'secret_other' WHEN error::text LIKE '%dispatch%' THEN 'dispatch' ELSE 'other' END reason,count(*) n FROM executions WHERE status IN ('failed','timeout') GROUP BY 1) failures")
@@ -192,9 +232,11 @@ def main():
         except Exception as error:
             # Diagnostics must not suppress the independent recovery exercise.
             report['diagnostic_error'] = type(error).__name__
-        print('Verifying DB/S3/key backup and restoring a separate temporary database', flush=True)
+        print('Verifying DB/S3/key backup and switching to the restored database', flush=True)
         operations.backup(folder / 'backup')
-        report['backup_restore'] = 'custom dump restored to separate DB; counts and actual Secret decryption verified; S3 backup hashes verified'
+        report['backup_restore'] = 'custom dump restored to separate DB; runtime switched to restored DB; counts and actual Secret decryption verified; S3 backup hashes verified'
+        original_count = int(operations.sql('SELECT count(*) FROM executions', 'hibana'))
+        restored_count = int(operations.sql('SELECT count(*) FROM executions'))
         report['post_maintenance_http'] = False
         # New port-forward connections after drain/Pod replacement.
         with operations.forward('control-plane', 8080) as api, operations.forward('control-plane', 8083) as apps:
@@ -207,9 +249,13 @@ def main():
             next_client.replace(folder / 'client.json')
             command('node', ROOT / 'scripts/acceptance/application.mjs', '--verify-restored', folder, timeout=180)
         report['post_maintenance_http'] = True
+        if int(operations.sql('SELECT count(*) FROM executions', 'hibana')) != original_count or int(operations.sql('SELECT count(*) FROM executions')) <= restored_count:
+            raise ValueError('Post-restore requests were not recorded only in the restored DB')
+        report['live_restored_database'] = True
         report['recovery'] = json.loads((folder / 'recovery.json').read_text())
         report['application'] = json.loads((folder / 'application.json').read_text())
         report['version_code'] = json.loads((folder / 'version-code.json').read_text())
+        report['tail'] = json.loads((folder / 'tail.json').read_text())
         observations = [json.loads(line) for line in (folder / 'resources.jsonl').read_text().splitlines()]
         report['resource_samples'] = len(observations)
         report['resource_observation_errors'] = sum('observation_error' in row for row in observations)

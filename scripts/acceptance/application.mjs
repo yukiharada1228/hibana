@@ -6,6 +6,7 @@ import http from 'node:http';
 import {setTimeout as sleep} from 'node:timers/promises';
 import {runCommand} from '../bounded-process.mjs';
 import {issueAcceptanceToken} from './credentials.mjs';
+import {startTail} from './live-tail.mjs';
 
 const root=resolve(import.meta.dirname,'../..');
 const folder=resolve(['--verify-restored','--verify-lifecycle'].includes(process.argv[2]) ? process.argv[3] : process.env.HIBANA_ACCEPTANCE_FOLDER);
@@ -166,6 +167,12 @@ if (process.argv[2] === '--verify-restored') {
   await runCommand(process.execPath,[join(root,'scripts/acceptance/version-code.mjs'),folder],{timeoutMs:360000});
   console.log('PASS CLI build/deploy, app auth, explicit Secrets/egress, HTTP validation, update and rollback');
 
+  const tail=await startTail({cliEntry:state.cliEntry,cwd:folder,
+    env:{...process.env,HIBANA_URL:state.url,HIBANA_TOKEN:state.deployToken},
+    secrets:[state.apiToken,state.upstreamToken,state.adminToken,state.deployToken]});
+  assert.equal((await request('/items/MISSING')).status,404);
+  await savePrivate('load-start.json',{started_at:new Date().toISOString()});
+
   // Fixed concurrency, bounded latency sampling and a graceful in-flight drain at
   // the duration boundary. No external public service receives this load.
   const start=performance.now();
@@ -189,6 +196,12 @@ if (process.argv[2] === '--verify-restored') {
   const monitoring=(async()=>{
     while(failures===0 && performance.now()-start<seconds*1000) {
       await sleep(Math.min(30000,Math.max(1,seconds*1000-(performance.now()-start))));
+      try {
+        tail.snapshot();
+        if(await readFile(join(folder,'acceptance-failure.json'),'utf8').catch(error=>{
+          if(error.code==='ENOENT') return '';throw error;
+        })) throw new Error('Resource/retention observer failed');
+      } catch {failures++;}
       const ordered=latencies.sort((a,b)=>a-b);latencies=[];
       const sample={seconds:Math.round((performance.now()-start)/1000),count,failures,statuses:{...statuses},p95_ms:ordered[Math.ceil(ordered.length*.95)-1]??null,max_ms:worst};
       await appendFile(join(folder,'load.jsonl'),JSON.stringify(sample)+'\n');
@@ -198,9 +211,19 @@ if (process.argv[2] === '--verify-restored') {
   await loading;await monitoring;
   let finalProbePassed=true;
   try { await checkHealthy('v2'); } catch { finalProbePassed=false; }
+  let tailResult={passed:false};
+  try {
+    tailResult=await tail.verifyStored(api);
+    assert.ok(tailResult.statuses[200]>0&&tailResult.statuses[404]>0,'Tail missed HTTP outcomes');
+    await tail.stop();
+  } catch {
+    tailResult.passed=false;
+    await tail.stop().catch(()=>{});
+  }
+  await writeFile(join(folder,'tail.json'),JSON.stringify(tailResult,null,2)+'\n');
   const elapsed=(performance.now()-start)/1000;
   Object.assign(record,{elapsed_seconds:elapsed,count,failures,statuses,max_ms:worst,final_probe_passed:finalProbePassed,
-    passed:count>0&&failures===0&&finalProbePassed&&elapsed>=seconds});
+    passed:count>0&&failures===0&&finalProbePassed&&tailResult.passed&&elapsed>=seconds});
   await writeFile(join(folder,'application.json'),JSON.stringify(record,null,2)+'\n');
   assert.ok(record.passed,'sustained HTTP load failed');
 }

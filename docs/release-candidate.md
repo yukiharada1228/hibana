@@ -1,4 +1,6 @@
-# Hibana 0.2.0-rc.9
+# Hibana 0.2.0-rc.10
+
+rc.10では完了した実行履歴を既定で30日間保持し、期限切れの行を少量ずつ削除します。利用量・監査・Secrets・配備した版は保持します。`EXECUTION_RETENTION_DAYS=0`で履歴行の自動削除を停止できます。追加DBマイグレーションはありません。旧CLIからのnpm更新と、k8sでの負荷・履歴清掃・tail・復元の受入試験も追加しました。
 
 rc.9ではnpm配布物のJavaScriptコンパイラを検証済みの版へ固定し、新規インストールで脆弱な間接依存を取得する問題を修正しました。配布パッケージのインストール後にも依存監査を実行します。rc.7・rc.8からの追加DBマイグレーションはありません。
 
@@ -6,7 +8,7 @@ rc.8ではCLIのログ閲覧を`hibana tail`へ統一し、`logs`コマンドを
 
 新規導入は空DBで行います。0.2.0-rc.2のDBを更新する場合は、Control Planeを停止・バックアップして[OIDC専用版への切り替え](authentication.md#oidc専用版への切り替え)を実施します。v0.1.0の旧スキーマへの上書き更新は拒否するため、[DBの作成と切替](database.md)に従って別の検証先を指定してください。
 
-CLI・PC用Wasmtimeランタイム・コンソール・Control Plane・Workerを`0.2.0-rc.9`に揃えた公開候補版です。[GitHub Release](https://github.com/yukiharada1228/hibana/releases/tag/v0.2.0-rc.9)とnpmで公開済みです。通常の開発は[ログインから配備・tail・rollbackまでの手順](../README.md#開発から配備まで)、既存のアプリは[CLIの更新手順](../sdk/README.md#既存プロジェクトの更新)を使ってください。`dev`による同じ版のランタイムの自動取得も利用できます。
+CLI・PC用Wasmtimeランタイム・コンソール・Control Plane・Workerを`0.2.0-rc.10`に揃えた公開候補版です。[GitHub Release](https://github.com/yukiharada1228/hibana/releases/tag/v0.2.0-rc.10)とnpmで公開済みです。通常の開発は[ログインから配備・tail・rollbackまでの手順](../README.md#開発から配備まで)、既存のアプリは[CLIの更新手順](../sdk/README.md#既存プロジェクトの更新)を使ってください。`dev`による同じ版のランタイムの自動取得も利用できます。
 
 ## 含まれる変更
 
@@ -34,9 +36,9 @@ CLI・PC用Wasmtimeランタイム・コンソール・Control Plane・Workerを
 公開済みのrc.9はGitHub Releaseから取得します。
 
 ```bash
-gh release download v0.2.0-rc.9 --repo yukiharada1228/hibana \
-  --dir .local/release/0.2.0-rc.9
-cd .local/release/0.2.0-rc.9
+gh release download v0.2.0-rc.10 --repo yukiharada1228/hibana \
+  --dir .local/release/0.2.0-rc.10
+cd .local/release/0.2.0-rc.10
 shasum -a 256 -c SHA256SUMS
 ```
 
@@ -44,11 +46,11 @@ shasum -a 256 -c SHA256SUMS
 
 | 配布物 | ファイル |
 | --- | --- |
-| CLI | `hibana-cli-0.2.0-rc.9.tgz` |
-| Kubernetesマニフェスト | `hibana-kubernetes-0.2.0-rc.9.tar.gz` |
-| PC用ランタイム | `hibana-worker-0.2.0-rc.9-{darwin,linux}-{x64,arm64}`の4ファイル |
-| 基盤イメージ | `hibana-platform-0.2.0-rc.9-linux-{amd64,arm64}.tar`の2ファイル |
-| コンソールイメージ | `hibana-console-0.2.0-rc.9-linux-{amd64,arm64}.tar`の2ファイル |
+| CLI | `hibana-cli-0.2.0-rc.10.tgz` |
+| Kubernetesマニフェスト | `hibana-kubernetes-0.2.0-rc.10.tar.gz` |
+| PC用ランタイム | `hibana-worker-0.2.0-rc.10-{darwin,linux}-{x64,arm64}`の4ファイル |
+| 基盤イメージ | `hibana-platform-0.2.0-rc.10-linux-{amd64,arm64}.tar`の2ファイル |
+| コンソールイメージ | `hibana-console-0.2.0-rc.10-linux-{amd64,arm64}.tar`の2ファイル |
 
 作成元はReleaseのタグのcommit SHAで確認できます。異なる実行・バージョンのファイルを混在させず、ハッシュ確認後に社内へ搬入してください。未公開の次期候補を試す場合は、同じコミットのCI・Security dependencies・Hibana releaseが成功したActions実行の`hibana-release-candidate`を取得します。Actionsの成果物は14日間保持されます。[候補の作成手順](releases.md#ソースから候補を作る)を参照してください。
 
@@ -58,9 +60,9 @@ shasum -a 256 -c SHA256SUMS
 
 ```bash
 # 取得したファイルがあるディレクトリで実行
-npx --yes --package=./hibana-cli-0.2.0-rc.9.tgz hibana --version
-npx --yes --package=./hibana-cli-0.2.0-rc.9.tgz hibana runtime install --from ./hibana-worker-0.2.0-rc.9-darwin-arm64 --sha256 HASH
-npx --yes --package=./hibana-cli-0.2.0-rc.9.tgz hibana init hello --cli-package ./hibana-cli-0.2.0-rc.9.tgz
+npx --yes --package=./hibana-cli-0.2.0-rc.10.tgz hibana --version
+npx --yes --package=./hibana-cli-0.2.0-rc.10.tgz hibana runtime install --from ./hibana-worker-0.2.0-rc.10-darwin-arm64 --sha256 HASH
+npx --yes --package=./hibana-cli-0.2.0-rc.10.tgz hibana init hello --cli-package ./hibana-cli-0.2.0-rc.10.tgz
 cd hello
 npm run dev
 # 別ターミナルで curl http://127.0.0.1:8787/
@@ -74,9 +76,9 @@ npm run dev
 CPUに合うDocker archiveを読み込み、社内レジストリへ搬入します。`registry.example.internal`とkubeconfig/contextを実サイトのものへ変更してください。
 
 ```bash
-docker load --input hibana-platform-0.2.0-rc.9-linux-amd64.tar
-docker tag hibana-platform:0.2.0-rc.9-linux-amd64 registry.example.internal/hibana/platform:0.2.0-rc.9-amd64
-docker push registry.example.internal/hibana/platform:0.2.0-rc.9-amd64
+docker load --input hibana-platform-0.2.0-rc.10-linux-amd64.tar
+docker tag hibana-platform:0.2.0-rc.10-linux-amd64 registry.example.internal/hibana/platform:0.2.0-rc.10-amd64
+docker push registry.example.internal/hibana/platform:0.2.0-rc.10-amd64
 hibana platform init my-site
 # my-site/README.mdに沿ってDB・Redis・S3・DNS・TLSを設定
 hibana platform install --kubeconfig /secure/config --context staging \

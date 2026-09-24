@@ -1,6 +1,6 @@
 # 手元のCLIからオンプレHibanaを操作する
 
-この手順は公開候補版`0.2.0-rc.9`向けです。CLI・ランタイム・コンソール・基盤イメージを同じ版に揃えます。[配布物と基盤の更新条件](release-candidate.md)、[既存プロジェクトのCLI更新](../sdk/README.md#既存プロジェクトの更新)も確認してください。
+この手順は公開候補版`0.2.0-rc.10`向けです。CLI・ランタイム・コンソール・基盤イメージを同じ版に揃えます。[配布物と基盤の更新条件](release-candidate.md)、[既存プロジェクトのCLI更新](../sdk/README.md#既存プロジェクトの更新)も確認してください。
 
 CLIを導入すると、ローカル開発ランタイムは初回の`dev`で自動取得します。Kubernetes上の基盤は管理者が別途導入します。開発者のPCにはクラスタの資格情報を渡さず、Hibanaのテナント用認証でHTTPS管理APIを操作します。
 
@@ -69,13 +69,13 @@ Node.js 24以上が必要です。初回作成には `npx --yes @yukiharada1228/
 
 ```bash
 # 開発者のPCで実行
-npx --yes @yukiharada1228/hibana@0.2.0-rc.9 --version
-npx --yes @yukiharada1228/hibana@0.2.0-rc.9 --help
+npx --yes @yukiharada1228/hibana@0.2.0-rc.10 --version
+npx --yes @yukiharada1228/hibana@0.2.0-rc.10 --help
 ```
 
 パッケージに含めるのはCLI、言語テンプレート、WIT、既存クラスタを操作する小さな管理ツールとマイグレーションの公開マニフェストです。Control Plane/Workerのソース・バイナリ、Dockerfile、kind構築処理、開発用資格情報は含みません。アプリの配備・削除・Secrets操作でPython・Docker・kubectlを起動することはありません。
 
-JS/TSのビルドにはoptionalDependenciesとして固定したコンパイラーを使います。ビルド済みWasmだけを配備するPCでは`npm install -g @yukiharada1228/hibana@0.2.0-rc.9 --omit=optional`でJSコンパイラーを省略できます。ソースからの作成や閉域環境への搬入は[配布ガイド](releases.md)を参照してください。
+JS/TSのビルドにはoptionalDependenciesとして固定したコンパイラーを使います。ビルド済みWasmだけを配備するPCでは`npm install -g @yukiharada1228/hibana@0.2.0-rc.10 --omit=optional`でJSコンパイラーを省略できます。ソースからの作成や閉域環境への搬入は[配布ガイド](releases.md)を参照してください。
 
 ## 開発者の操作
 
@@ -84,11 +84,11 @@ JS/TSのビルドにはoptionalDependenciesとして固定したコンパイラ�
 管理者から管理API URL・テナント名・組織のアカウントを受け取ります。公開 URL は基盤から自動取得します。ログイン時はブラウザで組織の認証基盤に接続します。CIでは専用APIトークンを`HIBANA_TOKEN`へ設定してください。ログインは開発環境もOIDCに統一しています。[認証と移行の詳細](authentication.md)を参照してください。
 
 ```bash
-npx --yes @yukiharada1228/hibana@0.2.0-rc.9 login \
+npx --yes @yukiharada1228/hibana@0.2.0-rc.10 login \
   --url https://hibana.example.internal/api \
   --tenant team
 
-npx --yes @yukiharada1228/hibana@0.2.0-rc.9 init hello
+npx --yes @yukiharada1228/hibana@0.2.0-rc.10 init hello
 cd hello
 npm run dev
 # 別ターミナルで curl http://127.0.0.1:8787/ を確認し、Ctrl+Cで停止

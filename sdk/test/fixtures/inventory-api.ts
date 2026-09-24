@@ -16,6 +16,8 @@ app.use('*', async (c, next) => {
   c.header('X-Content-Type-Options', 'nosniff');
   c.header('X-App-Release', c.env.RELEASE || 'unknown');
   await next();
+  // Public request metadata only; never headers, query strings or Secret values.
+  console.log(JSON.stringify({event:'acceptance_request',method:c.req.method,path:c.req.path,status:c.res.status,release:c.env.RELEASE}));
 });
 
 app.get('/health', c => c.json({ status: 'ok' }));
