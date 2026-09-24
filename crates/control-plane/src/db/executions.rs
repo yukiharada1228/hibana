@@ -30,6 +30,53 @@ pub fn application_logs_expression() -> Expr {
 /// Bound each cleanup transaction. Suspended tenants are included by the reaper.
 pub const LOG_CLEANUP_BATCH_SIZE: u64 = 500;
 
+pub const EXECUTION_CLEANUP_BATCH_SIZE: u64 = 500;
+
+/// Delete committed terminal history only. Accounting and audit records live in
+/// separate tables; unfinished executions still pin their code and Secret keys.
+/// The literal terminal predicate matches idx_executions_tenant_finished even
+/// with a generic prepared plan. SKIP LOCKED lets multiple CPs share the work.
+pub async fn purge_expired_executions(
+    tx: &DatabaseTransaction,
+    tenant: &str,
+    retention_days: u32,
+) -> Result<u64, DbErr> {
+    if retention_days == 0 {
+        return Ok(0);
+    }
+    let expired = Condition::all()
+        .add(executions::Column::TenantId.eq(tenant))
+        .add(Expr::cust("status IN ('succeeded', 'failed', 'timeout')"))
+        .add(
+            Expr::col(executions::Column::FinishedAt)
+                .lte(now().sub(Expr::cust("interval '24 hours'").mul(i64::from(retention_days)))),
+        );
+    let ids: Vec<String> = executions::Entity::find()
+        .select_only()
+        .column(executions::Column::Id)
+        .filter(expired.clone())
+        .order_by_asc(executions::Column::FinishedAt)
+        .limit(EXECUTION_CLEANUP_BATCH_SIZE)
+        .lock_with_behavior(
+            sea_orm::sea_query::LockType::Update,
+            sea_orm::sea_query::LockBehavior::SkipLocked,
+        )
+        .into_tuple()
+        .all(tx)
+        .await?;
+    // Materialize the locked IDs once. An IN (SELECT ... FOR UPDATE LIMIT ...)
+    // can be rescanned by PostgreSQL and exceed the intended batch size.
+    if ids.is_empty() {
+        return Ok(0);
+    }
+    Ok(executions::Entity::delete_many()
+        .filter(expired)
+        .filter(executions::Column::Id.is_in(ids))
+        .exec(tx)
+        .await?
+        .rows_affected)
+}
+
 pub async fn purge_expired_application_logs(
     tx: &DatabaseTransaction,
     tenant: &str,

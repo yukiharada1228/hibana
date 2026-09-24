@@ -113,8 +113,15 @@ pub(crate) async fn run() -> anyhow::Result<()> {
     // stuck-execution sweeper の deadline。invoke ハンドラの post-commit publish 失敗や worker 側
     // 取りこぼしで孤立した pending/running 行を回収し、in-flight スロットの恒久リークを防ぐ（§8）。
     let stuck_deadline = config.stuck_execution_deadline_secs;
+    let retention_days = config.execution_retention_days;
     tokio::spawn(async move {
-        reaper::run(reaper_state, reaper_interval, stuck_deadline).await;
+        reaper::run(
+            reaper_state,
+            reaper_interval,
+            stuck_deadline,
+            retention_days,
+        )
+        .await;
     });
 
     // --- KEK ローテーション進捗の gauge 更新（M7c-4, §4.7.2）---

@@ -26,6 +26,8 @@ data:
   WORKER_DB_MAX_CONNECTIONS: "8"
   WORKER_DRAIN_TIMEOUT_SECS: "75"
   STUCK_EXECUTION_DEADLINE_SECS: "1800"
+  # Completed execution history; 0 disables cleanup (otherwise 1..3650 days).
+  EXECUTION_RETENTION_DAYS: "30"
   WASM_CACHE_DIR: "/var/cache/hibana"
   TMPDIR: "/tmp"
   LOG_FORMAT: "json"

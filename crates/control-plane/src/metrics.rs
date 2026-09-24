@@ -18,6 +18,7 @@ pub struct Metrics {
     pub admission_rejections_total: IntCounterVec,
     pub reaper_swept_total: IntCounter,
     pub reaper_tenants_last: IntGauge,
+    pub execution_history_deleted_total: IntCounter,
 
     pub secret_material_issued_total: IntCounterVec,
     pub secret_versions_by_kid: IntGaugeVec,
@@ -108,6 +109,14 @@ impl Metrics {
             ),
         );
 
+        let execution_history_deleted_total = register(
+            &registry,
+            IntCounter::new(
+                "faas_execution_history_deleted_total",
+                "Number of terminal execution history rows deleted after retention expiry",
+            ),
+        );
+
         let secret_material_issued_total = register(
             &registry,
             IntCounterVec::new(
@@ -140,6 +149,7 @@ impl Metrics {
             admission_rejections_total,
             reaper_swept_total,
             reaper_tenants_last,
+            execution_history_deleted_total,
             secret_material_issued_total,
             secret_versions_by_kid,
         })

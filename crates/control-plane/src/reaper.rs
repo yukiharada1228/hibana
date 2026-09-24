@@ -5,9 +5,15 @@ use crate::state::AppState;
 
 /// reaper ループ。`main` から `tokio::spawn` される。
 ///
-/// `interval_secs` 周期で全テナントの入力清掃・孤立行回収を行う。
+/// `interval_secs` 周期で全テナントの入力・ログ・履歴の清掃と孤立行回収を行う。
 /// `stuck_deadline_secs` は孤立 pending/running 行を failed 化する deadline（0 で sweep 無効）。
-pub async fn run(state: AppState, interval_secs: u64, stuck_deadline_secs: u64) {
+/// `retention_days` は完了済み履歴の保存日数（0 で履歴削除のみ無効）。
+pub async fn run(
+    state: AppState,
+    interval_secs: u64,
+    stuck_deadline_secs: u64,
+    retention_days: u32,
+) {
     // 0 は「無効」を意味させず、最低 1 秒に丸めて暴走 tight-loop を防ぐ。
     let period = Duration::from_secs(interval_secs.max(1));
     let mut ticker = tokio::time::interval(period);
@@ -15,19 +21,20 @@ pub async fn run(state: AppState, interval_secs: u64, stuck_deadline_secs: u64) 
     tracing::info!(
         interval_secs = period.as_secs(),
         stuck_deadline_secs,
+        retention_days,
         "in-flight reaper + stuck-execution sweeper started"
     );
 
     loop {
         ticker.tick().await;
-        if let Err(e) = reconcile_once(&state, stuck_deadline_secs).await {
+        if let Err(e) = reconcile_once(&state, stuck_deadline_secs, retention_days).await {
             // best-effort: 周期内の失敗は記録のみ。次の周期で再試行する。
             tracing::warn!(error = %e, "in-flight reaper pass failed; will retry next interval");
         }
     }
 }
 
-/// 1 周期分の入力清掃・孤立実行回収。停止中のテナントも処理する。
+/// 1 周期分の清掃・孤立実行回収。停止中のテナントも処理する。
 ///
 /// テナント列挙の失敗（DB 障害）はパス全体を失敗扱いにする（次周期で再試行）。個々の
 /// テナントの入力清掃・回収失敗はそのテナントだけスキップし、他テナントの処理は続ける
@@ -35,13 +42,14 @@ pub async fn run(state: AppState, interval_secs: u64, stuck_deadline_secs: u64) 
 pub(crate) async fn reconcile_once(
     state: &AppState,
     stuck_deadline_secs: u64,
+    retention_days: u32,
 ) -> anyhow::Result<()> {
     // tenants は RLS 無し → GUC 不要でプールから直接列挙できる。
     let tenants = crate::db::list_tenants_for_admin(state.pool()).await?;
 
     let mut reconciled = 0usize;
     for (tenant, _) in &tenants {
-        match reconcile_tenant(state, tenant, stuck_deadline_secs).await {
+        match reconcile_tenant(state, tenant, stuck_deadline_secs, retention_days).await {
             Ok(()) => reconciled += 1,
             Err(e) => {
                 // DB エラーは当該テナントのみスキップし、次周期で再試行する。
@@ -65,11 +73,12 @@ pub(crate) async fn reconcile_once(
     Ok(())
 }
 
-/// 1 テナント分の入力清掃・孤立実行回収。終端状態のコミットで同時実行枠も解放される。
+/// 1 テナント分の清掃・孤立実行回収。終端状態のコミットで同時実行枠も解放される。
 async fn reconcile_tenant(
     state: &AppState,
     tenant: &str,
     stuck_deadline_secs: u64,
+    retention_days: u32,
 ) -> anyhow::Result<()> {
     // executions は FORCE RLS 下 → 清掃と回収は GUC を設定した同一 tx で実行する。
     let tx = state.pool().begin().await?;
@@ -140,6 +149,23 @@ async fn reconcile_tenant(
         tx.commit().await?;
         if removed < crate::db::LOG_CLEANUP_BATCH_SIZE {
             break;
+        }
+    }
+    // Keep each transaction and each tenant's pass bounded, as for log cleanup.
+    // Retention is independent of orphan recovery and also covers suspended tenants.
+    if retention_days > 0 {
+        for _ in 0..10 {
+            let tx = state.pool().begin().await?;
+            crate::db::set_tenant_guc(&tx, tenant).await?;
+            let removed = crate::db::purge_expired_executions(&tx, tenant, retention_days).await?;
+            tx.commit().await?;
+            state
+                .metrics()
+                .execution_history_deleted_total
+                .inc_by(removed);
+            if removed < crate::db::EXECUTION_CLEANUP_BATCH_SIZE {
+                break;
+            }
         }
     }
     Ok(())

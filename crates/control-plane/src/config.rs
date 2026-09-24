@@ -10,6 +10,7 @@ const DEFAULT_INVOKE_BURST: u64 = 500;
 const DEFAULT_MAX_CONCURRENT: u64 = 20;
 const DEFAULT_REAPER_INTERVAL_SECS: u64 = 30;
 const DEFAULT_STUCK_EXECUTION_DEADLINE_SECS: u64 = 900;
+pub(crate) const DEFAULT_EXECUTION_RETENTION_DAYS: u32 = 30;
 
 const DEFAULT_INTERNAL_BIND_ADDR: &str = "127.0.0.1:8081";
 // An admitted request may redeem Secrets once before executing. The default
@@ -49,6 +50,7 @@ pub struct Config {
     pub max_concurrent_executions: u64,
     pub reaper_interval_secs: u64,
     pub stuck_execution_deadline_secs: u64,
+    pub execution_retention_days: u32,
     pub trusted_proxies: crate::client_ip::TrustedProxies,
 
     pub secrets_master_key: Redacted<String>,
@@ -173,6 +175,10 @@ impl Config {
                 "STUCK_EXECUTION_DEADLINE_SECS",
                 DEFAULT_STUCK_EXECUTION_DEADLINE_SECS,
             )?,
+            execution_retention_days: execution_retention_days(env_u64(
+                "EXECUTION_RETENTION_DAYS",
+                DEFAULT_EXECUTION_RETENTION_DAYS.into(),
+            )?)?,
             trusted_proxies: crate::client_ip::TrustedProxies::parse(&env_or(
                 "TRUSTED_PROXY_CIDRS",
                 "",
@@ -209,6 +215,14 @@ impl Config {
             trusted_proxies: self.trusted_proxies.clone(),
         }
     }
+}
+
+fn execution_retention_days(days: u64) -> anyhow::Result<u32> {
+    anyhow::ensure!(
+        days <= 3650,
+        "EXECUTION_RETENTION_DAYS must be 0..3650 (0 disables history cleanup)"
+    );
+    Ok(days as u32)
 }
 
 fn env_required(key: &str) -> anyhow::Result<String> {
@@ -288,6 +302,16 @@ pub(crate) fn parse_secret_keyring(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn execution_retention_is_bounded_and_can_be_disabled() {
+        for days in [0, 1, 30, 3650] {
+            assert_eq!(execution_retention_days(days).unwrap(), days as u32);
+        }
+        for days in [3651, u64::MAX] {
+            assert!(execution_retention_days(days).is_err());
+        }
+    }
 
     #[tokio::test(start_paused = true)]
     async fn admitted_default_traffic_can_redeem_secrets() {
