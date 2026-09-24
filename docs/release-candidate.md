@@ -33,7 +33,7 @@ CLI・PC用Wasmtimeランタイム・コンソール・Control Plane・Workerを
 
 ## 配布物を取得する
 
-公開済みのrc.9はGitHub Releaseから取得します。
+公開済みのrc.10はGitHub Releaseから取得します。
 
 ```bash
 gh release download v0.2.0-rc.10 --repo yukiharada1228/hibana \

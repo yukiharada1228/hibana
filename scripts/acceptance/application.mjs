@@ -61,6 +61,8 @@ if (process.argv[2] === '--verify-restored') {
     }
     recovery.warmup_seconds=(performance.now()-began)/1000;
     recovery.phase='inventory-v2';await checkHealthy('v2');
+    recovery.phase='deploy-restored';await cli(['deploy','--version','mvp-restored']);
+    recovery.phase='inventory-redeployed';await checkHealthy('v2');
     recovery.phase='rollback-v1';await cli(['rollback','--version','mvp-v1']);
     recovery.phase='inventory-v1';await checkHealthy('v1');
     recovery.phase='rollback-v2';await cli(['rollback','--version','mvp-v2']);

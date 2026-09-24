@@ -49,6 +49,7 @@ jobs:
           tags: hibana-platform:acceptance
           load: true
           cache-from: |
+            type=gha,scope=acceptance
             type=gha,scope=release-amd64
             type=gha
           cache-to: type=gha,scope=acceptance,mode=max
@@ -86,3 +87,4 @@ jobs:
             .local/mvp-acceptance/*/tail.json
             .local/mvp-acceptance/*/load.jsonl
             .local/mvp-acceptance/*/resources.jsonl
+            .local/mvp-acceptance/*/application.log
