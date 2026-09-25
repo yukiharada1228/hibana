@@ -19,12 +19,14 @@ jobs:
       - uses: hashicorp/setup-terraform@v3
         with: {terraform_version: '1.15.1'}
       - run: python -m pip install -r infra/requirements.txt
+      - run: sudo apt-get update && sudo apt-get install -y gnupg
       - run: |
           ansible-playbook -i infra/ansible/inventory.example.yml infra/ansible/network.yml --syntax-check
           ansible-playbook -i infra/ansible/inventory.example.yml infra/ansible/bootstrap.yml --syntax-check
           ansible-playbook -i infra/ansible/inventory.example.yml infra/ansible/deploy.yml --syntax-check
           ansible-playbook -i infra/ansible/inventory.example.yml infra/ansible/cd.yml --syntax-check
           python infra/tests/test_cd.py
+          python infra/tests/test_cd_backup.py
           python infra/tests/test_actions_deploy.py
           python infra/tests/test_render.py
           terraform -chdir=infra/terraform/dns fmt -check -recursive

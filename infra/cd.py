@@ -4,13 +4,15 @@
 import argparse
 import datetime
 import fcntl
-import io
+import hashlib
 import json
 import os
 from pathlib import Path
 import re
+import shutil
 import subprocess
 import tarfile
+import tempfile
 import urllib.request
 
 REPO = "yukiharada1228/hibana"
@@ -44,40 +46,84 @@ def write_state(state):
 
 
 def backup(version):
-    from ansible.parsing.vault import VaultLib, VaultSecret
-
-    files = {}
-    for namespace in ["hibana", "hibana-identity", "hibana-edge"]:
-        files[namespace + ".json"] = run(KUBE + ["-n", namespace, "get",
-            "deployments,configmaps,secrets,services,ingresses,networkpolicies,persistentvolumeclaims", "-o", "json"])
-    files["rendered.tar.gz"] = run(["tar", "-C", "/opt/hibana", "-czf", "-", "rendered"])
-    files["site.yml"] = (ROOT / "site.yml").read_bytes()
-    for database, namespace, deployment, user in [
-        ("hibana", "hibana", "hibana-postgres", "hibana_admin"),
-        ("keycloak", "hibana-identity", "keycloak-postgres", "keycloak"),
-    ]:
-        command = KUBE + ["-n", namespace, "exec", "deployment/" + deployment, "--"]
-        data = run(command + ["pg_dump", "-U", user, "-d", database, "-Fc"])
-        if not data.startswith(b"PGDMP"):
-            raise RuntimeError("Invalid database backup")
-        run(KUBE + ["-n", namespace, "exec", "-i", "deployment/" + deployment,
-                    "--", "pg_restore", "--list"], input=data)
-        files[database + ".dump"] = data
-    buffer = io.BytesIO()
-    with tarfile.open(fileobj=buffer, mode="w:gz") as archive:
-        for name, data in files.items():
-            info = tarfile.TarInfo(name)
-            info.size, info.mode = len(data), 0o600
-            archive.addfile(info, io.BytesIO(data))
-    vault = VaultLib([("default", VaultSecret((ROOT / "vault.key").read_bytes().strip()))])
-    encrypted = vault.encrypt(buffer.getvalue())
-    if vault.decrypt(encrypted) != buffer.getvalue():
-        raise RuntimeError("Backup encryption verification failed")
+    # DB growth must consume disk, not the deployment service's 512 MiB memory.
+    # Publish only after a full decrypt/hash check, retaining old backups on error.
     directory = ROOT / "backups"
-    directory.mkdir(exist_ok=True)
-    target = directory / (datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%dT%H%M%SZ") + "-" + version + ".vault")
-    target.write_bytes(encrypted)
+    directory.mkdir(mode=0o700, exist_ok=True)
+    # main holds the deployment lock. A killed process may have left private
+    # plaintext staging files; discard only its unpublished temporary workspace.
+    for stale in directory.glob(".backup-*"):
+        shutil.rmtree(stale)
+    with tempfile.TemporaryDirectory(prefix=".backup-", dir=directory) as temporary:
+        work = Path(temporary)
+        files = work / "files"
+        files.mkdir(mode=0o700)
+        for namespace in ["hibana", "hibana-identity", "hibana-edge"]:
+            capture_file(KUBE + ["-n", namespace, "get",
+                "deployments,configmaps,secrets,services,ingresses,networkpolicies,persistentvolumeclaims",
+                "-o", "json"], files / (namespace + ".json"))
+        capture_file(["tar", "-C", str(ROOT.parent), "-czf", "-", "rendered"], files / "rendered.tar.gz")
+        shutil.copyfile(ROOT / "site.yml", files / "site.yml")
+        for database, namespace, deployment, user in [
+            ("hibana", "hibana", "hibana-postgres", "hibana_admin"),
+            ("keycloak", "hibana-identity", "keycloak-postgres", "keycloak"),
+        ]:
+            dump = files / (database + ".dump")
+            capture_file(KUBE + ["-n", namespace, "exec", "deployment/" + deployment,
+                                "--", "pg_dump", "-U", user, "-d", database, "-Fc"], dump)
+            with dump.open("rb", buffering=0) as source:
+                if source.read(5) != b"PGDMP":
+                    raise RuntimeError("Invalid database backup")
+                source.seek(0)
+                subprocess.run(KUBE + ["-n", namespace, "exec", "-i", "deployment/" + deployment,
+                                      "--", "pg_restore", "--list"], stdin=source,
+                               stdout=subprocess.DEVNULL, check=True, timeout=1800)
+        archive = work / "backup.tar.gz"
+        with tarfile.open(archive, mode="w:gz") as bundle:
+            for path in sorted(files.iterdir()):
+                bundle.add(path, arcname=path.name)
+        # An isolated keyring and no passphrase caching keep the existing Vault
+        # key off argv and out of the operator's normal GnuPG configuration.
+        home = work / "gnupg"
+        home.mkdir(mode=0o700)
+        gpg = ["gpg", "--no-options", "--homedir", str(home), "--batch", "--yes",
+               "--pinentry-mode", "loopback", "--no-symkey-cache", "--passphrase-file", str(ROOT / "vault.key")]
+        encrypted, decrypted = work / "backup.gpg", work / "verified.tar.gz"
+        try:
+            subprocess.run(gpg + ["--rfc4880", "--cipher-algo", "AES256", "--compress-algo", "none",
+                                  "--output", str(encrypted), "--symmetric", str(archive)], check=True, timeout=1800)
+            subprocess.run(gpg + ["--output", str(decrypted), "--decrypt", str(encrypted)], check=True, timeout=1800)
+            if file_hash(archive) != file_hash(decrypted):
+                raise RuntimeError("Backup encryption verification failed")
+        finally:
+            subprocess.run(["gpgconf", "--homedir", str(home), "--kill", "gpg-agent"],
+                           check=False, timeout=30)
+        target = directory / (datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
+                              + "-" + version + ".tar.gz.gpg")
+        encrypted.replace(target)
     return target
+
+
+def capture_file(command, destination):
+    with destination.open("wb") as output:
+        subprocess.run(command, stdout=output, check=True, timeout=1800)
+
+
+def file_hash(path):
+    with path.open("rb") as source:
+        return hashlib.file_digest(source, "sha256").digest()
+
+
+def prune_backups():
+    directory = ROOT / "backups"
+    backups = sorted([*directory.glob("*.vault"), *directory.glob("*.tar.gz.gpg")])
+    for old in backups[:-3]:
+        try:
+            old.unlink()
+        except OSError as error:
+            # Deployment already succeeded. Retention failure must not turn a
+            # healthy release into a failed deployment or require a redeploy.
+            print("Warning: could not prune backup: " + str(error), flush=True)
 
 
 def verify(version, config):
@@ -111,6 +157,8 @@ def main():
     os.umask(0o077)
     with (ROOT / "lock").open("w") as lock:
         fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        if (ROOT / "maintenance").exists():
+            raise RuntimeError("CD configuration maintenance is incomplete; rerun infra/ansible/cd.yml")
         state = json.loads((ROOT / "state.json").read_text())
         if state.get("attempt") and not args.retry:
             raise RuntimeError("Incomplete deployment; an operator must inspect state.json and deploy.log before --retry")
@@ -127,17 +175,23 @@ def main():
         if actual != sha:
             raise RuntimeError("Tag moved or marker commit mismatch")
         # Never deploy an older/divergent commit, including a newly republished old tag.
-        run(["git", "-C", str(source), "merge-base", "--is-ancestor", state["commit"], sha])
+        for base in {state["commit"], state.get("attempt", {}).get("commit", state["commit"])}:
+            run(["git", "-C", str(source), "merge-base", "--is-ancestor", base, sha])
         run(["git", "-C", str(source), "checkout", "--quiet", "--detach", sha])
         version = tag[1:]
         if json.loads((source / "sdk/package.json").read_text())["version"] != version:
             raise RuntimeError("Source version mismatch")
-        state["attempt"] = {"tag": tag, "commit": sha, "started_at": datetime.datetime.now(datetime.timezone.utc).isoformat()}
+        state["attempt"] = state.get("attempt", {}) | {
+            "tag": tag, "commit": sha, "started_at": datetime.datetime.now(datetime.timezone.utc).isoformat()}
         write_state(state)
         print("Deploying " + tag, flush=True)
         with (ROOT / "deploy.log").open("wb") as log:
             try:
                 saved = backup(version)
+                # A retry may back up a partially migrated DB. Preserve the
+                # original pre-update backup until the release is verified.
+                state["attempt"].setdefault("backup", str(saved))
+                write_state(state)
                 import yaml
                 site = yaml.safe_load((ROOT / "site.yml").read_text())
                 site["hibana"]["version"] = version
@@ -153,8 +207,7 @@ def main():
                 write_state({"tag": tag, "commit": sha, "published_at": release["published_at"],
                              "deployed_at": datetime.datetime.now(datetime.timezone.utc).isoformat(), "backup": str(saved)})
                 # Prune only after success; retain the latest three verified DB/config backups.
-                for old in sorted((ROOT / "backups").glob("*.vault"))[:-3]:
-                    old.unlink()
+                prune_backups()
                 print("Production verified: " + tag, flush=True)
             except Exception:
                 print("Deployment failed; automatic retries are paused. See private deploy.log.", flush=True)

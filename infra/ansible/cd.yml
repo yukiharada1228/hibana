@@ -1,29 +1,22 @@
 ---
-# Run from the operator's machine once. Existing production files stay private.
-- name: Authorize the control-plane deployment key on worker nodes
-  hosts: workers
-  become: true
-  tasks:
-    - name: Install the dedicated key restricted to the control-plane private IP
-      ansible.builtin.lineinfile:
-        path: /home/ubuntu/.ssh/authorized_keys
-        line: 'from="{{ hostvars[groups["control_plane"][0]].node_ip }}",restrict {{ lookup("file", cd_key_file + ".pub") }}'
-        mode: '0600'
-
-- name: Install the Actions-triggered production deployer
+# Run from the operator's machine. Refuse concurrent deployment/configuration.
+- name: Quiesce deployments before changing controller files or worker access
   hosts: control_plane
   become: true
+  any_errors_fatal: true
   tasks:
     - name: Validate the dedicated Actions SSH port
       ansible.builtin.assert:
         that:
           - cd_actions_ssh_port | int >= 1024
           - cd_actions_ssh_port | int <= 65535
-    - name: Refuse to replace an active legacy deployment
-      ansible.builtin.command: systemctl is-active hibana-cd.service
-      register: legacy_deploy
+    - name: Refuse to interrupt an active deployment
+      ansible.builtin.command:
+        argv: [systemctl, is-active, '{{ item }}']
+      loop: [hibana-cd.service, hibana-deploy.service]
+      register: active_deploy
       changed_when: false
-      failed_when: legacy_deploy.stdout in ['active', 'activating']
+      failed_when: active_deploy.stdout not in ['inactive', 'failed', 'unknown']
     - name: Detect the legacy polling timer
       ansible.builtin.stat:
         path: /etc/systemd/system/hibana-cd.timer
@@ -34,6 +27,41 @@
         enabled: false
         state: stopped
       when: legacy_timer.stat.exists
+    - name: Detect the deployment listener
+      ansible.builtin.stat:
+        path: /etc/systemd/system/hibana-deploy-sshd.service
+      register: existing_listener
+    - name: Stop new Actions connections during controller maintenance
+      ansible.builtin.systemd_service:
+        name: hibana-deploy-sshd
+        state: stopped
+      when: existing_listener.stat.exists
+    - name: Create the private controller directory
+      ansible.builtin.file:
+        path: /opt/hibana/cd
+        state: directory
+        mode: '0700'
+    - name: Lock out deploys after checking for a deployment that raced with maintenance
+      ansible.builtin.command:
+        argv: [flock, --nonblock, /opt/hibana/cd/lock, touch, /opt/hibana/cd/maintenance]
+      changed_when: true
+
+- name: Authorize the control-plane deployment key on worker nodes
+  hosts: workers
+  become: true
+  any_errors_fatal: true
+  tasks:
+    - name: Install the dedicated key restricted to the control-plane private IP
+      ansible.builtin.lineinfile:
+        path: /home/ubuntu/.ssh/authorized_keys
+        line: 'from="{{ hostvars[groups["control_plane"][0]].node_ip }}",restrict {{ lookup("file", cd_key_file + ".pub") }}'
+        mode: '0600'
+
+- name: Install the Actions-triggered production deployer
+  hosts: control_plane
+  become: true
+  any_errors_fatal: true
+  tasks:
     - name: Remove the legacy polling units
       ansible.builtin.file:
         path: '/etc/systemd/system/{{ item }}'
@@ -41,14 +69,9 @@
       loop: [hibana-cd.timer, hibana-cd.service]
     - name: Install deployment controller dependencies
       ansible.builtin.apt:
-        name: [git, python3-venv]
+        name: [git, python3-venv, gnupg]
         state: present
         update_cache: true
-    - name: Create the private controller directory
-      ansible.builtin.file:
-        path: /opt/hibana/cd
-        state: directory
-        mode: '0700'
     - name: Install private configuration without logging its contents
       ansible.builtin.copy:
         src: '{{ item.source }}'
@@ -174,3 +197,7 @@
         name: hibana-firewall
         state: reloaded
       when: deploy_firewall.changed
+    - name: Allow deployments only after controller maintenance succeeded
+      ansible.builtin.file:
+        path: /opt/hibana/cd/maintenance
+        state: absent

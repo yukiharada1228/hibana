@@ -303,7 +303,7 @@ jobs:
   deploy-production:
     name: Deploy production VPS
     needs: approve-production
-    if: ${{ always() && needs.approve-production.result == 'success' }}
+    if: ${{ always() && !cancelled() && needs.approve-production.result == 'success' }}
     permissions:
       contents: read
       actions: read
