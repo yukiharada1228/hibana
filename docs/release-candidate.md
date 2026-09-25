@@ -1,6 +1,6 @@
-# Hibana 0.2.0-rc.11
+# Hibana 0.2.0-rc.12
 
-rc.11ではWasmのコンパイル結果を認証付きでGarageへ共有し、Workerのメモリ・ローカルディスクを容量制限付きキャッシュとして扱います。全アプリの事前常駐を廃止し、追い出されたアプリはHTTP受付時に復元します。ローカル保存ができなくても検証済みコードをメモリで実行します。追加DBマイグレーションはありません。Control PlaneとWorkerを一緒に更新し、両方へ同じ`COMPILED_CACHE_KEY`を設定します。既存の署名鍵からの導出はVPSレンダラとローカル導入処理が行います。共有鍵未設定では従来どおり元Wasmからコンパイルします。
+rc.12ではWasmのコンパイル結果を認証付きでGarageへ共有し、Workerのメモリ・ローカルディスクを容量制限付きキャッシュとして扱います。全アプリの事前常駐を廃止し、追い出されたアプリはHTTP受付時に復元します。ローカル保存ができなくても検証済みコードをメモリで実行します。追加DBマイグレーションはありません。Control PlaneとWorkerを一緒に更新し、両方へ同じ`COMPILED_CACHE_KEY`を設定します。既存の署名鍵からの導出はVPSレンダラとローカル導入処理が行います。共有鍵未設定では従来どおり元Wasmからコンパイルします。
 
 KAGOYA 2GB×3台向けのTerraform/Ansible構成も追加しました。最小VPS構成は単一Worker・`Recreate`のため、Pod更新中の無停止は保証しません。[キャッシュ設計](architecture.md)と[容量超過時のローカル検証](vps-demand-cache-validation.md)を参照してください。
 
@@ -12,7 +12,9 @@ rc.8ではCLIのログ閲覧を`hibana tail`へ統一し、`logs`コマンドを
 
 新規導入は空DBで行います。0.2.0-rc.2のDBを更新する場合は、Control Planeを停止・バックアップして[OIDC専用版への切り替え](authentication.md#oidc専用版への切り替え)を実施します。v0.1.0の旧スキーマへの上書き更新は拒否するため、[DBの作成と切替](database.md)に従って別の検証先を指定してください。
 
-CLI・PC用Wasmtimeランタイム・コンソール・Control Plane・Workerを`0.2.0-rc.11`に揃えた公開候補版です。[GitHub Release](https://github.com/yukiharada1228/hibana/releases/tag/v0.2.0-rc.11)とnpmで公開済みです。通常の開発は[ログインから配備・tail・rollbackまでの手順](../README.md#開発から配備まで)、既存のアプリは[CLIの更新手順](../sdk/README.md#既存プロジェクトの更新)を使ってください。`dev`による同じ版のランタイムの自動取得も利用できます。
+CLI・PC用Wasmtimeランタイム・コンソール・Control Plane・Workerを`0.2.0-rc.12`に揃えた公開候補版です。[GitHub Release](https://github.com/yukiharada1228/hibana/releases/tag/v0.2.0-rc.12)とnpmで公開済みです。通常の開発は[ログインから配備・tail・rollbackまでの手順](../README.md#開発から配備まで)、既存のアプリは[CLIの更新手順](../sdk/README.md#既存プロジェクトの更新)を使ってください。`dev`による同じ版のランタイムの自動取得も利用できます。
+
+rc.11はCIの旧MinIOイメージ取得とブラウザ試験で停止し、配布していません。rc.12ではCIのS3を本番と同じGarageへ変更し、ブラウザ試験終了時の通信処理を待つように修正しました。
 
 ## 含まれる変更
 
@@ -37,12 +39,12 @@ CLI・PC用Wasmtimeランタイム・コンソール・Control Plane・Workerを
 
 ## 配布物を取得する
 
-公開済みのrc.11はGitHub Releaseから取得します。
+公開済みのrc.12はGitHub Releaseから取得します。
 
 ```bash
-gh release download v0.2.0-rc.11 --repo yukiharada1228/hibana \
-  --dir .local/release/0.2.0-rc.11
-cd .local/release/0.2.0-rc.11
+gh release download v0.2.0-rc.12 --repo yukiharada1228/hibana \
+  --dir .local/release/0.2.0-rc.12
+cd .local/release/0.2.0-rc.12
 shasum -a 256 -c SHA256SUMS
 ```
 
@@ -50,11 +52,11 @@ shasum -a 256 -c SHA256SUMS
 
 | 配布物 | ファイル |
 | --- | --- |
-| CLI | `hibana-cli-0.2.0-rc.11.tgz` |
-| Kubernetesマニフェスト | `hibana-kubernetes-0.2.0-rc.11.tar.gz` |
-| PC用ランタイム | `hibana-worker-0.2.0-rc.11-{darwin,linux}-{x64,arm64}`の4ファイル |
-| 基盤イメージ | `hibana-platform-0.2.0-rc.11-linux-{amd64,arm64}.tar`の2ファイル |
-| コンソールイメージ | `hibana-console-0.2.0-rc.11-linux-{amd64,arm64}.tar`の2ファイル |
+| CLI | `hibana-cli-0.2.0-rc.12.tgz` |
+| Kubernetesマニフェスト | `hibana-kubernetes-0.2.0-rc.12.tar.gz` |
+| PC用ランタイム | `hibana-worker-0.2.0-rc.12-{darwin,linux}-{x64,arm64}`の4ファイル |
+| 基盤イメージ | `hibana-platform-0.2.0-rc.12-linux-{amd64,arm64}.tar`の2ファイル |
+| コンソールイメージ | `hibana-console-0.2.0-rc.12-linux-{amd64,arm64}.tar`の2ファイル |
 
 作成元はReleaseのタグのcommit SHAで確認できます。異なる実行・バージョンのファイルを混在させず、ハッシュ確認後に社内へ搬入してください。未公開の次期候補を試す場合は、同じコミットのCI・Security dependencies・Hibana releaseが成功したActions実行の`hibana-release-candidate`を取得します。Actionsの成果物は14日間保持されます。[候補の作成手順](releases.md#ソースから候補を作る)を参照してください。
 
@@ -64,9 +66,9 @@ shasum -a 256 -c SHA256SUMS
 
 ```bash
 # 取得したファイルがあるディレクトリで実行
-npx --yes --package=./hibana-cli-0.2.0-rc.11.tgz hibana --version
-npx --yes --package=./hibana-cli-0.2.0-rc.11.tgz hibana runtime install --from ./hibana-worker-0.2.0-rc.11-darwin-arm64 --sha256 HASH
-npx --yes --package=./hibana-cli-0.2.0-rc.11.tgz hibana init hello --cli-package ./hibana-cli-0.2.0-rc.11.tgz
+npx --yes --package=./hibana-cli-0.2.0-rc.12.tgz hibana --version
+npx --yes --package=./hibana-cli-0.2.0-rc.12.tgz hibana runtime install --from ./hibana-worker-0.2.0-rc.12-darwin-arm64 --sha256 HASH
+npx --yes --package=./hibana-cli-0.2.0-rc.12.tgz hibana init hello --cli-package ./hibana-cli-0.2.0-rc.12.tgz
 cd hello
 npm run dev
 # 別ターミナルで curl http://127.0.0.1:8787/
@@ -80,9 +82,9 @@ npm run dev
 CPUに合うDocker archiveを読み込み、社内レジストリへ搬入します。`registry.example.internal`とkubeconfig/contextを実サイトのものへ変更してください。
 
 ```bash
-docker load --input hibana-platform-0.2.0-rc.11-linux-amd64.tar
-docker tag hibana-platform:0.2.0-rc.11-linux-amd64 registry.example.internal/hibana/platform:0.2.0-rc.11-amd64
-docker push registry.example.internal/hibana/platform:0.2.0-rc.11-amd64
+docker load --input hibana-platform-0.2.0-rc.12-linux-amd64.tar
+docker tag hibana-platform:0.2.0-rc.12-linux-amd64 registry.example.internal/hibana/platform:0.2.0-rc.12-amd64
+docker push registry.example.internal/hibana/platform:0.2.0-rc.12-amd64
 hibana platform init my-site
 # my-site/README.mdに沿ってDB・Redis・S3・DNS・TLSを設定
 hibana platform install --kubeconfig /secure/config --context staging \

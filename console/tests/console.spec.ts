@@ -800,6 +800,9 @@ test("extension details fail visibly and do not display another version's metada
   await expect(page.getByRole("alert")).toContainText(
     "バージョンの情報が一致しません",
   );
+  // The view may refresh again while the assertion completes. Drain route.fetch
+  // before Playwright disposes the context and its response bodies.
+  await page.unrouteAll({ behavior: "wait" });
 });
 
 test("Read users can inspect shared egress and failed policy reads do not imply denied access", async ({

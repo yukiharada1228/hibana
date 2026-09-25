@@ -1,0 +1,15 @@
+# Disposable CI storage. Keep existing developers' MinIO volumes unchanged.
+services:
+  garage:
+    image: dxflrs/garage:v2.3.0@sha256:866bd13ed2038ba7e7190e840482bc27234c4afaf77be8cfa439ae088c1e4690
+    command: [/garage, server, --single-node, --default-bucket]
+    environment:
+      GARAGE_DEFAULT_ACCESS_KEY: GK0123456789abcdef0123456789abcdef
+      GARAGE_DEFAULT_SECRET_KEY: 0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef
+      GARAGE_DEFAULT_BUCKET: hibana-components
+    ports:
+      - "127.0.0.1:9000:9000"
+      - "127.0.0.1:3903:3903"
+    volumes:
+      - ./docker/garage-ci.toml:/etc/garage.toml:ro
+    tmpfs: [/data]

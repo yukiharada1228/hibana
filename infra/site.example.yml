@@ -5,7 +5,7 @@ hibana:
   admin_email: owner@hibana.cloud
   management_node: hibana-management
   execution_node: hibana-execution
-  version: 0.2.0-rc.11
+  version: 0.2.0-rc.12
   architecture: amd64
   pod_cidr: 10.244.0.0/16
   ingress_pod_ip: 10.244.255.10

@@ -153,8 +153,8 @@ jobs:
       S3_ENDPOINT: http://localhost:9000
       S3_REGION: us-east-1
       S3_BUCKET: hibana-components
-      S3_ACCESS_KEY: minioadmin
-      S3_SECRET_KEY: minioadmin
+      S3_ACCESS_KEY: GK0123456789abcdef0123456789abcdef
+      S3_SECRET_KEY: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
       JOB_SIGNING_KEY: AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8
       JOB_SIGNING_KID: k1
       SECRETS_MASTER_KEY: "0011223344556677889900112233445566778899001122334455667788990011"
@@ -201,10 +201,16 @@ jobs:
           go-version: '1.26.4'
           cache-dependency-path: sdk/templates/go/go.sum
 
-      - name: Start services (postgres / redis / minio)
+      - name: Start services (postgres / redis / Garage)
         run: |
-          docker compose up -d --wait postgres redis minio
-          docker compose run --rm minio-setup
+          docker compose -f docker-compose.yml -f docker-compose.ci.yml up -d --wait postgres redis garage
+          for attempt in {1..30}; do
+            if curl --fail --silent http://127.0.0.1:3903/health; then break; fi
+            sleep 1
+          done
+          curl --fail --silent http://127.0.0.1:3903/health
+          curl --fail --silent --aws-sigv4 'aws:amz:us-east-1:s3' \
+            --user "$S3_ACCESS_KEY:$S3_SECRET_KEY" http://127.0.0.1:9000/hibana-components
 
       # release ビルド: debug の wasmtime は 12MiB JS コンポーネントの precompile が CI(2core) で
       # 極端に遅く gate が実用にならないため、CP/worker は --release で立てる（precompile が高速化）。
