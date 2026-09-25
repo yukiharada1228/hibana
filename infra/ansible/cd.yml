@@ -1,0 +1,92 @@
+---
+# Run from the operator's machine once. Existing production files stay private.
+- name: Authorize the control-plane deployment key on worker nodes
+  hosts: workers
+  become: true
+  tasks:
+    - name: Install the dedicated key restricted to the control-plane private IP
+      ansible.builtin.lineinfile:
+        path: /home/ubuntu/.ssh/authorized_keys
+        line: 'from="{{ hostvars[groups["control_plane"][0]].node_ip }}",restrict {{ lookup("file", cd_key_file + ".pub") }}'
+        mode: '0600'
+
+- name: Install the outbound-only production release poller
+  hosts: control_plane
+  become: true
+  tasks:
+    - name: Install deployment controller dependencies
+      ansible.builtin.apt:
+        name: [git, python3-venv]
+        state: present
+        update_cache: true
+    - name: Create the private controller directory
+      ansible.builtin.file:
+        path: /opt/hibana/cd
+        state: directory
+        mode: '0700'
+    - name: Install private configuration without logging its contents
+      ansible.builtin.copy:
+        src: '{{ item.source }}'
+        dest: '/opt/hibana/cd/{{ item.name }}'
+        mode: '0600'
+        decrypt: false
+      loop:
+        - {source: '{{ cd_inventory_file }}', name: inventory.yml}
+        - {source: '{{ cd_site_file }}', name: site.yml}
+        - {source: '{{ cd_vault_file }}', name: vault.yml}
+        - {source: '{{ cd_vault_key_file }}', name: vault.key}
+        - {source: '{{ cd_key_file }}', name: ssh-key}
+        - {source: '{{ cd_known_hosts_file }}', name: known_hosts}
+      no_log: true
+    - name: Copy deployment dependencies and controller
+      ansible.builtin.copy:
+        src: '{{ playbook_dir }}/../{{ item }}'
+        dest: '/opt/hibana/cd/{{ item }}'
+        mode: '0600'
+      loop: [requirements.txt, cd.py]
+    - name: Install the pinned Ansible controller in an isolated environment
+      ansible.builtin.pip:
+        requirements: /opt/hibana/cd/requirements.txt
+        virtualenv: /opt/hibana/cd/venv
+        virtualenv_command: python3 -m venv
+    - name: Initialize release state without replacing an existing deployment record
+      ansible.builtin.copy:
+        content: '{{ cd_initial_state | to_nice_json }}'
+        dest: /opt/hibana/cd/state.json
+        mode: '0600'
+        force: false
+    - name: Install the serialized deployment service
+      ansible.builtin.copy:
+        dest: /etc/systemd/system/hibana-cd.service
+        mode: '0644'
+        content: |
+          [Unit]
+          Description=Deploy CI-approved Hibana releases
+          Wants=network-online.target
+          After=network-online.target
+          [Service]
+          Type=oneshot
+          ExecStart=/opt/hibana/cd/venv/bin/python /opt/hibana/cd/cd.py
+          UMask=0077
+          TimeoutStartSec=50min
+          Nice=10
+          MemoryMax=512M
+    - name: Install the release check timer
+      ansible.builtin.copy:
+        dest: /etc/systemd/system/hibana-cd.timer
+        mode: '0644'
+        content: |
+          [Unit]
+          Description=Check for approved Hibana releases every five minutes
+          [Timer]
+          OnBootSec=2min
+          OnUnitInactiveSec=5min
+          RandomizedDelaySec=30s
+          [Install]
+          WantedBy=timers.target
+    - name: Enable deployment polling
+      ansible.builtin.systemd_service:
+        name: hibana-cd.timer
+        daemon_reload: true
+        enabled: true
+        state: started

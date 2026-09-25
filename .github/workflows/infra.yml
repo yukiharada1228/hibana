@@ -1,10 +1,9 @@
 name: VPS IaC
 on:
   pull_request:
-    paths: ['infra/**', 'deploy/**', 'sdk/platform/**', '.github/workflows/infra.yml']
-  push:
     branches: [develop, main]
-    paths: ['infra/**', 'deploy/**', 'sdk/platform/**', '.github/workflows/infra.yml']
+  push:
+    branches: [develop, main, 'release/**']
 permissions:
   contents: read
 jobs:
@@ -24,6 +23,8 @@ jobs:
           ansible-playbook -i infra/ansible/inventory.example.yml infra/ansible/network.yml --syntax-check
           ansible-playbook -i infra/ansible/inventory.example.yml infra/ansible/bootstrap.yml --syntax-check
           ansible-playbook -i infra/ansible/inventory.example.yml infra/ansible/deploy.yml --syntax-check
+          ansible-playbook -i infra/ansible/inventory.example.yml infra/ansible/cd.yml --syntax-check
+          python infra/tests/test_cd.py
           python infra/tests/test_render.py
           terraform -chdir=infra/terraform/dns fmt -check -recursive
           terraform -chdir=infra/terraform/dns init -backend=false

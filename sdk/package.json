@@ -1,6 +1,6 @@
 {
   "name": "@yukiharada1228/hibana",
-  "version": "0.2.0-rc.12",
+  "version": "0.2.0-rc.13",
   "publishConfig": {
     "access": "public",
     "registry": "https://registry.npmjs.org"

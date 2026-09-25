@@ -258,8 +258,17 @@ impl ArtifactCache {
         shared_request: Option<(Option<&str>, &axum::http::HeaderValue)>,
         invocation: bool,
     ) -> Result<Option<Arc<PreparedComponent>>, ExecError> {
-        if let Some(component) = self.existing(sha, invocation)? {
-            return Ok(component);
+        // A historical version may have lost its shared copy while inactive.
+        // Explicit publication must republish a local hit under the new DB pin;
+        // otherwise a warm deploy can leave the next cold Pod recompiling it.
+        let republish = !invocation && self.shared.is_some() && shared_request.is_some();
+        if !republish {
+            if let Some(component) = self.existing(sha, invocation)? {
+                return Ok(component);
+            }
+        }
+        if !hibana_shared::preparation::valid_digest(sha) {
+            return Err(ExecError::Failed("Invalid artifact digest".into()));
         }
         let stripe = usize::from(u8::from_str_radix(&sha[..2], 16).unwrap())
             % self.inflight_precompile.len();
@@ -269,8 +278,10 @@ impl ArtifactCache {
         )
         .await
         .map_err(|_| ExecError::Failed("Artifact preparation capacity timeout".into()))?;
-        if let Some(component) = self.existing(sha, invocation)? {
-            return Ok(component);
+        if !republish {
+            if let Some(component) = self.existing(sha, invocation)? {
+                return Ok(component);
+            }
         }
         let cwasm_path = self.wasm_cache_dir.join(format!("{sha}.cwasm"));
 
@@ -284,8 +295,21 @@ impl ArtifactCache {
         // Hold the capacity permit through transfer, validation and persistence.
         // The compiler retains its own reference until the child is reaped.
         let permit = Arc::new(permit);
-        let remote = match (&self.shared, shared_request) {
-            (Some(cache), Some((Some(url), _))) => cache.fetch(sha, url).await,
+        let local = if republish {
+            let _writer = self.disk_writer.lock().unwrap();
+            // Private, bounded regular files; the writer guard prevents eviction
+            // or replacement between metadata validation and this read.
+            self.disk_file(sha)?
+                .and_then(|_| std::fs::read(&cwasm_path).ok())
+        } else {
+            None
+        };
+        let local = match local {
+            Some(bytes) => self.validate_native(bytes, permit.clone()).await.ok(),
+            None => None,
+        };
+        let remote = match (&self.shared, shared_request, local.is_none()) {
+            (Some(cache), Some((Some(url), _)), true) => cache.fetch(sha, url).await,
             _ => None,
         };
         let remote = if let Some(bytes) = remote {
@@ -300,7 +324,7 @@ impl ArtifactCache {
             None
         };
         let from_shared = remote.is_some();
-        let (cwasm, component) = if let Some(bytes) = remote {
+        let (cwasm, component) = if let Some(bytes) = local.or(remote) {
             bytes
         } else {
             self.metrics.wasmtime_component_cache_misses_total.inc();

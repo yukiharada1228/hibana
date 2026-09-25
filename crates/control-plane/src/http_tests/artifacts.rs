@@ -1,5 +1,85 @@
 use super::*;
 
+pub(super) async fn retention_serializes_with_publication(
+    state: &AppState,
+    owner: &DatabaseConnection,
+) {
+    let gc = owner.begin().await.unwrap();
+    fixture_execute(&gc, "SELECT pg_advisory_xact_lock(1212760641, 1)", vec![])
+        .await
+        .unwrap();
+    let copied = state.clone();
+    let mut pin = tokio::spawn(async move {
+        crate::artifact_reservations::Reservation::new(
+            &copied,
+            "http",
+            "cache-pin-race",
+            "unused",
+            &"ab".repeat(32),
+        )
+        .await
+    });
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(200), &mut pin)
+            .await
+            .is_err(),
+        "pin creation must wait for GC before preparing any code"
+    );
+    gc.commit().await.unwrap();
+    let reservation = pin.await.unwrap().unwrap();
+    let hashes = hibana_database::postgres::function_rows(
+        state.pool(),
+        "hibana_protected_artifact_hashes",
+        vec![],
+    )
+    .await
+    .unwrap();
+    assert!(hashes
+        .iter()
+        .any(|row| row.try_get::<String>("", "sha256").unwrap() == "ab".repeat(32)));
+
+    let publication = state.pool().begin().await.unwrap();
+    db::set_tenant_guc(&publication, "http").await.unwrap();
+    reservation.lock(&publication).await.unwrap();
+    let concurrent_gc = owner.begin().await.unwrap();
+    assert!(
+        !fixture_scalar::<bool>(
+            &concurrent_gc,
+            "SELECT pg_try_advisory_xact_lock(1212760641, 1)",
+            vec![]
+        )
+        .await
+        .unwrap(),
+        "GC cannot cross the reservation-to-publication handoff"
+    );
+    publication.commit().await.unwrap();
+    assert!(fixture_scalar::<bool>(
+        &concurrent_gc,
+        "SELECT pg_try_advisory_xact_lock(1212760641, 1)",
+        vec![]
+    )
+    .await
+    .unwrap());
+    concurrent_gc.commit().await.unwrap();
+    // A transaction begun while the reservation was live must not revive it
+    // after waiting for the GC guard past its expiry.
+    let expired = state.pool().begin().await.unwrap();
+    db::set_tenant_guc(&expired, "http").await.unwrap();
+    fixture_execute(owner, "UPDATE artifact_reservations SET expires_at=clock_timestamp()+interval '50 milliseconds' WHERE version_id='cache-pin-race'", vec![]).await.unwrap();
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    assert!(reservation.lock(&expired).await.is_err());
+    expired.rollback().await.unwrap();
+    reservation.finish().await;
+    fixture_execute(
+        owner,
+        "DELETE FROM artifact_reservations WHERE version_id='cache-pin-race'",
+        vec![],
+    )
+    .await
+    .unwrap();
+    println!("PASS shared GC serializes with deployment pin creation and publication commit across DB connections");
+}
+
 pub(super) async fn recovery(state: &AppState, owner: &DatabaseConnection, id: &str) {
     fixture_execute(owner, "UPDATE component_versions SET storage_uri='http/versions/source-v1.wasm',wasm_sha256=repeat('a',64) WHERE id='source-v1'", vec![]).await.unwrap();
     let valid = token(state, id, "http", "source-v1");

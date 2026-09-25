@@ -91,7 +91,7 @@ pub async fn assert_runtime_schema(db: &impl ConnectionTrait) -> Result<(), DbEr
             &Query::select()
                 .column("version")
                 .from(("public", "seaql_migrations"))
-                .and_where(Expr::col("version").eq("m20260923_000013_application_logs"))
+                .and_where(Expr::col("version").eq("m20260925_000014_compiled_retention"))
                 .to_owned(),
         )
         .await;

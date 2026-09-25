@@ -1,6 +1,6 @@
 name: Hibana release
 
-# Branches build candidates; version tags publish verified assets and the npm CLI.
+# Branches build candidates; version tags publish, verify npm, then authorize CD.
 on:
   workflow_dispatch:
     inputs:
@@ -20,6 +20,10 @@ on:
 
 permissions:
   contents: read
+
+concurrency:
+  group: release-${{ github.ref }}-${{ inputs.publish_tag || '' }}
+  cancel-in-progress: false
 
 env:
   CARGO_BUILD_JOBS: 2
@@ -250,6 +254,52 @@ jobs:
             echo 'The published CLI is not installable yet. Check npm before retrying; do not republish the same version.' >&2
             exit 1
           fi
+
+  approve-production:
+    name: Mark verified release for production
+    needs: [publish-npm, resume-npm]
+    if: >-
+      always() && !cancelled() &&
+      (needs.publish-npm.result == 'success' || needs.resume-npm.result == 'success')
+    runs-on: ubuntu-22.04
+    timeout-minutes: 5
+    environment: production
+    permissions:
+      contents: write
+      actions: read
+    env:
+      RELEASE_TAG: ${{ inputs.publish_tag || github.ref_name }}
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - name: Validate the release tag
+        run: '[[ "$RELEASE_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[a-z0-9.-]+)?$ ]]'
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.RELEASE_TAG }}
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+      - name: Recheck the exact commit before authorizing production
+        run: |
+          GITHUB_REF_TYPE=tag GITHUB_REF_NAME="$RELEASE_TAG" node scripts/release.mjs version
+          GITHUB_SHA="$(git rev-parse HEAD)" node scripts/check-release-ci.mjs
+      - name: Publish the deployment marker once
+        run: |
+          node --input-type=module -e '
+            import {execFileSync} from "node:child_process";
+            import {writeFileSync} from "node:fs";
+            writeFileSync("production.json", JSON.stringify({schema: 1,
+              repository: process.env.GITHUB_REPOSITORY, tag: process.env.RELEASE_TAG,
+              commit: execFileSync("git", ["rev-parse", "HEAD"], {encoding: "utf8"}).trim()}) + "\n");'
+          if gh release view "$RELEASE_TAG" --json assets --jq '.assets[].name' | grep -qx production.json; then
+            mkdir existing-marker
+            gh release download "$RELEASE_TAG" --pattern production.json --dir existing-marker
+            cmp production.json existing-marker/production.json
+          else
+            gh release upload "$RELEASE_TAG" production.json
+          fi
+          echo 'Verified release authorized. The production VPS polls every five minutes; this job does not claim deployment success.' >> "$GITHUB_STEP_SUMMARY"
 
   resume-npm:
     name: Verify existing Release and optionally publish to npm

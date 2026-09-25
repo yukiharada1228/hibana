@@ -8,6 +8,7 @@ export function requireReleaseChecks(runs, sha) {
   for (const path of [
     ".github/workflows/ci.yml",
     ".github/workflows/security.yml",
+    ".github/workflows/infra.yml",
   ]) {
     const matching = runs.filter(
       (run) =>
@@ -62,5 +63,5 @@ if (
     pages.flatMap((page) => page.workflow_runs),
     sha,
   );
-  console.log(`Release gate: CI and dependency audit succeeded for ${sha}`);
+  console.log(`Release gate: CI, dependency audit and VPS IaC succeeded for ${sha}`);
 }

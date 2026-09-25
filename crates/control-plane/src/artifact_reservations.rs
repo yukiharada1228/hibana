@@ -21,6 +21,7 @@ impl Reservation {
     ) -> Result<Self, AppError> {
         let id = hibana_shared::new_artifact_reservation_id();
         let tx = state.pool().begin().await?;
+        crate::storage::compiled::protect_publication(&tx).await?;
         db::set_tenant_guc(&tx, tenant).await?;
         artifact_reservations::Entity::insert(artifact_reservations::ActiveModel {
             id: Set(id.clone()),
@@ -49,6 +50,7 @@ impl Reservation {
     }
 
     pub(crate) async fn lock(&self, tx: &sea_orm::DatabaseTransaction) -> Result<(), AppError> {
+        crate::storage::compiled::protect_publication(tx).await?;
         artifact_reservations::Entity::find_by_id(self.id.clone())
             .filter(artifact_reservations::Column::TenantId.eq(&self.tenant))
             .filter(
@@ -56,7 +58,9 @@ impl Reservation {
                     artifact_reservations::Entity,
                     artifact_reservations::Column::ExpiresAt,
                 ))
-                .gt(now()),
+                // The advisory guard may have waited behind GC. Check wall time
+                // after that wait, not the transaction's earlier start time.
+                .gt(Func::cust("clock_timestamp")),
             )
             .lock_exclusive()
             .one(tx)

@@ -131,6 +131,7 @@ async fn http_mvp_regression() {
     assert_usage_boundaries(&pool).await;
     let store = Arc::new(crate::store::InProcStore::new());
     let state = state(pool.clone(), store.clone());
+    artifacts::retention_serializes_with_publication(&state, &owner).await;
 
     let unavailable = self::state(pool.clone(), Arc::new(crate::store::FailingStore));
     assert_eq!(
@@ -1890,7 +1891,7 @@ async fn assert_fresh_schema(owner: &DatabaseConnection) {
     assert_eq!(scalar(owner,"SELECT count(*) FROM information_schema.tables WHERE table_schema='public' AND table_type='BASE TABLE'").await,16);
     assert_eq!(
         scalar(owner, "SELECT count(*) FROM seaql_migrations").await,
-        13
+        14
     );
     assert_eq!(scalar(owner,"SELECT count(*) FROM pg_class c JOIN pg_namespace n ON c.relnamespace=n.oid WHERE n.nspname='public' AND c.relkind='r' AND c.relrowsecurity AND c.relforcerowsecurity").await,13);
     assert_eq!(scalar(owner,"SELECT count(*) FROM information_schema.columns WHERE table_schema='public' AND column_name IN ('canary_weight','canary_version_id','chain_depth','routing_reason','idempotency_key')").await,0);

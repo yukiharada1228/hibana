@@ -4332,5 +4332,29 @@
     "remote_ip": "133.18.122.133",
     "ms": 499.351,
     "valid": true
+  },
+  "disk_followup": {
+    "report": "vps-disk-cache-validation.json",
+    "started_at": "2026-09-25T11:42:30.335481+00:00",
+    "finished_at": "2026-09-25T11:44:28.154488+00:00",
+    "measurements": {
+      "disk": {
+        "n": 30,
+        "http_200": 30,
+        "median_ms": 97.36,
+        "p95_ms": 108.837,
+        "min_ms": 87.861,
+        "max_ms": 110.12
+      },
+      "paired_hot": {
+        "n": 30,
+        "http_200": 30,
+        "median_ms": 92.242,
+        "p95_ms": 109.32,
+        "min_ms": 81.486,
+        "max_ms": 112.019
+      }
+    },
+    "same_pod": true
   }
 }

@@ -45,7 +45,7 @@ console.log(process.env.HIBANA_TEST_MODE === 'wrong' ? 'hibana 0.0.0' : 'hibana 
     rmSync(directory, { recursive: true, force: true });
   }
 });
-const successful = ["ci", "security"].map((name, index) => ({
+const successful = ["ci", "security", "infra"].map((name, index) => ({
   id: index + 1,
   path: `.github/workflows/${name}.yml`,
   head_sha: sha,
@@ -55,7 +55,7 @@ const successful = ["ci", "security"].map((name, index) => ({
   updated_at: "2026-09-20T10:00:00Z",
 }));
 
-test("exact release commit requires both successful branch checks", () => {
+test("exact release commit requires all successful branch checks", () => {
   requireReleaseChecks(successful, sha);
   assert.throws(() => requireReleaseChecks(successful.slice(0, 1), sha));
   assert.throws(() => requireReleaseChecks(successful, "b".repeat(40)));

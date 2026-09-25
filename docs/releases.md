@@ -4,15 +4,15 @@ CLI は npm の `@yukiharada1228/hibana` と [GitHub Releases](https://github.co
 
 CLI・ローカルランタイム・コンソール・Control Plane・Workerを同じバージョンに揃えます。異なる版の混在は検証対象外です。
 
-現在の公開候補版は[`0.2.0-rc.12`](https://github.com/yukiharada1228/hibana/releases/tag/v0.2.0-rc.12)です。以下のnpxの例をそのまま利用できます。npmの候補版は`next`で配布するため、バージョンを指定して取得してください。[基盤の更新条件と配布物](release-candidate.md)も確認してください。
+現在の公開候補版は[`0.2.0-rc.13`](https://github.com/yukiharada1228/hibana/releases/tag/v0.2.0-rc.13)です。以下のnpxの例をそのまま利用できます。npmの候補版は`next`で配布するため、バージョンを指定して取得してください。[基盤の更新条件と配布物](release-candidate.md)も確認してください。
 
 ## 開発者のPC
 
 Node.js 24以上を用意し、公開されているバージョンを指定します。
 
 ```bash
-npx --yes @yukiharada1228/hibana@0.2.0-rc.12 --version
-npx --yes @yukiharada1228/hibana@0.2.0-rc.12 init hello
+npx --yes @yukiharada1228/hibana@0.2.0-rc.13 --version
+npx --yes @yukiharada1228/hibana@0.2.0-rc.13 init hello
 cd hello
 npm run dev
 # Ctrl+Cで停止
@@ -31,8 +31,8 @@ CLIの導入にリポジトリ、Rust、Docker、kubectlは不要です。`init`
 Releaseの`hibana-cli-VERSION.tgz`、OSに合う`hibana-worker-VERSION-OS-ARCH`、`SHA256SUMS`を搬入します。HASHには該当バイナリのチェックサムを指定します。
 
 ```bash
-npx --yes --package=/path/to/hibana-cli-0.2.0-rc.12.tgz hibana runtime install --from /path/to/hibana-worker-0.2.0-rc.12-linux-x64 --sha256 HASH
-npx --yes --package=/path/to/hibana-cli-0.2.0-rc.12.tgz hibana init hello --cli-package /path/to/hibana-cli-0.2.0-rc.12.tgz
+npx --yes --package=/path/to/hibana-cli-0.2.0-rc.13.tgz hibana runtime install --from /path/to/hibana-worker-0.2.0-rc.13-linux-x64 --sha256 HASH
+npx --yes --package=/path/to/hibana-cli-0.2.0-rc.13.tgz hibana init hello --cli-package /path/to/hibana-cli-0.2.0-rc.13.tgz
 cd hello
 npm run dev
 ```
@@ -44,10 +44,10 @@ npm run dev
 CPUに合う`hibana-platform-VERSION-linux-ARCH.tar`をDockerへ読み込み、社内レジストリへ搬入します。`registry.example.com`は自社の宛先へ置き換えます。
 
 ```bash
-docker load --input hibana-platform-0.2.0-rc.12-linux-amd64.tar
-docker tag hibana-platform:0.2.0-rc.12-linux-amd64 registry.example.com/hibana/platform:0.2.0-rc.12-amd64
-docker push registry.example.com/hibana/platform:0.2.0-rc.12-amd64
-tar -xzf hibana-kubernetes-0.2.0-rc.12.tar.gz
+docker load --input hibana-platform-0.2.0-rc.13-linux-amd64.tar
+docker tag hibana-platform:0.2.0-rc.13-linux-amd64 registry.example.com/hibana/platform:0.2.0-rc.13-amd64
+docker push registry.example.com/hibana/platform:0.2.0-rc.13-amd64
+tar -xzf hibana-kubernetes-0.2.0-rc.13.tar.gz
 ```
 
 `hibana platform init my-site`でサイト用overlayを生成し、同梱のREADMEに沿ってAPIとアプリのDNS・TLS、DB・Redis・S3の接続情報を設定します。署名・暗号化・bootstrap用のキーは生成時に作成し、秘密値のファイルはGitから除外します。
@@ -84,9 +84,9 @@ node scripts/release.mjs checksums .local/release
 
 ## GitHub Releaseとnpmパッケージを公開する
 
-`.github/workflows/release.yml`（Hibana release）は`release/**`ブランチまたは手動実行で候補をビルドします。`vVERSION`タグでは、同じコミットのCIとSecurity dependenciesの最新実行が両方成功したことを確認してからGitHub Releaseを公開・検証し、同じCLI tarballをnpmへ公開します。未実行・実行中・失敗の場合は公開を止めます。正式版は`latest`、候補版は`next`タグを使います。ローカルランタイムの自動取得先が先に利用可能になる順序です。
+`.github/workflows/release.yml`（Hibana release）は`release/**`ブランチまたは手動実行で候補をビルドします。`vVERSION`タグでは、同じコミットのCI・Security dependencies・VPS IaCがすべて成功したことを確認してからGitHub Releaseを公開・検証し、同じCLI tarballをnpmへ公開します。未実行・実行中・失敗の場合は公開を止めます。正式版は`latest`、候補版は`next`タグを使います。npmからの導入確認後に本番用マーカーを公開し、[VPSのCD](production-cd.md)がバックアップ・マイグレーション・更新・疎通確認を実行します。
 
-公開担当者は npm の `@yukiharada1228` スコープへの公開権限を用意します。初回は同じ版のランタイムをGitHub Releaseに公開した上で、`npm login` 後に検証済みの tarball を `npm publish ./hibana-cli-0.2.0-rc.12.tgz --access public --tag next` で公開し、以後は [npm trusted publishing](https://docs.npmjs.com/trusted-publishers/) を設定します。npm のパッケージ設定に GitHub owner `yukiharada1228`、repository `hibana`、workflow filename `release.yml` を登録し、`npm publish` を許可します。CI は Node.js 24 と npm 11.5.1 以上を使い、公開ジョブだけに `id-token: write` を付与します。長期間有効なnpmトークンは保存しません。
+公開担当者は npm の `@yukiharada1228` スコープへの公開権限を用意します。初回は同じ版のランタイムをGitHub Releaseに公開した上で、`npm login` 後に検証済みの tarball を `npm publish ./hibana-cli-0.2.0-rc.13.tgz --access public --tag next` で公開し、以後は [npm trusted publishing](https://docs.npmjs.com/trusted-publishers/) を設定します。npm のパッケージ設定に GitHub owner `yukiharada1228`、repository `hibana`、workflow filename `release.yml` を登録し、`npm publish` を許可します。CI は Node.js 24 と npm 11.5.1 以上を使い、公開ジョブだけに `id-token: write` を付与します。長期間有効なnpmトークンは保存しません。
 
 公開後は `npm view @yukiharada1228/hibana@VERSION version` と `npx --yes @yukiharada1228/hibana@VERSION --version` で確認します。npm は公開済みの同じバージョンを上書きできないため、変更した候補は新しいバージョン番号で配布します。コンソールも同じ版を取得できることを確認してから更新してください。
 

@@ -5,7 +5,7 @@ import {setTimeout as sleep} from 'node:timers/promises';
 import {join} from 'node:path';
 
 export async function testSharedCache({api, sql, token, wasm, upload, app, internal,
-  restart, startWorker, stopWorker, metricsUrl, folder, objects, failWrites}) {
+  restart, startWorker, stopWorker, metricsUrl, folder, objects, objectSizes, failWrites}) {
   const key = 'ba'.repeat(32);
   const env = {COMPILED_CACHE_KEY:key};
   const prefix = '/test-components/_hibana/compiled/v1/';
@@ -75,9 +75,84 @@ export async function testSharedCache({api, sql, token, wasm, upload, app, inter
   const accepted = await fetch(internal+'/internal/compiled-artifact',{method:'POST',headers,body:original});
   assert.equal(accepted.status,204); await accepted.text();
   cacheKeys = [...objects.keys()].filter(k=>k.startsWith(prefix));
-  assert.equal(cacheKeys.length,256);
+  assert.equal(cacheKeys.length,257, 'published artifact is outside the 256 spare-entry budget');
   assert.ok(objects.has('/test-components/'+row.storage_uri), 'GC retains original Wasm');
-  console.log('PASS cache upload authorization and MAC binding; shared entry eviction preserves source Wasm');
+  console.log('PASS cache upload authorization and MAC binding; source and published native code are retained');
+
+  // More published objects than both the old 256 budget and 4096 scan limit.
+  // These are metadata fixtures, never passed to the unsafe deserializer.
+  const digest = n => n.toString(16).padStart(64,'0');
+  const fixtureKey = n => prefix+'00'.repeat(32)+'/'+digest(n)+'.cwasm';
+  for (const key of cacheKeys) if (key !== cacheKey) objects.delete(key);
+  await sql(`
+    INSERT INTO components(id,tenant_id,name)
+      SELECT 'cache-pin-'||n, CASE WHEN n%2=0 THEN 'http' ELSE 'other' END, 'cache-pin-'||n FROM generate_series(1,4097) n;
+    INSERT INTO component_versions(id,tenant_id,component_id,version,storage_uri,wasm_sha256)
+      SELECT id||'-v1',tenant_id,id,'1','unused',lpad(to_hex(substring(id from 11)::int),64,'0') FROM components WHERE id LIKE 'cache-pin-%';
+    UPDATE components SET active_version_id=id||'-v1' WHERE id LIKE 'cache-pin-%';
+    INSERT INTO components(id,tenant_id,name) VALUES ('cache-pin-duplicate','http','cache-pin-duplicate');
+    INSERT INTO component_versions(id,tenant_id,component_id,version,storage_uri,wasm_sha256)
+      VALUES ('cache-pin-duplicate-v1','http','cache-pin-duplicate','1','unused','${digest(1)}');
+    UPDATE components SET active_version_id=id||'-v1' WHERE id='cache-pin-duplicate';
+    INSERT INTO component_versions(id,tenant_id,component_id,version,storage_uri,wasm_sha256)
+      SELECT 'cache-history-'||n,'other','cache-pin-1',n::text,'unused',lpad(to_hex(n),64,'0') FROM generate_series(10001,10003) n;
+    UPDATE components SET previous_active_version_id='cache-history-10001' WHERE id='cache-pin-1';
+    INSERT INTO executions(id,tenant_id,component_id,version_id,status,http_request)
+      VALUES ('cache-running','other','cache-pin-1','cache-history-10002','running',true),
+             ('cache-pending','other','cache-pin-1','cache-history-10003','pending',true);
+    INSERT INTO artifact_reservations(id,tenant_id,version_id,storage_uri,wasm_sha256,expires_at)
+      VALUES ('cache-reserved','other','not-yet-published','unused','${digest(10004)}',now()+interval '5 minutes'),
+             ('cache-expired','other','abandoned','unused','${digest(10005)}',now()-interval '1 second');
+  `);
+  const pinned = [...Array.from({length:4097}, (_,i)=>i+1),10001,10002,10003,10004];
+  for (const n of [...pinned,10005,...Array.from({length:300}, (_,i)=>20000+i)]) objects.set(fixtureKey(n),Buffer.from('metadata fixture'));
+  // Advertise real-world native sizes without allocating hundreds of GiB.
+  // Protected objects alone exceed 2 GiB; they must not consume the spare budget.
+  for (const n of pinned) objectSizes.set(fixtureKey(n),55*1024*1024);
+  const publish = async () => {
+    const result = await fetch(internal+'/internal/compiled-artifact',{method:'POST',headers,body:original});
+    assert.equal(result.status,204,await result.text());
+  };
+  const beforeFailedScan = [...objects.keys()].sort();
+  await sql('REVOKE EXECUTE ON FUNCTION hibana_protected_artifact_hashes() FROM faas_app');
+  try {
+    const failed = await fetch(internal+'/internal/compiled-artifact',{method:'POST',headers,body:original});
+    assert.equal(failed.status,503,await failed.text());
+    assert.deepEqual([...objects.keys()].sort(),beforeFailedScan,'a failed reference lookup must not delete any objects');
+  } finally {
+    await sql('GRANT EXECUTE ON FUNCTION hibana_protected_artifact_hashes() TO faas_app');
+  }
+  await publish();
+  for (const n of pinned) assert.ok(objects.has(fixtureKey(n)),`protected native artifact ${n} must survive GC`);
+  assert.equal([...objects.keys()].filter(k=>k.startsWith(prefix)).length,pinned.length+1+256);
+  assert.ok(!objects.has(fixtureKey(10005)), 'expired preparation is reclaimable');
+  // A deleted app and a released rollback/execution pin become reclaimable.
+  await sql(`UPDATE components SET deleted_at=now() WHERE id='cache-pin-1';
+    UPDATE executions SET status='succeeded' WHERE id IN ('cache-running','cache-pending');
+    DELETE FROM artifact_reservations WHERE id IN ('cache-reserved','cache-expired');`);
+  await publish();
+  for (const n of [10001,10002,10003,10004]) assert.ok(!objects.has(fixtureKey(n)),`released artifact ${n} should be collected`);
+  assert.ok(objects.has(fixtureKey(1)),'another tenant still publishes the same source hash');
+  await sql("UPDATE components SET deleted_at=now() WHERE id='cache-pin-duplicate'");
+  await publish();
+  assert.ok(!objects.has(fixtureKey(1)),'last live reference released');
+  for (const key of [...objects.keys()]) if (key.startsWith(prefix) && key !== cacheKey) objects.delete(key);
+  objectSizes.clear();
+  await sql(`UPDATE components SET deleted_at=now() WHERE id LIKE 'cache-pin-%'`);
+  console.log('PASS 4097 published apps across tenants, rollback targets, pending/running executions and deployment pins survive shared GC; released references are collected');
+
+  // Reactivating a historical version with only a local copy must republish it.
+  const beforeRepublish = await metrics();
+  objects.delete(cacheKey);
+  assert.equal((await upload(id,token,'shared-local-republish',wasm)).status,201);
+  assert.ok(objects.has(cacheKey));
+  const misses = text => text.match(/^wasmtime_component_cache_misses_total (\d+)$/m)?.[1];
+  assert.equal(misses(await metrics()),misses(beforeRepublish),'local preparation republishes without recompilation');
+  await replace();
+  assert.equal((await app('shared-cache')).status,200);
+  assert.match(await metrics(), /^wasmtime_component_cache_misses_total 0$/m);
+  assert.match(await metrics(), /^hibana_worker_shared_cache_total\{outcome="hit"\} 1$/m);
+  console.log('PASS warm publication restores a missing shared copy; the following empty Pod reuses it without compilation');
 
   // A cache smaller than one compiled artifact still serves verified code.
   await stopWorker();

@@ -1,6 +1,6 @@
 {
   "name": "@hibana/console",
-  "version": "0.2.0-rc.12",
+  "version": "0.2.0-rc.13",
   "private": true,
   "type": "module",
   "engines": {

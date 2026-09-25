@@ -47,6 +47,8 @@ const nativeTarget = resolve(process.env.CARGO_TARGET_DIR || 'target', 'debug');
 delete process.env.CARGO_TARGET_DIR;
 const log = await open(join(folder, 'cp.log'), 'w');
 const objects = new Map();
+// Optional logical sizes for GC tests; no large fixture bodies are allocated.
+const objectSizes = new Map();
 const deniedDeletes = new Set();
 let heldPut, onPut, releasePut, heldGet, releaseGet, cp, worker, failDelete = false, failCacheWrites = false;
 const s3 = createServer(async (req, res) => {
@@ -57,9 +59,12 @@ const s3 = createServer(async (req, res) => {
   }
   if (req.method === 'GET' && target.searchParams.get('list-type') === '2') {
     const prefix = '/test-components/' + target.searchParams.get('prefix');
-    const entries = [...objects.entries()].filter(([key]) => key.startsWith(prefix));
-    const xml = entries.map(([key,bytes]) => `<Contents><Key>${key.slice('/test-components/'.length)}</Key><Size>${bytes.length}</Size><LastModified>2026-01-01T00:00:00Z</LastModified></Contents>`).join('');
-    res.writeHead(200, {'Content-Type':'application/xml'}).end(`<ListBucketResult><IsTruncated>false</IsTruncated>${xml}</ListBucketResult>`); return;
+    const after = target.searchParams.get('continuation-token') || '';
+    const entries = [...objects.entries()].filter(([key]) => key.startsWith(prefix) && key > after).sort(([a],[b]) => a.localeCompare(b));
+    const page = entries.slice(0, Number(target.searchParams.get('max-keys') || 1000));
+    const truncated = entries.length > page.length;
+    const xml = page.map(([key,bytes]) => `<Contents><Key>${key.slice('/test-components/'.length)}</Key><Size>${objectSizes.get(key) ?? bytes.length}</Size><LastModified>2026-01-01T00:00:00Z</LastModified></Contents>`).join('');
+    res.writeHead(200, {'Content-Type':'application/xml'}).end(`<ListBucketResult><IsTruncated>${truncated}</IsTruncated>${truncated ? `<NextContinuationToken>${page.at(-1)[0]}</NextContinuationToken>` : ''}${xml}</ListBucketResult>`); return;
   }
   if (req.method === 'DELETE') {
     if (deniedDeletes.has(key)) { res.writeHead(403).end('<Error><Code>AccessDenied</Code></Error>'); return; }
@@ -479,7 +484,7 @@ try {
   await testSecretRekey({api, sql, pg, restart:async env => { await stop(); await start(env); }});
   await testExecutionShutdown({api, token, wasm, upload, url, internal, metricsUrl:`http://127.0.0.1:${metricsPort}`, startWorker, stopWorker:() => stop(worker)});
   await testRuntimeBoundaries({api, sql, token, wasm, upload, url, internal, metricsUrl:`http://127.0.0.1:${metricsPort}`, startWorker, stopWorker:() => stop(worker)});
-  await testSharedCache({api, sql, token, wasm, upload, app, internal, folder, objects,
+  await testSharedCache({api, sql, token, wasm, upload, app, internal, folder, objects, objectSizes,
     restart:async env => { await stop(); await start(env); }, startWorker,
     stopWorker:() => stop(worker), metricsUrl:`http://127.0.0.1:${metricsPort}`,
     failWrites:value => { failCacheWrites=value; }});

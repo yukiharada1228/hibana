@@ -9,7 +9,7 @@
 //! 通常のHTTP実行ではURLを発行せず、準備済みの成果物を使用する。
 
 use std::time::Duration;
-mod compiled;
+pub(crate) mod compiled;
 
 use aws_credential_types::Credentials;
 use aws_sdk_s3::config::{BehaviorVersion, Region};

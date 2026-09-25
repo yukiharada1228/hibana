@@ -138,8 +138,8 @@ CIではこの検証とAnsible構文検査を実行します。リモートへ�
 
 ### 共有コンパイルキャッシュ
 
-レンダラは保存済みの署名seedから、用途を分けた`COMPILED_CACHE_KEY`を導出して`hibana-runtime`へ設定します。対応する新しいControl Plane・Workerでは、既存Garageバケットへコンパイル結果を保存し、新しいPodで再利用します。追加のサービスやPVCは不要です。共有キャッシュは2 GiB・256件までで、元Wasmと別のprefixから古いキャッシュを回収します。鍵を変更すると共有成果物は再作成されます。詳しくは[キャッシュ設計](../docs/architecture.md)と[ローカル検証結果](../docs/vps-shared-cache-validation.md)を参照してください。
+レンダラは保存済みの署名seedから、用途を分けた`COMPILED_CACHE_KEY`を導出して`hibana-runtime`へ設定します。対応する新しいControl Plane・Workerでは、既存Garageバケットへコンパイル結果を保存し、新しいPodで再利用します。追加のサービスやPVCは不要です。公開中の版・直前のロールバック先・実行中・準備中の成果物を保持し、それ以外のキャッシュだけを2 GiB・256件までに回収します。保護対象はこの枠を超えて保存するため、Garageの空き容量を監視し、アプリ数に応じて容量を確保してください。元Wasmは削除しません。鍵を変更すると共有成果物は再作成されます。詳しくは[キャッシュ設計](../docs/architecture.md)と[ローカル検証結果](../docs/vps-shared-cache-validation.md)を参照してください。
 
 Workerのローカルコードは公開アプリ全件を保持せず、容量を超えた分を退避し、必要時にGarageから復元します。アプリの切替えでPodは作り直しません。最小VPS構成のPod更新は、新旧Podの同時配置に必要な余裕がないため`Recreate`のままです。標準のRollingUpdate用DNS終了猶予は外し、旧Podの予約を早く解放します。この最小構成はPod交換中の無停止を保証しません。
 
-公開中のKAGOYA 2GB×3台へrc.12を反映し、同じアプリのGarage復元・再コンパイルと、8アプリの容量超過時の復元を[本番で実測](../docs/vps-production-cache-validation.md)しました。HTTP応答の計測はPodの起動・DNS待機と分けています。
+KAGOYA 2GB×3台のrc.12で、同じアプリのGarage復元・再コンパイルと、8アプリの容量超過時の復元を[本番で実測](../docs/vps-production-cache-validation.md)しました。HTTP応答の計測はPodの起動・DNS待機と分けています。rc.13以降の更新は、追加サーバーを使わない[本番CD](../docs/production-cd.md)で公開検証・バックアップ・DB更新・疎通確認まで自動化できます。
