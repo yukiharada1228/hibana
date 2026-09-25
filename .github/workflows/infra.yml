@@ -25,6 +25,7 @@ jobs:
           ansible-playbook -i infra/ansible/inventory.example.yml infra/ansible/deploy.yml --syntax-check
           ansible-playbook -i infra/ansible/inventory.example.yml infra/ansible/cd.yml --syntax-check
           python infra/tests/test_cd.py
+          python infra/tests/test_actions_deploy.py
           python infra/tests/test_render.py
           terraform -chdir=infra/terraform/dns fmt -check -recursive
           terraform -chdir=infra/terraform/dns init -backend=false

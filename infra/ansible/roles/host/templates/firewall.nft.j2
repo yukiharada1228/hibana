@@ -13,6 +13,9 @@ table inet hibana {
     ip saddr { {{ groups['all'] | map('extract', hostvars, 'node_ip') | join(', ') }} } accept
     ip saddr {{ pod_cidr }} accept
     ip saddr { {{ ssh_source_cidrs | join(', ') }} } tcp dport 22 accept
+{% if inventory_hostname in groups['control_plane'] and cd_actions_ssh_port | default(0) | int > 0 %}
+    tcp dport {{ cd_actions_ssh_port }} accept
+{% endif %}
 {% if inventory_hostname in groups['management'] %}
     tcp dport { 80, 443 } accept
 {% endif %}

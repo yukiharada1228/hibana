@@ -20,10 +20,12 @@ STATE = {"commit": "b" * 40, "published_at": "2026-09-24T00:00:00Z", "tag": "v0.
 
 
 class GateTests(unittest.TestCase):
-    def test_only_new_published_approved_releases_are_candidates(self):
-        for change in [{"draft": True}, {"assets": []}, {"published_at": STATE["published_at"]}]:
-            self.assertIsNone(cd.candidate([RELEASE | change], STATE))
-        self.assertEqual(cd.candidate([RELEASE], STATE), RELEASE)
+    def test_unpublished_or_wrong_release_cannot_deploy(self):
+        for change in [{"draft": True}, {"tag_name": "v1.0.0"}, {"published_at": None}]:
+            state, error, _, deploy, _ = self.scenario(release=RELEASE | change)
+            self.assertIsNotNone(error)
+            self.assertEqual(state, STATE)
+            self.assertEqual(deploy, 0)
 
     def test_marker_rejects_repository_tag_commit_and_schema_substitution(self):
         cd.validate_marker(MARKER, TAG, SHA)
@@ -35,7 +37,7 @@ class GateTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 cd.validate_marker(MARKER | {"tag": tag}, tag, SHA)
 
-    def scenario(self, state=STATE, marker=MARKER, failure=None):
+    def scenario(self, state=STATE, marker=MARKER, failure=None, release=RELEASE):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             (root / "state.json").write_text(json.dumps(state))
@@ -49,8 +51,8 @@ class GateTests(unittest.TestCase):
                 if "merge-base" in args and failure == "ancestor":
                     raise subprocess.CalledProcessError(1, args)
                 return b""
-            with patch.object(cd, "ROOT", root), patch("sys.argv", ["cd.py"]), \
-                    patch.object(cd, "get_json", side_effect=[[RELEASE], marker]) as network, \
+            with patch.object(cd, "ROOT", root), patch("sys.argv", ["cd.py", "--tag", TAG, "--commit", SHA]), \
+                    patch.object(cd, "get_json", side_effect=[release, marker]) as network, \
                     patch.object(cd, "run", side_effect=command), \
                     patch.object(cd, "backup", return_value=root / "backups/new.vault") as backup, \
                     patch.object(cd, "verify") as verify, patch.object(cd.subprocess, "run") as deploy:
@@ -71,7 +73,7 @@ class GateTests(unittest.TestCase):
         state = STATE | {"attempt": {"tag": TAG}}
         result, error, network, deploy, _ = self.scenario(state=state)
         self.assertEqual(result, state)
-        self.assertIsNone(error)
+        self.assertIsInstance(error, RuntimeError)
         self.assertEqual((network, deploy), (0, 0))
 
     def test_invalid_marker_or_rollback_cannot_reach_backup_and_deployment(self):

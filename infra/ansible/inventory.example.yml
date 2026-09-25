@@ -9,6 +9,8 @@ all:
     service_cidr: 10.96.0.0/16
     # Your operator IP, not 0.0.0.0/0. SSH host keys must be verified before first use.
     ssh_source_cidrs: [203.0.113.10/32]
+    # Enable only when installing cd.yml; a separate forced-command SSH listener.
+    # cd_actions_ssh_port: 2222
   children:
     control_plane:
       hosts:

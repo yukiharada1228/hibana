@@ -263,7 +263,6 @@ jobs:
       (needs.publish-npm.result == 'success' || needs.resume-npm.result == 'success')
     runs-on: ubuntu-22.04
     timeout-minutes: 5
-    environment: production
     permissions:
       contents: write
       actions: read
@@ -299,7 +298,18 @@ jobs:
           else
             gh release upload "$RELEASE_TAG" production.json
           fi
-          echo 'Verified release authorized. The production VPS polls every five minutes; this job does not claim deployment success.' >> "$GITHUB_STEP_SUMMARY"
+          echo 'Verified release authorized. The next job deploys to the VPS and waits for verification.' >> "$GITHUB_STEP_SUMMARY"
+
+  deploy-production:
+    name: Deploy production VPS
+    needs: approve-production
+    if: ${{ always() && needs.approve-production.result == 'success' }}
+    permissions:
+      contents: read
+      actions: read
+    uses: ./.github/workflows/deploy-production.yml
+    with:
+      release_tag: ${{ inputs.publish_tag || github.ref_name }}
 
   resume-npm:
     name: Verify existing Release and optionally publish to npm

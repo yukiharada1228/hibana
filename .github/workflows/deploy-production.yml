@@ -1,0 +1,75 @@
+name: Deploy production
+
+on:
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: 'Existing verified release tag to deploy (for example v0.2.0-rc.13)'
+        required: true
+        type: string
+  workflow_call:
+    inputs:
+      release_tag:
+        required: true
+        type: string
+
+permissions:
+  contents: read
+  actions: read
+
+concurrency:
+  group: production-deploy
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    name: Deploy and verify production VPS
+    runs-on: ubuntu-22.04
+    timeout-minutes: 60
+    environment:
+      name: production
+      url: https://hibana.cloud
+    env:
+      RELEASE_TAG: ${{ inputs.release_tag }}
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+      - name: Resolve the release and verify its production authorization
+        id: release
+        run: |
+          [[ "$RELEASE_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[a-z0-9.-]+)?$ ]]
+          git fetch --no-tags origin "refs/tags/$RELEASE_TAG:refs/tags/$RELEASE_TAG"
+          sha=$(git rev-parse "$RELEASE_TAG^{commit}")
+          export RELEASE_SHA="$sha"
+          gh release view "$RELEASE_TAG" --json isDraft,tagName > release.json
+          gh release download "$RELEASE_TAG" --pattern production.json
+          python3 - <<'PY'
+          import json, os, subprocess
+          release = json.load(open('release.json'))
+          assert release == {'isDraft': False, 'tagName': os.environ['RELEASE_TAG']}
+          assert json.load(open('production.json')) == {'schema': 1,
+              'repository': os.environ['GITHUB_REPOSITORY'], 'tag': os.environ['RELEASE_TAG'],
+              'commit': os.environ['RELEASE_SHA']}
+          package = json.loads(subprocess.check_output(['git', 'show', os.environ['RELEASE_SHA'] + ':sdk/package.json']))
+          assert package['version'] == os.environ['RELEASE_TAG'][1:]
+          PY
+          GITHUB_SHA="$sha" node scripts/check-release-ci.mjs
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
+      - name: Back up, migrate, deploy and verify on the VPS
+        env:
+          RELEASE_SHA: ${{ steps.release.outputs.sha }}
+          PRODUCTION_SSH_HOST: ${{ vars.PRODUCTION_SSH_HOST }}
+          PRODUCTION_SSH_PORT: ${{ vars.PRODUCTION_SSH_PORT }}
+          PRODUCTION_SSH_KNOWN_HOSTS: ${{ vars.PRODUCTION_SSH_KNOWN_HOSTS }}
+          PRODUCTION_SSH_KEY: ${{ secrets.PRODUCTION_SSH_KEY }}
+        run: python3 infra/deploy-client.py --tag "$RELEASE_TAG" --commit "$RELEASE_SHA"
+      - name: Verify public traffic from GitHub Actions
+        run: |
+          curl --fail --silent --show-error --max-time 120 https://hibana.cloud/api/readyz
+          curl --fail --silent --show-error --max-time 120 https://hello.demo.apps.hibana.cloud/
+          printf '\nProduction deployed and verified: %s (%s)\n' "$RELEASE_TAG" '${{ steps.release.outputs.sha }}' >> "$GITHUB_STEP_SUMMARY"

@@ -10,10 +10,35 @@
         line: 'from="{{ hostvars[groups["control_plane"][0]].node_ip }}",restrict {{ lookup("file", cd_key_file + ".pub") }}'
         mode: '0600'
 
-- name: Install the outbound-only production release poller
+- name: Install the Actions-triggered production deployer
   hosts: control_plane
   become: true
   tasks:
+    - name: Validate the dedicated Actions SSH port
+      ansible.builtin.assert:
+        that:
+          - cd_actions_ssh_port | int >= 1024
+          - cd_actions_ssh_port | int <= 65535
+    - name: Refuse to replace an active legacy deployment
+      ansible.builtin.command: systemctl is-active hibana-cd.service
+      register: legacy_deploy
+      changed_when: false
+      failed_when: legacy_deploy.stdout in ['active', 'activating']
+    - name: Detect the legacy polling timer
+      ansible.builtin.stat:
+        path: /etc/systemd/system/hibana-cd.timer
+      register: legacy_timer
+    - name: Disable periodic deployment
+      ansible.builtin.systemd_service:
+        name: hibana-cd.timer
+        enabled: false
+        state: stopped
+      when: legacy_timer.stat.exists
+    - name: Remove the legacy polling units
+      ansible.builtin.file:
+        path: '/etc/systemd/system/{{ item }}'
+        state: absent
+      loop: [hibana-cd.timer, hibana-cd.service]
     - name: Install deployment controller dependencies
       ansible.builtin.apt:
         name: [git, python3-venv]
@@ -55,38 +80,97 @@
         dest: /opt/hibana/cd/state.json
         mode: '0600'
         force: false
-    - name: Install the serialized deployment service
+    - name: Create a dedicated account with no general administrative access
+      ansible.builtin.user:
+        name: hibana-deploy
+        system: true
+        home: /var/lib/hibana-deploy
+        shell: /bin/sh
+        password_lock: true
+    - name: Install the Actions public key in a root-owned file
       ansible.builtin.copy:
-        dest: /etc/systemd/system/hibana-cd.service
+        content: 'restrict {{ lookup("file", cd_actions_public_key_file) }}'
+        dest: /etc/ssh/hibana-deploy.authorized_keys
+        mode: '0644'
+    - name: Install the validating root deployment command
+      ansible.builtin.copy:
+        src: '{{ playbook_dir }}/../actions-deploy.py'
+        dest: /usr/local/sbin/hibana-actions-deploy
+        mode: '0755'
+    - name: Install the restricted SSH entry point
+      ansible.builtin.copy:
+        dest: /usr/local/bin/hibana-deploy-entry
+        mode: '0755'
+        content: |
+          #!/bin/sh
+          exec /usr/bin/sudo -n /usr/local/sbin/hibana-actions-deploy "${SSH_ORIGINAL_COMMAND:-}"
+    - name: Allow only the validating deployment command through sudo
+      ansible.builtin.copy:
+        dest: /etc/sudoers.d/hibana-deploy
+        mode: '0440'
+        validate: /usr/sbin/visudo -cf %s
+        content: |
+          hibana-deploy ALL=(root) NOPASSWD: /usr/local/sbin/hibana-actions-deploy
+    - name: Configure a separate SSH listener with forced deployment only
+      ansible.builtin.copy:
+        dest: /etc/ssh/sshd_config_hibana_deploy
+        mode: '0600'
+        validate: /usr/sbin/sshd -t -f %s
+        content: |
+          Port {{ cd_actions_ssh_port }}
+          AddressFamily inet
+          ListenAddress 0.0.0.0
+          HostKey /etc/ssh/ssh_host_ed25519_key
+          PidFile /run/sshd-hibana-deploy.pid
+          AllowUsers hibana-deploy
+          AuthorizedKeysFile /etc/ssh/hibana-deploy.authorized_keys
+          AuthenticationMethods publickey
+          PubkeyAuthentication yes
+          PasswordAuthentication no
+          KbdInteractiveAuthentication no
+          PermitRootLogin no
+          UsePAM yes
+          StrictModes yes
+          DisableForwarding yes
+          PermitTTY no
+          PermitUserRC no
+          PermitUserEnvironment no
+          MaxAuthTries 3
+          MaxSessions 1
+          MaxStartups 3:30:10
+          ClientAliveInterval 30
+          ClientAliveCountMax 3
+          ForceCommand /usr/local/bin/hibana-deploy-entry
+      register: deploy_sshd_config
+    - name: Install the deployment SSH service
+      ansible.builtin.copy:
+        dest: /etc/systemd/system/hibana-deploy-sshd.service
         mode: '0644'
         content: |
           [Unit]
-          Description=Deploy CI-approved Hibana releases
-          Wants=network-online.target
-          After=network-online.target
+          Description=Restricted SSH entry for GitHub Actions deployments
+          After=network.target
           [Service]
-          Type=oneshot
-          ExecStart=/opt/hibana/cd/venv/bin/python /opt/hibana/cd/cd.py
-          UMask=0077
-          TimeoutStartSec=50min
-          Nice=10
-          MemoryMax=512M
-    - name: Install the release check timer
-      ansible.builtin.copy:
-        dest: /etc/systemd/system/hibana-cd.timer
-        mode: '0644'
-        content: |
-          [Unit]
-          Description=Check for approved Hibana releases every five minutes
-          [Timer]
-          OnBootSec=2min
-          OnUnitInactiveSec=5min
-          RandomizedDelaySec=30s
+          ExecStart=/usr/sbin/sshd -D -f /etc/ssh/sshd_config_hibana_deploy
+          Restart=on-failure
           [Install]
-          WantedBy=timers.target
-    - name: Enable deployment polling
+          WantedBy=multi-user.target
+      register: deploy_sshd_unit
+    - name: Enable the restricted deployment listener
       ansible.builtin.systemd_service:
-        name: hibana-cd.timer
+        name: hibana-deploy-sshd
         daemon_reload: true
         enabled: true
-        state: started
+        state: '{{ "restarted" if deploy_sshd_config.changed or deploy_sshd_unit.changed else "started" }}'
+    - name: Preserve the operator SSH restriction and open only the deployment listener
+      ansible.builtin.template:
+        src: roles/host/templates/firewall.nft.j2
+        dest: /etc/hibana-firewall.nft
+        mode: '0600'
+        validate: /usr/sbin/nft -c -f %s
+      register: deploy_firewall
+    - name: Apply the deployment firewall without touching Kubernetes rules
+      ansible.builtin.systemd_service:
+        name: hibana-firewall
+        state: reloaded
+      when: deploy_firewall.changed

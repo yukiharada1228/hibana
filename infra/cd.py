@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Pull only CI-approved public releases. Runs on the control plane, never in a PR."""
+"""Deploy an explicitly requested, CI-approved release on the control plane."""
 
 import argparse
 import datetime
@@ -35,13 +35,6 @@ def validate_marker(marker, tag, sha):
         raise ValueError("Invalid commit")
     if marker != {"schema": 1, "repository": REPO, "tag": tag, "commit": sha}:
         raise ValueError("Release marker does not match its immutable source")
-
-
-def candidate(releases, state):
-    eligible = [r for r in releases if not r["draft"]
-                and r["published_at"] > state["published_at"]
-                and any(a["name"] == "production.json" for a in r["assets"])]
-    return max(eligible, key=lambda r: r["published_at"], default=None)
 
 
 def write_state(state):
@@ -109,24 +102,22 @@ def verify(version, config):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--tag", required=True)
+    parser.add_argument("--commit", required=True)
     parser.add_argument("--retry", action="store_true", help="Operator-only retry after inspecting/fixing the last failure")
     args = parser.parse_args()
+    tag, sha = args.tag, args.commit
+    validate_marker({"schema": 1, "repository": REPO, "tag": tag, "commit": sha}, tag, sha)
     os.umask(0o077)
     with (ROOT / "lock").open("w") as lock:
         fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
         state = json.loads((ROOT / "state.json").read_text())
         if state.get("attempt") and not args.retry:
-            print("CD paused after an incomplete attempt; inspect state.json and deploy.log.")
-            return
-        release = candidate(get_json(f"https://api.github.com/repos/{REPO}/releases?per_page=20"), state)
-        if not release:
-            return
-        tag = release["tag_name"]
-        # Validate before using the tag in URLs or git arguments.
-        if not re.fullmatch(r"v\d+\.\d+\.\d+(?:-[a-z0-9.-]+)?", tag):
-            raise ValueError("Invalid release tag")
+            raise RuntimeError("Incomplete deployment; an operator must inspect state.json and deploy.log before --retry")
+        release = get_json(f"https://api.github.com/repos/{REPO}/releases/tags/{tag}")
+        if release["draft"] or release["tag_name"] != tag or not release["published_at"]:
+            raise ValueError("A published release is required")
         marker = get_json(f"https://github.com/{REPO}/releases/download/{tag}/production.json")
-        sha = marker.get("commit", "")
         validate_marker(marker, tag, sha)
         source = ROOT / "source"
         if not source.exists():
@@ -135,7 +126,7 @@ def main():
         actual = run(["git", "-C", str(source), "rev-parse", tag + "^{commit}"]).decode().strip()
         if actual != sha:
             raise RuntimeError("Tag moved or marker commit mismatch")
-        # Never auto-deploy an older/divergent commit, including a newly republished old tag.
+        # Never deploy an older/divergent commit, including a newly republished old tag.
         run(["git", "-C", str(source), "merge-base", "--is-ancestor", state["commit"], sha])
         run(["git", "-C", str(source), "checkout", "--quiet", "--detach", sha])
         version = tag[1:]
