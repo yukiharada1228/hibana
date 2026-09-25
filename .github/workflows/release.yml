@@ -178,7 +178,7 @@ jobs:
     if: github.ref_type == 'tag'
     needs: assemble
     runs-on: ubuntu-22.04
-    timeout-minutes: 20
+    timeout-minutes: 50
     permissions:
       contents: write
       actions: read
@@ -195,7 +195,7 @@ jobs:
       - name: Require successful CI and security audit for this commit
         env:
           GH_TOKEN: ${{ github.token }}
-        run: node scripts/check-release-ci.mjs
+        run: node scripts/check-release-ci.mjs --wait
       - name: Publish versioned assets
         env:
           GH_TOKEN: ${{ github.token }}
@@ -305,7 +305,7 @@ jobs:
     name: Verify existing Release and optionally publish to npm
     if: github.event_name == 'workflow_dispatch' && inputs.publish_tag != ''
     runs-on: ubuntu-22.04
-    timeout-minutes: 30
+    timeout-minutes: 60
     permissions:
       contents: read
       actions: read
@@ -327,7 +327,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           GITHUB_REF_TYPE=tag GITHUB_REF_NAME="$RELEASE_TAG" node scripts/release.mjs version
-          GITHUB_SHA="$(git rev-parse HEAD)" node scripts/check-release-ci.mjs
+          GITHUB_SHA="$(git rev-parse HEAD)" node scripts/check-release-ci.mjs --wait
       - name: Download and verify every published asset
         run: |
           version=$(node scripts/release.mjs version)

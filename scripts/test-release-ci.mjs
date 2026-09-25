@@ -5,7 +5,7 @@ import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { delimiter, join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { requireReleaseChecks } from "./check-release-ci.mjs";
+import { requireReleaseChecks, releaseChecksPending } from "./check-release-ci.mjs";
 
 const sha = "a".repeat(40);
 
@@ -65,6 +65,20 @@ test("exact release commit requires all successful branch checks", () => {
       sha,
     ),
   );
+});
+
+test("publishing waits for pending exact-commit checks but terminal failure never passes", () => {
+  assert.equal(releaseChecksPending(successful, sha), false);
+  assert.equal(releaseChecksPending([], sha), true);
+  assert.equal(releaseChecksPending(successful, "b".repeat(40)), true);
+  for (const status of ["queued", "in_progress", "waiting"]) {
+    const runs = [...successful, { ...successful[0], status, conclusion: null }];
+    assert.equal(releaseChecksPending(runs, sha), true);
+    assert.throws(() => requireReleaseChecks(runs, sha));
+  }
+  const failed = successful.map((run) => ({ ...run, conclusion: "failure" }));
+  assert.equal(releaseChecksPending(failed, sha), false);
+  assert.throws(() => requireReleaseChecks(failed, sha));
 });
 
 test("a rerun of an older run is ordered by its latest result, not its ID", () => {

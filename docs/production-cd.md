@@ -1,6 +1,6 @@
 # 本番の継続的デリバリー
 
-`develop`へのpushでCI・Security dependencies・VPS IaCを実行します。公開するコミットに`vVERSION`タグを付けると、4種類のランタイムと2種類のCPU用コンテナ、CLI、Kubernetesマニフェストをビルドします。同じコミットの3つのチェックが成功してからGitHub Releaseとnpmへ公開し、実際のnpm導入を確認します。最後に`production` environmentを使うジョブがReleaseへ`production.json`を追加します。このファイルが本番更新の許可です。通常のbranch/PRビルドでは発行しません。タグ・配布物・マーカーを上書きしません。
+`develop`へのpushでCI・Security dependencies・VPS IaCを実行します。公開するコミットに`vVERSION`タグを付けると、4種類のランタイムと2種類のCPU用コンテナ、CLI、Kubernetesマニフェストをビルドします。公開ビルドが先に終わった場合はチェックの完了を最大30分待ちます。同じコミットの3つのチェックが成功してからGitHub Releaseとnpmへ公開し、実際のnpm導入を確認します。最後に`production` environmentを使うジョブがReleaseへ`production.json`を追加します。このファイルが本番更新の許可です。通常のbranch/PRビルドでは発行しません。タグ・配布物・マーカーを上書きしません。
 
 KAGOYAのcontrol-planeでsystemd timerが5分おき（最大30秒の追加揺らぎ）に公開GitHub Releaseを確認します。マーカーのrepository・tag・commit、タグの実体、ソースの版、現在稼働するコミットからの前進を検査し、既存のAnsibleを実行します。SSHやKubernetes APIの公開範囲を増やさず、GitHubに本番SSH鍵・Vault鍵・DB認証情報を保存しません。常駐するActions runnerも追加しません。1回の実行をファイルロックで直列化します。
 
