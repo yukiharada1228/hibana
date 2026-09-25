@@ -86,3 +86,5 @@ node scripts/k8s-local-scale.mjs --hpa
 これらは短時間・単一物理ホストの受入試験です。長時間負荷、Hono/JS/Goの大きい成果物のcold start、実CNI、ノード障害、DB/Redis/S3の切替と復元は[本番導入条件](on-prem-production.md)として別途評価します。
 
 コンパイルの制限、混合soak・復元・障害試験は[隔離・復元・障害試験](resilience.md)を参照してください。
+
+KAGOYA 2GB×3台・実行Pod1個での、キャッシュ退避後のHono応答と同時復元は[本番キャッシュ実測](vps-production-cache-validation.md)に記録しています。Pod起動を除くHTTP所要時間と、再コンパイル・共有キャッシュhitを分けて確認しました。

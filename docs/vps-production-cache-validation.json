@@ -1,0 +1,4336 @@
+{
+  "version": "0.2.0-rc.12",
+  "source_commit": "309b0671a2858b50a301302ac29ea9b50d6981e0",
+  "run": "20260925095057",
+  "scope": "Production KAGOYA 3 x 2GB plan; macOS client over public HTTPS; fresh TLS connection each request. Node OS, image layers and other services stay warm.",
+  "nodes": [
+    {
+      "name": "hibana-cp",
+      "capacity": {
+        "cpu": "2",
+        "ephemeral-storage": "203212376Ki",
+        "hugepages-1Gi": "0",
+        "hugepages-2Mi": "0",
+        "memory": "2009028Ki",
+        "pods": "110"
+      },
+      "allocatable": {
+        "cpu": "1800m",
+        "ephemeral-storage": "187280525412",
+        "hugepages-1Gi": "0",
+        "hugepages-2Mi": "0",
+        "memory": "1644484Ki",
+        "pods": "110"
+      },
+      "os": "Ubuntu 24.04.4 LTS",
+      "kernel": "6.8.0-142-generic",
+      "architecture": "amd64"
+    },
+    {
+      "name": "hibana-execution",
+      "capacity": {
+        "cpu": "2",
+        "ephemeral-storage": "203212376Ki",
+        "hugepages-1Gi": "0",
+        "hugepages-2Mi": "0",
+        "memory": "2009032Ki",
+        "pods": "110"
+      },
+      "allocatable": {
+        "cpu": "1800m",
+        "ephemeral-storage": "187280525412",
+        "hugepages-1Gi": "0",
+        "hugepages-2Mi": "0",
+        "memory": "1644488Ki",
+        "pods": "110"
+      },
+      "os": "Ubuntu 24.04.4 LTS",
+      "kernel": "6.8.0-124-generic",
+      "architecture": "amd64"
+    },
+    {
+      "name": "hibana-management",
+      "capacity": {
+        "cpu": "2",
+        "ephemeral-storage": "203212376Ki",
+        "hugepages-1Gi": "0",
+        "hugepages-2Mi": "0",
+        "memory": "2009032Ki",
+        "pods": "110"
+      },
+      "allocatable": {
+        "cpu": "1800m",
+        "ephemeral-storage": "187280525412",
+        "hugepages-1Gi": "0",
+        "hugepages-2Mi": "0",
+        "memory": "1644488Ki",
+        "pods": "110"
+      },
+      "os": "Ubuntu 24.04.4 LTS",
+      "kernel": "6.8.0-124-generic",
+      "architecture": "amd64"
+    }
+  ],
+  "hello": {
+    "id": "cmp_9db48069aa644c81a37fa519009338a0",
+    "active_version_id": "ver_580a6988471a4bb3975ba6551df41de1",
+    "wasm_sha256": "b269536a6e759ef9389d3e8d78433aedef45d4d46149b447725601a2d8e60b40",
+    "size_bytes": 12393107,
+    "resource_limits": {
+      "max_memory_bytes": 268435456,
+      "max_wall_time_ms": 15000,
+      "max_execution_time_ms": 20000
+    }
+  },
+  "measurements": {
+    "before_rc10_hot": {
+      "n": 20,
+      "http_200": 20,
+      "median_ms": 95.581,
+      "p95_ms": 105.813,
+      "min_ms": 86.081,
+      "max_ms": 109.144
+    },
+    "hot": {
+      "n": 50,
+      "http_200": 50,
+      "median_ms": 94.239,
+      "p95_ms": 105.046,
+      "min_ms": 83.838,
+      "max_ms": 106.667
+    },
+    "garage": {
+      "n": 3,
+      "http_200": 3,
+      "median_ms": 481.568,
+      "p95_ms": 483.127,
+      "min_ms": 465.089,
+      "max_ms": 483.127
+    },
+    "source": {
+      "n": 3,
+      "http_200": 3,
+      "median_ms": 18870.173,
+      "p95_ms": 18925.425,
+      "min_ms": 18710.056,
+      "max_ms": 18925.425
+    },
+    "parallel_cold": {
+      "n": 4,
+      "http_200": 4,
+      "median_ms": 582.961,
+      "p95_ms": 585.315,
+      "min_ms": 582.881,
+      "max_ms": 585.315
+    },
+    "rotation": {
+      "n": 24,
+      "http_200": 24,
+      "median_ms": 520.426,
+      "p95_ms": 728.883,
+      "min_ms": 465.131,
+      "max_ms": 788.555
+    },
+    "fixture_hot": {
+      "n": 50,
+      "http_200": 50,
+      "median_ms": 92.993,
+      "p95_ms": 103.177,
+      "min_ms": 82.037,
+      "max_ms": 108.86
+    }
+  },
+  "cache_budget_bytes": 134217728,
+  "cache_max_observed_bytes": 116183008,
+  "worker_peak_working_set_bytes": 375042048,
+  "memory_samples": 268,
+  "trials": [
+    {
+      "label": "garage-1",
+      "shared_enabled": true,
+      "pod_name": "hibana-worker-5c88498fb8-x8ksb",
+      "pod_uid": "58b2bdd8-4d72-45f1-9e72-85646aadada4",
+      "replacement_to_ready_s": 6.763769374927506,
+      "pod_conditions": [
+        {
+          "lastProbeTime": null,
+          "lastTransitionTime": "2026-09-25T09:51:05Z",
+          "observedGeneration": 1,
+          "status": "True",
+          "type": "PodReadyToStartContainers"
+        },
+        {
+          "lastProbeTime": null,
+          "lastTransitionTime": "2026-09-25T09:51:04Z",
+          "observedGeneration": 1,
+          "status": "True",
+          "type": "Initialized"
+        },
+        {
+          "lastProbeTime": null,
+          "lastTransitionTime": "2026-09-25T09:51:10Z",
+          "observedGeneration": 1,
+          "status": "True",
+          "type": "Ready"
+        },
+        {
+          "lastProbeTime": null,
+          "lastTransitionTime": "2026-09-25T09:51:10Z",
+          "observedGeneration": 1,
+          "status": "True",
+          "type": "ContainersReady"
+        },
+        {
+          "lastProbeTime": null,
+          "lastTransitionTime": "2026-09-25T09:51:04Z",
+          "observedGeneration": 1,
+          "status": "True",
+          "type": "PodScheduled"
+        }
+      ],
+      "container_statuses": [
+        {
+          "allocatedResources": {
+            "cpu": "500m",
+            "ephemeral-storage": "1Gi",
+            "memory": "768Mi"
+          },
+          "containerID": "containerd://06b0329458d247d9bfbc3639bfd0360ca46090db6fb28c3891b86883f6cca28a",
+          "image": "docker.io/library/hibana-platform:0.2.0-rc.12-linux-amd64",
+          "imageID": "sha256:c9b3ce8d97ffce565eac90336793a2717f0ca801f534b765e13aa33af1a734a1",
+          "lastState": {},
+          "name": "worker",
+          "ready": true,
+          "resources": {
+            "limits": {
+              "cpu": "2",
+              "ephemeral-storage": "5Gi",
+              "memory": "1280Mi"
+            },
+            "requests": {
+              "cpu": "500m",
+              "ephemeral-storage": "1Gi",
+              "memory": "768Mi"
+            }
+          },
+          "restartCount": 0,
+          "started": true,
+          "state": {
+            "running": {
+              "startedAt": "2026-09-25T09:51:05Z"
+            }
+          },
+          "user": {
+            "linux": {
+              "gid": 10001,
+              "supplementalGroups": [
+                10001
+              ],
+              "uid": 10001
+            }
+          },
+          "volumeMounts": [
+            {
+              "mountPath": "/tmp",
+              "name": "tmp"
+            },
+            {
+              "mountPath": "/var/cache/hibana",
+              "name": "cache"
+            }
+          ]
+        }
+      ],
+      "before_metrics": {
+        "hibana_worker_active_compilations": 0.0,
+        "wasmtime_component_cache_misses_total": 0.0
+      },
+      "before_files": [],
+      "request": {
+        "label": "garage-1",
+        "app": "hello",
+        "utc": "2026-09-25T09:51:48.046944+00:00",
+        "curl_exit": 0,
+        "body": "Hello from Hono on Hibana 🔥",
+        "error": "",
+        "http_code": 200,
+        "time_namelookup": 0.003269,
+        "time_connect": 0.022162,
+        "time_appconnect": 0.051894,
+        "time_starttransfer": 0.476097,
+        "time_total": 0.481568,
+        "http_version": "2",
+        "remote_ip": "133.18.122.133",
+        "ms": 481.568,
+        "valid": true
+      },
+      "after_metrics": {
+        "executions_total{outcome=\"succeeded\"}": 1.0,
+        "hibana_worker_active_compilations": 0.0,
+        "hibana_worker_shared_cache_total{outcome=\"hit\"}": 1.0,
+        "wasmtime_component_cache_misses_total": 0.0
+      },
+      "after_files": [
+        {
+          "sha256": "b269536a6e759ef9389d3e8d78433aedef45d4d46149b447725601a2d8e60b40",
+          "bytes": 58091504
+        }
+      ],
+      "restore_timings": [
+        {
+          "timestamp": "2026-09-25T09:51:48.011379Z",
+          "level": "DEBUG",
+          "message": "artifact restored for invocation",
+          "sha256": "b269536a6e759ef9389d3e8d78433aedef45d4d46149b447725601a2d8e60b40",
+          "elapsed_ms": 377,
+          "target": "hibana_worker::direct_http"
+        }
+      ],
+      "final_container_statuses": [
+        {
+          "allocatedResources": {
+            "cpu": "500m",
+            "ephemeral-storage": "1Gi",
+            "memory": "768Mi"
+          },
+          "containerID": "containerd://06b0329458d247d9bfbc3639bfd0360ca46090db6fb28c3891b86883f6cca28a",
+          "image": "docker.io/library/hibana-platform:0.2.0-rc.12-linux-amd64",
+          "imageID": "sha256:c9b3ce8d97ffce565eac90336793a2717f0ca801f534b765e13aa33af1a734a1",
+          "lastState": {},
+          "name": "worker",
+          "ready": true,
+          "resources": {
+            "limits": {
+              "cpu": "2",
+              "ephemeral-storage": "5Gi",
+              "memory": "1280Mi"
+            },
+            "requests": {
+              "cpu": "500m",
+              "ephemeral-storage": "1Gi",
+              "memory": "768Mi"
+            }
+          },
+          "restartCount": 0,
+          "started": true,
+          "state": {
+            "running": {
+              "startedAt": "2026-09-25T09:51:05Z"
+            }
+          },
+          "user": {
+            "linux": {
+              "gid": 10001,
+              "supplementalGroups": [
+                10001
+              ],
+              "uid": 10001
+            }
+          },
+          "volumeMounts": [
+            {
+              "mountPath": "/tmp",
+              "name": "tmp"
+            },
+            {
+              "mountPath": "/var/cache/hibana",
+              "name": "cache"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "label": "garage-2",
+      "shared_enabled": true,
+      "pod_name": "hibana-worker-6b68d47bff-pf7wd",
+      "pod_uid": "ebc74fbe-9c4e-4ce4-97cc-7d2733d72586",
+      "replacement_to_ready_s": 6.818938208045438,
+      "pod_conditions": [
+        {
+          "lastProbeTime": null,
+          "lastTransitionTime": "2026-09-25T09:51:52Z",
+          "observedGeneration": 1,
+          "status": "True",
+          "type": "PodReadyToStartContainers"
+        },
+        {
+          "lastProbeTime": null,
+          "lastTransitionTime": "2026-09-25T09:51:51Z",
+          "observedGeneration": 1,
+          "status": "True",
+          "type": "Initialized"
+        },
+        {
+          "lastProbeTime": null,
+          "lastTransitionTime": "2026-09-25T09:51:57Z",
+          "observedGeneration": 1,
+          "status": "True",
+          "type": "Ready"
+        },
+        {
+          "lastProbeTime": null,
+          "lastTransitionTime": "2026-09-25T09:51:57Z",
+          "observedGeneration": 1,
+          "status": "True",
+          "type": "ContainersReady"
+        },
+        {
+          "lastProbeTime": null,
+          "lastTransitionTime": "2026-09-25T09:51:51Z",
+          "observedGeneration": 1,
+          "status": "True",
+          "type": "PodScheduled"
+        }
+      ],
+      "container_statuses": [
+        {
+          "allocatedResources": {
+            "cpu": "500m",
+            "ephemeral-storage": "1Gi",
+            "memory": "768Mi"
+          },
+          "containerID": "containerd://7f7059c637551576d8783e0d4c0643e8f19e57ebea57eeb010659a317d198dbb",
+          "image": "docker.io/library/hibana-platform:0.2.0-rc.12-linux-amd64",
+          "imageID": "sha256:c9b3ce8d97ffce565eac90336793a2717f0ca801f534b765e13aa33af1a734a1",
+          "lastState": {},
+          "name": "worker",
+          "ready": true,
+          "resources": {
+            "limits": {
+              "cpu": "2",
+              "ephemeral-storage": "5Gi",
+              "memory": "1280Mi"
+            },
+            "requests": {
+              "cpu": "500m",
+              "ephemeral-storage": "1Gi",
+              "memory": "768Mi"
+            }
+          },
+          "restartCount": 0,
+          "started": true,
+          "state": {
+            "running": {
+              "startedAt": "2026-09-25T09:51:52Z"
+            }
+          },
+          "user": {
+            "linux": {
+              "gid": 10001,
+              "supplementalGroups": [
+                10001
+              ],
+              "uid": 10001
+            }
+          },
+          "volumeMounts": [
+            {
+              "mountPath": "/tmp",
+              "name": "tmp"
+            },
+            {
+              "mountPath": "/var/cache/hibana",
+              "name": "cache"
+            }
+          ]
+        }
+      ],
+      "before_metrics": {
+        "hibana_worker_active_compilations": 0.0,
+        "wasmtime_component_cache_misses_total": 0.0
+      },
+      "before_files": [],
+      "request": {
+        "label": "garage-2",
+        "app": "hello",
+        "utc": "2026-09-25T09:52:34.806380+00:00",
+        "curl_exit": 0,
+        "body": "Hello from Hono on Hibana 🔥",
+        "error": "",
+        "http_code": 200,
+        "time_namelookup": 0.002008,
+        "time_connect": 0.019081,
+        "time_appconnect": 0.048047,
+        "time_starttransfer": 0.45816,
+        "time_total": 0.465089,
+        "http_version": "2",
+        "remote_ip": "133.18.122.133",
+        "ms": 465.089,
+        "valid": true
+      },
+      "after_metrics": {
+        "executions_total{outcome=\"succeeded\"}": 1.0,
+        "hibana_worker_active_compilations": 0.0,
+        "hibana_worker_shared_cache_total{outcome=\"hit\"}": 1.0,
+        "wasmtime_component_cache_misses_total": 0.0
+      },
+      "after_files": [
+        {
+          "sha256": "b269536a6e759ef9389d3e8d78433aedef45d4d46149b447725601a2d8e60b40",
+          "bytes": 58091504
+        }
+      ],
+      "restore_timings": [
+        {
+          "timestamp": "2026-09-25T09:52:34.769451Z",
+          "level": "DEBUG",
+          "message": "artifact restored for invocation",
+          "sha256": "b269536a6e759ef9389d3e8d78433aedef45d4d46149b447725601a2d8e60b40",
+          "elapsed_ms": 354,
+          "target": "hibana_worker::direct_http"
+        }
+      ],
+      "final_container_statuses": [
+        {
+          "allocatedResources": {
+            "cpu": "500m",
+            "ephemeral-storage": "1Gi",
+            "memory": "768Mi"
+          },
+          "containerID": "containerd://7f7059c637551576d8783e0d4c0643e8f19e57ebea57eeb010659a317d198dbb",
+          "image": "docker.io/library/hibana-platform:0.2.0-rc.12-linux-amd64",
+          "imageID": "sha256:c9b3ce8d97ffce565eac90336793a2717f0ca801f534b765e13aa33af1a734a1",
+          "lastState": {},
+          "name": "worker",
+          "ready": true,
+          "resources": {
+            "limits": {
+              "cpu": "2",
+              "ephemeral-storage": "5Gi",
+              "memory": "1280Mi"
+            },
+            "requests": {
+              "cpu": "500m",
+              "ephemeral-storage": "1Gi",
+              "memory": "768Mi"
+            }
+          },
+          "restartCount": 0,
+          "started": true,
+          "state": {
+            "running": {
+              "startedAt": "2026-09-25T09:51:52Z"
+            }
+          },
+          "user": {
+            "linux": {
+              "gid": 10001,
+              "supplementalGroups": [
+                10001
+              ],
+              "uid": 10001
+            }
+          },
+          "volumeMounts": [
+            {
+              "mountPath": "/tmp",
+              "name": "tmp"
+            },
+            {
+              "mountPath": "/var/cache/hibana",
+              "name": "cache"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "label": "garage-3",
+      "shared_enabled": true,
+      "pod_name": "hibana-worker-6c58454c86-8shkf",
+      "pod_uid": "7a609d45-a715-4894-aa2d-87f7964e4ff8",
+      "replacement_to_ready_s": 8.296723125036806,
+      "pod_conditions": [
+        {
+          "lastProbeTime": null,
+          "lastTransitionTime": "2026-09-25T09:52:39Z",
+          "observedGeneration": 1,
+          "status": "True",
+          "type": "PodReadyToStartContainers"
+        },
+        {
+          "lastProbeTime": null,
+          "lastTransitionTime": "2026-09-25T09:52:38Z",
+          "observedGeneration": 1,
+          "status": "True",
+          "type": "Initialized"
+        },
+        {
+          "lastProbeTime": null,
+          "lastTransitionTime": "2026-09-25T09:52:44Z",
+          "observedGeneration": 1,
+          "status": "True",
+          "type": "Ready"
+        },
+        {
+          "lastProbeTime": null,
+          "lastTransitionTime": "2026-09-25T09:52:44Z",
+          "observedGeneration": 1,
+          "status": "True",
+          "type": "ContainersReady"
+        },
+        {
+          "lastProbeTime": null,
+          "lastTransitionTime": "2026-09-25T09:52:38Z",
+          "observedGeneration": 1,
+          "status": "True",
+          "type": "PodScheduled"
+        }
+      ],
+      "container_statuses": [
+        {
+          "allocatedResources": {
+            "cpu": "500m",
+            "ephemeral-storage": "1Gi",
+            "memory": "768Mi"
+          },
+          "containerID": "containerd://5dbfb80841b2551f73d2bd5aab2c41e63d97f539066ded8914579b0212ecd761",
+          "image": "docker.io/library/hibana-platform:0.2.0-rc.12-linux-amd64",
+          "imageID": "sha256:c9b3ce8d97ffce565eac90336793a2717f0ca801f534b765e13aa33af1a734a1",
+          "lastState": {},
+          "name": "worker",
+          "ready": true,
+          "resources": {
+            "limits": {
+              "cpu": "2",
+              "ephemeral-storage": "5Gi",
+              "memory": "1280Mi"
+            },
+            "requests": {
+              "cpu": "500m",
+              "ephemeral-storage": "1Gi",
+              "memory": "768Mi"
+            }
+          },
+          "restartCount": 0,
+          "started": true,
+          "state": {
+            "running": {
+              "startedAt": "2026-09-25T09:52:39Z"
+            }
+          },
+          "user": {
+            "linux": {
+              "gid": 10001,
+              "supplementalGroups": [
+                10001
+              ],
+              "uid": 10001
+            }
+          },
+          "volumeMounts": [
+            {
+              "mountPath": "/tmp",
+              "name": "tmp"
+            },
+            {
+              "mountPath": "/var/cache/hibana",
+              "name": "cache"
+            }
+          ]
+        }
+      ],
+      "before_metrics": {
+        "hibana_worker_active_compilations": 0.0,
+        "wasmtime_component_cache_misses_total": 0.0
+      },
+      "before_files": [],
+      "request": {
+        "label": "garage-3",
+        "app": "hello",
+        "utc": "2026-09-25T09:53:23.492658+00:00",
+        "curl_exit": 0,
+        "body": "Hello from Hono on Hibana 🔥",
+        "error": "",
+        "http_code": 200,
+        "time_namelookup": 0.003269,
+        "time_connect": 0.021043,
+        "time_appconnect": 0.049577,
+        "time_starttransfer": 0.477918,
+        "time_total": 0.483127,
+        "http_version": "2",
+        "remote_ip": "133.18.122.133",
+        "ms": 483.12699999999995,
+        "valid": true
+      },
+      "after_metrics": {
+        "executions_total{outcome=\"succeeded\"}": 1.0,
+        "hibana_worker_active_compilations": 0.0,
+        "hibana_worker_shared_cache_total{outcome=\"hit\"}": 1.0,
+        "wasmtime_component_cache_misses_total": 0.0
+      },
+      "after_files": [
+        {
+          "sha256": "b269536a6e759ef9389d3e8d78433aedef45d4d46149b447725601a2d8e60b40",
+          "bytes": 58091504
+        }
+      ],
+      "restore_timings": [
+        {
+          "timestamp": "2026-09-25T09:53:23.455330Z",
+          "level": "DEBUG",
+          "message": "artifact restored for invocation",
+          "sha256": "b269536a6e759ef9389d3e8d78433aedef45d4d46149b447725601a2d8e60b40",
+          "elapsed_ms": 384,
+          "target": "hibana_worker::direct_http"
+        }
+      ],
+      "final_container_statuses": [
+        {
+          "allocatedResources": {
+            "cpu": "500m",
+            "ephemeral-storage": "1Gi",
+            "memory": "768Mi"
+          },
+          "containerID": "containerd://5dbfb80841b2551f73d2bd5aab2c41e63d97f539066ded8914579b0212ecd761",
+          "image": "docker.io/library/hibana-platform:0.2.0-rc.12-linux-amd64",
+          "imageID": "sha256:c9b3ce8d97ffce565eac90336793a2717f0ca801f534b765e13aa33af1a734a1",
+          "lastState": {},
+          "name": "worker",
+          "ready": true,
+          "resources": {
+            "limits": {
+              "cpu": "2",
+              "ephemeral-storage": "5Gi",
+              "memory": "1280Mi"
+            },
+            "requests": {
+              "cpu": "500m",
+              "ephemeral-storage": "1Gi",
+              "memory": "768Mi"
+            }
+          },
+          "restartCount": 0,
+          "started": true,
+          "state": {
+            "running": {
+              "startedAt": "2026-09-25T09:52:39Z"
+            }
+          },
+          "user": {
+            "linux": {
+              "gid": 10001,
+              "supplementalGroups": [
+                10001
+              ],
+              "uid": 10001
+            }
+          },
+          "volumeMounts": [
+            {
+              "mountPath": "/tmp",
+              "name": "tmp"
+            },
+            {
+              "mountPath": "/var/cache/hibana",
+              "name": "cache"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "label": "source-1",
+      "shared_enabled": false,
+      "pod_name": "hibana-worker-5f976487bf-kmlwz",
+      "pod_uid": "983cff26-08ca-437e-9c09-834e778005dc",
+      "replacement_to_ready_s": 6.846386416000314,
+      "pod_conditions": [
+        {
+          "lastProbeTime": null,
+          "lastTransitionTime": "2026-09-25T09:53:27Z",
+          "observedGeneration": 1,
+          "status": "True",
+          "type": "PodReadyToStartContainers"
+        },
+        {
+          "lastProbeTime": null,
+          "lastTransitionTime": "2026-09-25T09:53:27Z",
+          "observedGeneration": 1,
+          "status": "True",
+          "type": "Initialized"
+        },
+        {
+          "lastProbeTime": null,
+          "lastTransitionTime": "2026-09-25T09:53:32Z",
+          "observedGeneration": 1,
+          "status": "True",
+          "type": "Ready"
+        },
+        {
+          "lastProbeTime": null,
+          "lastTransitionTime": "2026-09-25T09:53:32Z",
+          "observedGeneration": 1,
+          "status": "True",
+          "type": "ContainersReady"
+        },
+        {
+          "lastProbeTime": null,
+          "lastTransitionTime": "2026-09-25T09:53:27Z",
+          "observedGeneration": 1,
+          "status": "True",
+          "type": "PodScheduled"
+        }
+      ],
+      "container_statuses": [
+        {
+          "allocatedResources": {
+            "cpu": "500m",
+            "ephemeral-storage": "1Gi",
+            "memory": "768Mi"
+          },
+          "containerID": "containerd://607dce0509bb36b2f2d2e0008d5faccace4817c895dd2cf5c6116378148ad64d",
+          "image": "docker.io/library/hibana-platform:0.2.0-rc.12-linux-amd64",
+          "imageID": "sha256:c9b3ce8d97ffce565eac90336793a2717f0ca801f534b765e13aa33af1a734a1",
+          "lastState": {},
+          "name": "worker",
+          "ready": true,
+          "resources": {
+            "limits": {
+              "cpu": "2",
+              "ephemeral-storage": "5Gi",
+              "memory": "1280Mi"
+            },
+            "requests": {
+              "cpu": "500m",
+              "ephemeral-storage": "1Gi",
+              "memory": "768Mi"
+            }
+          },
+          "restartCount": 0,
+          "started": true,
+          "state": {
+            "running": {
+              "startedAt": "2026-09-25T09:53:27Z"
+            }
+          },
+          "user": {
+            "linux": {
+              "gid": 10001,
+              "supplementalGroups": [
+                10001
+              ],
+              "uid": 10001
+            }
+          },
+          "volumeMounts": [
+            {
+              "mountPath": "/tmp",
+              "name": "tmp"
+            },
+            {
+              "mountPath": "/var/cache/hibana",
+              "name": "cache"
+            }
+          ]
+        }
+      ],
+      "before_metrics": {
+        "hibana_worker_active_compilations": 0.0,
+        "wasmtime_component_cache_misses_total": 0.0
+      },
+      "before_files": [],
+      "request": {
+        "label": "source-1",
+        "app": "hello",
+        "utc": "2026-09-25T09:54:28.813465+00:00",
+        "curl_exit": 0,
+        "body": "Hello from Hono on Hibana 🔥",
+        "error": "",
+        "http_code": 200,
+        "time_namelookup": 0.007755,
+        "time_connect": 0.029609,
+        "time_appconnect": 0.061547,
+        "time_starttransfer": 18.920284,
+        "time_total": 18.925425,
+        "http_version": "2",
+        "remote_ip": "133.18.122.133",
+        "ms": 18925.425,
+        "valid": true
+      },
+      "after_metrics": {
+        "executions_total{outcome=\"succeeded\"}": 1.0,
+        "hibana_worker_active_compilations": 0.0,
+        "wasmtime_component_cache_misses_total": 1.0
+      },
+      "after_files": [
+        {
+          "sha256": "b269536a6e759ef9389d3e8d78433aedef45d4d46149b447725601a2d8e60b40",
+          "bytes": 58091504
+        }
+      ],
+      "restore_timings": [
+        {
+          "timestamp": "2026-09-25T09:54:28.772735Z",
+          "level": "DEBUG",
+          "message": "artifact restored for invocation",
+          "sha256": "b269536a6e759ef9389d3e8d78433aedef45d4d46149b447725601a2d8e60b40",
+          "elapsed_ms": 18811,
+          "target": "hibana_worker::direct_http"
+        }
+      ],
+      "final_container_statuses": [
+        {
+          "allocatedResources": {
+            "cpu": "500m",
+            "ephemeral-storage": "1Gi",
+            "memory": "768Mi"
+          },
+          "containerID": "containerd://607dce0509bb36b2f2d2e0008d5faccace4817c895dd2cf5c6116378148ad64d",
+          "image": "docker.io/library/hibana-platform:0.2.0-rc.12-linux-amd64",
+          "imageID": "sha256:c9b3ce8d97ffce565eac90336793a2717f0ca801f534b765e13aa33af1a734a1",
+          "lastState": {},
+          "name": "worker",
+          "ready": true,
+          "resources": {
+            "limits": {
+              "cpu": "2",
+              "ephemeral-storage": "5Gi",
+              "memory": "1280Mi"
+            },
+            "requests": {
+              "cpu": "500m",
+              "ephemeral-storage": "1Gi",
+              "memory": "768Mi"
+            }
+          },
+          "restartCount": 0,
+          "started": true,
+          "state": {
+            "running": {
+              "startedAt": "2026-09-25T09:53:27Z"
+            }
+          },
+          "user": {
+            "linux": {
+              "gid": 10001,
+              "supplementalGroups": [
+                10001
+              ],
+              "uid": 10001
+            }
+          },
+          "volumeMounts": [
+            {
+              "mountPath": "/tmp",
+              "name": "tmp"
+            },
+            {
+              "mountPath": "/var/cache/hibana",
+              "name": "cache"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "label": "source-2",
+      "shared_enabled": false,
+      "pod_name": "hibana-worker-6dcbd57f64-rmzvt",
+      "pod_uid": "df066498-2bb7-4767-8b6a-59610c028ca5",
+      "replacement_to_ready_s": 6.815767041989602,
+      "pod_conditions": [
+        {
+          "lastProbeTime": null,
+          "lastTransitionTime": "2026-09-25T09:54:33Z",
+          "observedGeneration": 1,
+          "status": "True",
+          "type": "PodReadyToStartContainers"
+        },
+        {
+          "lastProbeTime": null,
+          "lastTransitionTime": "2026-09-25T09:54:32Z",
+          "observedGeneration": 1,
+          "status": "True",
+          "type": "Initialized"
+        },
+        {
+          "lastProbeTime": null,
+          "lastTransitionTime": "2026-09-25T09:54:37Z",
+          "observedGeneration": 1,
+          "status": "True",
+          "type": "Ready"
+        },
+        {
+          "lastProbeTime": null,
+          "lastTransitionTime": "2026-09-25T09:54:37Z",
+          "observedGeneration": 1,
+          "status": "True",
+          "type": "ContainersReady"
+        },
+        {
+          "lastProbeTime": null,
+          "lastTransitionTime": "2026-09-25T09:54:32Z",
+          "observedGeneration": 1,
+          "status": "True",
+          "type": "PodScheduled"
+        }
+      ],
+      "container_statuses": [
+        {
+          "allocatedResources": {
+            "cpu": "500m",
+            "ephemeral-storage": "1Gi",
+            "memory": "768Mi"
+          },
+          "containerID": "containerd://0a125e4b28ea039f28ba347aa30c3f161c31631227e15f690c77104c7024e169",
+          "image": "docker.io/library/hibana-platform:0.2.0-rc.12-linux-amd64",
+          "imageID": "sha256:c9b3ce8d97ffce565eac90336793a2717f0ca801f534b765e13aa33af1a734a1",
+          "lastState": {},
+          "name": "worker",
+          "ready": true,
+          "resources": {
+            "limits": {
+              "cpu": "2",
+              "ephemeral-storage": "5Gi",
+              "memory": "1280Mi"
+            },
+            "requests": {
+              "cpu": "500m",
+              "ephemeral-storage": "1Gi",
+              "memory": "768Mi"
+            }
+          },
+          "restartCount": 0,
+          "started": true,
+          "state": {
+            "running": {
+              "startedAt": "2026-09-25T09:54:33Z"
+            }
+          },
+          "user": {
+            "linux": {
+              "gid": 10001,
+              "supplementalGroups": [
+                10001
+              ],
+              "uid": 10001
+            }
+          },
+          "volumeMounts": [
+            {
+              "mountPath": "/tmp",
+              "name": "tmp"
+            },
+            {
+              "mountPath": "/var/cache/hibana",
+              "name": "cache"
+            }
+          ]
+        }
+      ],
+      "before_metrics": {
+        "hibana_worker_active_compilations": 0.0,
+        "wasmtime_component_cache_misses_total": 0.0
+      },
+      "before_files": [],
+      "request": {
+        "label": "source-2",
+        "app": "hello",
+        "utc": "2026-09-25T09:55:34.047040+00:00",
+        "curl_exit": 0,
+        "body": "Hello from Hono on Hibana 🔥",
+        "error": "",
+        "http_code": 200,
+        "time_namelookup": 0.008077,
+        "time_connect": 0.02614,
+        "time_appconnect": 0.05424,
+        "time_starttransfer": 18.865201,
+        "time_total": 18.870173,
+        "http_version": "2",
+        "remote_ip": "133.18.122.133",
+        "ms": 18870.173000000003,
+        "valid": true
+      },
+      "after_metrics": {
+        "executions_total{outcome=\"succeeded\"}": 1.0,
+        "hibana_worker_active_compilations": 0.0,
+        "wasmtime_component_cache_misses_total": 1.0
+      },
+      "after_files": [
+        {
+          "sha256": "b269536a6e759ef9389d3e8d78433aedef45d4d46149b447725601a2d8e60b40",
+          "bytes": 58091504
+        }
+      ],
+      "restore_timings": [
+        {
+          "timestamp": "2026-09-25T09:55:34.002827Z",
+          "level": "DEBUG",
+          "message": "artifact restored for invocation",
+          "sha256": "b269536a6e759ef9389d3e8d78433aedef45d4d46149b447725601a2d8e60b40",
+          "elapsed_ms": 18765,
+          "target": "hibana_worker::direct_http"
+        }
+      ],
+      "final_container_statuses": [
+        {
+          "allocatedResources": {
+            "cpu": "500m",
+            "ephemeral-storage": "1Gi",
+            "memory": "768Mi"
+          },
+          "containerID": "containerd://0a125e4b28ea039f28ba347aa30c3f161c31631227e15f690c77104c7024e169",
+          "image": "docker.io/library/hibana-platform:0.2.0-rc.12-linux-amd64",
+          "imageID": "sha256:c9b3ce8d97ffce565eac90336793a2717f0ca801f534b765e13aa33af1a734a1",
+          "lastState": {},
+          "name": "worker",
+          "ready": true,
+          "resources": {
+            "limits": {
+              "cpu": "2",
+              "ephemeral-storage": "5Gi",
+              "memory": "1280Mi"
+            },
+            "requests": {
+              "cpu": "500m",
+              "ephemeral-storage": "1Gi",
+              "memory": "768Mi"
+            }
+          },
+          "restartCount": 0,
+          "started": true,
+          "state": {
+            "running": {
+              "startedAt": "2026-09-25T09:54:33Z"
+            }
+          },
+          "user": {
+            "linux": {
+              "gid": 10001,
+              "supplementalGroups": [
+                10001
+              ],
+              "uid": 10001
+            }
+          },
+          "volumeMounts": [
+            {
+              "mountPath": "/tmp",
+              "name": "tmp"
+            },
+            {
+              "mountPath": "/var/cache/hibana",
+              "name": "cache"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "label": "source-3",
+      "shared_enabled": false,
+      "pod_name": "hibana-worker-98795b6b7-bct5s",
+      "pod_uid": "d8db8c6a-6a2a-44a9-9fb4-7e6b0e36a5bb",
+      "replacement_to_ready_s": 8.382092250045389,
+      "pod_conditions": [
+        {
+          "lastProbeTime": null,
+          "lastTransitionTime": "2026-09-25T09:55:38Z",
+          "observedGeneration": 1,
+          "status": "True",
+          "type": "PodReadyToStartContainers"
+        },
+        {
+          "lastProbeTime": null,
+          "lastTransitionTime": "2026-09-25T09:55:37Z",
+          "observedGeneration": 1,
+          "status": "True",
+          "type": "Initialized"
+        },
+        {
+          "lastProbeTime": null,
+          "lastTransitionTime": "2026-09-25T09:55:43Z",
+          "observedGeneration": 1,
+          "status": "True",
+          "type": "Ready"
+        },
+        {
+          "lastProbeTime": null,
+          "lastTransitionTime": "2026-09-25T09:55:43Z",
+          "observedGeneration": 1,
+          "status": "True",
+          "type": "ContainersReady"
+        },
+        {
+          "lastProbeTime": null,
+          "lastTransitionTime": "2026-09-25T09:55:37Z",
+          "observedGeneration": 1,
+          "status": "True",
+          "type": "PodScheduled"
+        }
+      ],
+      "container_statuses": [
+        {
+          "allocatedResources": {
+            "cpu": "500m",
+            "ephemeral-storage": "1Gi",
+            "memory": "768Mi"
+          },
+          "containerID": "containerd://a6b55af953f512821c58197188121b7ade734ea8573beebea7aaa9bf7bbc79ee",
+          "image": "docker.io/library/hibana-platform:0.2.0-rc.12-linux-amd64",
+          "imageID": "sha256:c9b3ce8d97ffce565eac90336793a2717f0ca801f534b765e13aa33af1a734a1",
+          "lastState": {},
+          "name": "worker",
+          "ready": true,
+          "resources": {
+            "limits": {
+              "cpu": "2",
+              "ephemeral-storage": "5Gi",
+              "memory": "1280Mi"
+            },
+            "requests": {
+              "cpu": "500m",
+              "ephemeral-storage": "1Gi",
+              "memory": "768Mi"
+            }
+          },
+          "restartCount": 0,
+          "started": true,
+          "state": {
+            "running": {
+              "startedAt": "2026-09-25T09:55:38Z"
+            }
+          },
+          "user": {
+            "linux": {
+              "gid": 10001,
+              "supplementalGroups": [
+                10001
+              ],
+              "uid": 10001
+            }
+          },
+          "volumeMounts": [
+            {
+              "mountPath": "/tmp",
+              "name": "tmp"
+            },
+            {
+              "mountPath": "/var/cache/hibana",
+              "name": "cache"
+            }
+          ]
+        }
+      ],
+      "before_metrics": {
+        "hibana_worker_active_compilations": 0.0,
+        "wasmtime_component_cache_misses_total": 0.0
+      },
+      "before_files": [],
+      "request": {
+        "label": "source-3",
+        "app": "hello",
+        "utc": "2026-09-25T09:56:40.781678+00:00",
+        "curl_exit": 0,
+        "body": "Hello from Hono on Hibana 🔥",
+        "error": "",
+        "http_code": 200,
+        "time_namelookup": 0.001856,
+        "time_connect": 0.020172,
+        "time_appconnect": 0.048644,
+        "time_starttransfer": 18.709336,
+        "time_total": 18.710056,
+        "http_version": "2",
+        "remote_ip": "133.18.122.133",
+        "ms": 18710.056,
+        "valid": true
+      },
+      "after_metrics": {
+        "executions_total{outcome=\"succeeded\"}": 1.0,
+        "hibana_worker_active_compilations": 0.0,
+        "wasmtime_component_cache_misses_total": 1.0
+      },
+      "after_files": [
+        {
+          "sha256": "b269536a6e759ef9389d3e8d78433aedef45d4d46149b447725601a2d8e60b40",
+          "bytes": 58091504
+        }
+      ],
+      "restore_timings": [
+        {
+          "timestamp": "2026-09-25T09:56:40.685322Z",
+          "level": "DEBUG",
+          "message": "artifact restored for invocation",
+          "sha256": "b269536a6e759ef9389d3e8d78433aedef45d4d46149b447725601a2d8e60b40",
+          "elapsed_ms": 18556,
+          "target": "hibana_worker::direct_http"
+        }
+      ],
+      "final_container_statuses": [
+        {
+          "allocatedResources": {
+            "cpu": "500m",
+            "ephemeral-storage": "1Gi",
+            "memory": "768Mi"
+          },
+          "containerID": "containerd://a6b55af953f512821c58197188121b7ade734ea8573beebea7aaa9bf7bbc79ee",
+          "image": "docker.io/library/hibana-platform:0.2.0-rc.12-linux-amd64",
+          "imageID": "sha256:c9b3ce8d97ffce565eac90336793a2717f0ca801f534b765e13aa33af1a734a1",
+          "lastState": {},
+          "name": "worker",
+          "ready": true,
+          "resources": {
+            "limits": {
+              "cpu": "2",
+              "ephemeral-storage": "5Gi",
+              "memory": "1280Mi"
+            },
+            "requests": {
+              "cpu": "500m",
+              "ephemeral-storage": "1Gi",
+              "memory": "768Mi"
+            }
+          },
+          "restartCount": 0,
+          "started": true,
+          "state": {
+            "running": {
+              "startedAt": "2026-09-25T09:55:38Z"
+            }
+          },
+          "user": {
+            "linux": {
+              "gid": 10001,
+              "supplementalGroups": [
+                10001
+              ],
+              "uid": 10001
+            }
+          },
+          "volumeMounts": [
+            {
+              "mountPath": "/tmp",
+              "name": "tmp"
+            },
+            {
+              "mountPath": "/var/cache/hibana",
+              "name": "cache"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "label": "concurrent-garage",
+      "shared_enabled": true,
+      "pod_name": "hibana-worker-d694bb4d6-5h6z7",
+      "pod_uid": "a5ccf1bc-c00d-4ebc-8497-43f69771f057",
+      "replacement_to_ready_s": 6.862386540975422,
+      "pod_conditions": [
+        {
+          "lastProbeTime": null,
+          "lastTransitionTime": "2026-09-25T09:56:45Z",
+          "observedGeneration": 1,
+          "status": "True",
+          "type": "PodReadyToStartContainers"
+        },
+        {
+          "lastProbeTime": null,
+          "lastTransitionTime": "2026-09-25T09:56:44Z",
+          "observedGeneration": 1,
+          "status": "True",
+          "type": "Initialized"
+        },
+        {
+          "lastProbeTime": null,
+          "lastTransitionTime": "2026-09-25T09:56:50Z",
+          "observedGeneration": 1,
+          "status": "True",
+          "type": "Ready"
+        },
+        {
+          "lastProbeTime": null,
+          "lastTransitionTime": "2026-09-25T09:56:50Z",
+          "observedGeneration": 1,
+          "status": "True",
+          "type": "ContainersReady"
+        },
+        {
+          "lastProbeTime": null,
+          "lastTransitionTime": "2026-09-25T09:56:44Z",
+          "observedGeneration": 1,
+          "status": "True",
+          "type": "PodScheduled"
+        }
+      ],
+      "container_statuses": [
+        {
+          "allocatedResources": {
+            "cpu": "500m",
+            "ephemeral-storage": "1Gi",
+            "memory": "768Mi"
+          },
+          "containerID": "containerd://e1fc3c10b77c98fc8ebdafa09ed6f101a8937e94a38f6d6b824a4bd9e363173a",
+          "image": "docker.io/library/hibana-platform:0.2.0-rc.12-linux-amd64",
+          "imageID": "sha256:c9b3ce8d97ffce565eac90336793a2717f0ca801f534b765e13aa33af1a734a1",
+          "lastState": {},
+          "name": "worker",
+          "ready": true,
+          "resources": {
+            "limits": {
+              "cpu": "2",
+              "ephemeral-storage": "5Gi",
+              "memory": "1280Mi"
+            },
+            "requests": {
+              "cpu": "500m",
+              "ephemeral-storage": "1Gi",
+              "memory": "768Mi"
+            }
+          },
+          "restartCount": 0,
+          "started": true,
+          "state": {
+            "running": {
+              "startedAt": "2026-09-25T09:56:45Z"
+            }
+          },
+          "user": {
+            "linux": {
+              "gid": 10001,
+              "supplementalGroups": [
+                10001
+              ],
+              "uid": 10001
+            }
+          },
+          "volumeMounts": [
+            {
+              "mountPath": "/tmp",
+              "name": "tmp"
+            },
+            {
+              "mountPath": "/var/cache/hibana",
+              "name": "cache"
+            }
+          ]
+        }
+      ],
+      "before_metrics": {
+        "hibana_worker_active_compilations": 0.0,
+        "wasmtime_component_cache_misses_total": 0.0
+      },
+      "before_files": [],
+      "requests": [
+        {
+          "label": "parallel-0",
+          "app": "hello",
+          "utc": "2026-09-25T09:57:27.913861+00:00",
+          "curl_exit": 0,
+          "body": "Hello from Hono on Hibana 🔥",
+          "error": "",
+          "http_code": 200,
+          "time_namelookup": 0.03053,
+          "time_connect": 0.051268,
+          "time_appconnect": 0.082848,
+          "time_starttransfer": 0.562445,
+          "time_total": 0.582942,
+          "http_version": "2",
+          "remote_ip": "133.18.122.133",
+          "ms": 582.942,
+          "valid": true
+        },
+        {
+          "label": "parallel-1",
+          "app": "hello",
+          "utc": "2026-09-25T09:57:27.914293+00:00",
+          "curl_exit": 0,
+          "body": "Hello from Hono on Hibana 🔥",
+          "error": "",
+          "http_code": 200,
+          "time_namelookup": 0.030544,
+          "time_connect": 0.047654,
+          "time_appconnect": 0.081229,
+          "time_starttransfer": 0.580986,
+          "time_total": 0.585315,
+          "http_version": "2",
+          "remote_ip": "133.18.122.133",
+          "ms": 585.315,
+          "valid": true
+        },
+        {
+          "label": "parallel-2",
+          "app": "hello",
+          "utc": "2026-09-25T09:57:27.914057+00:00",
+          "curl_exit": 0,
+          "body": "Hello from Hono on Hibana 🔥",
+          "error": "",
+          "http_code": 200,
+          "time_namelookup": 0.030551,
+          "time_connect": 0.047609,
+          "time_appconnect": 0.074149,
+          "time_starttransfer": 0.576457,
+          "time_total": 0.58298,
+          "http_version": "2",
+          "remote_ip": "133.18.122.133",
+          "ms": 582.98,
+          "valid": true
+        },
+        {
+          "label": "parallel-3",
+          "app": "hello",
+          "utc": "2026-09-25T09:57:27.914100+00:00",
+          "curl_exit": 0,
+          "body": "Hello from Hono on Hibana 🔥",
+          "error": "",
+          "http_code": 200,
+          "time_namelookup": 0.030524,
+          "time_connect": 0.047614,
+          "time_appconnect": 0.074627,
+          "time_starttransfer": 0.556925,
+          "time_total": 0.582881,
+          "http_version": "2",
+          "remote_ip": "133.18.122.133",
+          "ms": 582.881,
+          "valid": true
+        }
+      ],
+      "after_metrics": {
+        "executions_total{outcome=\"succeeded\"}": 4.0,
+        "hibana_worker_active_compilations": 0.0,
+        "hibana_worker_shared_cache_total{outcome=\"hit\"}": 1.0,
+        "wasmtime_component_cache_hits_total{tier=\"lru\"}": 3.0,
+        "wasmtime_component_cache_misses_total": 0.0
+      },
+      "after_files": [
+        {
+          "sha256": "b269536a6e759ef9389d3e8d78433aedef45d4d46149b447725601a2d8e60b40",
+          "bytes": 58091504
+        }
+      ],
+      "restore_timings": [
+        {
+          "timestamp": "2026-09-25T09:57:27.862541Z",
+          "level": "DEBUG",
+          "message": "artifact restored for invocation",
+          "sha256": "b269536a6e759ef9389d3e8d78433aedef45d4d46149b447725601a2d8e60b40",
+          "elapsed_ms": 404,
+          "target": "hibana_worker::direct_http"
+        },
+        {
+          "timestamp": "2026-09-25T09:57:27.863395Z",
+          "level": "DEBUG",
+          "message": "artifact restored for invocation",
+          "sha256": "b269536a6e759ef9389d3e8d78433aedef45d4d46149b447725601a2d8e60b40",
+          "elapsed_ms": 416,
+          "target": "hibana_worker::direct_http"
+        },
+        {
+          "timestamp": "2026-09-25T09:57:27.869039Z",
+          "level": "DEBUG",
+          "message": "artifact restored for invocation",
+          "sha256": "b269536a6e759ef9389d3e8d78433aedef45d4d46149b447725601a2d8e60b40",
+          "elapsed_ms": 413,
+          "target": "hibana_worker::direct_http"
+        },
+        {
+          "timestamp": "2026-09-25T09:57:27.893431Z",
+          "level": "DEBUG",
+          "message": "artifact restored for invocation",
+          "sha256": "b269536a6e759ef9389d3e8d78433aedef45d4d46149b447725601a2d8e60b40",
+          "elapsed_ms": 423,
+          "target": "hibana_worker::direct_http"
+        }
+      ],
+      "final_container_statuses": [
+        {
+          "allocatedResources": {
+            "cpu": "500m",
+            "ephemeral-storage": "1Gi",
+            "memory": "768Mi"
+          },
+          "containerID": "containerd://e1fc3c10b77c98fc8ebdafa09ed6f101a8937e94a38f6d6b824a4bd9e363173a",
+          "image": "docker.io/library/hibana-platform:0.2.0-rc.12-linux-amd64",
+          "imageID": "sha256:c9b3ce8d97ffce565eac90336793a2717f0ca801f534b765e13aa33af1a734a1",
+          "lastState": {},
+          "name": "worker",
+          "ready": true,
+          "resources": {
+            "limits": {
+              "cpu": "2",
+              "ephemeral-storage": "5Gi",
+              "memory": "1280Mi"
+            },
+            "requests": {
+              "cpu": "500m",
+              "ephemeral-storage": "1Gi",
+              "memory": "768Mi"
+            }
+          },
+          "restartCount": 0,
+          "started": true,
+          "state": {
+            "running": {
+              "startedAt": "2026-09-25T09:56:45Z"
+            }
+          },
+          "user": {
+            "linux": {
+              "gid": 10001,
+              "supplementalGroups": [
+                10001
+              ],
+              "uid": 10001
+            }
+          },
+          "volumeMounts": [
+            {
+              "mountPath": "/tmp",
+              "name": "tmp"
+            },
+            {
+              "mountPath": "/var/cache/hibana",
+              "name": "cache"
+            }
+          ]
+        }
+      ]
+    }
+  ],
+  "fixtures": [
+    {
+      "id": "cmp_f2f259bce9fe4222a537734c4684cbef",
+      "name": "cachebench-20260925095057-01",
+      "index": 1,
+      "wasm_bytes": 12389126,
+      "sha256": "0a08794ade2ce50ab765bf83af5a5809d5262cc613a32ba24b0536b8b18c8ab3",
+      "version_id": "ver_df3174089edc49f3911540030be96c5d",
+      "deploy_seconds": 20.807170582935214,
+      "files_after_publish": [
+        {
+          "sha256": "0a08794ade2ce50ab765bf83af5a5809d5262cc613a32ba24b0536b8b18c8ab3",
+          "bytes": 58091504
+        },
+        {
+          "sha256": "b269536a6e759ef9389d3e8d78433aedef45d4d46149b447725601a2d8e60b40",
+          "bytes": 58091504
+        }
+      ],
+      "deleted": true
+    },
+    {
+      "id": "cmp_fe565097138a48e195b84704cc58c4ef",
+      "name": "cachebench-20260925095057-02",
+      "index": 2,
+      "wasm_bytes": 12389125,
+      "sha256": "63a737c05fb17df474dc646427ba238f271c59089f1740ad35464e4fb0a07afc",
+      "version_id": "ver_913c9d62b21d465e83f812b5d4363e9d",
+      "deploy_seconds": 21.100497790961526,
+      "files_after_publish": [
+        {
+          "sha256": "63a737c05fb17df474dc646427ba238f271c59089f1740ad35464e4fb0a07afc",
+          "bytes": 58091504
+        },
+        {
+          "sha256": "0a08794ade2ce50ab765bf83af5a5809d5262cc613a32ba24b0536b8b18c8ab3",
+          "bytes": 58091504
+        }
+      ],
+      "deleted": true
+    },
+    {
+      "id": "cmp_c01c7b6d8b574ea9b8840aaa31dd338a",
+      "name": "cachebench-20260925095057-03",
+      "index": 3,
+      "wasm_bytes": 12389114,
+      "sha256": "da33e99f224a96b32d7166e71598ab0ce4fa485da57ac57e4cb5079d21f4b915",
+      "version_id": "ver_b86195fa615f4496a7b9670d8ab25ab5",
+      "deploy_seconds": 21.086915832944214,
+      "files_after_publish": [
+        {
+          "sha256": "63a737c05fb17df474dc646427ba238f271c59089f1740ad35464e4fb0a07afc",
+          "bytes": 58091504
+        },
+        {
+          "sha256": "da33e99f224a96b32d7166e71598ab0ce4fa485da57ac57e4cb5079d21f4b915",
+          "bytes": 58091504
+        }
+      ],
+      "deleted": true
+    },
+    {
+      "id": "cmp_4680a162affa4a658aab4f11b7227047",
+      "name": "cachebench-20260925095057-04",
+      "index": 4,
+      "wasm_bytes": 12389158,
+      "sha256": "06c0c2a2c85a711328b2375bfcd08ba7fb7196b5c435626abeff70e98d18e6f6",
+      "version_id": "ver_3328eabcafd94809b323fb0505c25a72",
+      "deploy_seconds": 20.956710916943848,
+      "files_after_publish": [
+        {
+          "sha256": "06c0c2a2c85a711328b2375bfcd08ba7fb7196b5c435626abeff70e98d18e6f6",
+          "bytes": 58091504
+        },
+        {
+          "sha256": "da33e99f224a96b32d7166e71598ab0ce4fa485da57ac57e4cb5079d21f4b915",
+          "bytes": 58091504
+        }
+      ],
+      "deleted": true
+    },
+    {
+      "id": "cmp_ae7cf3e4d1a04600a0d62ec2b24b7b4b",
+      "name": "cachebench-20260925095057-05",
+      "index": 5,
+      "wasm_bytes": 12389113,
+      "sha256": "31a62c3491378b56b5c0b18603eaf8ca55ce772dc477de963364a683e30eacf2",
+      "version_id": "ver_192a650b469a4e1cbd8b08638cd85033",
+      "deploy_seconds": 21.287979042041115,
+      "files_after_publish": [
+        {
+          "sha256": "06c0c2a2c85a711328b2375bfcd08ba7fb7196b5c435626abeff70e98d18e6f6",
+          "bytes": 58091504
+        },
+        {
+          "sha256": "31a62c3491378b56b5c0b18603eaf8ca55ce772dc477de963364a683e30eacf2",
+          "bytes": 58091504
+        }
+      ],
+      "deleted": true
+    },
+    {
+      "id": "cmp_1c5718fcfe354dc3b333f2301edb8101",
+      "name": "cachebench-20260925095057-06",
+      "index": 6,
+      "wasm_bytes": 12389094,
+      "sha256": "8d742cdb8a3c704120acd428f59dc350e5111366a55a7be3b811f660c8e3bbcd",
+      "version_id": "ver_8d161fea7f84457498043db3a803baf6",
+      "deploy_seconds": 21.41342529200483,
+      "files_after_publish": [
+        {
+          "sha256": "8d742cdb8a3c704120acd428f59dc350e5111366a55a7be3b811f660c8e3bbcd",
+          "bytes": 58091504
+        },
+        {
+          "sha256": "31a62c3491378b56b5c0b18603eaf8ca55ce772dc477de963364a683e30eacf2",
+          "bytes": 58091504
+        }
+      ],
+      "deleted": true
+    },
+    {
+      "id": "cmp_7719537e59bd4e6a90156b0f504f0936",
+      "name": "cachebench-20260925095057-07",
+      "index": 7,
+      "wasm_bytes": 12389183,
+      "sha256": "351581f555ef455c6d2e19ed0b0f9b881bed2f1d03449a55b360bf7e2599155d",
+      "version_id": "ver_86e68a1145cf4ce48f2cf8de08a8d6e4",
+      "deploy_seconds": 20.871737040928565,
+      "files_after_publish": [
+        {
+          "sha256": "351581f555ef455c6d2e19ed0b0f9b881bed2f1d03449a55b360bf7e2599155d",
+          "bytes": 58091504
+        },
+        {
+          "sha256": "8d742cdb8a3c704120acd428f59dc350e5111366a55a7be3b811f660c8e3bbcd",
+          "bytes": 58091504
+        }
+      ],
+      "deleted": true
+    },
+    {
+      "id": "cmp_be45b065cef14675962bcdae0c79a1c6",
+      "name": "cachebench-20260925095057-08",
+      "index": 8,
+      "wasm_bytes": 12389104,
+      "sha256": "02a06b5234deaa78e0ed3d91ff075cc2d1d925f365b1d06187fe94f47ce02e45",
+      "version_id": "ver_77642f75a6254d12892d578429a89e44",
+      "deploy_seconds": 21.52118104195688,
+      "files_after_publish": [
+        {
+          "sha256": "02a06b5234deaa78e0ed3d91ff075cc2d1d925f365b1d06187fe94f47ce02e45",
+          "bytes": 58091504
+        },
+        {
+          "sha256": "351581f555ef455c6d2e19ed0b0f9b881bed2f1d03449a55b360bf7e2599155d",
+          "bytes": 58091504
+        }
+      ],
+      "deleted": true
+    }
+  ],
+  "rotation": {
+    "requests": [
+      {
+        "label": "rotation-0-1",
+        "app": "cachebench-20260925095057-01",
+        "utc": "2026-09-25T10:00:31.306647+00:00",
+        "curl_exit": 0,
+        "body": "{\"app\":\"density-01\",\"message\":\"density-ok\"}",
+        "error": "",
+        "http_code": 200,
+        "time_namelookup": 0.259521,
+        "time_connect": 0.275872,
+        "time_appconnect": 0.306151,
+        "time_starttransfer": 0.723183,
+        "time_total": 0.728883,
+        "http_version": "2",
+        "remote_ip": "133.18.122.133",
+        "ms": 728.8829999999999,
+        "valid": true,
+        "files_after": [
+          {
+            "sha256": "02a06b5234deaa78e0ed3d91ff075cc2d1d925f365b1d06187fe94f47ce02e45",
+            "bytes": 58091504
+          },
+          {
+            "sha256": "0a08794ade2ce50ab765bf83af5a5809d5262cc613a32ba24b0536b8b18c8ab3",
+            "bytes": 58091504
+          }
+        ]
+      },
+      {
+        "label": "rotation-0-2",
+        "app": "cachebench-20260925095057-02",
+        "utc": "2026-09-25T10:00:32.947138+00:00",
+        "curl_exit": 0,
+        "body": "{\"app\":\"density-02\",\"message\":\"density-ok\"}",
+        "error": "",
+        "http_code": 200,
+        "time_namelookup": 0.169386,
+        "time_connect": 0.186615,
+        "time_appconnect": 0.213799,
+        "time_starttransfer": 0.657748,
+        "time_total": 0.665231,
+        "http_version": "2",
+        "remote_ip": "133.18.122.133",
+        "ms": 665.231,
+        "valid": true,
+        "files_after": [
+          {
+            "sha256": "63a737c05fb17df474dc646427ba238f271c59089f1740ad35464e4fb0a07afc",
+            "bytes": 58091504
+          },
+          {
+            "sha256": "0a08794ade2ce50ab765bf83af5a5809d5262cc613a32ba24b0536b8b18c8ab3",
+            "bytes": 58091504
+          }
+        ]
+      },
+      {
+        "label": "rotation-0-3",
+        "app": "cachebench-20260925095057-03",
+        "utc": "2026-09-25T10:00:34.769808+00:00",
+        "curl_exit": 0,
+        "body": "{\"app\":\"density-03\",\"message\":\"density-ok\"}",
+        "error": "",
+        "http_code": 200,
+        "time_namelookup": 0.032847,
+        "time_connect": 0.048849,
+        "time_appconnect": 0.075617,
+        "time_starttransfer": 0.512244,
+        "time_total": 0.522137,
+        "http_version": "2",
+        "remote_ip": "133.18.122.133",
+        "ms": 522.137,
+        "valid": true,
+        "files_after": [
+          {
+            "sha256": "63a737c05fb17df474dc646427ba238f271c59089f1740ad35464e4fb0a07afc",
+            "bytes": 58091504
+          },
+          {
+            "sha256": "da33e99f224a96b32d7166e71598ab0ce4fa485da57ac57e4cb5079d21f4b915",
+            "bytes": 58091504
+          }
+        ]
+      },
+      {
+        "label": "rotation-0-4",
+        "app": "cachebench-20260925095057-04",
+        "utc": "2026-09-25T10:00:36.382905+00:00",
+        "curl_exit": 0,
+        "body": "{\"app\":\"density-04\",\"message\":\"density-ok\"}",
+        "error": "",
+        "http_code": 200,
+        "time_namelookup": 0.038671,
+        "time_connect": 0.058747,
+        "time_appconnect": 0.088191,
+        "time_starttransfer": 0.545411,
+        "time_total": 0.550568,
+        "http_version": "2",
+        "remote_ip": "133.18.122.133",
+        "ms": 550.568,
+        "valid": true,
+        "files_after": [
+          {
+            "sha256": "06c0c2a2c85a711328b2375bfcd08ba7fb7196b5c435626abeff70e98d18e6f6",
+            "bytes": 58091504
+          },
+          {
+            "sha256": "da33e99f224a96b32d7166e71598ab0ce4fa485da57ac57e4cb5079d21f4b915",
+            "bytes": 58091504
+          }
+        ]
+      },
+      {
+        "label": "rotation-0-5",
+        "app": "cachebench-20260925095057-05",
+        "utc": "2026-09-25T10:00:37.855781+00:00",
+        "curl_exit": 0,
+        "body": "{\"app\":\"density-05\",\"message\":\"density-ok\"}",
+        "error": "",
+        "http_code": 200,
+        "time_namelookup": 0.023681,
+        "time_connect": 0.042193,
+        "time_appconnect": 0.07085,
+        "time_starttransfer": 0.508076,
+        "time_total": 0.513665,
+        "http_version": "2",
+        "remote_ip": "133.18.122.133",
+        "ms": 513.6650000000001,
+        "valid": true,
+        "files_after": [
+          {
+            "sha256": "06c0c2a2c85a711328b2375bfcd08ba7fb7196b5c435626abeff70e98d18e6f6",
+            "bytes": 58091504
+          },
+          {
+            "sha256": "31a62c3491378b56b5c0b18603eaf8ca55ce772dc477de963364a683e30eacf2",
+            "bytes": 58091504
+          }
+        ]
+      },
+      {
+        "label": "rotation-0-6",
+        "app": "cachebench-20260925095057-06",
+        "utc": "2026-09-25T10:00:39.415581+00:00",
+        "curl_exit": 0,
+        "body": "{\"app\":\"density-06\",\"message\":\"density-ok\"}",
+        "error": "",
+        "http_code": 200,
+        "time_namelookup": 0.03823,
+        "time_connect": 0.059596,
+        "time_appconnect": 0.091813,
+        "time_starttransfer": 0.590433,
+        "time_total": 0.594696,
+        "http_version": "2",
+        "remote_ip": "133.18.122.133",
+        "ms": 594.696,
+        "valid": true,
+        "files_after": [
+          {
+            "sha256": "8d742cdb8a3c704120acd428f59dc350e5111366a55a7be3b811f660c8e3bbcd",
+            "bytes": 58091504
+          },
+          {
+            "sha256": "31a62c3491378b56b5c0b18603eaf8ca55ce772dc477de963364a683e30eacf2",
+            "bytes": 58091504
+          }
+        ]
+      },
+      {
+        "label": "rotation-0-7",
+        "app": "cachebench-20260925095057-07",
+        "utc": "2026-09-25T10:00:40.989957+00:00",
+        "curl_exit": 0,
+        "body": "{\"app\":\"density-07\",\"message\":\"density-ok\"}",
+        "error": "",
+        "http_code": 200,
+        "time_namelookup": 0.034223,
+        "time_connect": 0.051946,
+        "time_appconnect": 0.081819,
+        "time_starttransfer": 0.607109,
+        "time_total": 0.607451,
+        "http_version": "2",
+        "remote_ip": "133.18.122.133",
+        "ms": 607.4509999999999,
+        "valid": true,
+        "files_after": [
+          {
+            "sha256": "351581f555ef455c6d2e19ed0b0f9b881bed2f1d03449a55b360bf7e2599155d",
+            "bytes": 58091504
+          },
+          {
+            "sha256": "8d742cdb8a3c704120acd428f59dc350e5111366a55a7be3b811f660c8e3bbcd",
+            "bytes": 58091504
+          }
+        ]
+      },
+      {
+        "label": "rotation-0-8",
+        "app": "cachebench-20260925095057-08",
+        "utc": "2026-09-25T10:00:42.833681+00:00",
+        "curl_exit": 0,
+        "body": "{\"app\":\"density-08\",\"message\":\"density-ok\"}",
+        "error": "",
+        "http_code": 200,
+        "time_namelookup": 0.16856,
+        "time_connect": 0.187816,
+        "time_appconnect": 0.220519,
+        "time_starttransfer": 0.787886,
+        "time_total": 0.788555,
+        "http_version": "2",
+        "remote_ip": "133.18.122.133",
+        "ms": 788.555,
+        "valid": true,
+        "files_after": [
+          {
+            "sha256": "02a06b5234deaa78e0ed3d91ff075cc2d1d925f365b1d06187fe94f47ce02e45",
+            "bytes": 58091504
+          },
+          {
+            "sha256": "351581f555ef455c6d2e19ed0b0f9b881bed2f1d03449a55b360bf7e2599155d",
+            "bytes": 58091504
+          }
+        ]
+      },
+      {
+        "label": "rotation-1-1",
+        "app": "cachebench-20260925095057-01",
+        "utc": "2026-09-25T10:00:44.258505+00:00",
+        "curl_exit": 0,
+        "body": "{\"app\":\"density-01\",\"message\":\"density-ok\"}",
+        "error": "",
+        "http_code": 200,
+        "time_namelookup": 0.002241,
+        "time_connect": 0.020534,
+        "time_appconnect": 0.047429,
+        "time_starttransfer": 0.467775,
+        "time_total": 0.473315,
+        "http_version": "2",
+        "remote_ip": "133.18.122.133",
+        "ms": 473.315,
+        "valid": true,
+        "files_after": [
+          {
+            "sha256": "02a06b5234deaa78e0ed3d91ff075cc2d1d925f365b1d06187fe94f47ce02e45",
+            "bytes": 58091504
+          },
+          {
+            "sha256": "0a08794ade2ce50ab765bf83af5a5809d5262cc613a32ba24b0536b8b18c8ab3",
+            "bytes": 58091504
+          }
+        ]
+      },
+      {
+        "label": "rotation-1-2",
+        "app": "cachebench-20260925095057-02",
+        "utc": "2026-09-25T10:00:45.803545+00:00",
+        "curl_exit": 0,
+        "body": "{\"app\":\"density-02\",\"message\":\"density-ok\"}",
+        "error": "",
+        "http_code": 200,
+        "time_namelookup": 0.003074,
+        "time_connect": 0.021341,
+        "time_appconnect": 0.053416,
+        "time_starttransfer": 0.520527,
+        "time_total": 0.521163,
+        "http_version": "2",
+        "remote_ip": "133.18.122.133",
+        "ms": 521.163,
+        "valid": true,
+        "files_after": [
+          {
+            "sha256": "63a737c05fb17df474dc646427ba238f271c59089f1740ad35464e4fb0a07afc",
+            "bytes": 58091504
+          },
+          {
+            "sha256": "0a08794ade2ce50ab765bf83af5a5809d5262cc613a32ba24b0536b8b18c8ab3",
+            "bytes": 58091504
+          }
+        ]
+      },
+      {
+        "label": "rotation-1-3",
+        "app": "cachebench-20260925095057-03",
+        "utc": "2026-09-25T10:00:47.235384+00:00",
+        "curl_exit": 0,
+        "body": "{\"app\":\"density-03\",\"message\":\"density-ok\"}",
+        "error": "",
+        "http_code": 200,
+        "time_namelookup": 0.003101,
+        "time_connect": 0.020553,
+        "time_appconnect": 0.04929,
+        "time_starttransfer": 0.475973,
+        "time_total": 0.476425,
+        "http_version": "2",
+        "remote_ip": "133.18.122.133",
+        "ms": 476.425,
+        "valid": true,
+        "files_after": [
+          {
+            "sha256": "63a737c05fb17df474dc646427ba238f271c59089f1740ad35464e4fb0a07afc",
+            "bytes": 58091504
+          },
+          {
+            "sha256": "da33e99f224a96b32d7166e71598ab0ce4fa485da57ac57e4cb5079d21f4b915",
+            "bytes": 58091504
+          }
+        ]
+      },
+      {
+        "label": "rotation-1-4",
+        "app": "cachebench-20260925095057-04",
+        "utc": "2026-09-25T10:00:48.684123+00:00",
+        "curl_exit": 0,
+        "body": "{\"app\":\"density-04\",\"message\":\"density-ok\"}",
+        "error": "",
+        "http_code": 200,
+        "time_namelookup": 0.002358,
+        "time_connect": 0.020792,
+        "time_appconnect": 0.049365,
+        "time_starttransfer": 0.484701,
+        "time_total": 0.487992,
+        "http_version": "2",
+        "remote_ip": "133.18.122.133",
+        "ms": 487.99199999999996,
+        "valid": true,
+        "files_after": [
+          {
+            "sha256": "06c0c2a2c85a711328b2375bfcd08ba7fb7196b5c435626abeff70e98d18e6f6",
+            "bytes": 58091504
+          },
+          {
+            "sha256": "da33e99f224a96b32d7166e71598ab0ce4fa485da57ac57e4cb5079d21f4b915",
+            "bytes": 58091504
+          }
+        ]
+      },
+      {
+        "label": "rotation-1-5",
+        "app": "cachebench-20260925095057-05",
+        "utc": "2026-09-25T10:00:50.101267+00:00",
+        "curl_exit": 0,
+        "body": "{\"app\":\"density-05\",\"message\":\"density-ok\"}",
+        "error": "",
+        "http_code": 200,
+        "time_namelookup": 0.002276,
+        "time_connect": 0.02065,
+        "time_appconnect": 0.049822,
+        "time_starttransfer": 0.464566,
+        "time_total": 0.465131,
+        "http_version": "2",
+        "remote_ip": "133.18.122.133",
+        "ms": 465.13100000000003,
+        "valid": true,
+        "files_after": [
+          {
+            "sha256": "06c0c2a2c85a711328b2375bfcd08ba7fb7196b5c435626abeff70e98d18e6f6",
+            "bytes": 58091504
+          },
+          {
+            "sha256": "31a62c3491378b56b5c0b18603eaf8ca55ce772dc477de963364a683e30eacf2",
+            "bytes": 58091504
+          }
+        ]
+      },
+      {
+        "label": "rotation-1-6",
+        "app": "cachebench-20260925095057-06",
+        "utc": "2026-09-25T10:00:51.637714+00:00",
+        "curl_exit": 0,
+        "body": "{\"app\":\"density-06\",\"message\":\"density-ok\"}",
+        "error": "",
+        "http_code": 200,
+        "time_namelookup": 0.002449,
+        "time_connect": 0.02289,
+        "time_appconnect": 0.0528,
+        "time_starttransfer": 0.525375,
+        "time_total": 0.526043,
+        "http_version": "2",
+        "remote_ip": "133.18.122.133",
+        "ms": 526.043,
+        "valid": true,
+        "files_after": [
+          {
+            "sha256": "8d742cdb8a3c704120acd428f59dc350e5111366a55a7be3b811f660c8e3bbcd",
+            "bytes": 58091504
+          },
+          {
+            "sha256": "31a62c3491378b56b5c0b18603eaf8ca55ce772dc477de963364a683e30eacf2",
+            "bytes": 58091504
+          }
+        ]
+      },
+      {
+        "label": "rotation-1-7",
+        "app": "cachebench-20260925095057-07",
+        "utc": "2026-09-25T10:00:53.071424+00:00",
+        "curl_exit": 0,
+        "body": "{\"app\":\"density-07\",\"message\":\"density-ok\"}",
+        "error": "",
+        "http_code": 200,
+        "time_namelookup": 0.002186,
+        "time_connect": 0.018243,
+        "time_appconnect": 0.045423,
+        "time_starttransfer": 0.499508,
+        "time_total": 0.499954,
+        "http_version": "2",
+        "remote_ip": "133.18.122.133",
+        "ms": 499.954,
+        "valid": true,
+        "files_after": [
+          {
+            "sha256": "351581f555ef455c6d2e19ed0b0f9b881bed2f1d03449a55b360bf7e2599155d",
+            "bytes": 58091504
+          },
+          {
+            "sha256": "8d742cdb8a3c704120acd428f59dc350e5111366a55a7be3b811f660c8e3bbcd",
+            "bytes": 58091504
+          }
+        ]
+      },
+      {
+        "label": "rotation-1-8",
+        "app": "cachebench-20260925095057-08",
+        "utc": "2026-09-25T10:00:54.462826+00:00",
+        "curl_exit": 0,
+        "body": "{\"app\":\"density-08\",\"message\":\"density-ok\"}",
+        "error": "",
+        "http_code": 200,
+        "time_namelookup": 0.002832,
+        "time_connect": 0.020743,
+        "time_appconnect": 0.048333,
+        "time_starttransfer": 0.478419,
+        "time_total": 0.483917,
+        "http_version": "2",
+        "remote_ip": "133.18.122.133",
+        "ms": 483.917,
+        "valid": true,
+        "files_after": [
+          {
+            "sha256": "02a06b5234deaa78e0ed3d91ff075cc2d1d925f365b1d06187fe94f47ce02e45",
+            "bytes": 58091504
+          },
+          {
+            "sha256": "351581f555ef455c6d2e19ed0b0f9b881bed2f1d03449a55b360bf7e2599155d",
+            "bytes": 58091504
+          }
+        ]
+      },
+      {
+        "label": "rotation-2-1",
+        "app": "cachebench-20260925095057-01",
+        "utc": "2026-09-25T10:00:55.923952+00:00",
+        "curl_exit": 0,
+        "body": "{\"app\":\"density-01\",\"message\":\"density-ok\"}",
+        "error": "",
+        "http_code": 200,
+        "time_namelookup": 0.004798,
+        "time_connect": 0.02196,
+        "time_appconnect": 0.051206,
+        "time_starttransfer": 0.470512,
+        "time_total": 0.475904,
+        "http_version": "2",
+        "remote_ip": "133.18.122.133",
+        "ms": 475.904,
+        "valid": true,
+        "files_after": [
+          {
+            "sha256": "02a06b5234deaa78e0ed3d91ff075cc2d1d925f365b1d06187fe94f47ce02e45",
+            "bytes": 58091504
+          },
+          {
+            "sha256": "0a08794ade2ce50ab765bf83af5a5809d5262cc613a32ba24b0536b8b18c8ab3",
+            "bytes": 58091504
+          }
+        ]
+      },
+      {
+        "label": "rotation-2-2",
+        "app": "cachebench-20260925095057-02",
+        "utc": "2026-09-25T10:00:57.475996+00:00",
+        "curl_exit": 0,
+        "body": "{\"app\":\"density-02\",\"message\":\"density-ok\"}",
+        "error": "",
+        "http_code": 200,
+        "time_namelookup": 0.002649,
+        "time_connect": 0.02168,
+        "time_appconnect": 0.051237,
+        "time_starttransfer": 0.567698,
+        "time_total": 0.56802,
+        "http_version": "2",
+        "remote_ip": "133.18.122.133",
+        "ms": 568.02,
+        "valid": true,
+        "files_after": [
+          {
+            "sha256": "63a737c05fb17df474dc646427ba238f271c59089f1740ad35464e4fb0a07afc",
+            "bytes": 58091504
+          },
+          {
+            "sha256": "0a08794ade2ce50ab765bf83af5a5809d5262cc613a32ba24b0536b8b18c8ab3",
+            "bytes": 58091504
+          }
+        ]
+      },
+      {
+        "label": "rotation-2-3",
+        "app": "cachebench-20260925095057-03",
+        "utc": "2026-09-25T10:00:59.013601+00:00",
+        "curl_exit": 0,
+        "body": "{\"app\":\"density-03\",\"message\":\"density-ok\"}",
+        "error": "",
+        "http_code": 200,
+        "time_namelookup": 0.003527,
+        "time_connect": 0.019276,
+        "time_appconnect": 0.04569,
+        "time_starttransfer": 0.518908,
+        "time_total": 0.519688,
+        "http_version": "2",
+        "remote_ip": "133.18.122.133",
+        "ms": 519.688,
+        "valid": true,
+        "files_after": [
+          {
+            "sha256": "63a737c05fb17df474dc646427ba238f271c59089f1740ad35464e4fb0a07afc",
+            "bytes": 58091504
+          },
+          {
+            "sha256": "da33e99f224a96b32d7166e71598ab0ce4fa485da57ac57e4cb5079d21f4b915",
+            "bytes": 58091504
+          }
+        ]
+      },
+      {
+        "label": "rotation-2-4",
+        "app": "cachebench-20260925095057-04",
+        "utc": "2026-09-25T10:01:00.459361+00:00",
+        "curl_exit": 0,
+        "body": "{\"app\":\"density-04\",\"message\":\"density-ok\"}",
+        "error": "",
+        "http_code": 200,
+        "time_namelookup": 0.007293,
+        "time_connect": 0.023843,
+        "time_appconnect": 0.056626,
+        "time_starttransfer": 0.471981,
+        "time_total": 0.477579,
+        "http_version": "2",
+        "remote_ip": "133.18.122.133",
+        "ms": 477.57899999999995,
+        "valid": true,
+        "files_after": [
+          {
+            "sha256": "06c0c2a2c85a711328b2375bfcd08ba7fb7196b5c435626abeff70e98d18e6f6",
+            "bytes": 58091504
+          },
+          {
+            "sha256": "da33e99f224a96b32d7166e71598ab0ce4fa485da57ac57e4cb5079d21f4b915",
+            "bytes": 58091504
+          }
+        ]
+      },
+      {
+        "label": "rotation-2-5",
+        "app": "cachebench-20260925095057-05",
+        "utc": "2026-09-25T10:01:02.003126+00:00",
+        "curl_exit": 0,
+        "body": "{\"app\":\"density-05\",\"message\":\"density-ok\"}",
+        "error": "",
+        "http_code": 200,
+        "time_namelookup": 0.002604,
+        "time_connect": 0.022856,
+        "time_appconnect": 0.054528,
+        "time_starttransfer": 0.584931,
+        "time_total": 0.599711,
+        "http_version": "2",
+        "remote_ip": "133.18.122.133",
+        "ms": 599.711,
+        "valid": true,
+        "files_after": [
+          {
+            "sha256": "06c0c2a2c85a711328b2375bfcd08ba7fb7196b5c435626abeff70e98d18e6f6",
+            "bytes": 58091504
+          },
+          {
+            "sha256": "31a62c3491378b56b5c0b18603eaf8ca55ce772dc477de963364a683e30eacf2",
+            "bytes": 58091504
+          }
+        ]
+      },
+      {
+        "label": "rotation-2-6",
+        "app": "cachebench-20260925095057-06",
+        "utc": "2026-09-25T10:01:03.482431+00:00",
+        "curl_exit": 0,
+        "body": "{\"app\":\"density-06\",\"message\":\"density-ok\"}",
+        "error": "",
+        "http_code": 200,
+        "time_namelookup": 0.003281,
+        "time_connect": 0.025412,
+        "time_appconnect": 0.059057,
+        "time_starttransfer": 0.53277,
+        "time_total": 0.537334,
+        "http_version": "2",
+        "remote_ip": "133.18.122.133",
+        "ms": 537.334,
+        "valid": true,
+        "files_after": [
+          {
+            "sha256": "8d742cdb8a3c704120acd428f59dc350e5111366a55a7be3b811f660c8e3bbcd",
+            "bytes": 58091504
+          },
+          {
+            "sha256": "31a62c3491378b56b5c0b18603eaf8ca55ce772dc477de963364a683e30eacf2",
+            "bytes": 58091504
+          }
+        ]
+      },
+      {
+        "label": "rotation-2-7",
+        "app": "cachebench-20260925095057-07",
+        "utc": "2026-09-25T10:01:04.995082+00:00",
+        "curl_exit": 0,
+        "body": "{\"app\":\"density-07\",\"message\":\"density-ok\"}",
+        "error": "",
+        "http_code": 200,
+        "time_namelookup": 0.002681,
+        "time_connect": 0.020744,
+        "time_appconnect": 0.049353,
+        "time_starttransfer": 0.501441,
+        "time_total": 0.508486,
+        "http_version": "2",
+        "remote_ip": "133.18.122.133",
+        "ms": 508.486,
+        "valid": true,
+        "files_after": [
+          {
+            "sha256": "351581f555ef455c6d2e19ed0b0f9b881bed2f1d03449a55b360bf7e2599155d",
+            "bytes": 58091504
+          },
+          {
+            "sha256": "8d742cdb8a3c704120acd428f59dc350e5111366a55a7be3b811f660c8e3bbcd",
+            "bytes": 58091504
+          }
+        ]
+      },
+      {
+        "label": "rotation-2-8",
+        "app": "cachebench-20260925095057-08",
+        "utc": "2026-09-25T10:01:06.465072+00:00",
+        "curl_exit": 0,
+        "body": "{\"app\":\"density-08\",\"message\":\"density-ok\"}",
+        "error": "",
+        "http_code": 200,
+        "time_namelookup": 0.003491,
+        "time_connect": 0.020815,
+        "time_appconnect": 0.050858,
+        "time_starttransfer": 0.481531,
+        "time_total": 0.485828,
+        "http_version": "2",
+        "remote_ip": "133.18.122.133",
+        "ms": 485.828,
+        "valid": true,
+        "files_after": [
+          {
+            "sha256": "02a06b5234deaa78e0ed3d91ff075cc2d1d925f365b1d06187fe94f47ce02e45",
+            "bytes": 58091504
+          },
+          {
+            "sha256": "351581f555ef455c6d2e19ed0b0f9b881bed2f1d03449a55b360bf7e2599155d",
+            "bytes": 58091504
+          }
+        ]
+      }
+    ],
+    "before": {
+      "executions_total{outcome=\"succeeded\"}": 4.0,
+      "hibana_worker_active_compilations": 0.0,
+      "hibana_worker_shared_cache_total{outcome=\"hit\"}": 1.0,
+      "hibana_worker_shared_cache_total{outcome=\"miss\"}": 8.0,
+      "hibana_worker_shared_cache_total{outcome=\"stored\"}": 8.0,
+      "wasmtime_component_cache_hits_total{tier=\"lru\"}": 3.0,
+      "wasmtime_component_cache_misses_total": 8.0
+    },
+    "after": {
+      "executions_total{outcome=\"succeeded\"}": 28.0,
+      "hibana_worker_active_compilations": 0.0,
+      "hibana_worker_shared_cache_total{outcome=\"hit\"}": 25.0,
+      "hibana_worker_shared_cache_total{outcome=\"miss\"}": 8.0,
+      "hibana_worker_shared_cache_total{outcome=\"stored\"}": 8.0,
+      "wasmtime_component_cache_hits_total{tier=\"lru\"}": 3.0,
+      "wasmtime_component_cache_misses_total": 8.0
+    },
+    "pod_uid": "a5ccf1bc-c00d-4ebc-8497-43f69771f057",
+    "files": [
+      {
+        "sha256": "02a06b5234deaa78e0ed3d91ff075cc2d1d925f365b1d06187fe94f47ce02e45",
+        "bytes": 58091504
+      },
+      {
+        "sha256": "351581f555ef455c6d2e19ed0b0f9b881bed2f1d03449a55b360bf7e2599155d",
+        "bytes": 58091504
+      }
+    ],
+    "final_container_statuses": [
+      {
+        "allocatedResources": {
+          "cpu": "500m",
+          "ephemeral-storage": "1Gi",
+          "memory": "768Mi"
+        },
+        "containerID": "containerd://e1fc3c10b77c98fc8ebdafa09ed6f101a8937e94a38f6d6b824a4bd9e363173a",
+        "image": "docker.io/library/hibana-platform:0.2.0-rc.12-linux-amd64",
+        "imageID": "sha256:c9b3ce8d97ffce565eac90336793a2717f0ca801f534b765e13aa33af1a734a1",
+        "lastState": {},
+        "name": "worker",
+        "ready": true,
+        "resources": {
+          "limits": {
+            "cpu": "2",
+            "ephemeral-storage": "5Gi",
+            "memory": "1280Mi"
+          },
+          "requests": {
+            "cpu": "500m",
+            "ephemeral-storage": "1Gi",
+            "memory": "768Mi"
+          }
+        },
+        "restartCount": 0,
+        "started": true,
+        "state": {
+          "running": {
+            "startedAt": "2026-09-25T09:56:45Z"
+          }
+        },
+        "user": {
+          "linux": {
+            "gid": 10001,
+            "supplementalGroups": [
+              10001
+            ],
+            "uid": 10001
+          }
+        },
+        "volumeMounts": [
+          {
+            "mountPath": "/tmp",
+            "name": "tmp"
+          },
+          {
+            "mountPath": "/var/cache/hibana",
+            "name": "cache"
+          }
+        ]
+      }
+    ]
+  },
+  "hot": [
+    {
+      "label": "new-hot-0",
+      "app": "hello",
+      "utc": "2026-09-25T09:50:58.503299+00:00",
+      "curl_exit": 0,
+      "body": "Hello from Hono on Hibana 🔥",
+      "error": "",
+      "http_code": 200,
+      "time_namelookup": 0.002587,
+      "time_connect": 0.017526,
+      "time_appconnect": 0.044445,
+      "time_starttransfer": 0.080808,
+      "time_total": 0.086788,
+      "http_version": "2",
+      "remote_ip": "133.18.122.133",
+      "ms": 86.78800000000001,
+      "valid": true
+    },
+    {
+      "label": "new-hot-1",
+      "app": "hello",
+      "utc": "2026-09-25T09:50:58.604593+00:00",
+      "curl_exit": 0,
+      "body": "Hello from Hono on Hibana 🔥",
+      "error": "",
+      "http_code": 200,
+      "time_namelookup": 0.001729,
+      "time_connect": 0.020319,
+      "time_appconnect": 0.047971,
+      "time_starttransfer": 0.087809,
+      "time_total": 0.093356,
+      "http_version": "2",
+      "remote_ip": "133.18.122.133",
+      "ms": 93.356,
+      "valid": true
+    },
+    {
+      "label": "new-hot-2",
+      "app": "hello",
+      "utc": "2026-09-25T09:50:58.710258+00:00",
+      "curl_exit": 0,
+      "body": "Hello from Hono on Hibana 🔥",
+      "error": "",
+      "http_code": 200,
+      "time_namelookup": 0.002834,
+      "time_connect": 0.021499,
+      "time_appconnect": 0.05086,
+      "time_starttransfer": 0.089645,
+      "time_total": 0.095637,
+      "http_version": "2",
+      "remote_ip": "133.18.122.133",
+      "ms": 95.637,
+      "valid": true
+    },
+    {
+      "label": "new-hot-3",
+      "app": "hello",
+      "utc": "2026-09-25T09:50:58.812453+00:00",
+      "curl_exit": 0,
+      "body": "Hello from Hono on Hibana 🔥",
+      "error": "",
+      "http_code": 200,
+      "time_namelookup": 0.001655,
+      "time_connect": 0.018253,
+      "time_appconnect": 0.045157,
+      "time_starttransfer": 0.086186,
+      "time_total": 0.091941,
+      "http_version": "2",
+      "remote_ip": "133.18.122.133",
+      "ms": 91.94099999999999,
+      "valid": true
+    },
+    {
+      "label": "new-hot-4",
+      "app": "hello",
+      "utc": "2026-09-25T09:50:58.924312+00:00",
+      "curl_exit": 0,
+      "body": "Hello from Hono on Hibana 🔥",
+      "error": "",
+      "http_code": 200,
+      "time_namelookup": 0.002272,
+      "time_connect": 0.022741,
+      "time_appconnect": 0.05328,
+      "time_starttransfer": 0.092781,
+      "time_total": 0.096166,
+      "http_version": "2",
+      "remote_ip": "133.18.122.133",
+      "ms": 96.166,
+      "valid": true
+    },
+    {
+      "label": "new-hot-5",
+      "app": "hello",
+      "utc": "2026-09-25T09:50:59.031505+00:00",
+      "curl_exit": 0,
+      "body": "Hello from Hono on Hibana 🔥",
+      "error": "",
+      "http_code": 200,
+      "time_namelookup": 0.001514,
+      "time_connect": 0.02225,
+      "time_appconnect": 0.051725,
+      "time_starttransfer": 0.090825,
+      "time_total": 0.096455,
+      "http_version": "2",
+      "remote_ip": "133.18.122.133",
+      "ms": 96.455,
+      "valid": true
+    },
+    {
+      "label": "new-hot-6",
+      "app": "hello",
+      "utc": "2026-09-25T09:50:59.127103+00:00",
+      "curl_exit": 0,
+      "body": "Hello from Hono on Hibana 🔥",
+      "error": "",
+      "http_code": 200,
+      "time_namelookup": 0.002284,
+      "time_connect": 0.018913,
+      "time_appconnect": 0.044364,
+      "time_starttransfer": 0.080092,
+      "time_total": 0.084798,
+      "http_version": "2",
+      "remote_ip": "133.18.122.133",
+      "ms": 84.798,
+      "valid": true
+    },
+    {
+      "label": "new-hot-7",
+      "app": "hello",
+      "utc": "2026-09-25T09:50:59.234642+00:00",
+      "curl_exit": 0,
+      "body": "Hello from Hono on Hibana 🔥",
+      "error": "",
+      "http_code": 200,
+      "time_namelookup": 0.00269,
+      "time_connect": 0.024351,
+      "time_appconnect": 0.053413,
+      "time_starttransfer": 0.092704,
+      "time_total": 0.096059,
+      "http_version": "2",
+      "remote_ip": "133.18.122.133",
+      "ms": 96.05900000000001,
+      "valid": true
+    },
+    {
+      "label": "new-hot-8",
+      "app": "hello",
+      "utc": "2026-09-25T09:50:59.336625+00:00",
+      "curl_exit": 0,
+      "body": "Hello from Hono on Hibana 🔥",
+      "error": "",
+      "http_code": 200,
+      "time_namelookup": 0.002987,
+      "time_connect": 0.021083,
+      "time_appconnect": 0.048724,
+      "time_starttransfer": 0.085312,
+      "time_total": 0.09008,
+      "http_version": "2",
+      "remote_ip": "133.18.122.133",
+      "ms": 90.08,
+      "valid": true
+    },
+    {
+      "label": "new-hot-9",
+      "app": "hello",
+      "utc": "2026-09-25T09:50:59.444611+00:00",
+      "curl_exit": 0,
+      "body": "Hello from Hono on Hibana 🔥",
+      "error": "",
+      "http_code": 200,
+      "time_namelookup": 0.001854,
+      "time_connect": 0.022799,
+      "time_appconnect": 0.053467,
+      "time_starttransfer": 0.093022,
+      "time_total": 0.09863,
+      "http_version": "2",
+      "remote_ip": "133.18.122.133",
+      "ms": 98.63,
+      "valid": true
+    },
+    {
+      "label": "new-hot-10",
+      "app": "hello",
+      "utc": "2026-09-25T09:50:59.546245+00:00",
+      "curl_exit": 0,
+      "body": "Hello from Hono on Hibana 🔥",
+      "error": "",
+      "http_code": 200,
+      "time_namelookup": 0.001938,
+      "time_connect": 0.021392,
+      "time_appconnect": 0.050243,
+      "time_starttransfer": 0.088999,
+      "time_total": 0.093569,
+      "http_version": "2",
+      "remote_ip": "133.18.122.133",
+      "ms": 93.569,
+      "valid": true
+    },
+    {
+      "label": "new-hot-11",
+      "app": "hello",
+      "utc": "2026-09-25T09:50:59.649229+00:00",
+      "curl_exit": 0,
+      "body": "Hello from Hono on Hibana 🔥",
+      "error": "",
+      "http_code": 200,
+      "time_namelookup": 0.001449,
+      "time_connect": 0.019731,
+      "time_appconnect": 0.04941,
+      "time_starttransfer": 0.088259,
+      "time_total": 0.092946,
+      "http_version": "2",
+      "remote_ip": "133.18.122.133",
+      "ms": 92.946,
+      "valid": true
+    },
+    {
+      "label": "new-hot-12",
+      "app": "hello",
+      "utc": "2026-09-25T09:50:59.754543+00:00",
+      "curl_exit": 0,
+      "body": "Hello from Hono on Hibana 🔥",
+      "error": "",
+      "http_code": 200,
+      "time_namelookup": 0.001962,
+      "time_connect": 0.019948,
+      "time_appconnect": 0.049201,
+      "time_starttransfer": 0.085535,
+      "time_total": 0.090189,
+      "http_version": "2",
+      "remote_ip": "133.18.122.133",
+      "ms": 90.18900000000001,
+      "valid": true
+    },
+    {
+      "label": "new-hot-13",
+      "app": "hello",
+      "utc": "2026-09-25T09:50:59.858618+00:00",
+      "curl_exit": 0,
+      "body": "Hello from Hono on Hibana 🔥",
+      "error": "",
+      "http_code": 200,
+      "time_namelookup": 0.001465,
+      "time_connect": 0.021155,
+      "time_appconnect": 0.050245,
+      "time_starttransfer": 0.089687,
+      "time_total": 0.094751,
+      "http_version": "2",
+      "remote_ip": "133.18.122.133",
+      "ms": 94.751,
+      "valid": true
+    },
+    {
+      "label": "new-hot-14",
+      "app": "hello",
+      "utc": "2026-09-25T09:50:59.962827+00:00",
+      "curl_exit": 0,
+      "body": "Hello from Hono on Hibana 🔥",
+      "error": "",
+      "http_code": 200,
+      "time_namelookup": 0.001548,
+      "time_connect": 0.020108,
+      "time_appconnect": 0.049044,
+      "time_starttransfer": 0.086743,
+      "time_total": 0.09012,
+      "http_version": "2",
+      "remote_ip": "133.18.122.133",
+      "ms": 90.12,
+      "valid": true
+    },
+    {
+      "label": "new-hot-15",
+      "app": "hello",
+      "utc": "2026-09-25T09:51:00.073241+00:00",
+      "curl_exit": 0,
+      "body": "Hello from Hono on Hibana 🔥",
+      "error": "",
+      "http_code": 200,
+      "time_namelookup": 0.001804,
+      "time_connect": 0.020561,
+      "time_appconnect": 0.050446,
+      "time_starttransfer": 0.093808,
+      "time_total": 0.099437,
+      "http_version": "2",
+      "remote_ip": "133.18.122.133",
+      "ms": 99.437,
+      "valid": true
+    },
+    {
+      "label": "new-hot-16",
+      "app": "hello",
+      "utc": "2026-09-25T09:51:00.182254+00:00",
+      "curl_exit": 0,
+      "body": "Hello from Hono on Hibana 🔥",
+      "error": "",
+      "http_code": 200,
+      "time_namelookup": 0.002588,
+      "time_connect": 0.021076,
+      "time_appconnect": 0.050714,
+      "time_starttransfer": 0.089521,
+      "time_total": 0.092872,
+      "http_version": "2",
+      "remote_ip": "133.18.122.133",
+      "ms": 92.872,
+      "valid": true
+    },
+    {
+      "label": "new-hot-17",
+      "app": "hello",
+      "utc": "2026-09-25T09:51:00.291155+00:00",
+      "curl_exit": 0,
+      "body": "Hello from Hono on Hibana 🔥",
+      "error": "",
+      "http_code": 200,
+      "time_namelookup": 0.002149,
+      "time_connect": 0.02215,
+      "time_appconnect": 0.050426,
+      "time_starttransfer": 0.089589,
+      "time_total": 0.095332,
+      "http_version": "2",
+      "remote_ip": "133.18.122.133",
+      "ms": 95.332,
+      "valid": true
+    },
+    {
+      "label": "new-hot-18",
+      "app": "hello",
+      "utc": "2026-09-25T09:51:00.388691+00:00",
+      "curl_exit": 0,
+      "body": "Hello from Hono on Hibana 🔥",
+      "error": "",
+      "http_code": 200,
+      "time_namelookup": 0.001576,
+      "time_connect": 0.01812,
+      "time_appconnect": 0.043642,
+      "time_starttransfer": 0.080501,
+      "time_total": 0.086147,
+      "http_version": "2",
+      "remote_ip": "133.18.122.133",
+      "ms": 86.147,
+      "valid": true
+    },
+    {
+      "label": "new-hot-19",
+      "app": "hello",
+      "utc": "2026-09-25T09:51:00.490498+00:00",
+      "curl_exit": 0,
+      "body": "Hello from Hono on Hibana 🔥",
+      "error": "",
+      "http_code": 200,
+      "time_namelookup": 0.00274,
+      "time_connect": 0.019381,
+      "time_appconnect": 0.045879,
+      "time_starttransfer": 0.081182,
+      "time_total": 0.086686,
+      "http_version": "2",
+      "remote_ip": "133.18.122.133",
+      "ms": 86.68599999999999,
+      "valid": true
+    },
+    {
+      "label": "new-hot-20",
+      "app": "hello",
+      "utc": "2026-09-25T09:51:00.596183+00:00",
+      "curl_exit": 0,
+      "body": "Hello from Hono on Hibana 🔥",
+      "error": "",
+      "http_code": 200,
+      "time_namelookup": 0.001471,
+      "time_connect": 0.021698,
+      "time_appconnect": 0.051266,
+      "time_starttransfer": 0.089219,
+      "time_total": 0.095773,
+      "http_version": "2",
+      "remote_ip": "133.18.122.133",
+      "ms": 95.773,
+      "valid": true
+    },
+    {
+      "label": "new-hot-21",
+      "app": "hello",
+      "utc": "2026-09-25T09:51:00.699325+00:00",
+      "curl_exit": 0,
+      "body": "Hello from Hono on Hibana 🔥",
+      "error": "",
+      "http_code": 200,
+      "time_namelookup": 0.002048,
+      "time_connect": 0.017567,
+      "time_appconnect": 0.04401,
+      "time_starttransfer": 0.081758,
+      "time_total": 0.087638,
+      "http_version": "2",
+      "remote_ip": "133.18.122.133",
+      "ms": 87.63799999999999,
+      "valid": true
+    },
+    {
+      "label": "new-hot-22",
+      "app": "hello",
+      "utc": "2026-09-25T09:51:00.815930+00:00",
+      "curl_exit": 0,
+      "body": "Hello from Hono on Hibana 🔥",
+      "error": "",
+      "http_code": 200,
+      "time_namelookup": 0.0022,
+      "time_connect": 0.022512,
+      "time_appconnect": 0.05407,
+      "time_starttransfer": 0.095996,
+      "time_total": 0.101544,
+      "http_version": "2",
+      "remote_ip": "133.18.122.133",
+      "ms": 101.544,
+      "valid": true
+    },
+    {
+      "label": "new-hot-23",
+      "app": "hello",
+      "utc": "2026-09-25T09:51:00.927354+00:00",
+      "curl_exit": 0,
+      "body": "Hello from Hono on Hibana 🔥",
+      "error": "",
+      "http_code": 200,
+      "time_namelookup": 0.002784,
+      "time_connect": 0.022481,
+      "time_appconnect": 0.052074,
+      "time_starttransfer": 0.090007,
+      "time_total": 0.095541,
+      "http_version": "2",
+      "remote_ip": "133.18.122.133",
+      "ms": 95.541,
+      "valid": true
+    },
+    {
+      "label": "new-hot-24",
+      "app": "hello",
+      "utc": "2026-09-25T09:51:01.036297+00:00",
+      "curl_exit": 0,
+      "body": "Hello from Hono on Hibana 🔥",
+      "error": "",
+      "http_code": 200,
+      "time_namelookup": 0.001445,
+      "time_connect": 0.022044,
+      "time_appconnect": 0.052022,
+      "time_starttransfer": 0.092281,
+      "time_total": 0.097057,
+      "http_version": "2",
+      "remote_ip": "133.18.122.133",
+      "ms": 97.057,
+      "valid": true
+    },
+    {
+      "label": "new-hot-25",
+      "app": "hello",
+      "utc": "2026-09-25T09:51:01.146191+00:00",
+      "curl_exit": 0,
+      "body": "Hello from Hono on Hibana 🔥",
+      "error": "",
+      "http_code": 200,
+      "time_namelookup": 0.002619,
+      "time_connect": 0.019562,
+      "time_appconnect": 0.049712,
+      "time_starttransfer": 0.089524,
+      "time_total": 0.094282,
+      "http_version": "2",
+      "remote_ip": "133.18.122.133",
+      "ms": 94.28200000000001,
+      "valid": true
+    },
+    {
+      "label": "new-hot-26",
+      "app": "hello",
+      "utc": "2026-09-25T09:51:01.248485+00:00",
+      "curl_exit": 0,
+      "body": "Hello from Hono on Hibana 🔥",
+      "error": "",
+      "http_code": 200,
+      "time_namelookup": 0.002036,
+      "time_connect": 0.018877,
+      "time_appconnect": 0.044914,
+      "time_starttransfer": 0.081682,
+      "time_total": 0.089603,
+      "http_version": "2",
+      "remote_ip": "133.18.122.133",
+      "ms": 89.60300000000001,
+      "valid": true
+    },
+    {
+      "label": "new-hot-27",
+      "app": "hello",
+      "utc": "2026-09-25T09:51:01.356515+00:00",
+      "curl_exit": 0,
+      "body": "Hello from Hono on Hibana 🔥",
+      "error": "",
+      "http_code": 200,
+      "time_namelookup": 0.001477,
+      "time_connect": 0.021859,
+      "time_appconnect": 0.053136,
+      "time_starttransfer": 0.093289,
+      "time_total": 0.098385,
+      "http_version": "2",
+      "remote_ip": "133.18.122.133",
+      "ms": 98.385,
+      "valid": true
+    },
+    {
+      "label": "new-hot-28",
+      "app": "hello",
+      "utc": "2026-09-25T09:51:01.466221+00:00",
+      "curl_exit": 0,
+      "body": "Hello from Hono on Hibana 🔥",
+      "error": "",
+      "http_code": 200,
+      "time_namelookup": 0.002558,
+      "time_connect": 0.020643,
+      "time_appconnect": 0.049087,
+      "time_starttransfer": 0.087943,
+      "time_total": 0.093446,
+      "http_version": "2",
+      "remote_ip": "133.18.122.133",
+      "ms": 93.446,
+      "valid": true
+    },
+    {
+      "label": "new-hot-29",
+      "app": "hello",
+      "utc": "2026-09-25T09:51:01.574393+00:00",
+      "curl_exit": 0,
+      "body": "Hello from Hono on Hibana 🔥",
+      "error": "",
+      "http_code": 200,
+      "time_namelookup": 0.001574,
+      "time_connect": 0.021478,
+      "time_appconnect": 0.051123,
+      "time_starttransfer": 0.090292,
+      "time_total": 0.096009,
+      "http_version": "2",
+      "remote_ip": "133.18.122.133",
+      "ms": 96.009,
+      "valid": true
+    },
+    {
+      "label": "new-hot-30",
+      "app": "hello",
+      "utc": "2026-09-25T09:51:01.682432+00:00",
+      "curl_exit": 0,
+      "body": "Hello from Hono on Hibana 🔥",
+      "error": "",
+      "http_code": 200,
+      "time_namelookup": 0.002366,
+      "time_connect": 0.020029,
+      "time_appconnect": 0.048912,
+      "time_starttransfer": 0.087191,
+      "time_total": 0.092759,
+      "http_version": "2",
+      "remote_ip": "133.18.122.133",
+      "ms": 92.759,
+      "valid": true
+    },
+    {
+      "label": "new-hot-31",
+      "app": "hello",
+      "utc": "2026-09-25T09:51:01.803487+00:00",
+      "curl_exit": 0,
+      "body": "Hello from Hono on Hibana 🔥",
+      "error": "",
+      "http_code": 200,
+      "time_namelookup": 0.002599,
+      "time_connect": 0.02443,
+      "time_appconnect": 0.061144,
+      "time_starttransfer": 0.100791,
+      "time_total": 0.105046,
+      "http_version": "2",
+      "remote_ip": "133.18.122.133",
+      "ms": 105.046,
+      "valid": true
+    },
+    {
+      "label": "new-hot-32",
+      "app": "hello",
+      "utc": "2026-09-25T09:51:01.922678+00:00",
+      "curl_exit": 0,
+      "body": "Hello from Hono on Hibana 🔥",
+      "error": "",
+      "http_code": 200,
+      "time_namelookup": 0.001646,
+      "time_connect": 0.02116,
+      "time_appconnect": 0.051637,
+      "time_starttransfer": 0.096369,
+      "time_total": 0.105089,
+      "http_version": "2",
+      "remote_ip": "133.18.122.133",
+      "ms": 105.089,
+      "valid": true
+    },
+    {
+      "label": "new-hot-33",
+      "app": "hello",
+      "utc": "2026-09-25T09:51:02.040693+00:00",
+      "curl_exit": 0,
+      "body": "Hello from Hono on Hibana 🔥",
+      "error": "",
+      "http_code": 200,
+      "time_namelookup": 0.003029,
+      "time_connect": 0.02441,
+      "time_appconnect": 0.054395,
+      "time_starttransfer": 0.096182,
+      "time_total": 0.101865,
+      "http_version": "2",
+      "remote_ip": "133.18.122.133",
+      "ms": 101.865,
+      "valid": true
+    },
+    {
+      "label": "new-hot-34",
+      "app": "hello",
+      "utc": "2026-09-25T09:51:02.143017+00:00",
+      "curl_exit": 0,
+      "body": "Hello from Hono on Hibana 🔥",
+      "error": "",
+      "http_code": 200,
+      "time_namelookup": 0.002988,
+      "time_connect": 0.020127,
+      "time_appconnect": 0.048458,
+      "time_starttransfer": 0.084708,
+      "time_total": 0.089961,
+      "http_version": "2",
+      "remote_ip": "133.18.122.133",
+      "ms": 89.961,
+      "valid": true
+    },
+    {
+      "label": "new-hot-35",
+      "app": "hello",
+      "utc": "2026-09-25T09:51:02.245956+00:00",
+      "curl_exit": 0,
+      "body": "Hello from Hono on Hibana 🔥",
+      "error": "",
+      "http_code": 200,
+      "time_namelookup": 0.002113,
+      "time_connect": 0.018006,
+      "time_appconnect": 0.044051,
+      "time_starttransfer": 0.07825,
+      "time_total": 0.083838,
+      "http_version": "2",
+      "remote_ip": "133.18.122.133",
+      "ms": 83.838,
+      "valid": true
+    },
+    {
+      "label": "new-hot-36",
+      "app": "hello",
+      "utc": "2026-09-25T09:51:02.350605+00:00",
+      "curl_exit": 0,
+      "body": "Hello from Hono on Hibana 🔥",
+      "error": "",
+      "http_code": 200,
+      "time_namelookup": 0.00207,
+      "time_connect": 0.02015,
+      "time_appconnect": 0.04687,
+      "time_starttransfer": 0.084517,
+      "time_total": 0.09017,
+      "http_version": "2",
+      "remote_ip": "133.18.122.133",
+      "ms": 90.17,
+      "valid": true
+    },
+    {
+      "label": "new-hot-37",
+      "app": "hello",
+      "utc": "2026-09-25T09:51:02.465627+00:00",
+      "curl_exit": 0,
+      "body": "Hello from Hono on Hibana 🔥",
+      "error": "",
+      "http_code": 200,
+      "time_namelookup": 0.00163,
+      "time_connect": 0.021419,
+      "time_appconnect": 0.052691,
+      "time_starttransfer": 0.092707,
+      "time_total": 0.09919,
+      "http_version": "2",
+      "remote_ip": "133.18.122.133",
+      "ms": 99.19,
+      "valid": true
+    },
+    {
+      "label": "new-hot-38",
+      "app": "hello",
+      "utc": "2026-09-25T09:51:02.575951+00:00",
+      "curl_exit": 0,
+      "body": "Hello from Hono on Hibana 🔥",
+      "error": "",
+      "http_code": 200,
+      "time_namelookup": 0.00162,
+      "time_connect": 0.022629,
+      "time_appconnect": 0.052755,
+      "time_starttransfer": 0.093247,
+      "time_total": 0.098222,
+      "http_version": "2",
+      "remote_ip": "133.18.122.133",
+      "ms": 98.22200000000001,
+      "valid": true
+    },
+    {
+      "label": "new-hot-39",
+      "app": "hello",
+      "utc": "2026-09-25T09:51:02.683890+00:00",
+      "curl_exit": 0,
+      "body": "Hello from Hono on Hibana 🔥",
+      "error": "",
+      "http_code": 200,
+      "time_namelookup": 0.001521,
+      "time_connect": 0.021183,
+      "time_appconnect": 0.050855,
+      "time_starttransfer": 0.091914,
+      "time_total": 0.096573,
+      "http_version": "2",
+      "remote_ip": "133.18.122.133",
+      "ms": 96.57300000000001,
+      "valid": true
+    },
+    {
+      "label": "new-hot-40",
+      "app": "hello",
+      "utc": "2026-09-25T09:51:02.784716+00:00",
+      "curl_exit": 0,
+      "body": "Hello from Hono on Hibana 🔥",
+      "error": "",
+      "http_code": 200,
+      "time_namelookup": 0.00264,
+      "time_connect": 0.01732,
+      "time_appconnect": 0.043561,
+      "time_starttransfer": 0.078422,
+      "time_total": 0.084136,
+      "http_version": "2",
+      "remote_ip": "133.18.122.133",
+      "ms": 84.136,
+      "valid": true
+    },
+    {
+      "label": "new-hot-41",
+      "app": "hello",
+      "utc": "2026-09-25T09:51:02.899303+00:00",
+      "curl_exit": 0,
+      "body": "Hello from Hono on Hibana 🔥",
+      "error": "",
+      "http_code": 200,
+      "time_namelookup": 0.001498,
+      "time_connect": 0.022221,
+      "time_appconnect": 0.052414,
+      "time_starttransfer": 0.0924,
+      "time_total": 0.097446,
+      "http_version": "2",
+      "remote_ip": "133.18.122.133",
+      "ms": 97.446,
+      "valid": true
+    },
+    {
+      "label": "new-hot-42",
+      "app": "hello",
+      "utc": "2026-09-25T09:51:03.016106+00:00",
+      "curl_exit": 0,
+      "body": "Hello from Hono on Hibana 🔥",
+      "error": "",
+      "http_code": 200,
+      "time_namelookup": 0.001985,
+      "time_connect": 0.019224,
+      "time_appconnect": 0.049575,
+      "time_starttransfer": 0.090917,
+      "time_total": 0.097616,
+      "http_version": "2",
+      "remote_ip": "133.18.122.133",
+      "ms": 97.616,
+      "valid": true
+    },
+    {
+      "label": "new-hot-43",
+      "app": "hello",
+      "utc": "2026-09-25T09:51:03.126688+00:00",
+      "curl_exit": 0,
+      "body": "Hello from Hono on Hibana 🔥",
+      "error": "",
+      "http_code": 200,
+      "time_namelookup": 0.003301,
+      "time_connect": 0.020807,
+      "time_appconnect": 0.048812,
+      "time_starttransfer": 0.084555,
+      "time_total": 0.089316,
+      "http_version": "2",
+      "remote_ip": "133.18.122.133",
+      "ms": 89.316,
+      "valid": true
+    },
+    {
+      "label": "new-hot-44",
+      "app": "hello",
+      "utc": "2026-09-25T09:51:03.236503+00:00",
+      "curl_exit": 0,
+      "body": "Hello from Hono on Hibana 🔥",
+      "error": "",
+      "http_code": 200,
+      "time_namelookup": 0.002151,
+      "time_connect": 0.019259,
+      "time_appconnect": 0.0462,
+      "time_starttransfer": 0.088631,
+      "time_total": 0.094195,
+      "http_version": "2",
+      "remote_ip": "133.18.122.133",
+      "ms": 94.19500000000001,
+      "valid": true
+    },
+    {
+      "label": "new-hot-45",
+      "app": "hello",
+      "utc": "2026-09-25T09:51:03.350156+00:00",
+      "curl_exit": 0,
+      "body": "Hello from Hono on Hibana 🔥",
+      "error": "",
+      "http_code": 200,
+      "time_namelookup": 0.003131,
+      "time_connect": 0.024491,
+      "time_appconnect": 0.053652,
+      "time_starttransfer": 0.093576,
+      "time_total": 0.100406,
+      "http_version": "2",
+      "remote_ip": "133.18.122.133",
+      "ms": 100.40599999999999,
+      "valid": true
+    },
+    {
+      "label": "new-hot-46",
+      "app": "hello",
+      "utc": "2026-09-25T09:51:03.465058+00:00",
+      "curl_exit": 0,
+      "body": "Hello from Hono on Hibana 🔥",
+      "error": "",
+      "http_code": 200,
+      "time_namelookup": 0.001504,
+      "time_connect": 0.020086,
+      "time_appconnect": 0.060756,
+      "time_starttransfer": 0.097309,
+      "time_total": 0.106667,
+      "http_version": "2",
+      "remote_ip": "133.18.122.133",
+      "ms": 106.667,
+      "valid": true
+    },
+    {
+      "label": "new-hot-47",
+      "app": "hello",
+      "utc": "2026-09-25T09:51:03.561982+00:00",
+      "curl_exit": 0,
+      "body": "Hello from Hono on Hibana 🔥",
+      "error": "",
+      "http_code": 200,
+      "time_namelookup": 0.001304,
+      "time_connect": 0.017873,
+      "time_appconnect": 0.045009,
+      "time_starttransfer": 0.082085,
+      "time_total": 0.086756,
+      "http_version": "2",
+      "remote_ip": "133.18.122.133",
+      "ms": 86.756,
+      "valid": true
+    },
+    {
+      "label": "new-hot-48",
+      "app": "hello",
+      "utc": "2026-09-25T09:51:03.671468+00:00",
+      "curl_exit": 0,
+      "body": "Hello from Hono on Hibana 🔥",
+      "error": "",
+      "http_code": 200,
+      "time_namelookup": 0.003994,
+      "time_connect": 0.019445,
+      "time_appconnect": 0.045258,
+      "time_starttransfer": 0.081577,
+      "time_total": 0.088837,
+      "http_version": "2",
+      "remote_ip": "133.18.122.133",
+      "ms": 88.837,
+      "valid": true
+    },
+    {
+      "label": "new-hot-49",
+      "app": "hello",
+      "utc": "2026-09-25T09:51:03.768889+00:00",
+      "curl_exit": 0,
+      "body": "Hello from Hono on Hibana 🔥",
+      "error": "",
+      "http_code": 200,
+      "time_namelookup": 0.001452,
+      "time_connect": 0.019639,
+      "time_appconnect": 0.046225,
+      "time_starttransfer": 0.082292,
+      "time_total": 0.087775,
+      "http_version": "2",
+      "remote_ip": "133.18.122.133",
+      "ms": 87.775,
+      "valid": true
+    }
+  ],
+  "fixture_hot": [
+    {
+      "label": "fixture-hot-0",
+      "app": "cachebench-20260925095057-08",
+      "utc": "2026-09-25T10:01:09.642353+00:00",
+      "curl_exit": 0,
+      "body": "{\"app\":\"density-08\",\"message\":\"density-ok\"}",
+      "error": "",
+      "http_code": 200,
+      "time_namelookup": 0.002296,
+      "time_connect": 0.019476,
+      "time_appconnect": 0.047396,
+      "time_starttransfer": 0.083376,
+      "time_total": 0.089224,
+      "http_version": "2",
+      "remote_ip": "133.18.122.133",
+      "ms": 89.224,
+      "valid": true
+    },
+    {
+      "label": "fixture-hot-1",
+      "app": "cachebench-20260925095057-08",
+      "utc": "2026-09-25T10:01:09.743539+00:00",
+      "curl_exit": 0,
+      "body": "{\"app\":\"density-08\",\"message\":\"density-ok\"}",
+      "error": "",
+      "http_code": 200,
+      "time_namelookup": 0.001927,
+      "time_connect": 0.020189,
+      "time_appconnect": 0.047038,
+      "time_starttransfer": 0.084379,
+      "time_total": 0.088609,
+      "http_version": "2",
+      "remote_ip": "133.18.122.133",
+      "ms": 88.609,
+      "valid": true
+    },
+    {
+      "label": "fixture-hot-2",
+      "app": "cachebench-20260925095057-08",
+      "utc": "2026-09-25T10:01:09.847292+00:00",
+      "curl_exit": 0,
+      "body": "{\"app\":\"density-08\",\"message\":\"density-ok\"}",
+      "error": "",
+      "http_code": 200,
+      "time_namelookup": 0.001713,
+      "time_connect": 0.017698,
+      "time_appconnect": 0.045207,
+      "time_starttransfer": 0.080674,
+      "time_total": 0.086071,
+      "http_version": "2",
+      "remote_ip": "133.18.122.133",
+      "ms": 86.071,
+      "valid": true
+    },
+    {
+      "label": "fixture-hot-3",
+      "app": "cachebench-20260925095057-08",
+      "utc": "2026-09-25T10:01:09.959216+00:00",
+      "curl_exit": 0,
+      "body": "{\"app\":\"density-08\",\"message\":\"density-ok\"}",
+      "error": "",
+      "http_code": 200,
+      "time_namelookup": 0.002184,
+      "time_connect": 0.020671,
+      "time_appconnect": 0.05013,
+      "time_starttransfer": 0.088041,
+      "time_total": 0.09394,
+      "http_version": "2",
+      "remote_ip": "133.18.122.133",
+      "ms": 93.94,
+      "valid": true
+    },
+    {
+      "label": "fixture-hot-4",
+      "app": "cachebench-20260925095057-08",
+      "utc": "2026-09-25T10:01:10.071393+00:00",
+      "curl_exit": 0,
+      "body": "{\"app\":\"density-08\",\"message\":\"density-ok\"}",
+      "error": "",
+      "http_code": 200,
+      "time_namelookup": 0.002425,
+      "time_connect": 0.021299,
+      "time_appconnect": 0.050709,
+      "time_starttransfer": 0.089835,
+      "time_total": 0.094326,
+      "http_version": "2",
+      "remote_ip": "133.18.122.133",
+      "ms": 94.326,
+      "valid": true
+    },
+    {
+      "label": "fixture-hot-5",
+      "app": "cachebench-20260925095057-08",
+      "utc": "2026-09-25T10:01:10.176702+00:00",
+      "curl_exit": 0,
+      "body": "{\"app\":\"density-08\",\"message\":\"density-ok\"}",
+      "error": "",
+      "http_code": 200,
+      "time_namelookup": 0.002267,
+      "time_connect": 0.021461,
+      "time_appconnect": 0.050472,
+      "time_starttransfer": 0.088497,
+      "time_total": 0.091732,
+      "http_version": "2",
+      "remote_ip": "133.18.122.133",
+      "ms": 91.732,
+      "valid": true
+    },
+    {
+      "label": "fixture-hot-6",
+      "app": "cachebench-20260925095057-08",
+      "utc": "2026-09-25T10:01:10.275345+00:00",
+      "curl_exit": 0,
+      "body": "{\"app\":\"density-08\",\"message\":\"density-ok\"}",
+      "error": "",
+      "http_code": 200,
+      "time_namelookup": 0.00214,
+      "time_connect": 0.017719,
+      "time_appconnect": 0.0439,
+      "time_starttransfer": 0.076792,
+      "time_total": 0.082497,
+      "http_version": "2",
+      "remote_ip": "133.18.122.133",
+      "ms": 82.497,
+      "valid": true
+    },
+    {
+      "label": "fixture-hot-7",
+      "app": "cachebench-20260925095057-08",
+      "utc": "2026-09-25T10:01:10.384415+00:00",
+      "curl_exit": 0,
+      "body": "{\"app\":\"density-08\",\"message\":\"density-ok\"}",
+      "error": "",
+      "http_code": 200,
+      "time_namelookup": 0.002017,
+      "time_connect": 0.020991,
+      "time_appconnect": 0.049401,
+      "time_starttransfer": 0.087429,
+      "time_total": 0.091857,
+      "http_version": "2",
+      "remote_ip": "133.18.122.133",
+      "ms": 91.857,
+      "valid": true
+    },
+    {
+      "label": "fixture-hot-8",
+      "app": "cachebench-20260925095057-08",
+      "utc": "2026-09-25T10:01:10.497264+00:00",
+      "curl_exit": 0,
+      "body": "{\"app\":\"density-08\",\"message\":\"density-ok\"}",
+      "error": "",
+      "http_code": 200,
+      "time_namelookup": 0.001716,
+      "time_connect": 0.018617,
+      "time_appconnect": 0.046125,
+      "time_starttransfer": 0.08741,
+      "time_total": 0.09625,
+      "http_version": "2",
+      "remote_ip": "133.18.122.133",
+      "ms": 96.25,
+      "valid": true
+    },
+    {
+      "label": "fixture-hot-9",
+      "app": "cachebench-20260925095057-08",
+      "utc": "2026-09-25T10:01:10.590668+00:00",
+      "curl_exit": 0,
+      "body": "{\"app\":\"density-08\",\"message\":\"density-ok\"}",
+      "error": "",
+      "http_code": 200,
+      "time_namelookup": 0.001734,
+      "time_connect": 0.017124,
+      "time_appconnect": 0.043264,
+      "time_starttransfer": 0.076633,
+      "time_total": 0.082037,
+      "http_version": "2",
+      "remote_ip": "133.18.122.133",
+      "ms": 82.03699999999999,
+      "valid": true
+    },
+    {
+      "label": "fixture-hot-10",
+      "app": "cachebench-20260925095057-08",
+      "utc": "2026-09-25T10:01:10.702429+00:00",
+      "curl_exit": 0,
+      "body": "{\"app\":\"density-08\",\"message\":\"density-ok\"}",
+      "error": "",
+      "http_code": 200,
+      "time_namelookup": 0.001784,
+      "time_connect": 0.019851,
+      "time_appconnect": 0.049695,
+      "time_starttransfer": 0.095374,
+      "time_total": 0.100952,
+      "http_version": "2",
+      "remote_ip": "133.18.122.133",
+      "ms": 100.952,
+      "valid": true
+    },
+    {
+      "label": "fixture-hot-11",
+      "app": "cachebench-20260925095057-08",
+      "utc": "2026-09-25T10:01:10.806005+00:00",
+      "curl_exit": 0,
+      "body": "{\"app\":\"density-08\",\"message\":\"density-ok\"}",
+      "error": "",
+      "http_code": 200,
+      "time_namelookup": 0.002121,
+      "time_connect": 0.020328,
+      "time_appconnect": 0.048371,
+      "time_starttransfer": 0.084917,
+      "time_total": 0.090721,
+      "http_version": "2",
+      "remote_ip": "133.18.122.133",
+      "ms": 90.72099999999999,
+      "valid": true
+    },
+    {
+      "label": "fixture-hot-12",
+      "app": "cachebench-20260925095057-08",
+      "utc": "2026-09-25T10:01:10.911855+00:00",
+      "curl_exit": 0,
+      "body": "{\"app\":\"density-08\",\"message\":\"density-ok\"}",
+      "error": "",
+      "http_code": 200,
+      "time_namelookup": 0.002552,
+      "time_connect": 0.021018,
+      "time_appconnect": 0.050588,
+      "time_starttransfer": 0.088001,
+      "time_total": 0.092406,
+      "http_version": "2",
+      "remote_ip": "133.18.122.133",
+      "ms": 92.406,
+      "valid": true
+    },
+    {
+      "label": "fixture-hot-13",
+      "app": "cachebench-20260925095057-08",
+      "utc": "2026-09-25T10:01:11.015397+00:00",
+      "curl_exit": 0,
+      "body": "{\"app\":\"density-08\",\"message\":\"density-ok\"}",
+      "error": "",
+      "http_code": 200,
+      "time_namelookup": 0.002227,
+      "time_connect": 0.019845,
+      "time_appconnect": 0.048251,
+      "time_starttransfer": 0.084517,
+      "time_total": 0.089449,
+      "http_version": "2",
+      "remote_ip": "133.18.122.133",
+      "ms": 89.449,
+      "valid": true
+    },
+    {
+      "label": "fixture-hot-14",
+      "app": "cachebench-20260925095057-08",
+      "utc": "2026-09-25T10:01:11.124292+00:00",
+      "curl_exit": 0,
+      "body": "{\"app\":\"density-08\",\"message\":\"density-ok\"}",
+      "error": "",
+      "http_code": 200,
+      "time_namelookup": 0.003016,
+      "time_connect": 0.024167,
+      "time_appconnect": 0.054195,
+      "time_starttransfer": 0.094302,
+      "time_total": 0.098853,
+      "http_version": "2",
+      "remote_ip": "133.18.122.133",
+      "ms": 98.853,
+      "valid": true
+    },
+    {
+      "label": "fixture-hot-15",
+      "app": "cachebench-20260925095057-08",
+      "utc": "2026-09-25T10:01:11.227670+00:00",
+      "curl_exit": 0,
+      "body": "{\"app\":\"density-08\",\"message\":\"density-ok\"}",
+      "error": "",
+      "http_code": 200,
+      "time_namelookup": 0.002513,
+      "time_connect": 0.019057,
+      "time_appconnect": 0.046015,
+      "time_starttransfer": 0.081798,
+      "time_total": 0.087346,
+      "http_version": "2",
+      "remote_ip": "133.18.122.133",
+      "ms": 87.34599999999999,
+      "valid": true
+    },
+    {
+      "label": "fixture-hot-16",
+      "app": "cachebench-20260925095057-08",
+      "utc": "2026-09-25T10:01:11.331388+00:00",
+      "curl_exit": 0,
+      "body": "{\"app\":\"density-08\",\"message\":\"density-ok\"}",
+      "error": "",
+      "http_code": 200,
+      "time_namelookup": 0.002235,
+      "time_connect": 0.01859,
+      "time_appconnect": 0.046194,
+      "time_starttransfer": 0.083089,
+      "time_total": 0.087546,
+      "http_version": "2",
+      "remote_ip": "133.18.122.133",
+      "ms": 87.54599999999999,
+      "valid": true
+    },
+    {
+      "label": "fixture-hot-17",
+      "app": "cachebench-20260925095057-08",
+      "utc": "2026-09-25T10:01:11.439858+00:00",
+      "curl_exit": 0,
+      "body": "{\"app\":\"density-08\",\"message\":\"density-ok\"}",
+      "error": "",
+      "http_code": 200,
+      "time_namelookup": 0.001729,
+      "time_connect": 0.020067,
+      "time_appconnect": 0.048616,
+      "time_starttransfer": 0.08672,
+      "time_total": 0.09133,
+      "http_version": "2",
+      "remote_ip": "133.18.122.133",
+      "ms": 91.33,
+      "valid": true
+    },
+    {
+      "label": "fixture-hot-18",
+      "app": "cachebench-20260925095057-08",
+      "utc": "2026-09-25T10:01:11.544611+00:00",
+      "curl_exit": 0,
+      "body": "{\"app\":\"density-08\",\"message\":\"density-ok\"}",
+      "error": "",
+      "http_code": 200,
+      "time_namelookup": 0.002341,
+      "time_connect": 0.018636,
+      "time_appconnect": 0.045955,
+      "time_starttransfer": 0.081574,
+      "time_total": 0.087315,
+      "http_version": "2",
+      "remote_ip": "133.18.122.133",
+      "ms": 87.315,
+      "valid": true
+    },
+    {
+      "label": "fixture-hot-19",
+      "app": "cachebench-20260925095057-08",
+      "utc": "2026-09-25T10:01:11.659272+00:00",
+      "curl_exit": 0,
+      "body": "{\"app\":\"density-08\",\"message\":\"density-ok\"}",
+      "error": "",
+      "http_code": 200,
+      "time_namelookup": 0.001725,
+      "time_connect": 0.021993,
+      "time_appconnect": 0.053681,
+      "time_starttransfer": 0.093989,
+      "time_total": 0.09837,
+      "http_version": "2",
+      "remote_ip": "133.18.122.133",
+      "ms": 98.37,
+      "valid": true
+    },
+    {
+      "label": "fixture-hot-20",
+      "app": "cachebench-20260925095057-08",
+      "utc": "2026-09-25T10:01:11.765410+00:00",
+      "curl_exit": 0,
+      "body": "{\"app\":\"density-08\",\"message\":\"density-ok\"}",
+      "error": "",
+      "http_code": 200,
+      "time_namelookup": 0.002028,
+      "time_connect": 0.019751,
+      "time_appconnect": 0.047882,
+      "time_starttransfer": 0.085056,
+      "time_total": 0.08841,
+      "http_version": "2",
+      "remote_ip": "133.18.122.133",
+      "ms": 88.41,
+      "valid": true
+    },
+    {
+      "label": "fixture-hot-21",
+      "app": "cachebench-20260925095057-08",
+      "utc": "2026-09-25T10:01:11.895128+00:00",
+      "curl_exit": 0,
+      "body": "{\"app\":\"density-08\",\"message\":\"density-ok\"}",
+      "error": "",
+      "http_code": 200,
+      "time_namelookup": 0.001977,
+      "time_connect": 0.022596,
+      "time_appconnect": 0.062346,
+      "time_starttransfer": 0.102392,
+      "time_total": 0.10886,
+      "http_version": "2",
+      "remote_ip": "133.18.122.133",
+      "ms": 108.86,
+      "valid": true
+    },
+    {
+      "label": "fixture-hot-22",
+      "app": "cachebench-20260925095057-08",
+      "utc": "2026-09-25T10:01:12.013480+00:00",
+      "curl_exit": 0,
+      "body": "{\"app\":\"density-08\",\"message\":\"density-ok\"}",
+      "error": "",
+      "http_code": 200,
+      "time_namelookup": 0.002597,
+      "time_connect": 0.021187,
+      "time_appconnect": 0.050039,
+      "time_starttransfer": 0.093079,
+      "time_total": 0.099737,
+      "http_version": "2",
+      "remote_ip": "133.18.122.133",
+      "ms": 99.73700000000001,
+      "valid": true
+    },
+    {
+      "label": "fixture-hot-23",
+      "app": "cachebench-20260925095057-08",
+      "utc": "2026-09-25T10:01:12.128986+00:00",
+      "curl_exit": 0,
+      "body": "{\"app\":\"density-08\",\"message\":\"density-ok\"}",
+      "error": "",
+      "http_code": 200,
+      "time_namelookup": 0.001887,
+      "time_connect": 0.021845,
+      "time_appconnect": 0.054142,
+      "time_starttransfer": 0.09608,
+      "time_total": 0.10048,
+      "http_version": "2",
+      "remote_ip": "133.18.122.133",
+      "ms": 100.48,
+      "valid": true
+    },
+    {
+      "label": "fixture-hot-24",
+      "app": "cachebench-20260925095057-08",
+      "utc": "2026-09-25T10:01:12.247047+00:00",
+      "curl_exit": 0,
+      "body": "{\"app\":\"density-08\",\"message\":\"density-ok\"}",
+      "error": "",
+      "http_code": 200,
+      "time_namelookup": 0.001934,
+      "time_connect": 0.022705,
+      "time_appconnect": 0.054006,
+      "time_starttransfer": 0.094139,
+      "time_total": 0.099764,
+      "http_version": "2",
+      "remote_ip": "133.18.122.133",
+      "ms": 99.76400000000001,
+      "valid": true
+    },
+    {
+      "label": "fixture-hot-25",
+      "app": "cachebench-20260925095057-08",
+      "utc": "2026-09-25T10:01:12.348415+00:00",
+      "curl_exit": 0,
+      "body": "{\"app\":\"density-08\",\"message\":\"density-ok\"}",
+      "error": "",
+      "http_code": 200,
+      "time_namelookup": 0.002031,
+      "time_connect": 0.018496,
+      "time_appconnect": 0.044969,
+      "time_starttransfer": 0.080646,
+      "time_total": 0.08608,
+      "http_version": "2",
+      "remote_ip": "133.18.122.133",
+      "ms": 86.08,
+      "valid": true
+    },
+    {
+      "label": "fixture-hot-26",
+      "app": "cachebench-20260925095057-08",
+      "utc": "2026-09-25T10:01:12.453353+00:00",
+      "curl_exit": 0,
+      "body": "{\"app\":\"density-08\",\"message\":\"density-ok\"}",
+      "error": "",
+      "http_code": 200,
+      "time_namelookup": 0.002029,
+      "time_connect": 0.018598,
+      "time_appconnect": 0.046656,
+      "time_starttransfer": 0.081963,
+      "time_total": 0.086462,
+      "http_version": "2",
+      "remote_ip": "133.18.122.133",
+      "ms": 86.462,
+      "valid": true
+    },
+    {
+      "label": "fixture-hot-27",
+      "app": "cachebench-20260925095057-08",
+      "utc": "2026-09-25T10:01:12.565137+00:00",
+      "curl_exit": 0,
+      "body": "{\"app\":\"density-08\",\"message\":\"density-ok\"}",
+      "error": "",
+      "http_code": 200,
+      "time_namelookup": 0.00201,
+      "time_connect": 0.020907,
+      "time_appconnect": 0.050164,
+      "time_starttransfer": 0.089787,
+      "time_total": 0.095606,
+      "http_version": "2",
+      "remote_ip": "133.18.122.133",
+      "ms": 95.606,
+      "valid": true
+    },
+    {
+      "label": "fixture-hot-28",
+      "app": "cachebench-20260925095057-08",
+      "utc": "2026-09-25T10:01:12.672425+00:00",
+      "curl_exit": 0,
+      "body": "{\"app\":\"density-08\",\"message\":\"density-ok\"}",
+      "error": "",
+      "http_code": 200,
+      "time_namelookup": 0.002338,
+      "time_connect": 0.019354,
+      "time_appconnect": 0.046869,
+      "time_starttransfer": 0.084385,
+      "time_total": 0.090145,
+      "http_version": "2",
+      "remote_ip": "133.18.122.133",
+      "ms": 90.145,
+      "valid": true
+    },
+    {
+      "label": "fixture-hot-29",
+      "app": "cachebench-20260925095057-08",
+      "utc": "2026-09-25T10:01:12.781282+00:00",
+      "curl_exit": 0,
+      "body": "{\"app\":\"density-08\",\"message\":\"density-ok\"}",
+      "error": "",
+      "http_code": 200,
+      "time_namelookup": 0.001658,
+      "time_connect": 0.017589,
+      "time_appconnect": 0.046673,
+      "time_starttransfer": 0.086171,
+      "time_total": 0.090556,
+      "http_version": "2",
+      "remote_ip": "133.18.122.133",
+      "ms": 90.556,
+      "valid": true
+    },
+    {
+      "label": "fixture-hot-30",
+      "app": "cachebench-20260925095057-08",
+      "utc": "2026-09-25T10:01:12.893730+00:00",
+      "curl_exit": 0,
+      "body": "{\"app\":\"density-08\",\"message\":\"density-ok\"}",
+      "error": "",
+      "http_code": 200,
+      "time_namelookup": 0.003097,
+      "time_connect": 0.021366,
+      "time_appconnect": 0.049183,
+      "time_starttransfer": 0.086496,
+      "time_total": 0.09307,
+      "http_version": "2",
+      "remote_ip": "133.18.122.133",
+      "ms": 93.07,
+      "valid": true
+    },
+    {
+      "label": "fixture-hot-31",
+      "app": "cachebench-20260925095057-08",
+      "utc": "2026-09-25T10:01:13.004087+00:00",
+      "curl_exit": 0,
+      "body": "{\"app\":\"density-08\",\"message\":\"density-ok\"}",
+      "error": "",
+      "http_code": 200,
+      "time_namelookup": 0.003125,
+      "time_connect": 0.019623,
+      "time_appconnect": 0.047559,
+      "time_starttransfer": 0.084959,
+      "time_total": 0.088714,
+      "http_version": "2",
+      "remote_ip": "133.18.122.133",
+      "ms": 88.714,
+      "valid": true
+    },
+    {
+      "label": "fixture-hot-32",
+      "app": "cachebench-20260925095057-08",
+      "utc": "2026-09-25T10:01:13.115024+00:00",
+      "curl_exit": 0,
+      "body": "{\"app\":\"density-08\",\"message\":\"density-ok\"}",
+      "error": "",
+      "http_code": 200,
+      "time_namelookup": 0.001732,
+      "time_connect": 0.023214,
+      "time_appconnect": 0.053731,
+      "time_starttransfer": 0.097411,
+      "time_total": 0.10177,
+      "http_version": "2",
+      "remote_ip": "133.18.122.133",
+      "ms": 101.77,
+      "valid": true
+    },
+    {
+      "label": "fixture-hot-33",
+      "app": "cachebench-20260925095057-08",
+      "utc": "2026-09-25T10:01:13.218701+00:00",
+      "curl_exit": 0,
+      "body": "{\"app\":\"density-08\",\"message\":\"density-ok\"}",
+      "error": "",
+      "http_code": 200,
+      "time_namelookup": 0.00181,
+      "time_connect": 0.017872,
+      "time_appconnect": 0.04302,
+      "time_starttransfer": 0.084173,
+      "time_total": 0.092917,
+      "http_version": "2",
+      "remote_ip": "133.18.122.133",
+      "ms": 92.917,
+      "valid": true
+    },
+    {
+      "label": "fixture-hot-34",
+      "app": "cachebench-20260925095057-08",
+      "utc": "2026-09-25T10:01:13.325729+00:00",
+      "curl_exit": 0,
+      "body": "{\"app\":\"density-08\",\"message\":\"density-ok\"}",
+      "error": "",
+      "http_code": 200,
+      "time_namelookup": 0.001765,
+      "time_connect": 0.021523,
+      "time_appconnect": 0.051534,
+      "time_starttransfer": 0.090987,
+      "time_total": 0.096405,
+      "http_version": "2",
+      "remote_ip": "133.18.122.133",
+      "ms": 96.405,
+      "valid": true
+    },
+    {
+      "label": "fixture-hot-35",
+      "app": "cachebench-20260925095057-08",
+      "utc": "2026-09-25T10:01:13.447980+00:00",
+      "curl_exit": 0,
+      "body": "{\"app\":\"density-08\",\"message\":\"density-ok\"}",
+      "error": "",
+      "http_code": 200,
+      "time_namelookup": 0.002631,
+      "time_connect": 0.022824,
+      "time_appconnect": 0.061395,
+      "time_starttransfer": 0.100861,
+      "time_total": 0.106863,
+      "http_version": "2",
+      "remote_ip": "133.18.122.133",
+      "ms": 106.863,
+      "valid": true
+    },
+    {
+      "label": "fixture-hot-36",
+      "app": "cachebench-20260925095057-08",
+      "utc": "2026-09-25T10:01:13.570921+00:00",
+      "curl_exit": 0,
+      "body": "{\"app\":\"density-08\",\"message\":\"density-ok\"}",
+      "error": "",
+      "http_code": 200,
+      "time_namelookup": 0.002701,
+      "time_connect": 0.022391,
+      "time_appconnect": 0.053952,
+      "time_starttransfer": 0.096989,
+      "time_total": 0.103177,
+      "http_version": "2",
+      "remote_ip": "133.18.122.133",
+      "ms": 103.177,
+      "valid": true
+    },
+    {
+      "label": "fixture-hot-37",
+      "app": "cachebench-20260925095057-08",
+      "utc": "2026-09-25T10:01:13.687811+00:00",
+      "curl_exit": 0,
+      "body": "{\"app\":\"density-08\",\"message\":\"density-ok\"}",
+      "error": "",
+      "http_code": 200,
+      "time_namelookup": 0.002243,
+      "time_connect": 0.020167,
+      "time_appconnect": 0.053576,
+      "time_starttransfer": 0.091082,
+      "time_total": 0.09659,
+      "http_version": "2",
+      "remote_ip": "133.18.122.133",
+      "ms": 96.58999999999999,
+      "valid": true
+    },
+    {
+      "label": "fixture-hot-38",
+      "app": "cachebench-20260925095057-08",
+      "utc": "2026-09-25T10:01:13.803340+00:00",
+      "curl_exit": 0,
+      "body": "{\"app\":\"density-08\",\"message\":\"density-ok\"}",
+      "error": "",
+      "http_code": 200,
+      "time_namelookup": 0.001741,
+      "time_connect": 0.020816,
+      "time_appconnect": 0.05218,
+      "time_starttransfer": 0.091495,
+      "time_total": 0.097412,
+      "http_version": "2",
+      "remote_ip": "133.18.122.133",
+      "ms": 97.41199999999999,
+      "valid": true
+    },
+    {
+      "label": "fixture-hot-39",
+      "app": "cachebench-20260925095057-08",
+      "utc": "2026-09-25T10:01:13.912730+00:00",
+      "curl_exit": 0,
+      "body": "{\"app\":\"density-08\",\"message\":\"density-ok\"}",
+      "error": "",
+      "http_code": 200,
+      "time_namelookup": 0.001904,
+      "time_connect": 0.018656,
+      "time_appconnect": 0.047422,
+      "time_starttransfer": 0.085429,
+      "time_total": 0.091053,
+      "http_version": "2",
+      "remote_ip": "133.18.122.133",
+      "ms": 91.053,
+      "valid": true
+    },
+    {
+      "label": "fixture-hot-40",
+      "app": "cachebench-20260925095057-08",
+      "utc": "2026-09-25T10:01:14.019052+00:00",
+      "curl_exit": 0,
+      "body": "{\"app\":\"density-08\",\"message\":\"density-ok\"}",
+      "error": "",
+      "http_code": 200,
+      "time_namelookup": 0.00218,
+      "time_connect": 0.01845,
+      "time_appconnect": 0.046482,
+      "time_starttransfer": 0.082666,
+      "time_total": 0.08821,
+      "http_version": "2",
+      "remote_ip": "133.18.122.133",
+      "ms": 88.21,
+      "valid": true
+    },
+    {
+      "label": "fixture-hot-41",
+      "app": "cachebench-20260925095057-08",
+      "utc": "2026-09-25T10:01:14.133234+00:00",
+      "curl_exit": 0,
+      "body": "{\"app\":\"density-08\",\"message\":\"density-ok\"}",
+      "error": "",
+      "http_code": 200,
+      "time_namelookup": 0.00348,
+      "time_connect": 0.02393,
+      "time_appconnect": 0.054069,
+      "time_starttransfer": 0.093536,
+      "time_total": 0.098375,
+      "http_version": "2",
+      "remote_ip": "133.18.122.133",
+      "ms": 98.375,
+      "valid": true
+    },
+    {
+      "label": "fixture-hot-42",
+      "app": "cachebench-20260925095057-08",
+      "utc": "2026-09-25T10:01:14.235697+00:00",
+      "curl_exit": 0,
+      "body": "{\"app\":\"density-08\",\"message\":\"density-ok\"}",
+      "error": "",
+      "http_code": 200,
+      "time_namelookup": 0.0015,
+      "time_connect": 0.017295,
+      "time_appconnect": 0.049929,
+      "time_starttransfer": 0.08719,
+      "time_total": 0.093083,
+      "http_version": "2",
+      "remote_ip": "133.18.122.133",
+      "ms": 93.083,
+      "valid": true
+    },
+    {
+      "label": "fixture-hot-43",
+      "app": "cachebench-20260925095057-08",
+      "utc": "2026-09-25T10:01:14.360905+00:00",
+      "curl_exit": 0,
+      "body": "{\"app\":\"density-08\",\"message\":\"density-ok\"}",
+      "error": "",
+      "http_code": 200,
+      "time_namelookup": 0.003591,
+      "time_connect": 0.020705,
+      "time_appconnect": 0.048408,
+      "time_starttransfer": 0.085884,
+      "time_total": 0.090271,
+      "http_version": "2",
+      "remote_ip": "133.18.122.133",
+      "ms": 90.271,
+      "valid": true
+    },
+    {
+      "label": "fixture-hot-44",
+      "app": "cachebench-20260925095057-08",
+      "utc": "2026-09-25T10:01:14.482234+00:00",
+      "curl_exit": 0,
+      "body": "{\"app\":\"density-08\",\"message\":\"density-ok\"}",
+      "error": "",
+      "http_code": 200,
+      "time_namelookup": 0.003204,
+      "time_connect": 0.02271,
+      "time_appconnect": 0.054414,
+      "time_starttransfer": 0.094789,
+      "time_total": 0.100596,
+      "http_version": "2",
+      "remote_ip": "133.18.122.133",
+      "ms": 100.596,
+      "valid": true
+    },
+    {
+      "label": "fixture-hot-45",
+      "app": "cachebench-20260925095057-08",
+      "utc": "2026-09-25T10:01:14.595730+00:00",
+      "curl_exit": 0,
+      "body": "{\"app\":\"density-08\",\"message\":\"density-ok\"}",
+      "error": "",
+      "http_code": 200,
+      "time_namelookup": 0.00179,
+      "time_connect": 0.023219,
+      "time_appconnect": 0.055402,
+      "time_starttransfer": 0.096633,
+      "time_total": 0.102216,
+      "http_version": "2",
+      "remote_ip": "133.18.122.133",
+      "ms": 102.21600000000001,
+      "valid": true
+    },
+    {
+      "label": "fixture-hot-46",
+      "app": "cachebench-20260925095057-08",
+      "utc": "2026-09-25T10:01:14.698916+00:00",
+      "curl_exit": 0,
+      "body": "{\"app\":\"density-08\",\"message\":\"density-ok\"}",
+      "error": "",
+      "http_code": 200,
+      "time_namelookup": 0.001538,
+      "time_connect": 0.018455,
+      "time_appconnect": 0.045889,
+      "time_starttransfer": 0.086466,
+      "time_total": 0.093097,
+      "http_version": "2",
+      "remote_ip": "133.18.122.133",
+      "ms": 93.097,
+      "valid": true
+    },
+    {
+      "label": "fixture-hot-47",
+      "app": "cachebench-20260925095057-08",
+      "utc": "2026-09-25T10:01:14.812139+00:00",
+      "curl_exit": 0,
+      "body": "{\"app\":\"density-08\",\"message\":\"density-ok\"}",
+      "error": "",
+      "http_code": 200,
+      "time_namelookup": 0.001876,
+      "time_connect": 0.022577,
+      "time_appconnect": 0.056278,
+      "time_starttransfer": 0.097157,
+      "time_total": 0.101591,
+      "http_version": "2",
+      "remote_ip": "133.18.122.133",
+      "ms": 101.591,
+      "valid": true
+    },
+    {
+      "label": "fixture-hot-48",
+      "app": "cachebench-20260925095057-08",
+      "utc": "2026-09-25T10:01:14.912484+00:00",
+      "curl_exit": 0,
+      "body": "{\"app\":\"density-08\",\"message\":\"density-ok\"}",
+      "error": "",
+      "http_code": 200,
+      "time_namelookup": 0.001754,
+      "time_connect": 0.018316,
+      "time_appconnect": 0.04585,
+      "time_starttransfer": 0.081937,
+      "time_total": 0.088487,
+      "http_version": "2",
+      "remote_ip": "133.18.122.133",
+      "ms": 88.487,
+      "valid": true
+    },
+    {
+      "label": "fixture-hot-49",
+      "app": "cachebench-20260925095057-08",
+      "utc": "2026-09-25T10:01:15.030320+00:00",
+      "curl_exit": 0,
+      "body": "{\"app\":\"density-08\",\"message\":\"density-ok\"}",
+      "error": "",
+      "http_code": 200,
+      "time_namelookup": 0.001736,
+      "time_connect": 0.019342,
+      "time_appconnect": 0.047045,
+      "time_starttransfer": 0.093013,
+      "time_total": 0.097537,
+      "http_version": "2",
+      "remote_ip": "133.18.122.133",
+      "ms": 97.53699999999999,
+      "valid": true
+    }
+  ],
+  "restored": true,
+  "temporary_token_deleted": true,
+  "final_probe": {
+    "label": "final",
+    "app": "hello",
+    "utc": "2026-09-25T10:02:08.645233+00:00",
+    "curl_exit": 0,
+    "body": "Hello from Hono on Hibana 🔥",
+    "error": "",
+    "http_code": 200,
+    "time_namelookup": 0.005513,
+    "time_connect": 0.024967,
+    "time_appconnect": 0.054619,
+    "time_starttransfer": 0.493643,
+    "time_total": 0.499351,
+    "http_version": "2",
+    "remote_ip": "133.18.122.133",
+    "ms": 499.351,
+    "valid": true
+  }
+}
