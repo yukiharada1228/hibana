@@ -2,6 +2,8 @@
 
 2026-09-25、KAGOYAの2GB×3台へ`0.2.0-rc.13`を自動反映しました。配布物・本番のソースは`404d057b843a2936d1cb566c0cabf7a399e90939`です。実行手順と失敗時の対応は[本番CD](production-cd.md)を参照してください。
 
+現在はGitHub Actionsが更新を開始し、完了まで待つ構成です。以下の初回反映ではVPSのtimerを使いましたが、その後に削除し、末尾のActions直接実行で置き換えを検証しています。
+
 | 確認 | 結果 |
 | --- | --- |
 | リリース対象コミットのCI | [全ジョブ成功](https://github.com/yukiharada1228/hibana/actions/runs/36132623139)。Rust・HTTP・OIDC/SAML・ブラウザ・CLI新規導入/更新・Wasm拡張・JS/Rust/Go・rollbackを含む |
@@ -25,3 +27,22 @@
 更新中の約2秒間隔のAPI readiness観測114回では、404が1回、3秒タイムアウトが1回ありました。これはアプリ全体の停止時間の測定ではありません。単一Worker構成の更新を無停止とは扱いません。また、上のキャッシュカウンター確認は速度ベンチマークではありません。応答速度の既存測定は[rc.12の検証記録](vps-production-cache-validation.md)を参照してください。
 
 秘密値・DBの中身・生のインストールログは公開リポジトリに含めていません。バックアップはDB・設定用であり、Garageの災害復旧バックアップとは別です。
+
+## GitHub Actionsからの直接実行
+
+CDの変更`8df9a3b08d3b978a86882705e7a4a1931bc267b0`をpushし、`Deploy production`を`develop`から実行しました。対象は公開済みの`v0.2.0-rc.13`です。タグ・npm・配布物を再発行せず、Actionsから同じ版を再配備しています。
+
+| 確認 | 結果 |
+| --- | --- |
+| Actions | [実行36138341235](https://github.com/yukiharada1228/hibana/actions/runs/36138341235)成功。対象SHAのCI・公開マーカー検証、VPS更新、外部疎通確認を完了 |
+| CD変更のCI | `8df9a3b`の[通常CI](https://github.com/yukiharada1228/hibana/actions/runs/36137650188)・[Security](https://github.com/yukiharada1228/hibana/actions/runs/36137649771)・[VPS IaC](https://github.com/yukiharada1228/hibana/actions/runs/36137650003)がすべて成功 |
+| 更新時間 | ActionsのVPS更新ステップは13:01:20〜13:02:26 UTC。VPSの開始記録は13:01:24、完了記録は13:02:26。約66秒はバックアップと配備・検査全体の時間であり、アプリ停止時間ではない |
+| 専用接続 | KAGOYAの`hibana-cp-actions`をCPだけに適用。TCP 2222を公開し、22番の管理元IP制限と他2台のグループを維持 |
+| 操作制限 | 専用鍵による実SSH接続で`id`の実行とポート転送を拒否。root helperの別コマンド実行拒否とsystemd終了コード7の伝播も確認 |
+| 定期実行の撤去 | `hibana-cd.timer`は`LoadState=not-found`・`ActiveState=inactive`。専用SSHサービスだけが待ち受け、更新時に一時サービスを起動 |
+| バックアップ | 708,683 bytesの暗号化DB・設定バックアップを作成。管理者Macにもコピーし、復号したarchiveに両DB dumpが存在することを確認 |
+| 本番状態 | 3ノードReady、3つのDeploymentがrc.13で各1 Pod Available。未完了の更新記録なし |
+| 公開疎通・既存データ | Actionsと管理者Macの双方からAPI・helloのHTTP 200を確認。Console・OIDC discoveryも200。helloの公開版とコンパイル結果の保護を保持 |
+| リソース | VPS追加なし。更新サービスの最大メモリ約191 MiB |
+
+今後はRelease workflowのnpm検証と公開マーカー発行に続き、同じデプロイworkflowを呼び出します。今回の実環境検証は既存リリースを指定した手動起動です。新規タグからの連続実行とは区別します。入力検証・接続先検証・失敗の伝播・成功状態の照合は専用4テストで検証し、CD本体6テスト・IaCレンダー5テスト・workflow構文検証も通過しています。
