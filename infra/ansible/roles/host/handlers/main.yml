@@ -1,0 +1,12 @@
+---
+- name: Apply sysctl
+  ansible.builtin.command: sysctl --system
+  changed_when: true
+- name: Restart containerd
+  ansible.builtin.systemd_service: {name: containerd, state: restarted}
+- name: Reload ssh
+  ansible.builtin.systemd_service: {name: ssh, state: reloaded}
+- name: Restart journald
+  ansible.builtin.systemd_service: {name: systemd-journald, state: restarted}
+- name: Reload Hibana firewall
+  ansible.builtin.systemd_service: {name: hibana-firewall, state: reloaded}

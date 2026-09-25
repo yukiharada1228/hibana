@@ -42,30 +42,7 @@ pub(crate) fn spawn_metrics_server(
     bind_addr: String,
     shutdown: CancellationToken,
 ) {
-    let prepared = Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let readiness = prepared.clone();
-    let shutdown_check = shutdown.clone();
     let metrics = worker.metrics.clone();
-    tokio::spawn(async move {
-        loop {
-            tokio::select! {
-                _ = shutdown_check.cancelled() => return,
-                result = worker.applications_prepared() => match result {
-                    Ok(true) => {
-                        readiness.store(true, std::sync::atomic::Ordering::Release);
-                        info!("active applications prepared; worker ready");
-                        return;
-                    }
-                    Ok(false) => {},
-                    Err(_) => warn!("application readiness unavailable; will retry"),
-                }
-            }
-            tokio::select! {
-                _ = shutdown_check.cancelled() => return,
-                _ = tokio::time::sleep(std::time::Duration::from_secs(1)) => {},
-            }
-        }
-    });
     tokio::spawn(async move {
         use axum::{extract::State as AxState, routing::get, Router};
 
@@ -73,17 +50,16 @@ pub(crate) fn spawn_metrics_server(
         struct ProbeState {
             metrics: Arc<metrics::Metrics>,
             shutdown: CancellationToken,
-            prepared: Arc<std::sync::atomic::AtomicBool>,
         }
 
         async fn healthz() -> axum::http::StatusCode {
             axum::http::StatusCode::OK
         }
         async fn readyz(AxState(s): AxState<ProbeState>) -> axum::http::StatusCode {
-            if s.shutdown.is_cancelled() || !s.prepared.load(std::sync::atomic::Ordering::Acquire) {
+            if s.shutdown.is_cancelled() {
                 return axum::http::StatusCode::SERVICE_UNAVAILABLE;
             }
-            // Once warm, overload/dependency failures do not remove the entire
+            // Cache residency and overload do not remove the entire
             // fleet from discovery. Draining still withdraws this Worker.
             axum::http::StatusCode::OK
         }
@@ -98,11 +74,7 @@ pub(crate) fn spawn_metrics_server(
             .route("/healthz", get(healthz))
             .route("/readyz", get(readyz))
             .route("/metrics", get(metrics_handler))
-            .with_state(ProbeState {
-                metrics,
-                shutdown,
-                prepared,
-            });
+            .with_state(ProbeState { metrics, shutdown });
 
         let listener = match tokio::net::TcpListener::bind(&bind_addr).await {
             Ok(l) => l,

@@ -1,0 +1,128 @@
+---
+- name: Prepare the three dedicated Ubuntu nodes
+  hosts: all
+  become: true
+  any_errors_fatal: true
+  pre_tasks:
+    - name: Check the supported topology and operator access
+      ansible.builtin.assert:
+        that:
+          - groups['all'] | length == 3
+          - groups['control_plane'] | length == 1
+          - groups['management'] | length == 1
+          - groups['execution'] | length == 1
+          - (groups['control_plane'] + groups['management'] + groups['execution']) | unique | length == 3
+          - ansible_facts.distribution == 'Ubuntu'
+          - ansible_facts.distribution_version == '24.04'
+          - node_ip in ansible_facts.all_ipv4_addresses
+          - ssh_source_cidrs | length > 0
+          - "'0.0.0.0/0' not in ssh_source_cidrs"
+          - ansible_facts.processor_vcpus >= 2
+          - ansible_facts.memtotal_mb >= 1800
+        fail_msg: Requires three dedicated Ubuntu 24.04 nodes, configured private IPs and explicit SSH source CIDRs.
+    - name: Check that this is not an unmanaged existing cluster
+      ansible.builtin.stat:
+        path: /etc/kubernetes/kubelet.conf
+      register: existing_kubelet
+    - name: Read ownership marker
+      ansible.builtin.stat:
+        path: /etc/hibana-iac-node
+      register: ownership
+    - name: Refuse to adopt another cluster
+      ansible.builtin.assert:
+        that: not existing_kubelet.stat.exists or ownership.stat.exists
+  roles:
+    - host
+    - kubernetes
+
+- name: Initialize the single Kubernetes control plane
+  hosts: control_plane
+  become: true
+  tasks:
+    - name: Write kubeadm configuration
+      ansible.builtin.template:
+        src: roles/kubernetes/templates/kubeadm.yaml.j2
+        dest: /etc/kubernetes/hibana-init.yaml
+        mode: '0600'
+    - name: Initialize once; never reset an existing cluster
+      ansible.builtin.command: kubeadm init --config /etc/kubernetes/hibana-init.yaml
+      args:
+        creates: /etc/kubernetes/admin.conf
+      no_log: true
+    - name: Create a short lived join token only for missing workers
+      ansible.builtin.command: kubeadm token create --ttl 15m --print-join-command
+      register: join_command
+      changed_when: false
+      no_log: true
+      when: >-
+        groups['workers'] | map('extract', hostvars, 'existing_kubelet') |
+        selectattr('stat.exists', 'equalto', false) | list | length > 0
+
+- name: Join worker nodes
+  hosts: workers
+  become: true
+  tasks:
+    - name: Join once using the private address
+      ansible.builtin.command:
+        cmd: "{{ hostvars[groups['control_plane'][0]].join_command.stdout }} --node-name {{ inventory_hostname }}"
+        creates: /etc/kubernetes/kubelet.conf
+      when: not existing_kubelet.stat.exists
+      no_log: true
+
+- name: Install the policy enforcing Pod network
+  hosts: control_plane
+  become: true
+  tasks:
+    - name: Download pinned Calico manifest
+      ansible.builtin.get_url:
+        url: https://raw.githubusercontent.com/projectcalico/calico/v3.32.2/manifests/calico.yaml
+        checksum: sha256:a8c828a06a87c629a282ebbc424895b77f3a030251993e41ea400a743675bb02
+        dest: /etc/kubernetes/calico-upstream.yaml
+        mode: '0644'
+    - name: Copy network configuration helper
+      ansible.builtin.copy:
+        src: ../calico.py
+        dest: /etc/kubernetes/calico.py
+        mode: '0644'
+    - name: Render VXLAN network on the private node addresses
+      ansible.builtin.command:
+        argv: [python3, /etc/kubernetes/calico.py, /etc/kubernetes/calico-upstream.yaml, /etc/kubernetes/calico.yaml, "{{ pod_cidr }}", "{{ node_ip }}"]
+      register: network_render
+      changed_when: "'changed' in network_render.stdout"
+    - name: Check for Calico changes
+      ansible.builtin.command: kubectl --kubeconfig /etc/kubernetes/admin.conf diff --server-side -f /etc/kubernetes/calico.yaml
+      register: network_diff
+      changed_when: false
+      failed_when: network_diff.rc not in [0, 1]
+    - name: Apply Calico
+      ansible.builtin.command: kubectl --kubeconfig /etc/kubernetes/admin.conf apply --server-side -f /etc/kubernetes/calico.yaml
+      register: network_apply
+      changed_when: true
+      when: network_diff.rc == 1
+    - name: Wait for all nodes
+      ansible.builtin.command: kubectl --kubeconfig /etc/kubernetes/admin.conf wait nodes --all --for=condition=Ready --timeout=300s
+      changed_when: false
+    - name: Wait for CNI and DNS to become ready
+      ansible.builtin.command: "kubectl --kubeconfig /etc/kubernetes/admin.conf -n kube-system rollout status {{ item }} --timeout=300s"
+      loop: [daemonset/calico-node, deployment/calico-kube-controllers, deployment/coredns]
+      changed_when: false
+    - name: Read placement labels
+      ansible.builtin.command: kubectl --kubeconfig /etc/kubernetes/admin.conf get nodes -o json
+      register: node_labels
+      changed_when: false
+    - name: Assign placement labels
+      ansible.builtin.command:
+        argv: [kubectl, --kubeconfig, /etc/kubernetes/admin.conf, label, node, "{{ item.host }}", "hibana.io/role={{ item.role }}", --overwrite]
+      loop:
+        - {host: "{{ groups['management'][0] }}", role: management}
+        - {host: "{{ groups['execution'][0] }}", role: execution}
+      when: (node_labels.stdout | from_json)['items'] | selectattr('metadata.name', 'equalto', item.host) | map(attribute='metadata.labels') | map('dict2items') | flatten | selectattr('key', 'equalto', 'hibana.io/role') | selectattr('value', 'equalto', item.role) | list | length == 0
+      register: labels
+      changed_when: "'not labeled' not in labels.stdout"
+    - name: Read current CoreDNS replica count
+      ansible.builtin.command: kubectl --kubeconfig /etc/kubernetes/admin.conf -n kube-system get deployment coredns -o jsonpath={.spec.replicas}
+      register: coredns_count
+      changed_when: false
+    - name: Use one CoreDNS replica for this non HA installation
+      ansible.builtin.command: kubectl --kubeconfig /etc/kubernetes/admin.conf -n kube-system scale deployment coredns --replicas=1
+      when: coredns_count.stdout != '1'

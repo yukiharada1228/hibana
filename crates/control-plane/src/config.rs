@@ -25,6 +25,7 @@ const DEFAULT_METRICS_INCLUDE_TENANT_LABEL: bool = true;
 const SECRETS_MASTER_KEY_PLACEHOLDER: &str = "CHANGE_ME_REPLACE_WITH_32_BYTE_KEY_BEFORE_USE";
 
 pub struct Config {
+    pub compiled_cache_auth: Option<hibana_shared::compiled_cache::Auth>,
     pub auth: crate::oidc::config::OidcConfig,
     pub database_url: String,
     pub migration_database_url: String,
@@ -144,6 +145,8 @@ impl Config {
             "INGRESS_BASE_DOMAIN was removed; configure APP_PUBLIC_ORIGIN"
         );
         let cfg = Self {
+            compiled_cache_auth: hibana_shared::compiled_cache::Auth::from_env()
+                .map_err(anyhow::Error::msg)?,
             auth: crate::oidc::config::OidcConfig::from_env()?,
             database_url,
             migration_database_url,

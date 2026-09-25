@@ -72,7 +72,7 @@ Secret名と現在のvarsの衝突は、キーの存在確認だけで判定し�
 
 ## 実行履歴の保存期間
 
-以下は`0.2.0-rc.10`以降の仕様です。rc.9以前には履歴行の自動削除は含まれません。追加のDBマイグレーションは不要で、既存の完了時刻の索引を使用します。
+以下は`0.2.0-rc.11`以降の仕様です。rc.9以前には履歴行の自動削除は含まれません。追加のDBマイグレーションは不要で、既存の完了時刻の索引を使用します。
 
 Control Planeの`EXECUTION_RETENTION_DAYS`で、完了済み実行の保存期間を設定します。既定は`30`（30×24時間）、指定できる範囲は`0..3650`です。`0`は履歴行の自動削除を無効にします。不正な値では起動を拒否します。アプリの`hibana.json`ではなく、基盤の環境変数または`hibana-config` ConfigMapで指定し、全Control Planeを同じ値に揃えて再起動してください。
 
@@ -88,7 +88,7 @@ Control Planeの`EXECUTION_RETENTION_DAYS`で、完了済み実行の保存期�
 
 ## 空DBでの検証
 
-`0.2.0-rc.7`〜`0.2.0-rc.10`は`m20260923_000013_application_logs`まで適用します（rc.5・rc.6は`m20260922_000012_version_publication`まで）。`m20260922_000009_oidc_profile`は表示メールの一意制約を外します。`m20260922_000010_management_scopes`はトークンの旧`invoke`スコープだけを取り除き、DB制約を`read`・`deploy`・`admin`に限定します。行・有効な権限・期限・失効状態を保持します。削除した旧スコープは復元できないためdownは拒否します。
+`0.2.0-rc.7`〜`0.2.0-rc.11`は`m20260923_000013_application_logs`まで適用します（rc.5・rc.6は`m20260922_000012_version_publication`まで）。`m20260922_000009_oidc_profile`は表示メールの一意制約を外します。`m20260922_000010_management_scopes`はトークンの旧`invoke`スコープだけを取り除き、DB制約を`read`・`deploy`・`admin`に限定します。行・有効な権限・期限・失効状態を保持します。削除した旧スコープは復元できないためdownは拒否します。
 
 `m20260922_000012_version_publication`は、常に同じ値を保存していた`component_versions.status`を削除します。versionは検証・保存・Workerの準備が完了してから登録し、公開先と切り戻し先は`components.active_version_id`・`previous_active_version_id`だけで管理します。既存の公開先・成果物・設定・削除履歴を保持します。旧版は削除列を参照するため、Control Plane・Worker・Consoleを揃えて更新してください。この移行のdownは拒否します。
 

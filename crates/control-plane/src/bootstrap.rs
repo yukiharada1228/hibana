@@ -68,7 +68,8 @@ pub(crate) async fn run() -> anyhow::Result<()> {
         &config.s3_bucket,
         &config.s3_access_key,
         config.s3_secret_key_plain(),
-    );
+    )
+    .with_compiled_cache(config.compiled_cache_auth.clone());
     tracing::info!(endpoint = %config.s3_endpoint, bucket = %config.s3_bucket, "configured object storage");
 
     let seed = signing::decode_seed(config.job_signing_key_plain())?;
@@ -160,7 +161,6 @@ pub(crate) async fn run() -> anyhow::Result<()> {
         })
     };
 
-    crate::preparation::spawn(state.clone());
     crate::artifact_reservations::spawn(state.clone());
 
     // --- ルータ ---

@@ -42,7 +42,24 @@ class StartupTests(unittest.TestCase):
         for name in ["sdk.env", "secrets.json"]:
             self.assertEqual((self.cluster.state / name).stat().st_mode & 0o777, 0o600)
         runtime = next(item for item in first["items"] if item["metadata"]["name"] == "hibana-runtime")
-        self.assertEqual(set(runtime["stringData"]), {"DATABASE_URL"})
+        self.assertEqual(set(runtime["stringData"]), {"DATABASE_URL", "COMPILED_CACHE_KEY"})
+
+    def test_cache_key_upgrade_preserves_existing_credentials_and_preview_is_read_only(self):
+        stored = self.cluster.credentials()
+        runtime = next(item["stringData"] for item in stored["items"]
+                       if item["metadata"]["name"] == "hibana-runtime")
+        expected = runtime.pop("COMPILED_CACHE_KEY")
+        target = self.cluster.state / "secrets.json"
+        target.write_text(json.dumps(stored))
+        before = target.read_bytes()
+        sdk = (self.cluster.state / "sdk.env").read_bytes()
+        self.cluster.credential_settings()
+        self.assertEqual(target.read_bytes(), before)
+        upgraded = self.cluster.credentials()
+        runtime["COMPILED_CACHE_KEY"] = expected
+        self.assertEqual(upgraded, stored)
+        self.assertEqual(self.cluster.credentials(), upgraded)
+        self.assertEqual((self.cluster.state / "sdk.env").read_bytes(), sdk)
 
     def test_partial_credentials_are_not_replaced(self):
         target = self.cluster.state / "secrets.json"

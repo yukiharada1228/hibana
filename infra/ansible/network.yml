@@ -1,0 +1,65 @@
+---
+- name: Configure the dedicated VPS private interfaces
+  hosts: all
+  become: true
+  any_errors_fatal: true
+  tasks:
+    - name: Validate the explicitly selected private interface
+      ansible.builtin.assert:
+        that:
+          - groups['all'] | length == 3
+          - ansible_facts.distribution == 'Ubuntu'
+          - ansible_facts.distribution_version == '24.04'
+          - private_interface is defined
+          - private_interface in ansible_facts.interfaces
+          - private_interface != ansible_facts.default_ipv4.interface
+          - ansible_facts[private_interface].ipv4 is not defined or ansible_facts[private_interface].ipv4.address == node_ip
+          - ansible_facts[private_interface].ipv4_secondaries | default([]) | length == 0
+        fail_msg: Select the unused private NIC explicitly; this playbook never replaces the public interface configuration.
+    - name: Validate the private IPv4 subnet
+      ansible.builtin.command:
+        argv:
+          - python3
+          - -c
+          - |
+            import ipaddress, sys
+            address = ipaddress.ip_interface(sys.argv[1])
+            ranges = [ipaddress.ip_network(n) for n in ('10.0.0.0/8', '172.16.0.0/12', '192.168.0.0/16')]
+            assert address.version == 4 and any(address.network.subnet_of(n) for n in ranges)
+            assert address.ip not in (address.network.network_address, address.network.broadcast_address)
+          - "{{ node_ip }}/{{ private_prefix_length | default(24) }}"
+      changed_when: false
+    - name: Write the isolated private LAN configuration
+      ansible.builtin.copy:
+        dest: /etc/netplan/90-hibana-private.yaml
+        mode: '0600'
+        content: |
+          network:
+            version: 2
+            ethernets:
+              {{ private_interface }}:
+                match:
+                  macaddress: "{{ ansible_facts[private_interface].macaddress }}"
+                addresses: ["{{ node_ip }}/{{ private_prefix_length | default(24) }}"]
+                dhcp4: false
+                dhcp6: false
+                accept-ra: false
+                link-local: []
+                optional: true
+      register: private_network
+    - name: Validate netplan before applying it
+      ansible.builtin.command: netplan generate
+      changed_when: false
+      when: private_network.changed
+    - name: Apply private LAN without adding a default route
+      ansible.builtin.command: netplan apply
+      when: private_network.changed
+      changed_when: true
+    - name: Read back the private interface address
+      ansible.builtin.command:
+        argv: [ip, -json, -4, address, show, dev, "{{ private_interface }}"]
+      register: private_address
+      changed_when: false
+    - name: Require the requested address
+      ansible.builtin.assert:
+        that: node_ip in ((private_address.stdout | from_json)[0].addr_info | map(attribute='local') | list)

@@ -32,36 +32,79 @@ async fn invoke(State(state): State<HttpState>, headers: HeaderMap) -> Response 
     };
     // Redeem against a fixed CP endpoint. No URL, source, tenant or resource limit
     // supplied in the HTTP body is trusted. Invalid/replayed tokens never run a guest.
-    let job = match state.worker.control_plane.redeem(token).await {
+    let mut job = match state.worker.control_plane.redeem(token).await {
         Ok(job) => job,
         Err(status) => return status.into_response(),
     };
     let redeemed = std::time::Instant::now();
-    let resolved = match state.worker.resolve_job(&job).await {
+    let mut resolved = match state.worker.resolve_job(&job).await {
         Ok(resolved) => resolved,
         Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
     };
     let resolved_at = std::time::Instant::now();
-    // Keep the Arc through execution. Eviction after this check cannot trigger a
-    // compile or lose the prepared code. A cold Worker never claims the execution.
-    let component = match state
-        .worker
-        .artifacts
-        .cached_component(&job.wasm_sha256, true)
-    {
+    // The request owns its code before claiming the DB row. Loading/eviction
+    // never replays a guest, and removal from either cache cannot interrupt it.
+    let component = match state.worker.artifacts.cached_component(&job.wasm_sha256) {
         Ok(Some(component)) => component,
         _ => {
-            return (
-                StatusCode::SERVICE_UNAVAILABLE,
-                [
-                    (hibana_shared::http::WORKER_REJECTED_HEADER, "not_prepared"),
-                    ("retry-after", "1"),
-                ],
-                "Application is preparing on this Worker",
-            )
-                .into_response()
+            let load = async {
+                let authorized = state
+                    .worker
+                    .control_plane
+                    .execution_artifact(token, state.worker.artifacts.runtime_id())
+                    .await?;
+                let artifact = authorized.artifact;
+                if !artifact.sha256.eq_ignore_ascii_case(&job.wasm_sha256) {
+                    return Err(StatusCode::UNAUTHORIZED);
+                }
+                let preparation = axum::http::HeaderValue::from_str(&authorized.token)
+                    .map_err(|_| StatusCode::BAD_GATEWAY)?;
+                state
+                    .worker
+                    .artifacts
+                    .restore(
+                        &artifact.sha256,
+                        &artifact.url,
+                        Some((artifact.compiled_url.as_deref(), &preparation)),
+                    )
+                    .await
+                    .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)
+            };
+            let restored = tokio::select! {
+                _ = state.shutdown.cancelled() => return reject_capacity(&state.worker, "draining"),
+                result = tokio::time::timeout(std::time::Duration::from_secs(85), load) => result,
+            };
+            let component = match restored {
+                Ok(Ok(component)) => component,
+                _ => {
+                    return (
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        [
+                            (hibana_shared::http::WORKER_REJECTED_HEADER, "not_prepared"),
+                            ("retry-after", "1"),
+                        ],
+                        "Application code temporarily unavailable",
+                    )
+                        .into_response()
+                }
+            };
+            // Cold preparation can take longer than an execution token's TTL.
+            // Renew from the original dispatch token and recheck live permissions.
+            job = match state.worker.control_plane.redeem(token).await {
+                Ok(job) => job,
+                Err(status) => return status.into_response(),
+            };
+            resolved = match state.worker.resolve_job(&job).await {
+                Ok(resolved) => resolved,
+                Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
+            };
+            tracing::debug!(sha256 = %job.wasm_sha256, elapsed_ms = resolved_at.elapsed().as_millis() as u64, "artifact restored for invocation");
+            component
         }
     };
+    if state.shutdown.is_cancelled() {
+        return reject_capacity(&state.worker, "draining");
+    }
     let Some(memory) = state
         .worker
         .memory_budget
@@ -119,18 +162,19 @@ async fn prepare(
     let Some(token) = headers.get(hibana_shared::preparation::TOKEN_HEADER) else {
         return StatusCode::UNAUTHORIZED.into_response();
     };
-    let artifact = match state.worker.control_plane.redeem_artifact(token).await {
+    let artifact = match state
+        .worker
+        .control_plane
+        .redeem_artifact(token, state.worker.artifacts.runtime_id())
+        .await
+    {
         Ok(artifact) => artifact,
         Err(status) => return status.into_response(),
     };
     if method == axum::http::Method::HEAD {
-        return match state
-            .worker
-            .artifacts
-            .cached_component(&artifact.sha256, false)
-        {
-            Ok(Some(_)) => StatusCode::NO_CONTENT,
-            Ok(None) => StatusCode::SERVICE_UNAVAILABLE,
+        return match state.worker.artifacts.is_prepared(&artifact.sha256) {
+            Ok(true) => StatusCode::NO_CONTENT,
+            Ok(false) => StatusCode::SERVICE_UNAVAILABLE,
             Err(_) => StatusCode::UNPROCESSABLE_ENTITY,
         }
         .into_response();
@@ -139,7 +183,11 @@ async fn prepare(
     match state
         .worker
         .artifacts
-        .prepare(&artifact.sha256, &artifact.url)
+        .prepare(
+            &artifact.sha256,
+            &artifact.url,
+            Some((artifact.compiled_url.as_deref(), token)),
+        )
         .await
     {
         Ok(_) => {

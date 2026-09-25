@@ -1,0 +1,5 @@
+# Keep site inventories and private rendered manifests under ../.local/.
+*.vault.yml
+*.env
+*.pem
+*.key

@@ -7,7 +7,7 @@ Hibana用Keycloakを専用namespace `hibana-identity`へ配備する、検証環
 この機能は`0.2.0-rc.6`から含まれます。公開後はNode.js 24以上で次を実行します。
 
 ```sh
-npx --yes @yukiharada1228/hibana@0.2.0-rc.10 platform init my-site --with-keycloak
+npx --yes @yukiharada1228/hibana@0.2.0-rc.11 platform init my-site --with-keycloak
 ```
 
 チェックアウトから実行する場合は次を使います。

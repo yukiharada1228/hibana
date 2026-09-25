@@ -1,0 +1,315 @@
+{
+  "date": "2026-09-25",
+  "environment": {
+    "nodes": 3,
+    "cpu_per_node": 2,
+    "memory_per_node_bytes": 2147483648,
+    "architecture": "arm64",
+    "swap": false,
+    "kubernetes": "1.36.5",
+    "worker_replicas": 1,
+    "worker_memory_limit_mib": 1280,
+    "worker_cpu_limit": 2,
+    "image": "hibana-platform:shared-cache-20260925",
+    "image_index": "sha256:1809237a0eb18ed122c239c793b538f7191801c3cd5578ef65d05c8b2a34e692",
+    "storage": "Garage, existing bucket"
+  },
+  "artifact": {
+    "sha256": "19614ebf3ea9ce35ff698b7cd83929fb39ab25967d242dbd0a6889bfef3820d0",
+    "compiled_bytes": 54466512
+  },
+  "scope": "Each replacement has a new Pod UID and empty emptyDir. Images, OS caches, control plane, database and Garage remain warm. Single hello app, not a throughput or production VPS benchmark.",
+  "shared_cache_budget": {
+    "bytes": 2147483648,
+    "entries": 256,
+    "max_object_bytes": 134217760
+  },
+  "pod_replacements": [
+    {
+      "label": "first_compile",
+      "pod_uid": "75f3f7f9-abd2-4537-84bc-65f63a52196a",
+      "replacement_to_first_success_s": 27.189162680999985,
+      "container_started_to_kubernetes_ready_s": 25.0,
+      "preparation_ms": null,
+      "metrics": {
+        "hibana_worker_active_compilations": 0.0,
+        "hibana_worker_shared_cache_total{outcome=\"miss\"}": 1.0,
+        "hibana_worker_shared_cache_total{outcome=\"stored\"}": 1.0,
+        "wasmtime_component_cache_hits_total{tier=\"cwasm\"}": 1.0,
+        "wasmtime_component_cache_misses_total": 1.0
+      },
+      "first_http_ms": 153.22654100000932,
+      "warm_http_ms": [
+        73.82797300002153,
+        17.68323800001781,
+        14.692964000005304,
+        15.567048000008299,
+        13.812174000008781,
+        13.189578000009305,
+        14.22057100000984,
+        11.393831000020782,
+        11.073595999988584,
+        12.7750560000095
+      ],
+      "warm_http_p50_ms": 14.016372500009311,
+      "all_sampled_http_200_and_expected_body": true,
+      "sampled_peak_cgroup_bytes": 291467264,
+      "minimum_node_available_bytes": 1297629184,
+      "oom_kills": 0,
+      "container_restarts": 0,
+      "preparation_log": null,
+      "startup_logs": null
+    },
+    {
+      "label": "shared_restore_1",
+      "pod_uid": "75376314-d7b6-4c65-a29f-fbc91a5791c7",
+      "replacement_to_first_success_s": 30.712376596000013,
+      "container_started_to_kubernetes_ready_s": 26.0,
+      "preparation_ms": null,
+      "metrics": {
+        "hibana_worker_active_compilations": 0.0,
+        "hibana_worker_shared_cache_total{outcome=\"hit\"}": 1.0,
+        "wasmtime_component_cache_hits_total{tier=\"cwasm\"}": 1.0,
+        "wasmtime_component_cache_misses_total": 0.0
+      },
+      "first_http_ms": 76.85812200000441,
+      "warm_http_ms": [
+        95.50531899998305,
+        21.61543500000107,
+        29.039602000011655,
+        19.25650100000098,
+        27.316232999993417,
+        26.521296999987953,
+        40.10641600001463,
+        12.08770200000231,
+        11.847375999991527,
+        16.09575700001642
+      ],
+      "warm_http_p50_ms": 24.068365999994512,
+      "all_sampled_http_200_and_expected_body": true,
+      "sampled_peak_cgroup_bytes": 61022208,
+      "minimum_node_available_bytes": 1481863168,
+      "oom_kills": 0,
+      "container_restarts": 0,
+      "preparation_log": null,
+      "startup_logs": null
+    },
+    {
+      "label": "shared_restore_2",
+      "pod_uid": "48187dcd-d7f7-47ce-931e-d9c4fd786f2e",
+      "replacement_to_first_success_s": 30.85475765199999,
+      "container_started_to_kubernetes_ready_s": 30.0,
+      "preparation_ms": null,
+      "metrics": {
+        "hibana_worker_active_compilations": 0.0,
+        "hibana_worker_shared_cache_total{outcome=\"hit\"}": 1.0,
+        "wasmtime_component_cache_hits_total{tier=\"cwasm\"}": 1.0,
+        "wasmtime_component_cache_misses_total": 0.0
+      },
+      "first_http_ms": 74.3830330000037,
+      "warm_http_ms": [
+        35.651625000014064,
+        16.21503399999824,
+        26.906517000014674,
+        22.388737999989416,
+        18.855603000019983,
+        12.800106000014466,
+        10.77406499999256,
+        13.405468000001974,
+        11.800918999995247,
+        10.515779000002112
+      ],
+      "warm_http_p50_ms": 14.810251000000108,
+      "all_sampled_http_200_and_expected_body": true,
+      "sampled_peak_cgroup_bytes": 61022208,
+      "minimum_node_available_bytes": 1457577984,
+      "oom_kills": 0,
+      "container_restarts": 0,
+      "preparation_log": null,
+      "startup_logs": null
+    },
+    {
+      "label": "shared_restore_3",
+      "pod_uid": "92bc06e6-2d05-4eee-b9ec-647dfb6fc4f0",
+      "replacement_to_first_success_s": 32.014204146,
+      "container_started_to_kubernetes_ready_s": 30.0,
+      "preparation_ms": null,
+      "metrics": {
+        "hibana_worker_active_compilations": 0.0,
+        "hibana_worker_shared_cache_total{outcome=\"hit\"}": 1.0,
+        "wasmtime_component_cache_hits_total{tier=\"cwasm\"}": 1.0,
+        "wasmtime_component_cache_misses_total": 0.0
+      },
+      "first_http_ms": 63.39593799998511,
+      "warm_http_ms": [
+        42.08342600000492,
+        18.553660999998556,
+        18.47077400000785,
+        14.954187999990154,
+        11.761694000000489,
+        10.793794999983675,
+        18.52419900001223,
+        12.046447000017224,
+        12.937585000003082,
+        10.462035000017522
+      ],
+      "warm_http_p50_ms": 13.945886499996618,
+      "all_sampled_http_200_and_expected_body": true,
+      "sampled_peak_cgroup_bytes": 61579264,
+      "minimum_node_available_bytes": 1498443776,
+      "oom_kills": 0,
+      "container_restarts": 0,
+      "preparation_log": null,
+      "startup_logs": null
+    }
+  ],
+  "preparation_comparison": [
+    {
+      "label": "shared_disabled",
+      "pod_uid": "c507d829-2a72-454f-9eb2-17eb1aad7fb4",
+      "replacement_to_first_success_s": 12.891460340000037,
+      "container_started_to_kubernetes_ready_s": 12.0,
+      "preparation_ms": 8310,
+      "metrics": {
+        "hibana_worker_active_compilations": 0.0,
+        "wasmtime_component_cache_hits_total{tier=\"cwasm\"}": 1.0,
+        "wasmtime_component_cache_misses_total": 1.0
+      },
+      "first_http_ms": 71.62553699998853,
+      "warm_http_ms": [
+        53.96559600001183,
+        16.52694300003077,
+        13.817157000005409,
+        15.625652999972317,
+        14.733157000023311,
+        12.24797499997976,
+        10.89993699997649,
+        9.803297000019029,
+        9.631780999995954,
+        9.699913000019933
+      ],
+      "warm_http_p50_ms": 13.032565999992585,
+      "all_sampled_http_200_and_expected_body": true,
+      "sampled_peak_cgroup_bytes": 320970752,
+      "minimum_node_available_bytes": 1237798912,
+      "oom_kills": 0,
+      "container_restarts": 0,
+      "preparation_log": {
+        "timestamp": "2026-09-25T04:53:34.086667Z",
+        "level": "DEBUG",
+        "message": "artifact prepared",
+        "sha256": "19614ebf3ea9ce35ff698b7cd83929fb39ab25967d242dbd0a6889bfef3820d0",
+        "elapsed_ms": 8310,
+        "target": "hibana_worker::direct_http"
+      },
+      "startup_logs": [
+        {
+          "timestamp": "2026-09-25T04:53:24.603433Z",
+          "level": "INFO",
+          "message": "HTTP worker started",
+          "target": "hibana_worker"
+        },
+        {
+          "timestamp": "2026-09-25T04:53:25.776021Z",
+          "level": "INFO",
+          "message": "component cache: miss; downloading and precompiling",
+          "sha": "19614ebf3ea9ce35ff698b7cd83929fb39ab25967d242dbd0a6889bfef3820d0",
+          "target": "hibana_worker::artifacts"
+        },
+        {
+          "timestamp": "2026-09-25T04:53:34.671018Z",
+          "level": "INFO",
+          "message": "active applications prepared; worker ready",
+          "target": "hibana_worker::lifecycle"
+        }
+      ]
+    },
+    {
+      "label": "shared_enabled",
+      "pod_uid": "04a50450-4525-42bd-b493-6356540501fd",
+      "replacement_to_first_success_s": 26.43600233799998,
+      "container_started_to_kubernetes_ready_s": 25.0,
+      "preparation_ms": 515,
+      "metrics": {
+        "hibana_worker_active_compilations": 0.0,
+        "hibana_worker_shared_cache_total{outcome=\"hit\"}": 1.0,
+        "wasmtime_component_cache_hits_total{tier=\"cwasm\"}": 1.0,
+        "wasmtime_component_cache_misses_total": 0.0
+      },
+      "first_http_ms": 95.29647700003352,
+      "warm_http_ms": [
+        62.3708210000018,
+        16.357919000029142,
+        12.614364000000933,
+        11.844594000024244,
+        13.155085999983385,
+        21.163666000006742,
+        15.145595000035428,
+        14.503120999961538,
+        19.3512860000169,
+        16.79063699998551
+      ],
+      "warm_http_p50_ms": 15.751757000032285,
+      "all_sampled_http_200_and_expected_body": true,
+      "sampled_peak_cgroup_bytes": 61190144,
+      "minimum_node_available_bytes": 1432829952,
+      "oom_kills": 0,
+      "container_restarts": 0,
+      "preparation_log": {
+        "timestamp": "2026-09-25T04:55:07.366271Z",
+        "level": "DEBUG",
+        "message": "artifact prepared",
+        "sha256": "19614ebf3ea9ce35ff698b7cd83929fb39ab25967d242dbd0a6889bfef3820d0",
+        "elapsed_ms": 515,
+        "target": "hibana_worker::direct_http"
+      },
+      "startup_logs": [
+        {
+          "timestamp": "2026-09-25T04:54:47.415370Z",
+          "level": "INFO",
+          "message": "HTTP worker started",
+          "target": "hibana_worker"
+        },
+        {
+          "timestamp": "2026-09-25T04:55:07.162368Z",
+          "level": "DEBUG",
+          "message": "shared compiled cache",
+          "outcome": "hit",
+          "target": "hibana_worker::shared_cache"
+        },
+        {
+          "timestamp": "2026-09-25T04:55:07.549311Z",
+          "level": "INFO",
+          "message": "active applications prepared; worker ready",
+          "target": "hibana_worker::lifecycle"
+        }
+      ]
+    }
+  ],
+  "sampling_interval_s": 1,
+  "cleanup": {
+    "lab_deployment_specs_restored": true,
+    "hello_ok": true,
+    "runtime_key_restored": true,
+    "disposable_shared_cache_retained_bytes": 54466544,
+    "local_environments": [
+      {
+        "cluster": "hibana-dev",
+        "restored": true,
+        "node_ids_and_specs_unchanged": true
+      },
+      {
+        "cluster": "hibana-console",
+        "restored": true,
+        "node_ids_and_specs_unchanged": true
+      }
+    ],
+    "api_console_oidc_verified": true
+  },
+  "notes": [
+    "Preparation comparison is one sample per mode, and excludes discovery and Kubernetes readiness delays.",
+    "Shared mode still had a roughly 19-second delay before preparation began; whole-Pod recovery did not improve in these trials.",
+    "Initial profiling assertion incorrectly assumed only one preparation log; periodic cache checks also emit logs. Shared mode was remeasured using the first preparation record.",
+    "Sampled memory peaks can miss allocations shorter than one second."
+  ]
+}

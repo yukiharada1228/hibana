@@ -1,0 +1,259 @@
+{
+  "date": "2026-09-25",
+  "scope": "Local ARM64 kubeadm experiment; production was not changed",
+  "image": "hibana-platform:demand-cache-20260925",
+  "image_index_sha256": "55658aa301e13431a02c5ea92be0c987d9ec6bdef0b6d952517c5ddbaf1a9e07",
+  "environment": {
+    "nodes": 3,
+    "vcpu_per_node": 2,
+    "memory_mib_per_node": 2048,
+    "kubernetes": "1.36.5",
+    "swap": false,
+    "worker_replicas": 1,
+    "worker_memory_request_mib": 768,
+    "worker_memory_limit_mib": 1280,
+    "worker_guest_budget_mib": 1024,
+    "worker_max_concurrency": 8,
+    "disk_cache_budget_mib": 128
+  },
+  "applications": 8,
+  "native_bytes_per_app": 54466512,
+  "max_named_disk_bytes": 108933024,
+  "deployments": [
+    {
+      "deployment": "demand-01",
+      "seconds": 10.560888360000007,
+      "files": [
+        {
+          "sha256": "0a08794ade2ce50ab765bf83af5a5809d5262cc613a32ba24b0536b8b18c8ab3",
+          "bytes": 54466512
+        }
+      ]
+    },
+    {
+      "deployment": "demand-02",
+      "seconds": 11.992352576999991,
+      "files": [
+        {
+          "sha256": "0a08794ade2ce50ab765bf83af5a5809d5262cc613a32ba24b0536b8b18c8ab3",
+          "bytes": 54466512
+        },
+        {
+          "sha256": "63a737c05fb17df474dc646427ba238f271c59089f1740ad35464e4fb0a07afc",
+          "bytes": 54466512
+        }
+      ]
+    },
+    {
+      "deployment": "demand-03",
+      "seconds": 11.173002797999999,
+      "files": [
+        {
+          "sha256": "63a737c05fb17df474dc646427ba238f271c59089f1740ad35464e4fb0a07afc",
+          "bytes": 54466512
+        },
+        {
+          "sha256": "da33e99f224a96b32d7166e71598ab0ce4fa485da57ac57e4cb5079d21f4b915",
+          "bytes": 54466512
+        }
+      ]
+    },
+    {
+      "deployment": "demand-04",
+      "seconds": 10.813521127000001,
+      "files": [
+        {
+          "sha256": "06c0c2a2c85a711328b2375bfcd08ba7fb7196b5c435626abeff70e98d18e6f6",
+          "bytes": 54466512
+        },
+        {
+          "sha256": "da33e99f224a96b32d7166e71598ab0ce4fa485da57ac57e4cb5079d21f4b915",
+          "bytes": 54466512
+        }
+      ]
+    },
+    {
+      "deployment": "demand-05",
+      "seconds": 9.281680184999999,
+      "files": [
+        {
+          "sha256": "06c0c2a2c85a711328b2375bfcd08ba7fb7196b5c435626abeff70e98d18e6f6",
+          "bytes": 54466512
+        },
+        {
+          "sha256": "31a62c3491378b56b5c0b18603eaf8ca55ce772dc477de963364a683e30eacf2",
+          "bytes": 54466512
+        }
+      ]
+    },
+    {
+      "deployment": "demand-06",
+      "seconds": 9.029992358000015,
+      "files": [
+        {
+          "sha256": "31a62c3491378b56b5c0b18603eaf8ca55ce772dc477de963364a683e30eacf2",
+          "bytes": 54466512
+        },
+        {
+          "sha256": "8d742cdb8a3c704120acd428f59dc350e5111366a55a7be3b811f660c8e3bbcd",
+          "bytes": 54466512
+        }
+      ]
+    },
+    {
+      "deployment": "demand-07",
+      "seconds": 8.963598717999986,
+      "files": [
+        {
+          "sha256": "8d742cdb8a3c704120acd428f59dc350e5111366a55a7be3b811f660c8e3bbcd",
+          "bytes": 54466512
+        },
+        {
+          "sha256": "351581f555ef455c6d2e19ed0b0f9b881bed2f1d03449a55b360bf7e2599155d",
+          "bytes": 54466512
+        }
+      ]
+    },
+    {
+      "deployment": "demand-08",
+      "seconds": 9.098596046000011,
+      "files": [
+        {
+          "sha256": "351581f555ef455c6d2e19ed0b0f9b881bed2f1d03449a55b360bf7e2599155d",
+          "bytes": 54466512
+        },
+        {
+          "sha256": "02a06b5234deaa78e0ed3d91ff075cc2d1d925f365b1d06187fe94f47ce02e45",
+          "bytes": 54466512
+        }
+      ]
+    }
+  ],
+  "rotation": {
+    "requests": 24,
+    "successes": 24,
+    "p50_ms": 393.383,
+    "p95_ms": 507.77,
+    "max_ms": 539.199
+  },
+  "same_app": {
+    "requests": 50,
+    "successes": 50,
+    "p50_ms": 11.423,
+    "p95_ms": 26.902,
+    "max_ms": 28.035
+  },
+  "rotation_metrics_before": {
+    "hibana_worker_active_compilations": 0.0,
+    "hibana_worker_shared_cache_total{outcome=\"miss\"}": 8.0,
+    "hibana_worker_shared_cache_total{outcome=\"stored\"}": 8.0,
+    "wasmtime_component_cache_misses_total": 8.0
+  },
+  "rotation_metrics_after": {
+    "hibana_worker_active_compilations": 0.0,
+    "hibana_worker_shared_cache_total{outcome=\"hit\"}": 24.0,
+    "hibana_worker_shared_cache_total{outcome=\"miss\"}": 8.0,
+    "hibana_worker_shared_cache_total{outcome=\"stored\"}": 8.0,
+    "wasmtime_component_cache_misses_total": 8.0
+  },
+  "concurrent_cold": {
+    "requests": 4,
+    "successes": 4,
+    "p50_ms": 930.267,
+    "p95_ms": 932.352,
+    "max_ms": 932.352
+  },
+  "concurrent_cold_metrics": {
+    "hibana_worker_active_compilations": 0.0,
+    "hibana_worker_shared_cache_total{outcome=\"hit\"}": 1.0,
+    "wasmtime_component_cache_hits_total{tier=\"lru\"}": 3.0,
+    "wasmtime_component_cache_misses_total": 0.0
+  },
+  "maintenance_all_active_succeeded": true,
+  "main_worker": {
+    "memory_samples_1s": 114,
+    "peak_sampled_working_set_bytes": 433147904,
+    "oom_kills": 0,
+    "restarts": 0
+  },
+  "forced_replacement_without_dns_grace": {
+    "statuses": [
+      502,
+      502,
+      502,
+      502
+    ],
+    "elapsed_ms": [
+      3083.37,
+      3082.927,
+      3080.378,
+      3080.73
+    ],
+    "cp_connect_timeout_ms": 3000,
+    "coredns_ttl_s": 30,
+    "note": "Forced deletion of the only Worker: connection timeout before code restoration. Requests were not replayed."
+  },
+  "stale_dns_evidence": {
+    "old_ip": "10.244.85.167",
+    "new_ip": "10.244.85.168",
+    "answer_when_new_pod_ready": "10.244.85.167   hibana-worker-discovery.hibana.svc.cluster.local",
+    "new_pod_ready_s": 7.10834999299999
+  },
+  "single_worker_with_grace_but_no_room_for_overlap": {
+    "requests": 50,
+    "successes": 30,
+    "p50_ms": 63.983,
+    "p95_ms": 186.34,
+    "max_ms": 376.115
+  },
+  "rolling_full_transition": {
+    "requests": 100,
+    "successes": 100,
+    "p50_ms": 48.507,
+    "p95_ms": 116.812,
+    "max_ms": 519.398,
+    "old_pod_gone": true,
+    "new_pod_metrics": {
+      "hibana_worker_active_compilations": 0.0,
+      "hibana_worker_shared_cache_total{outcome=\"hit\"}": 1.0,
+      "wasmtime_component_cache_hits_total{tier=\"lru\"}": 79.0,
+      "wasmtime_component_cache_misses_total": 0.0
+    },
+    "worker_memory_request_mib": 512,
+    "native_disk_budget_mib": 2048,
+    "new_pod_restarts": 0
+  },
+  "restoration": {
+    "lab": {
+      "lab_deployment_specs_restored": true,
+      "hello_ok": true,
+      "runtime_key_restored": true
+    },
+    "local": [
+      {
+        "cluster": "hibana-dev",
+        "restored": true,
+        "node_ids_and_specs_unchanged": true
+      },
+      {
+        "cluster": "hibana-console",
+        "restored": true,
+        "node_ids_and_specs_unchanged": true
+      }
+    ]
+  },
+  "tests": {
+    "rust_unit_passed": 323,
+    "doc_tests_passed": 1,
+    "http_regression": "passed",
+    "platform_unit_passed": 245,
+    "infra_render_passed": 5
+  },
+  "limitations": [
+    "One physical Mac and ARM64 VMs; not production VPS latency.",
+    "Named cache-file budget excludes live mapped/unlinked files and temporary compilation files.",
+    "No physical ENOSPC was induced; budget-rejected writes and memory fallback were exercised.",
+    "Single Worker Recreate on the minimum VPS has planned downtime; only the separate overlap-capable rolling test verifies uninterrupted transition.",
+    "Shared-cache eviction can require recompiling retained source Wasm."
+  ]
+}

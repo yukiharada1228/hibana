@@ -52,6 +52,12 @@ spec:
           image: hibana-platform
           imagePullPolicy: IfNotPresent
           command: ["/usr/local/bin/hibana-worker"]
+          # Headless-Service DNS may retain the old Pod IP for 30 seconds.
+          # Keep serving it before SIGTERM starts the normal execution drain.
+          lifecycle:
+            preStop:
+              exec:
+                command: ["/bin/sleep", "35"]
           envFrom:
             - configMapRef:
                 name: hibana-config

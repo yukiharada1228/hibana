@@ -7,6 +7,7 @@ use prometheus::{
 
 pub struct Metrics {
     pub registry: Registry,
+    pub shared_cache_total: IntCounterVec,
     pub guest_memory_budget_bytes: IntGauge,
     pub guest_memory_reserved_bytes: IntGauge,
     pub capacity_rejections_total: IntCounterVec,
@@ -121,7 +122,18 @@ impl Metrics {
                 &["reason"],
             ),
         );
+        let shared_cache_total = register(
+            &registry,
+            IntCounterVec::new(
+                Opts::new(
+                    "hibana_worker_shared_cache_total",
+                    "Shared compiled cache transfers by outcome",
+                ),
+                &["outcome"],
+            ),
+        );
         Arc::new(Self {
+            shared_cache_total,
             control_plane_request_duration_seconds,
             guest_memory_budget_bytes,
             guest_memory_reserved_bytes,

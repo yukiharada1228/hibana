@@ -80,7 +80,7 @@ pub fn active_versions(tenant: &str) -> sea_orm::Select<component_versions::Enti
     )
 }
 
-/// Inventory for background preparation and Worker startup readiness. Each
+/// Inventory for explicit maintenance verification. Each
 /// tenant's versions are read under its transaction-local RLS context.
 pub struct ActiveArtifact {
     pub tenant_id: String,

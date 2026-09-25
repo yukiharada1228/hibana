@@ -1,3 +1,4 @@
+import {testSharedCache} from './test-shared-cache.mjs';
 import { issueFixtureToken } from "./test-api-credentials.mjs";
 // Invoked only by test-http.sh against its disposable PostgreSQL container.
 import assert from 'node:assert/strict';
@@ -47,9 +48,19 @@ delete process.env.CARGO_TARGET_DIR;
 const log = await open(join(folder, 'cp.log'), 'w');
 const objects = new Map();
 const deniedDeletes = new Set();
-let heldPut, onPut, releasePut, heldGet, releaseGet, cp, worker, failDelete = false;
+let heldPut, onPut, releasePut, heldGet, releaseGet, cp, worker, failDelete = false, failCacheWrites = false;
 const s3 = createServer(async (req, res) => {
-  const key = new URL(req.url, 'http://s3.invalid').pathname;
+  const target = new URL(req.url, 'http://s3.invalid');
+  const key = target.pathname;
+  if (req.method === 'PUT' && failCacheWrites && key.includes('/_hibana/compiled/')) {
+    req.resume(); res.writeHead(403).end('<Error><Code>AccessDenied</Code></Error>'); return;
+  }
+  if (req.method === 'GET' && target.searchParams.get('list-type') === '2') {
+    const prefix = '/test-components/' + target.searchParams.get('prefix');
+    const entries = [...objects.entries()].filter(([key]) => key.startsWith(prefix));
+    const xml = entries.map(([key,bytes]) => `<Contents><Key>${key.slice('/test-components/'.length)}</Key><Size>${bytes.length}</Size><LastModified>2026-01-01T00:00:00Z</LastModified></Contents>`).join('');
+    res.writeHead(200, {'Content-Type':'application/xml'}).end(`<ListBucketResult><IsTruncated>false</IsTruncated>${xml}</ListBucketResult>`); return;
+  }
   if (req.method === 'DELETE') {
     if (deniedDeletes.has(key)) { res.writeHead(403).end('<Error><Code>AccessDenied</Code></Error>'); return; }
     if (failDelete) { res.writeHead(503).end(); return; }
@@ -468,6 +479,10 @@ try {
   await testSecretRekey({api, sql, pg, restart:async env => { await stop(); await start(env); }});
   await testExecutionShutdown({api, token, wasm, upload, url, internal, metricsUrl:`http://127.0.0.1:${metricsPort}`, startWorker, stopWorker:() => stop(worker)});
   await testRuntimeBoundaries({api, sql, token, wasm, upload, url, internal, metricsUrl:`http://127.0.0.1:${metricsPort}`, startWorker, stopWorker:() => stop(worker)});
+  await testSharedCache({api, sql, token, wasm, upload, app, internal, folder, objects,
+    restart:async env => { await stop(); await start(env); }, startWorker,
+    stopWorker:() => stop(worker), metricsUrl:`http://127.0.0.1:${metricsPort}`,
+    failWrites:value => { failCacheWrites=value; }});
 } catch (error) {
   // Preserve diagnostics before the disposable fixture and its log are removed.
   const details = await readFile(join(folder, 'cp.log'), 'utf8');

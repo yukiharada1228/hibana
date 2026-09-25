@@ -1,6 +1,6 @@
 # Hibana CLI
 
-公開候補版`0.2.0-rc.10`はnpmから利用できます。初めて使う場合は[ログイン・作成・開発・配備・tail・rollbackの手順](../README.md#開発から配備まで)から始めてください。このページはCLIの導入・更新と各機能のリファレンスです。
+公開候補版`0.2.0-rc.11`はnpmから利用できます。初めて使う場合は[ログイン・作成・開発・配備・tail・rollbackの手順](../README.md#開発から配備まで)から始めてください。このページはCLIの導入・更新と各機能のリファレンスです。
 
 Hibanaの実行契約はWebAssembly Componentです。Honoは対応するJavaScriptフレームワークの一つで、専用SDKのインポートは必要ありません。
 
@@ -41,7 +41,7 @@ CLIはNode.js 24以上が必要です。ローカル実行ランタイムは初�
 [コンソール](../docs/console.md)のある基盤には`hibana login --url https://hibana.example.internal/api --tenant team`で接続できます。URLとテナント名は自分の環境に置き換えてください。ブラウザでは同じホストの`https://hibana.example.internal/`を開きます。CLIとコンソールは同じ管理APIを使い、配備済みアプリの実行・配信は接続先のKubernetesが担当します。
 
 ```bash
-npx --yes @yukiharada1228/hibana@0.2.0-rc.10 init my-app
+npx --yes @yukiharada1228/hibana@0.2.0-rc.11 init my-app
 cd my-app
 npm run dev
 ```
@@ -49,7 +49,7 @@ npm run dev
 `hibana init`や`hibana login`を直接実行したい場合は、グローバルインストールも利用できます。
 
 ```bash
-npm install -g @yukiharada1228/hibana@0.2.0-rc.10
+npm install -g @yukiharada1228/hibana@0.2.0-rc.11
 hibana init my-app
 cd my-app
 npm run dev
@@ -65,7 +65,7 @@ npm run dev
     "deploy": "hibana deploy"
   },
   "devDependencies": {
-    "@yukiharada1228/hibana": "0.2.0-rc.10"
+    "@yukiharada1228/hibana": "0.2.0-rc.11"
   }
 }
 ```
@@ -77,7 +77,7 @@ npm run dev
 プロジェクトのディレクトリで実行します。グローバルCLIを更新しても、プロジェクトに固定したCLIは更新されません。
 
 ```bash
-npm install --save-dev --save-exact @yukiharada1228/hibana@0.2.0-rc.10
+npm install --save-dev --save-exact @yukiharada1228/hibana@0.2.0-rc.11
 npm dedupe --prefer-dedupe
 npm audit
 npm exec -- hibana --version
@@ -127,7 +127,7 @@ Goの`componentize-go`は`go.mod`のtool依存として固定しています。�
 
 Rust・GoのプロジェクトにはWIT定義と依存ロックもコピーされるので、生成後のビルドはHibana固有の言語SDKに依存しません。Honoテンプレートは公式の最小サンプルの応答テキストを変更した`GET /`だけです。JavaScript・Rust・Goには`GET /`とバイナリを返す`POST /echo`があります。Rust・Goサンプルのecho入力上限は1 MiBです。
 
-以降の `hibana ...` は、CLIを導入済みのHono・JavaScriptプロジェクト内では `npm exec -- hibana ...` として実行できます。グローバル導入済みなら直接 `hibana ...` を使えます。プロジェクト作成前やRust・Goでは `npx --yes @yukiharada1228/hibana@0.2.0-rc.10 ...` も使えます。
+以降の `hibana ...` は、CLIを導入済みのHono・JavaScriptプロジェクト内では `npm exec -- hibana ...` として実行できます。グローバル導入済みなら直接 `hibana ...` を使えます。プロジェクト作成前やRust・Goでは `npx --yes @yukiharada1228/hibana@0.2.0-rc.11 ...` も使えます。
 
 ## ローカルで外部DBへ接続する
 

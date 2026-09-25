@@ -49,7 +49,16 @@ impl Worker {
             settings.compiler_limits,
             metrics.clone(),
         )?
-        .protect_versions(pool.clone());
+        .with_disk_budget(settings.cache_disk_bytes)?
+        .with_shared_cache(settings.compiled_cache_auth.clone().map(|auth| {
+            crate::shared_cache::SharedCache::new(
+                auth,
+                &engine,
+                http.clone(),
+                &settings.control_plane_internal_url,
+                metrics.clone(),
+            )
+        }));
         let control_plane = ControlPlaneClient::new(
             http,
             settings.control_plane_internal_url.clone(),
@@ -81,19 +90,6 @@ impl Worker {
             .await
     }
 
-    /// Startup barrier only: downloading/compiling stays on the authenticated
-    /// preparation path. Disk cache validation must not block HTTP I/O threads.
-    pub(crate) async fn applications_prepared(self: &Arc<Self>) -> anyhow::Result<bool> {
-        let hashes = self.repository.active_artifact_hashes().await?;
-        let worker = self.clone();
-        tokio::task::spawn_blocking(move || {
-            hashes
-                .iter()
-                .all(|sha| matches!(worker.artifacts.cached_component(sha, false), Ok(Some(_))))
-        })
-        .await
-        .context("application readiness task failed")
-    }
     /// True only when both guest execution and result persistence succeeded.
     pub(crate) async fn handle_http(
         &self,

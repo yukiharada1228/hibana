@@ -9,17 +9,52 @@ pub(crate) struct ControlPlaneClient {
     metrics: Arc<crate::metrics::Metrics>,
 }
 impl ControlPlaneClient {
+    pub(crate) async fn execution_artifact(
+        &self,
+        token: &HeaderValue,
+        runtime: Option<&str>,
+    ) -> Result<hibana_shared::preparation::AuthorizedArtifact, StatusCode> {
+        let mut request = self
+            .http
+            .post(format!(
+                "{}/internal/execution-artifact",
+                self.control_plane_internal_url.trim_end_matches('/')
+            ))
+            .header("x-hibana-job-token", token);
+        if let Some(runtime) = runtime {
+            request = request.header(hibana_shared::compiled_cache::RUNTIME_HEADER, runtime);
+        }
+        let response = request
+            .timeout(Duration::from_secs(5))
+            .send()
+            .await
+            .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
+        if !response.status().is_success() {
+            return Err(if response.status().is_client_error() {
+                StatusCode::UNAUTHORIZED
+            } else {
+                StatusCode::SERVICE_UNAVAILABLE
+            });
+        }
+        response.json().await.map_err(|_| StatusCode::BAD_GATEWAY)
+    }
+
     pub(crate) async fn redeem_artifact(
         &self,
         token: &HeaderValue,
+        runtime: Option<&str>,
     ) -> Result<hibana_shared::preparation::Artifact, StatusCode> {
-        let response = self
+        let mut request = self
             .http
             .post(format!(
                 "{}/internal/artifact",
                 self.control_plane_internal_url.trim_end_matches('/')
             ))
-            .header(hibana_shared::preparation::TOKEN_HEADER, token)
+            .header(hibana_shared::preparation::TOKEN_HEADER, token);
+        if let Some(runtime) = runtime {
+            request = request.header(hibana_shared::compiled_cache::RUNTIME_HEADER, runtime);
+        }
+        let response = request
             .timeout(Duration::from_secs(5))
             .send()
             .await

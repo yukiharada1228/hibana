@@ -9,7 +9,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.2.0-rc.10"
+version = "0.2.0-rc.11"
 edition = "2021"
 license = "MIT"
 
@@ -93,6 +93,7 @@ wasmparser = "0.221"
 
 # --- ハッシュ ---
 sha2 = "0.10"
+hmac = "0.12"
 
 # --- ジョブ署名トークン (M3c, §3.3)。pure-Rust（当環境は cc/aws-lc 不可）。
 # control-plane だけが署名鍵を持つ。shared / worker には入れない。

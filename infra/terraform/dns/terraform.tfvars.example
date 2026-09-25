@@ -1,0 +1,4 @@
+zone_id      = "0123456789abcdef0123456789abcdef"
+domain       = "hibana.cloud"
+ingress_ipv4 = "203.0.113.12"
+tenant_slugs = ["local"]

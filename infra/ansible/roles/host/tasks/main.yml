@@ -1,0 +1,126 @@
+---
+- name: Install host dependencies
+  ansible.builtin.apt:
+    name: [ca-certificates, curl, gpg, containerd, nftables, python3-yaml]
+    state: present
+    update_cache: true
+    cache_valid_time: 3600
+    lock_timeout: 600
+- name: Record managed node ownership
+  ansible.builtin.copy:
+    content: "Hibana VPS IaC; {{ inventory_hostname }}\n"
+    dest: /etc/hibana-iac-node
+    mode: '0644'
+- name: Load kernel modules
+  ansible.builtin.command: "modprobe {{ item }}"
+  loop: [overlay, br_netfilter]
+  changed_when: false
+- name: Persist kernel modules
+  ansible.builtin.copy:
+    content: "overlay\nbr_netfilter\n"
+    dest: /etc/modules-load.d/hibana.conf
+    mode: '0644'
+- name: Configure forwarding
+  ansible.builtin.copy:
+    content: "net.ipv4.ip_forward=1\nnet.bridge.bridge-nf-call-iptables=1\nnet.bridge.bridge-nf-call-ip6tables=1\n"
+    dest: /etc/sysctl.d/90-hibana.conf
+    mode: '0644'
+  notify: Apply sysctl
+- name: Read active swap
+  ansible.builtin.command: swapon --show --noheadings
+  register: swap
+  changed_when: false
+- name: Disable swap
+  ansible.builtin.command: swapoff -a
+  when: swap.stdout | length > 0
+- name: Disable swap at boot
+  ansible.builtin.replace:
+    path: /etc/fstab
+    regexp: '^(\s*[^#\n]+\s+\S+\s+swap\s+.*)$'
+    replace: '# Hibana disabled swap: \1'
+- name: Create containerd configuration directory
+  ansible.builtin.file:
+    path: /etc/containerd
+    state: directory
+    mode: '0755'
+- name: Use systemd cgroups and CRI
+  ansible.builtin.copy:
+    content: |
+      version = 2
+      [plugins."io.containerd.grpc.v1.cri"]
+        sandbox_image = "registry.k8s.io/pause:3.10.1"
+      [plugins."io.containerd.grpc.v1.cri".containerd.runtimes.runc]
+        runtime_type = "io.containerd.runc.v2"
+      [plugins."io.containerd.grpc.v1.cri".containerd.runtimes.runc.options]
+        SystemdCgroup = true
+    dest: /etc/containerd/config.toml
+    mode: '0644'
+  notify: Restart containerd
+- name: Enable containerd
+  ansible.builtin.systemd_service:
+    name: containerd
+    enabled: true
+    state: started
+- name: Require SSH key authentication
+  ansible.builtin.copy:
+    content: "PasswordAuthentication no\nKbdInteractiveAuthentication no\nPermitRootLogin prohibit-password\n"
+    dest: /etc/ssh/sshd_config.d/00-hibana.conf
+    mode: '0644'
+    validate: /usr/sbin/sshd -t -f %s
+  notify: Reload ssh
+- name: Create journal configuration directory
+  ansible.builtin.file:
+    path: /etc/systemd/journald.conf.d
+    state: directory
+    mode: '0755'
+- name: Bound system journal disk usage
+  ansible.builtin.copy:
+    content: "[Journal]\nSystemMaxUse=200M\nRuntimeMaxUse=50M\n"
+    dest: /etc/systemd/journald.conf.d/hibana.conf
+    mode: '0644'
+  notify: Restart journald
+- name: Inspect persistent volume directories
+  ansible.builtin.stat:
+    path: "/var/lib/hibana/{{ item }}"
+  loop: "{{ ['identity', 'traefik'] if inventory_hostname in groups['management'] else (['postgres', 'objects'] if inventory_hostname in groups['execution'] else []) }}"
+  register: volume_directories
+- name: Create only missing volume directories; preserve kubelet fsGroup permissions
+  ansible.builtin.file:
+    path: "/var/lib/hibana/{{ item.item }}"
+    state: directory
+    mode: '0750'
+  loop: "{{ volume_directories.results }}"
+  loop_control:
+    label: "{{ item.item }}"
+  when: not item.stat.exists
+- name: Configure host input firewall without replacing Kubernetes forwarding rules
+  ansible.builtin.template:
+    src: firewall.nft.j2
+    dest: /etc/hibana-firewall.nft
+    mode: '0600'
+    validate: /usr/sbin/nft -c -f %s
+  notify: Reload Hibana firewall
+- name: Install firewall service
+  ansible.builtin.copy:
+    dest: /etc/systemd/system/hibana-firewall.service
+    mode: '0644'
+    content: |
+      [Unit]
+      Description=Hibana host input firewall
+      Before=kubelet.service
+      After=network-pre.target
+      [Service]
+      Type=oneshot
+      RemainAfterExit=yes
+      ExecStart=/usr/sbin/nft -f /etc/hibana-firewall.nft
+      ExecReload=/usr/sbin/nft -f /etc/hibana-firewall.nft
+      [Install]
+      WantedBy=multi-user.target
+- name: Enable host firewall
+  ansible.builtin.systemd_service:
+    name: hibana-firewall
+    enabled: true
+    state: started
+    daemon_reload: true
+- name: Apply host changes before kubeadm
+  ansible.builtin.meta: flush_handlers

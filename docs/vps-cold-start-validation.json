@@ -1,0 +1,194 @@
+{
+  "date": "2026-09-25",
+  "url": "https://hello.demo.apps.hibana.cloud/",
+  "environment": "KAGOYA VPS x 3, each 2 vCPU / 2 GB; single Hibana Worker, image 0.2.0-rc.10-linux-amd64",
+  "scope": "New Worker Pod, empty emptyDir compilation cache, fresh process. OS, container image, control plane, DB, Redis and Garage stay warm.",
+  "method": "scale Worker 1 -> 0, wait for old Pod deletion and zero Pods, scale 0 -> 1; fresh curl/TLS per probe; sequential probes at least 0.5 s apart; no HTTP retries; 5 warm requests per trial",
+  "trials": [
+    {
+      "trial": 1,
+      "scale_up_start_utc": "2026-09-25T01:49:09.629771+00:00",
+      "first_success_utc": "2026-09-25T01:50:27.265166+00:00",
+      "scale_up_to_first_success_s": 77.6350055000512,
+      "worker_started_to_cache_miss_s": 27.037878,
+      "cache_miss_to_worker_ready_s": 18.063213,
+      "worker_started_to_worker_ready_s": 45.101091,
+      "first_success_http_ms": 110.311,
+      "first_success_ttfb_ms": 102.68599999999999,
+      "first_execution_wall_time_ms": 4,
+      "warm_http_ms": [
+        94.194,
+        101.027,
+        103.465,
+        92.727,
+        109.899
+      ],
+      "warm_execution_wall_time_ms": [
+        3,
+        3,
+        5,
+        3,
+        4
+      ],
+      "failure_status_counts": {
+        "502": 127
+      },
+      "first_failed_probe_start_utc": "2026-09-25T01:49:05.052934+00:00",
+      "last_failed_probe_end_utc": "2026-09-25T01:50:26.734979+00:00",
+      "observed_unavailability_to_success_s": 82.2117820000276,
+      "old_pod_uid": "08112213-a6e8-468c-a60a-7a740eba6ee6",
+      "new_pod_uid": "04feabee-40ef-48d9-b6e4-fa8def3ddf96",
+      "container_restart_count": 0,
+      "cache_miss_log_count": 1,
+      "startup_logs": [
+        {
+          "timestamp": "2026-09-25T01:49:10.724238Z",
+          "level": "INFO",
+          "message": "HTTP worker started",
+          "target": "hibana_worker"
+        },
+        {
+          "timestamp": "2026-09-25T01:49:37.762116Z",
+          "level": "INFO",
+          "message": "component cache: miss; downloading and precompiling",
+          "sha": "b269536a6e759ef9389d3e8d78433aedef45d4d46149b447725601a2d8e60b40",
+          "target": "hibana_worker::artifacts"
+        },
+        {
+          "timestamp": "2026-09-25T01:49:55.825329Z",
+          "level": "INFO",
+          "message": "active applications prepared; worker ready",
+          "target": "hibana_worker::lifecycle"
+        }
+      ]
+    },
+    {
+      "trial": 2,
+      "scale_up_start_utc": "2026-09-25T01:51:06.886331+00:00",
+      "first_success_utc": "2026-09-25T01:51:33.461009+00:00",
+      "scale_up_to_first_success_s": 26.574572583078407,
+      "worker_started_to_cache_miss_s": 5.943306,
+      "cache_miss_to_worker_ready_s": 18.142506,
+      "worker_started_to_worker_ready_s": 24.085812,
+      "first_success_http_ms": 105.71,
+      "first_success_ttfb_ms": 99.12899999999999,
+      "first_execution_wall_time_ms": 4,
+      "warm_http_ms": [
+        90.913,
+        102.09400000000001,
+        94.50500000000001,
+        95.156,
+        93.776
+      ],
+      "warm_execution_wall_time_ms": [
+        3,
+        3,
+        6,
+        3,
+        3
+      ],
+      "failure_status_counts": {
+        "502": 10
+      },
+      "first_failed_probe_start_utc": "2026-09-25T01:51:02.322567+00:00",
+      "last_failed_probe_end_utc": "2026-09-25T01:51:33.338966+00:00",
+      "observed_unavailability_to_success_s": 31.13830162503291,
+      "old_pod_uid": "04feabee-40ef-48d9-b6e4-fa8def3ddf96",
+      "new_pod_uid": "1bd856cd-38e0-4df6-aaf3-c3f437462b1e",
+      "container_restart_count": 0,
+      "cache_miss_log_count": 1,
+      "startup_logs": [
+        {
+          "timestamp": "2026-09-25T01:51:07.965283Z",
+          "level": "INFO",
+          "message": "HTTP worker started",
+          "target": "hibana_worker"
+        },
+        {
+          "timestamp": "2026-09-25T01:51:13.908589Z",
+          "level": "INFO",
+          "message": "component cache: miss; downloading and precompiling",
+          "sha": "b269536a6e759ef9389d3e8d78433aedef45d4d46149b447725601a2d8e60b40",
+          "target": "hibana_worker::artifacts"
+        },
+        {
+          "timestamp": "2026-09-25T01:51:32.051095Z",
+          "level": "INFO",
+          "message": "active applications prepared; worker ready",
+          "target": "hibana_worker::lifecycle"
+        }
+      ]
+    },
+    {
+      "trial": 3,
+      "scale_up_start_utc": "2026-09-25T01:52:18.965542+00:00",
+      "first_success_utc": "2026-09-25T01:53:16.700421+00:00",
+      "scale_up_to_first_success_s": 57.73461408400908,
+      "worker_started_to_cache_miss_s": 26.995899,
+      "cache_miss_to_worker_ready_s": 18.116533,
+      "worker_started_to_worker_ready_s": 45.112432,
+      "first_success_http_ms": 95.73700000000001,
+      "first_success_ttfb_ms": 92.546,
+      "first_execution_wall_time_ms": 4,
+      "warm_http_ms": [
+        87.331,
+        103.729,
+        85.851,
+        88.95,
+        88.13699999999999
+      ],
+      "warm_execution_wall_time_ms": [
+        4,
+        4,
+        3,
+        3,
+        3
+      ],
+      "failure_status_counts": {
+        "502": 71
+      },
+      "first_failed_probe_start_utc": "2026-09-25T01:52:14.847882+00:00",
+      "last_failed_probe_end_utc": "2026-09-25T01:53:16.178149+00:00",
+      "observed_unavailability_to_success_s": 61.85222616698593,
+      "old_pod_uid": "1bd856cd-38e0-4df6-aaf3-c3f437462b1e",
+      "new_pod_uid": "b718c85b-1dd6-4693-a487-94b4fb0d80c6",
+      "container_restart_count": 0,
+      "cache_miss_log_count": 1,
+      "startup_logs": [
+        {
+          "timestamp": "2026-09-25T01:52:20.065073Z",
+          "level": "INFO",
+          "message": "HTTP worker started",
+          "target": "hibana_worker"
+        },
+        {
+          "timestamp": "2026-09-25T01:52:47.060972Z",
+          "level": "INFO",
+          "message": "component cache: miss; downloading and precompiling",
+          "sha": "b269536a6e759ef9389d3e8d78433aedef45d4d46149b447725601a2d8e60b40",
+          "target": "hibana_worker::artifacts"
+        },
+        {
+          "timestamp": "2026-09-25T01:53:05.177505Z",
+          "level": "INFO",
+          "message": "active applications prepared; worker ready",
+          "target": "hibana_worker::lifecycle"
+        }
+      ]
+    }
+  ],
+  "restored": true,
+  "warm_http_15_samples_ms": {
+    "min": 85.851,
+    "median": 94.194,
+    "max": 109.899
+  },
+  "limitations": [
+    "3 cold trials and 15 warm samples of one hello app; not a tail latency or SLA estimate",
+    "Host OS, container image, database/storage and their caches were not reset",
+    "cache-miss-to-ready includes artifact download, compilation, loading and readiness polling, not pure compiler CPU time",
+    "Probe interval is at least 0.5 s and increases when a request is slow",
+    "No dedicated compilation duration metric was available; metrics Pod proxy timed out, so cold cache proof uses fresh Pod UID, emptyDir semantics and cache-miss logs",
+    "An earlier preflight reset was aborted because the script expected 503 but received 502; automatic recovery succeeded; excluded from these 3 trials"
+  ]
+}

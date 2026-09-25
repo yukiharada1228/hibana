@@ -1,12 +1,11 @@
 //! Private compiled-artifact storage with a byte budget. Never store tenant cwasm.
 use std::{
-    collections::HashSet,
     io::{self, Write},
     path::{Path, PathBuf},
     time::SystemTime,
 };
 pub(crate) const DISK_BUDGET: u64 = 2 * 1024 * 1024 * 1024;
-const DISK_ENTRIES: usize = 256;
+pub(crate) const DISK_ENTRIES: usize = 256;
 pub(crate) const MEMORY_BUDGET: usize = 256 * 1024 * 1024;
 
 fn owned_file(path: &Path) -> bool {
@@ -17,14 +16,13 @@ fn owned_file(path: &Path) -> bool {
 }
 
 pub(crate) fn prune(dir: &Path, incoming: u64, budget: u64) -> io::Result<()> {
-    prune_unprotected(dir, incoming, budget, &HashSet::new(), None)
+    prune_for_write(dir, incoming, budget, None)
 }
 
-fn prune_unprotected(
+fn prune_for_write(
     dir: &Path,
     incoming: u64,
     budget: u64,
-    protected: &HashSet<String>,
     replacing: Option<&Path>,
 ) -> io::Result<()> {
     if incoming > budget {
@@ -49,20 +47,9 @@ fn prune_unprotected(
         if total <= budget && count <= max_count {
             break;
         }
-        let digest = path.file_stem().and_then(|v| v.to_str()).unwrap_or("");
-        if protected.contains(digest) {
-            continue;
-        }
         victims.push(path);
         total = total.saturating_sub(size);
         count -= 1;
-    }
-    // Refuse the new preparation without evicting anything if the retained set
-    // cannot fit. In-memory LRU eviction is safe because these files stay available.
-    if total > budget || count > max_count {
-        return Err(io::Error::other(
-            "Active artifacts fill Worker cache; deployment rejected",
-        ));
     }
     for path in victims {
         std::fs::remove_file(path)?;
@@ -70,19 +57,8 @@ fn prune_unprotected(
     Ok(())
 }
 
-pub(crate) fn write(
-    dir: &Path,
-    target: &Path,
-    bytes: &[u8],
-    protected: &HashSet<String>,
-) -> io::Result<()> {
-    prune_unprotected(
-        dir,
-        bytes.len() as u64,
-        DISK_BUDGET,
-        protected,
-        Some(target),
-    )?;
+pub(crate) fn write(dir: &Path, target: &Path, bytes: &[u8], budget: u64) -> io::Result<()> {
+    prune_for_write(dir, bytes.len() as u64, budget, Some(target))?;
     // Stay in the private cache directory, on the target's filesystem.
     // tempfile owns creation, atomic replacement and cleanup on failure.
     let mut file = tempfile::Builder::new()
@@ -98,30 +74,17 @@ pub(crate) fn write(
 mod tests {
     use super::*;
     #[test]
-    fn active_and_reserved_artifacts_survive_count_and_byte_pressure() {
+    fn published_artifacts_can_be_evicted_at_the_entry_limit() {
         let temp = tempfile::tempdir().unwrap();
         let dir = temp.path();
-        let protected: HashSet<String> = (0..DISK_ENTRIES).map(|n| format!("{n:064x}")).collect();
-        for digest in &protected {
-            std::fs::write(dir.join(format!("{digest}.cwasm")), [0; 8]).unwrap();
+        for n in 0..DISK_ENTRIES {
+            std::fs::write(dir.join(format!("{n:064x}.cwasm")), [0; 8]).unwrap();
         }
         let extra = dir.join(format!("{:064x}.cwasm", DISK_ENTRIES));
-        assert!(write(dir, &extra, &[1], &protected).is_err());
-        assert!(prune_unprotected(dir, 1, (DISK_ENTRIES * 8) as u64, &protected, None).is_err());
+        write(dir, &extra, &[1], DISK_BUDGET).unwrap();
+        assert!(extra.exists());
         assert_eq!(std::fs::read_dir(dir).unwrap().count(), DISK_ENTRIES);
-        assert!(!extra.exists());
-        // Refreshing the same protected digest must not consume an extra entry.
-        write(
-            dir,
-            &dir.join(format!("{:064x}.cwasm", 0)),
-            &[2; 8],
-            &protected,
-        )
-        .unwrap();
-        let mut released = protected;
-        released.remove(&format!("{:064x}", 0));
-        write(dir, &extra, &[1], &released).unwrap();
-        assert!(!dir.join(format!("{:064x}.cwasm", 0)).exists());
+        write(dir, &extra, &[2], DISK_BUDGET).unwrap();
         assert_eq!(std::fs::read_dir(dir).unwrap().count(), DISK_ENTRIES);
     }
     #[test]
@@ -161,10 +124,10 @@ mod tests {
         let target = dir.join(format!("{}.cwasm", "a".repeat(64)));
         // A directory cannot be atomically replaced by the compiled file.
         std::fs::create_dir(&target).unwrap();
-        assert!(write(dir, &target, b"compiled", &HashSet::new()).is_err());
+        assert!(write(dir, &target, b"compiled", DISK_BUDGET).is_err());
         assert_eq!(std::fs::read_dir(dir).unwrap().count(), 2);
         std::fs::remove_dir(&target).unwrap();
-        write(dir, &target, b"compiled", &HashSet::new()).unwrap();
+        write(dir, &target, b"compiled", DISK_BUDGET).unwrap();
         assert_eq!(std::fs::read(&target).unwrap(), b"compiled");
         assert_eq!(std::fs::read(&stale).unwrap(), b"unowned");
         assert_eq!(std::fs::read_dir(dir).unwrap().count(), 2);

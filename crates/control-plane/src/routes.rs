@@ -19,6 +19,14 @@ pub(crate) fn build_internal_router(state: AppState) -> Router {
         )
         .route("/internal/direct-job", post(direct_http::redeem))
         .route("/internal/artifact", post(crate::preparation::redeem))
+        .route(
+            "/internal/execution-artifact",
+            post(crate::preparation::redeem_execution),
+        )
+        .route(
+            "/internal/compiled-artifact",
+            post(crate::compiled_cache::publish),
+        )
         .route("/internal/direct-result", post(crate::completion::complete))
         .route("/internal/job-env", post(handlers_secrets::job_env))
         .with_state(state)

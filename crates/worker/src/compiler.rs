@@ -20,7 +20,7 @@ pub(crate) struct Limits {
 pub(crate) async fn compile(
     bytes: Vec<u8>,
     limits: Limits,
-    permit: OwnedSemaphorePermit,
+    permit: std::sync::Arc<OwnedSemaphorePermit>,
     active: prometheus::IntGauge,
 ) -> anyhow::Result<Vec<u8>> {
     let mut command = isolated_command(std::env::current_exe()?.as_os_str());

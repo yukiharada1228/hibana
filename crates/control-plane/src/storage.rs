@@ -9,6 +9,7 @@
 //! 通常のHTTP実行ではURLを発行せず、準備済みの成果物を使用する。
 
 use std::time::Duration;
+mod compiled;
 
 use aws_credential_types::Credentials;
 use aws_sdk_s3::config::{BehaviorVersion, Region};
@@ -24,6 +25,8 @@ use hibana_shared::FaasError;
 pub struct Storage {
     client: Client,
     bucket: String,
+    pub(crate) compiled_auth: Option<hibana_shared::compiled_cache::Auth>,
+    pub(crate) compiled_uploads: std::sync::Arc<tokio::sync::Semaphore>,
 }
 
 impl Storage {
@@ -70,7 +73,17 @@ impl Storage {
         Self {
             client: Client::from_conf(config),
             bucket: bucket.to_string(),
+            compiled_auth: None,
+            compiled_uploads: std::sync::Arc::new(tokio::sync::Semaphore::new(1)),
         }
+    }
+
+    pub(crate) fn with_compiled_cache(
+        mut self,
+        auth: Option<hibana_shared::compiled_cache::Auth>,
+    ) -> Self {
+        self.compiled_auth = auth;
+        self
     }
 
     /// オブジェクトを保存する（本体アップロード, §6.2）。

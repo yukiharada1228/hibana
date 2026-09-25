@@ -1,0 +1,1041 @@
+{
+  "date": "2026-09-24",
+  "platform_release": "0.2.0-rc.10",
+  "source_commit": "e0c742002370732e97cd9c3cc18900eeb5ea4bfd",
+  "environment": "Same 3-node kind cluster as the 2GiB capacity pilot; one Kubernetes control plane and two worker nodes; linux/arm64",
+  "node_limits": [
+    {
+      "name": "/hibana-capacity-2g-control-plane",
+      "memory": 2147483648,
+      "memory_plus_swap": 2147483648,
+      "nano_cpus": 2000000000
+    },
+    {
+      "name": "/hibana-capacity-2g-worker",
+      "memory": 2147483648,
+      "memory_plus_swap": 2147483648,
+      "nano_cpus": 2000000000
+    },
+    {
+      "name": "/hibana-capacity-2g-worker2",
+      "memory": 2147483648,
+      "memory_plus_swap": 2147483648,
+      "nano_cpus": 2000000000
+    }
+  ],
+  "runtime": {
+    "control_plane_pods": 1,
+    "worker_pods": 1,
+    "worker_max_concurrency": 16,
+    "guest_memory_budget_mib": 1024,
+    "worker_memory_limit_mib": 1280,
+    "control_plane_memory_limit_mib": 512,
+    "tenant_rate_limit_per_second": 50,
+    "tenant_concurrency_limit": 20,
+    "ingress_pre_response_slots_per_control_plane": 8
+  },
+  "fixture": {
+    "source_sha256": "2093c9927f07d8e62ddb4772842145689771318ddef6603db95780559e9abbad",
+    "hold": "Hono handler waits 200ms before returning response headers; same Wasm for all memory limits",
+    "cpu": "Hono performs a fixed 1,000,000 integer-arithmetic iterations; response checksum validated"
+  },
+  "results": [
+    {
+      "label": "m128-c1-cpu",
+      "memory_limit_mib": 128,
+      "concurrency": 1,
+      "rounds": 12,
+      "path": "/cpu?n=1000000",
+      "batch_interval_ms": 500,
+      "seconds": 6.03,
+      "requests": 12,
+      "statuses": {
+        "200": 12
+      },
+      "valid_successes": 12,
+      "invalid_200": 0,
+      "success_rps": 1.99,
+      "p50_ms": 404,
+      "p95_ms": 477.4,
+      "p99_ms": 477.4,
+      "max_ms": 477.4,
+      "max_inflight": 1,
+      "max_reserved_mib": 128,
+      "worker_rejection_delta": {
+        "hibana_worker_capacity_rejections_total{reason=\"memory\"}": 0
+      },
+      "error_bodies": {},
+      "metric_samples": 115,
+      "metric_errors": 0,
+      "pod_unchanged": true,
+      "before_pod": [
+        {
+          "uid": "cb14e8cb-ce4e-43a4-9fcc-c984e3c084bd",
+          "restarts": [
+            0
+          ],
+          "phase": "Running"
+        }
+      ],
+      "after_pod": [
+        {
+          "uid": "cb14e8cb-ce4e-43a4-9fcc-c984e3c084bd",
+          "restarts": [
+            0
+          ],
+          "phase": "Running"
+        }
+      ]
+    },
+    {
+      "label": "m128-c2-cpu",
+      "memory_limit_mib": 128,
+      "concurrency": 2,
+      "rounds": 12,
+      "path": "/cpu?n=1000000",
+      "batch_interval_ms": 500,
+      "seconds": 6.07,
+      "requests": 24,
+      "statuses": {
+        "200": 24
+      },
+      "valid_successes": 24,
+      "invalid_200": 0,
+      "success_rps": 3.95,
+      "p50_ms": 418.9,
+      "p95_ms": 488.3,
+      "p99_ms": 490.5,
+      "max_ms": 490.5,
+      "max_inflight": 2,
+      "max_reserved_mib": 256,
+      "worker_rejection_delta": {
+        "hibana_worker_capacity_rejections_total{reason=\"memory\"}": 0
+      },
+      "error_bodies": {},
+      "metric_samples": 94,
+      "metric_errors": 0,
+      "pod_unchanged": true,
+      "before_pod": [
+        {
+          "uid": "cb14e8cb-ce4e-43a4-9fcc-c984e3c084bd",
+          "restarts": [
+            0
+          ],
+          "phase": "Running"
+        }
+      ],
+      "after_pod": [
+        {
+          "uid": "cb14e8cb-ce4e-43a4-9fcc-c984e3c084bd",
+          "restarts": [
+            0
+          ],
+          "phase": "Running"
+        }
+      ]
+    },
+    {
+      "label": "m128-c4-cpu",
+      "memory_limit_mib": 128,
+      "concurrency": 4,
+      "rounds": 12,
+      "path": "/cpu?n=1000000",
+      "batch_interval_ms": 500,
+      "seconds": 11.19,
+      "requests": 48,
+      "statuses": {
+        "200": 48
+      },
+      "valid_successes": 48,
+      "invalid_200": 0,
+      "success_rps": 4.29,
+      "p50_ms": 809.1,
+      "p95_ms": 923.5,
+      "p99_ms": 928.6,
+      "max_ms": 928.6,
+      "max_inflight": 4,
+      "max_reserved_mib": 512,
+      "worker_rejection_delta": {
+        "hibana_worker_capacity_rejections_total{reason=\"memory\"}": 0
+      },
+      "error_bodies": {},
+      "metric_samples": 164,
+      "metric_errors": 0,
+      "pod_unchanged": true,
+      "before_pod": [
+        {
+          "uid": "cb14e8cb-ce4e-43a4-9fcc-c984e3c084bd",
+          "restarts": [
+            0
+          ],
+          "phase": "Running"
+        }
+      ],
+      "after_pod": [
+        {
+          "uid": "cb14e8cb-ce4e-43a4-9fcc-c984e3c084bd",
+          "restarts": [
+            0
+          ],
+          "phase": "Running"
+        }
+      ]
+    },
+    {
+      "label": "m128-c8-cpu",
+      "memory_limit_mib": 128,
+      "concurrency": 8,
+      "rounds": 12,
+      "path": "/cpu?n=1000000",
+      "batch_interval_ms": 500,
+      "seconds": 21.22,
+      "requests": 96,
+      "statuses": {
+        "200": 96
+      },
+      "valid_successes": 96,
+      "invalid_200": 0,
+      "success_rps": 4.52,
+      "p50_ms": 1649.2,
+      "p95_ms": 1824.3,
+      "p99_ms": 1848,
+      "max_ms": 1848,
+      "max_inflight": 8,
+      "max_reserved_mib": 1024,
+      "worker_rejection_delta": {
+        "hibana_worker_capacity_rejections_total{reason=\"memory\"}": 0
+      },
+      "error_bodies": {},
+      "metric_samples": 269,
+      "metric_errors": 0,
+      "pod_unchanged": true,
+      "before_pod": [
+        {
+          "uid": "cb14e8cb-ce4e-43a4-9fcc-c984e3c084bd",
+          "restarts": [
+            0
+          ],
+          "phase": "Running"
+        }
+      ],
+      "after_pod": [
+        {
+          "uid": "cb14e8cb-ce4e-43a4-9fcc-c984e3c084bd",
+          "restarts": [
+            0
+          ],
+          "phase": "Running"
+        }
+      ]
+    },
+    {
+      "label": "m128-c8-hold-sustained",
+      "memory_limit_mib": 128,
+      "concurrency": 8,
+      "rounds": 240,
+      "path": "/hold",
+      "batch_interval_ms": 250,
+      "seconds": 65.78,
+      "requests": 1920,
+      "statuses": {
+        "200": 1920
+      },
+      "valid_successes": 1920,
+      "invalid_200": 0,
+      "success_rps": 29.19,
+      "p50_ms": 218.7,
+      "p95_ms": 231.9,
+      "p99_ms": 254.5,
+      "max_ms": 277,
+      "max_inflight": 8,
+      "max_reserved_mib": 1024,
+      "worker_rejection_delta": {
+        "hibana_worker_capacity_rejections_total{reason=\"memory\"}": 0
+      },
+      "error_bodies": {},
+      "metric_samples": 1248,
+      "metric_errors": 0,
+      "pod_unchanged": true,
+      "before_pod": [
+        {
+          "uid": "cb14e8cb-ce4e-43a4-9fcc-c984e3c084bd",
+          "restarts": [
+            0
+          ],
+          "phase": "Running"
+        }
+      ],
+      "after_pod": [
+        {
+          "uid": "cb14e8cb-ce4e-43a4-9fcc-c984e3c084bd",
+          "restarts": [
+            0
+          ],
+          "phase": "Running"
+        }
+      ]
+    },
+    {
+      "label": "m128-c8-hold",
+      "memory_limit_mib": 128,
+      "concurrency": 8,
+      "rounds": 60,
+      "path": "/hold",
+      "batch_interval_ms": 1000,
+      "seconds": 60.01,
+      "requests": 480,
+      "statuses": {
+        "200": 480
+      },
+      "valid_successes": 480,
+      "invalid_200": 0,
+      "success_rps": 8,
+      "p50_ms": 225.5,
+      "p95_ms": 244.9,
+      "p99_ms": 272.6,
+      "max_ms": 275.7,
+      "max_inflight": 8,
+      "max_reserved_mib": 1024,
+      "worker_rejection_delta": {
+        "hibana_worker_capacity_rejections_total{reason=\"memory\"}": 0
+      },
+      "error_bodies": {},
+      "metric_samples": 1134,
+      "metric_errors": 0,
+      "pod_unchanged": true,
+      "before_pod": [
+        {
+          "uid": "cb14e8cb-ce4e-43a4-9fcc-c984e3c084bd",
+          "restarts": [
+            0
+          ],
+          "phase": "Running"
+        }
+      ],
+      "after_pod": [
+        {
+          "uid": "cb14e8cb-ce4e-43a4-9fcc-c984e3c084bd",
+          "restarts": [
+            0
+          ],
+          "phase": "Running"
+        }
+      ]
+    },
+    {
+      "label": "m128-c9-hold",
+      "memory_limit_mib": 128,
+      "concurrency": 9,
+      "rounds": 10,
+      "path": "/hold",
+      "batch_interval_ms": 1000,
+      "seconds": 10,
+      "requests": 90,
+      "statuses": {
+        "200": 80,
+        "503": 10
+      },
+      "valid_successes": 80,
+      "invalid_200": 0,
+      "success_rps": 8,
+      "p50_ms": 219.8,
+      "p95_ms": 228.9,
+      "p99_ms": 230.6,
+      "max_ms": 230.6,
+      "max_inflight": 8,
+      "max_reserved_mib": 1024,
+      "worker_rejection_delta": {
+        "hibana_worker_capacity_rejections_total{reason=\"memory\"}": 0
+      },
+      "error_bodies": {
+        "{\"error\":{\"code\":\"request_capacity\",\"message\":\"request reception is busy; retry later\",\"retryable\":true}}": 10
+      },
+      "metric_samples": 188,
+      "metric_errors": 0,
+      "pod_unchanged": true,
+      "before_pod": [
+        {
+          "uid": "cb14e8cb-ce4e-43a4-9fcc-c984e3c084bd",
+          "restarts": [
+            0
+          ],
+          "phase": "Running"
+        }
+      ],
+      "after_pod": [
+        {
+          "uid": "cb14e8cb-ce4e-43a4-9fcc-c984e3c084bd",
+          "restarts": [
+            0
+          ],
+          "phase": "Running"
+        }
+      ]
+    },
+    {
+      "label": "m256-c1-hold",
+      "memory_limit_mib": 256,
+      "concurrency": 1,
+      "rounds": 10,
+      "path": "/hold",
+      "batch_interval_ms": 1000,
+      "seconds": 10,
+      "requests": 10,
+      "statuses": {
+        "200": 10
+      },
+      "valid_successes": 10,
+      "invalid_200": 0,
+      "success_rps": 1,
+      "p50_ms": 222,
+      "p95_ms": 229.4,
+      "p99_ms": 229.4,
+      "max_ms": 229.4,
+      "max_inflight": 1,
+      "max_reserved_mib": 256,
+      "worker_rejection_delta": {},
+      "error_bodies": {},
+      "metric_samples": 189,
+      "metric_errors": 0,
+      "pod_unchanged": true,
+      "before_pod": [
+        {
+          "uid": "cb14e8cb-ce4e-43a4-9fcc-c984e3c084bd",
+          "restarts": [
+            0
+          ],
+          "phase": "Running"
+        }
+      ],
+      "after_pod": [
+        {
+          "uid": "cb14e8cb-ce4e-43a4-9fcc-c984e3c084bd",
+          "restarts": [
+            0
+          ],
+          "phase": "Running"
+        }
+      ]
+    },
+    {
+      "label": "m256-c2-hold",
+      "memory_limit_mib": 256,
+      "concurrency": 2,
+      "rounds": 10,
+      "path": "/hold",
+      "batch_interval_ms": 1000,
+      "seconds": 10,
+      "requests": 20,
+      "statuses": {
+        "200": 20
+      },
+      "valid_successes": 20,
+      "invalid_200": 0,
+      "success_rps": 2,
+      "p50_ms": 222.8,
+      "p95_ms": 230.7,
+      "p99_ms": 231,
+      "max_ms": 231,
+      "max_inflight": 2,
+      "max_reserved_mib": 512,
+      "worker_rejection_delta": {},
+      "error_bodies": {},
+      "metric_samples": 189,
+      "metric_errors": 0,
+      "pod_unchanged": true,
+      "before_pod": [
+        {
+          "uid": "cb14e8cb-ce4e-43a4-9fcc-c984e3c084bd",
+          "restarts": [
+            0
+          ],
+          "phase": "Running"
+        }
+      ],
+      "after_pod": [
+        {
+          "uid": "cb14e8cb-ce4e-43a4-9fcc-c984e3c084bd",
+          "restarts": [
+            0
+          ],
+          "phase": "Running"
+        }
+      ]
+    },
+    {
+      "label": "m256-c4-hold-sustained",
+      "memory_limit_mib": 256,
+      "concurrency": 4,
+      "rounds": 120,
+      "path": "/hold",
+      "batch_interval_ms": 250,
+      "seconds": 32.64,
+      "requests": 480,
+      "statuses": {
+        "200": 480
+      },
+      "valid_successes": 480,
+      "invalid_200": 0,
+      "success_rps": 14.7,
+      "p50_ms": 217.2,
+      "p95_ms": 237.8,
+      "p99_ms": 274,
+      "max_ms": 279.3,
+      "max_inflight": 4,
+      "max_reserved_mib": 1024,
+      "worker_rejection_delta": {
+        "hibana_worker_capacity_rejections_total{reason=\"memory\"}": 0
+      },
+      "error_bodies": {},
+      "metric_samples": 615,
+      "metric_errors": 0,
+      "pod_unchanged": true,
+      "before_pod": [
+        {
+          "uid": "cb14e8cb-ce4e-43a4-9fcc-c984e3c084bd",
+          "restarts": [
+            0
+          ],
+          "phase": "Running"
+        }
+      ],
+      "after_pod": [
+        {
+          "uid": "cb14e8cb-ce4e-43a4-9fcc-c984e3c084bd",
+          "restarts": [
+            0
+          ],
+          "phase": "Running"
+        }
+      ]
+    },
+    {
+      "label": "m256-c4-hold",
+      "memory_limit_mib": 256,
+      "concurrency": 4,
+      "rounds": 60,
+      "path": "/hold",
+      "batch_interval_ms": 1000,
+      "seconds": 60.02,
+      "requests": 240,
+      "statuses": {
+        "200": 240
+      },
+      "valid_successes": 240,
+      "invalid_200": 0,
+      "success_rps": 4,
+      "p50_ms": 219.8,
+      "p95_ms": 231.7,
+      "p99_ms": 284.3,
+      "max_ms": 286.6,
+      "max_inflight": 4,
+      "max_reserved_mib": 1024,
+      "worker_rejection_delta": {},
+      "error_bodies": {},
+      "metric_samples": 1132,
+      "metric_errors": 0,
+      "pod_unchanged": true,
+      "before_pod": [
+        {
+          "uid": "cb14e8cb-ce4e-43a4-9fcc-c984e3c084bd",
+          "restarts": [
+            0
+          ],
+          "phase": "Running"
+        }
+      ],
+      "after_pod": [
+        {
+          "uid": "cb14e8cb-ce4e-43a4-9fcc-c984e3c084bd",
+          "restarts": [
+            0
+          ],
+          "phase": "Running"
+        }
+      ]
+    },
+    {
+      "label": "m256-c5-hold",
+      "memory_limit_mib": 256,
+      "concurrency": 5,
+      "rounds": 10,
+      "path": "/hold",
+      "batch_interval_ms": 1000,
+      "seconds": 10,
+      "requests": 50,
+      "statuses": {
+        "200": 40,
+        "503": 10
+      },
+      "valid_successes": 40,
+      "invalid_200": 0,
+      "success_rps": 4,
+      "p50_ms": 223,
+      "p95_ms": 229.8,
+      "p99_ms": 232.9,
+      "max_ms": 232.9,
+      "max_inflight": 4,
+      "max_reserved_mib": 1024,
+      "worker_rejection_delta": {
+        "hibana_worker_capacity_rejections_total{reason=\"memory\"}": 10
+      },
+      "error_bodies": {
+        "Worker capacity unavailable": 10
+      },
+      "metric_samples": 188,
+      "metric_errors": 0,
+      "pod_unchanged": true,
+      "before_pod": [
+        {
+          "uid": "cb14e8cb-ce4e-43a4-9fcc-c984e3c084bd",
+          "restarts": [
+            0
+          ],
+          "phase": "Running"
+        }
+      ],
+      "after_pod": [
+        {
+          "uid": "cb14e8cb-ce4e-43a4-9fcc-c984e3c084bd",
+          "restarts": [
+            0
+          ],
+          "phase": "Running"
+        }
+      ]
+    },
+    {
+      "label": "m64-c16-hold",
+      "memory_limit_mib": 64,
+      "concurrency": 16,
+      "rounds": 60,
+      "path": "/hold",
+      "batch_interval_ms": 1000,
+      "seconds": 60.01,
+      "requests": 960,
+      "statuses": {
+        "200": 480,
+        "503": 480
+      },
+      "valid_successes": 480,
+      "invalid_200": 0,
+      "success_rps": 8,
+      "p50_ms": 225.1,
+      "p95_ms": 243.6,
+      "p99_ms": 310.6,
+      "max_ms": 312.5,
+      "max_inflight": 8,
+      "max_reserved_mib": 512,
+      "worker_rejection_delta": {
+        "hibana_worker_capacity_rejections_total{reason=\"memory\"}": 0
+      },
+      "error_bodies": {
+        "{\"error\":{\"code\":\"request_capacity\",\"message\":\"request reception is busy; retry later\",\"retryable\":true}}": 480
+      },
+      "metric_samples": 1132,
+      "metric_errors": 0,
+      "pod_unchanged": true,
+      "before_pod": [
+        {
+          "uid": "cb14e8cb-ce4e-43a4-9fcc-c984e3c084bd",
+          "restarts": [
+            0
+          ],
+          "phase": "Running"
+        }
+      ],
+      "after_pod": [
+        {
+          "uid": "cb14e8cb-ce4e-43a4-9fcc-c984e3c084bd",
+          "restarts": [
+            0
+          ],
+          "phase": "Running"
+        }
+      ]
+    }
+  ],
+  "memory_by_phase": {
+    "setup": {
+      "hibana-capacity-2g-control-plane": {
+        "samples": 67,
+        "max_working_set_mib": 757.8,
+        "max_current_mib": 1101.3,
+        "max_oom_kill_counter": 0
+      },
+      "hibana-capacity-2g-worker": {
+        "samples": 67,
+        "max_working_set_mib": 939.0,
+        "max_current_mib": 1444.1,
+        "max_oom_kill_counter": 0
+      },
+      "hibana-capacity-2g-worker2": {
+        "samples": 67,
+        "max_working_set_mib": 743.4,
+        "max_current_mib": 878.7,
+        "max_oom_kill_counter": 0
+      }
+    },
+    "fixture-build": {
+      "hibana-capacity-2g-control-plane": {
+        "samples": 21,
+        "max_working_set_mib": 662.5,
+        "max_current_mib": 1099.7,
+        "max_oom_kill_counter": 0
+      },
+      "hibana-capacity-2g-worker": {
+        "samples": 21,
+        "max_working_set_mib": 679.5,
+        "max_current_mib": 1201.8,
+        "max_oom_kill_counter": 0
+      },
+      "hibana-capacity-2g-worker2": {
+        "samples": 21,
+        "max_working_set_mib": 661.3,
+        "max_current_mib": 1010.6,
+        "max_oom_kill_counter": 0
+      }
+    },
+    "m256-c1-hold": {
+      "hibana-capacity-2g-control-plane": {
+        "samples": 6,
+        "max_working_set_mib": 662.3,
+        "max_current_mib": 1099.5,
+        "max_oom_kill_counter": 0
+      },
+      "hibana-capacity-2g-worker": {
+        "samples": 6,
+        "max_working_set_mib": 667.7,
+        "max_current_mib": 1144.9,
+        "max_oom_kill_counter": 0
+      },
+      "hibana-capacity-2g-worker2": {
+        "samples": 6,
+        "max_working_set_mib": 461.0,
+        "max_current_mib": 873.7,
+        "max_oom_kill_counter": 0
+      }
+    },
+    "m256-c2-hold": {
+      "hibana-capacity-2g-control-plane": {
+        "samples": 5,
+        "max_working_set_mib": 664.2,
+        "max_current_mib": 1101.4,
+        "max_oom_kill_counter": 0
+      },
+      "hibana-capacity-2g-worker": {
+        "samples": 5,
+        "max_working_set_mib": 668.7,
+        "max_current_mib": 1146.0,
+        "max_oom_kill_counter": 0
+      },
+      "hibana-capacity-2g-worker2": {
+        "samples": 5,
+        "max_working_set_mib": 466.6,
+        "max_current_mib": 880.5,
+        "max_oom_kill_counter": 0
+      }
+    },
+    "m256-c4-hold": {
+      "hibana-capacity-2g-control-plane": {
+        "samples": 29,
+        "max_working_set_mib": 669.1,
+        "max_current_mib": 1106.3,
+        "max_oom_kill_counter": 0
+      },
+      "hibana-capacity-2g-worker": {
+        "samples": 29,
+        "max_working_set_mib": 676.0,
+        "max_current_mib": 1153.4,
+        "max_oom_kill_counter": 0
+      },
+      "hibana-capacity-2g-worker2": {
+        "samples": 29,
+        "max_working_set_mib": 487.1,
+        "max_current_mib": 903.3,
+        "max_oom_kill_counter": 0
+      }
+    },
+    "m256-c5-hold": {
+      "hibana-capacity-2g-control-plane": {
+        "samples": 5,
+        "max_working_set_mib": 667.5,
+        "max_current_mib": 1104.7,
+        "max_oom_kill_counter": 0
+      },
+      "hibana-capacity-2g-worker": {
+        "samples": 5,
+        "max_working_set_mib": 677.7,
+        "max_current_mib": 1155.0,
+        "max_oom_kill_counter": 0
+      },
+      "hibana-capacity-2g-worker2": {
+        "samples": 5,
+        "max_working_set_mib": 495.0,
+        "max_current_mib": 913.7,
+        "max_oom_kill_counter": 0
+      }
+    },
+    "deploy-memory-128": {
+      "hibana-capacity-2g-control-plane": {
+        "samples": 1,
+        "max_working_set_mib": 664.4,
+        "max_current_mib": 1101.7,
+        "max_oom_kill_counter": 0
+      },
+      "hibana-capacity-2g-worker": {
+        "samples": 1,
+        "max_working_set_mib": 690.6,
+        "max_current_mib": 1167.9,
+        "max_oom_kill_counter": 0
+      },
+      "hibana-capacity-2g-worker2": {
+        "samples": 1,
+        "max_working_set_mib": 494.0,
+        "max_current_mib": 924.7,
+        "max_oom_kill_counter": 0
+      }
+    },
+    "m128-c8-hold": {
+      "hibana-capacity-2g-control-plane": {
+        "samples": 29,
+        "max_working_set_mib": 670.2,
+        "max_current_mib": 1107.5,
+        "max_oom_kill_counter": 0
+      },
+      "hibana-capacity-2g-worker": {
+        "samples": 29,
+        "max_working_set_mib": 691.8,
+        "max_current_mib": 1169.2,
+        "max_oom_kill_counter": 0
+      },
+      "hibana-capacity-2g-worker2": {
+        "samples": 29,
+        "max_working_set_mib": 507.7,
+        "max_current_mib": 948.7,
+        "max_oom_kill_counter": 0
+      }
+    },
+    "m128-c9-hold": {
+      "hibana-capacity-2g-control-plane": {
+        "samples": 5,
+        "max_working_set_mib": 657.6,
+        "max_current_mib": 1095.0,
+        "max_oom_kill_counter": 0
+      },
+      "hibana-capacity-2g-worker": {
+        "samples": 5,
+        "max_working_set_mib": 690.9,
+        "max_current_mib": 1168.3,
+        "max_oom_kill_counter": 0
+      },
+      "hibana-capacity-2g-worker2": {
+        "samples": 5,
+        "max_working_set_mib": 501.0,
+        "max_current_mib": 942.9,
+        "max_oom_kill_counter": 0
+      }
+    },
+    "m64-c16-hold": {
+      "hibana-capacity-2g-control-plane": {
+        "samples": 56,
+        "max_working_set_mib": 661.1,
+        "max_current_mib": 1098.6,
+        "max_oom_kill_counter": 0
+      },
+      "hibana-capacity-2g-worker": {
+        "samples": 56,
+        "max_working_set_mib": 711.7,
+        "max_current_mib": 1189.1,
+        "max_oom_kill_counter": 0
+      },
+      "hibana-capacity-2g-worker2": {
+        "samples": 56,
+        "max_working_set_mib": 513.8,
+        "max_current_mib": 970.1,
+        "max_oom_kill_counter": 0
+      }
+    },
+    "deploy-memory-256": {
+      "hibana-capacity-2g-control-plane": {
+        "samples": 1,
+        "max_working_set_mib": 657.9,
+        "max_current_mib": 1095.4,
+        "max_oom_kill_counter": 0
+      },
+      "hibana-capacity-2g-worker": {
+        "samples": 1,
+        "max_working_set_mib": 702.3,
+        "max_current_mib": 1179.7,
+        "max_oom_kill_counter": 0
+      },
+      "hibana-capacity-2g-worker2": {
+        "samples": 1,
+        "max_working_set_mib": 505.8,
+        "max_current_mib": 975.3,
+        "max_oom_kill_counter": 0
+      }
+    },
+    "m256-c4-hold-sustained": {
+      "hibana-capacity-2g-control-plane": {
+        "samples": 16,
+        "max_working_set_mib": 664.0,
+        "max_current_mib": 1101.6,
+        "max_oom_kill_counter": 0
+      },
+      "hibana-capacity-2g-worker": {
+        "samples": 16,
+        "max_working_set_mib": 705.8,
+        "max_current_mib": 1183.2,
+        "max_oom_kill_counter": 0
+      },
+      "hibana-capacity-2g-worker2": {
+        "samples": 16,
+        "max_working_set_mib": 511.1,
+        "max_current_mib": 982.6,
+        "max_oom_kill_counter": 0
+      }
+    },
+    "m128-c8-hold-sustained": {
+      "hibana-capacity-2g-control-plane": {
+        "samples": 32,
+        "max_working_set_mib": 665.6,
+        "max_current_mib": 1103.2,
+        "max_oom_kill_counter": 0
+      },
+      "hibana-capacity-2g-worker": {
+        "samples": 32,
+        "max_working_set_mib": 707.3,
+        "max_current_mib": 1184.7,
+        "max_oom_kill_counter": 0
+      },
+      "hibana-capacity-2g-worker2": {
+        "samples": 32,
+        "max_working_set_mib": 520.4,
+        "max_current_mib": 1019.1,
+        "max_oom_kill_counter": 0
+      }
+    },
+    "m128-c1-cpu": {
+      "hibana-capacity-2g-control-plane": {
+        "samples": 3,
+        "max_working_set_mib": 665.0,
+        "max_current_mib": 1102.6,
+        "max_oom_kill_counter": 0
+      },
+      "hibana-capacity-2g-worker": {
+        "samples": 3,
+        "max_working_set_mib": 705.9,
+        "max_current_mib": 1183.3,
+        "max_oom_kill_counter": 0
+      },
+      "hibana-capacity-2g-worker2": {
+        "samples": 3,
+        "max_working_set_mib": 517.2,
+        "max_current_mib": 1016.5,
+        "max_oom_kill_counter": 0
+      }
+    },
+    "m128-c2-cpu": {
+      "hibana-capacity-2g-control-plane": {
+        "samples": 3,
+        "max_working_set_mib": 659.0,
+        "max_current_mib": 1096.6,
+        "max_oom_kill_counter": 0
+      },
+      "hibana-capacity-2g-worker": {
+        "samples": 3,
+        "max_working_set_mib": 706.7,
+        "max_current_mib": 1184.1,
+        "max_oom_kill_counter": 0
+      },
+      "hibana-capacity-2g-worker2": {
+        "samples": 3,
+        "max_working_set_mib": 517.0,
+        "max_current_mib": 1016.5,
+        "max_oom_kill_counter": 0
+      }
+    },
+    "m128-c4-cpu": {
+      "hibana-capacity-2g-control-plane": {
+        "samples": 6,
+        "max_working_set_mib": 661.4,
+        "max_current_mib": 1099.1,
+        "max_oom_kill_counter": 0
+      },
+      "hibana-capacity-2g-worker": {
+        "samples": 6,
+        "max_working_set_mib": 706.9,
+        "max_current_mib": 1184.3,
+        "max_oom_kill_counter": 0
+      },
+      "hibana-capacity-2g-worker2": {
+        "samples": 6,
+        "max_working_set_mib": 518.4,
+        "max_current_mib": 1018.8,
+        "max_oom_kill_counter": 0
+      }
+    },
+    "m128-c8-cpu": {
+      "hibana-capacity-2g-control-plane": {
+        "samples": 32,
+        "max_working_set_mib": 665.9,
+        "max_current_mib": 1103.7,
+        "max_oom_kill_counter": 0
+      },
+      "hibana-capacity-2g-worker": {
+        "samples": 32,
+        "max_working_set_mib": 707.5,
+        "max_current_mib": 1184.9,
+        "max_oom_kill_counter": 0
+      },
+      "hibana-capacity-2g-worker2": {
+        "samples": 32,
+        "max_working_set_mib": 521.8,
+        "max_current_mib": 1022.6,
+        "max_oom_kill_counter": 0
+      }
+    }
+  },
+  "running_pod_replacements": 0,
+  "running_container_restarts": 0,
+  "notes": [
+    "Requests are simultaneous batches; next batch waits at least 50ms after completion for result persistence. No automatic retries.",
+    "Worker metrics sampled about every 50ms; node cgroups about every 2s.",
+    "The 64MiB/16-request batch test failed its all-success criterion: 480 of 960 requests were rejected at ingress. Failed measurements are retained.",
+    "Ingress gate limits requests before response headers, not all streaming connections for their entire lifetime.",
+    "CPU and memory limits are enforced, but this does not reproduce a specific VPS CPU, independent VM overhead, disk or network.",
+    "No runtime code was changed; only disposable-cluster Worker settings and application resource metadata were changed."
+  ],
+  "restoration": {
+    "original_clusters": [
+      {
+        "cluster": "hibana-dev",
+        "node_identity_and_limits_preserved": true,
+        "deployment_specs_unchanged": true,
+        "all_replicas_available": true
+      },
+      {
+        "cluster": "hibana-console",
+        "node_identity_and_limits_preserved": true,
+        "deployment_specs_unchanged": true,
+        "all_replicas_available": true
+      }
+    ],
+    "http_checks": [
+      {
+        "url": "http://127.0.0.1:28080/readyz",
+        "status": 200
+      },
+      {
+        "url": "http://127.0.0.1:28081/healthz",
+        "status": 200
+      },
+      {
+        "url": "http://127.0.0.1:38180/realms/hibana-demo/.well-known/openid-configuration",
+        "status": 200
+      }
+    ],
+    "experiment_stopped": true
+  }
+}

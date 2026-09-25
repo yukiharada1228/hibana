@@ -49,4 +49,13 @@ pub fn valid_digest(sha: &str) -> bool {
 pub struct Artifact {
     pub sha256: String,
     pub url: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub compiled_url: Option<String>,
+}
+
+// No Debug: both the token and URLs grant short-lived access to an artifact.
+#[derive(Serialize, Deserialize)]
+pub struct AuthorizedArtifact {
+    pub artifact: Artifact,
+    pub token: String,
 }

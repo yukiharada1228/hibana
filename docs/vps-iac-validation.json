@@ -1,0 +1,73 @@
+{
+  "date": "2026-09-24",
+  "environment": {
+    "os": "Ubuntu 24.04.4",
+    "architecture": "arm64",
+    "nodes": 3,
+    "vcpu_per_node": 2,
+    "memory_gib_per_node": 2,
+    "kubernetes": "1.36.5",
+    "garage": "2.3.0",
+    "hibana": "0.2.0-rc.10"
+  },
+  "verification": {
+    "bootstrap_reapply_changes": 0,
+    "deploy_preserved": {
+      "nodes": true,
+      "pv": true,
+      "pvc": true,
+      "pods": true,
+      "secrets": true
+    },
+    "oidc_pkce": true,
+    "initial_password_change": true,
+    "garage_put_get_delete": true,
+    "wasm_upload_bytes": 12392954,
+    "vm_reboot_http_200": true,
+    "public_dns_applied": false,
+    "acme_issuance_tested": false,
+    "original_local_environments_restored": true,
+    "lab_vms_stopped_with_data_retained": true
+  },
+  "paced": {
+    "concurrency": 4,
+    "duration_seconds": 20.0,
+    "requests": 400,
+    "statuses": {
+      "200": 400
+    },
+    "invalid_200": 0,
+    "errors": {},
+    "p50_ms": 24.5,
+    "p95_ms": 50.6
+  },
+  "unpaced": {
+    "concurrency": 4,
+    "duration_seconds": 8.0,
+    "requests": 2504,
+    "statuses": {
+      "200": 894,
+      "429": 1610
+    },
+    "invalid_200": 0,
+    "errors": {
+      "rate_limited": 1610
+    },
+    "p50_ms": 7.6,
+    "p95_ms": 31.0
+  },
+  "node_memory_mib": {
+    "hibana-iac-cp": {
+      "availableBytes": 842.8,
+      "workingSetBytes": 1115.7
+    },
+    "hibana-iac-management": {
+      "availableBytes": 898.1,
+      "workingSetBytes": 1060.4
+    },
+    "hibana-iac-execution": {
+      "availableBytes": 1086.2,
+      "workingSetBytes": 872.2
+    }
+  }
+}

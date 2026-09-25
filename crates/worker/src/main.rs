@@ -14,6 +14,7 @@ mod network;
 mod repository;
 mod runtime;
 mod service;
+mod shared_cache;
 use config::Settings;
 use lifecycle::{spawn_metrics_server, spawn_shutdown_listener};
 use service::Worker;

@@ -1,0 +1,50 @@
+---
+- name: Create Kubernetes configuration and apt directories
+  ansible.builtin.file:
+    path: "{{ item }}"
+    state: directory
+    mode: '0755'
+  loop: [/etc/kubernetes, /etc/apt/keyrings, /etc/systemd/journald.conf.d]
+- name: Download Kubernetes repository key
+  ansible.builtin.get_url:
+    url: "https://pkgs.k8s.io/core:/stable:/v{{ kubernetes_version.split('.')[0:2] | join('.') }}/deb/Release.key"
+    dest: /etc/apt/keyrings/kubernetes.asc
+    mode: '0644'
+- name: Configure Kubernetes apt repository
+  ansible.builtin.copy:
+    content: "deb [signed-by=/etc/apt/keyrings/kubernetes.asc] https://pkgs.k8s.io/core:/stable:/v{{ kubernetes_version.split('.')[0:2] | join('.') }}/deb/ /\n"
+    dest: /etc/apt/sources.list.d/kubernetes.list
+    mode: '0644'
+- name: Check installed kubelet version
+  ansible.builtin.command: kubelet --version
+  register: installed_kubelet
+  changed_when: false
+  failed_when: false
+- name: Require a planned kubeadm upgrade for version changes
+  ansible.builtin.assert:
+    that: installed_kubelet.rc != 0 or installed_kubelet.stdout == 'Kubernetes v' + kubernetes_version
+    fail_msg: Existing Kubernetes version differs. Use the documented kubeadm upgrade procedure; bootstrap does not perform upgrades.
+- name: Install pinned Kubernetes packages
+  ansible.builtin.apt:
+    name:
+      - "kubelet={{ kubernetes_version }}-1.1"
+      - "kubeadm={{ kubernetes_version }}-1.1"
+      - "kubectl={{ kubernetes_version }}-1.1"
+    update_cache: true
+    cache_valid_time: 0
+    lock_timeout: 600
+- name: Keep Kubernetes versions under explicit operator control
+  ansible.builtin.dpkg_selections:
+    name: "{{ item }}"
+    selection: hold
+  loop: [kubeadm, kubelet, kubectl]
+- name: Select the private node address
+  ansible.builtin.copy:
+    content: "KUBELET_EXTRA_ARGS=--node-ip={{ node_ip }}\n"
+    dest: /etc/default/kubelet
+    mode: '0644'
+- name: Enable kubelet
+  ansible.builtin.systemd_service:
+    name: kubelet
+    enabled: true
+    state: started

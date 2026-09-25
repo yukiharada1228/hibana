@@ -10,6 +10,7 @@ mod redacted;
 pub use redacted::{expose_once, Redacted};
 
 pub mod capabilities;
+pub mod compiled_cache;
 pub mod diagnostics;
 pub mod egress;
 pub mod http;

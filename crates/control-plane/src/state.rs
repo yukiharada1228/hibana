@@ -153,7 +153,7 @@ impl AppState {
                     .no_proxy()
                     .redirect(reqwest::redirect::Policy::none())
                     .connect_timeout(Duration::from_secs(3))
-                    .read_timeout(Duration::from_secs(60))
+                    .read_timeout(Duration::from_secs(120))
                     .build()
                     .expect("internal HTTP client"),
                 preparation_http: crate::preparation::http_client(),

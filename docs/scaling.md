@@ -8,7 +8,7 @@ Hibanaの本番基盤はKubernetesを前提とし、常駐Worker Podを増減し
 
 1. Control PlaneがRedisのレート制限と、PostgreSQL上のテナント同時実行数を確認し、バージョンを固定した`pending`レコードを作成する。
 2. Headless Service `hibana-worker-discovery`のDNSでreadyなWorkerを取得し、開始先を順番に変える。内部HTTPクライアントは接続を再利用する。Kubernetes APIへのアクセス権限は不要。
-3. Workerは同時実行枠を確保し、署名トークンをControl Planeで交換する。DBから承認済み設定を取得し、メモリを予約した後、`pending → running`を条件付き更新する。この更新に成功したWorkerだけが実行する。
+3. Workerは同時実行枠を確保し、署名トークンをControl Planeで交換する。DBから承認済み設定を取得し、必要なコードを復元してメモリを予約した後、`pending → running`を条件付き更新する。この更新に成功したWorkerだけが実行する。
 4. Workerが**実行前の容量不足**を内部ヘッダー付き503で返した場合だけ、別のWorkerへ送る。異なる接続先を最大8件試す。ゲストの同名ヘッダーはWorkerで削除するため、アプリの503では再送しない。
 5. 転送に失敗した場合は`pending`のままの実行だけを`failed`にし、受付枠を返す。実行開始との競合はDBの条件付き更新で決着させる。未実行の拒否は利用量に加算しない。
 
@@ -25,6 +25,7 @@ HTTPのheadless接続ではPod IPへ直接送ります。HTTPSで`WORKER_HTTP_UR
 | `WORKER_MAX_CONCURRENCY` | 8 | 受付準備から結果保存までの同時リクエスト数 |
 | `WORKER_GUEST_MEMORY_BUDGET_MIB` | 2048 | 承認済み線形メモリ上限の予約合計。実行ごとにMiB単位で切り上げる |
 | `WORKER_MAX_COMPILATIONS` | 1 | ダウンロードからコンパイルまでの同時準備数 |
+| `WORKER_CACHE_DISK_MIB` | 2048 | 名前付きディスクキャッシュ。範囲1〜2048 MiB、最大256ファイル |
 | `WORKER_DB_MAX_CONNECTIONS` | 8 | WorkerプロセスごとのDB接続数 |
 | Kubernetes Worker memory limit | 4 GiB | cgroupによるプロセス全体の上限 |
 
@@ -32,7 +33,7 @@ HTTPのheadless接続ではPod IPへ直接送ります。HTTPSで`WORKER_HTTP_UR
 
 この2 GiBはPodのRSS全体を制限するものではありません。コンパイル、コードキャッシュ、ホストのHTTPバッファ、WASIリソースなどに余白が必要です。コンパイルは認証情報を渡さない別プロセスで行い、Linuxでは仮想メモリ1 GiB・CPU時間60秒、親側でも実時間60秒を制限します。これはPodを別にした隔離ではありません。
 
-Wasmダウンロードは32 MiB・30秒、コンパイル枠と同じ成果物の準備待ちはそれぞれ30秒で打ち切ります。呼出し側がキャンセルされたら子プロセスをkillしてwaitし、終了するまでコンパイル枠を保持します。同じ成果物の重複準備を固定数のロックで抑え、失敗したSHAごとのロックを無制限に保持しません。メモリLRUは64件かつシリアライズ量256 MiB、ディスクキャッシュは2 GiBを上限に古い成果物を退避します。RSS全体の制限ではありません。Control Planeのアップロード上限を32 MiBより上げてもWorkerの受入上限は増えません。
+Wasmダウンロードは32 MiB・30秒、コンパイル枠と同じ成果物の準備待ちはそれぞれ30秒・75秒で打ち切り、HTTPの復元全体は85秒で打ち切ります。呼出し側がキャンセルされたら子プロセスをkillしてwaitし、終了するまでコンパイル枠を保持します。同じ成果物の重複準備を固定数のロックで抑え、失敗したSHAごとのロックを無制限に保持しません。メモリLRUは64件かつシリアライズ量256 MiB、ディスクキャッシュは2 GiBを上限に古い成果物を退避します。RSS全体の制限ではありません。Control Planeのアップロード上限を32 MiBより上げてもWorkerの受入上限は増えません。
 
 ## 任意の自動スケール
 
@@ -58,9 +59,12 @@ DB接続数もPod数に比例します。CPは1 Pod最大10、Workerは既定8�
 - `hibana_worker_active_compilations`、キャッシュhit/miss：cold startとコンパイル集中。
 - CPの受付拒否、HTTP 429/503/502、p95/p99、DB pool待ち・接続数、Pod OOM/再起動、一時ストレージ消費。
 
-Workerは起動時に、有効なテナントのactive版がローカルで実行できることを確認してからreadyになります。準備用のHeadless Service `hibana-worker-preparation`は未Ready Podも返し、`WORKER_PREPARATION_URL`で指定します。実行用の`hibana-worker-discovery`はReady Podだけを返します。これにより新PodのWasm準備中は、`maxUnavailable: 0`の段階更新が旧Podを保持します。準備が失敗した場合は新Podを未Readyのまま残し、rolloutを完了させません。
+WorkerはDB・エンジン・HTTPの初期化後にreadyになり、アプリ全件の常駐は要求しません。キャッシュが空でも、最初のリクエストで共有キャッシュまたは元Wasmから復元します。コンパイル済みコードが共有先にあっても、転送・検証の時間は必要です。準備用Serviceは公開前の検証と明示的なメンテナンス確認に使用します。
 
-readyは過負荷の指標にしません。起動時の準備確認後は全Podがbusyでもreadyな接続先を保持し、明示的な503を返します。ドレインを開始すると未Readyになります。起動時の準備確認、Deploymentの段階更新、PDBの役割を混同しないでください。
+readyは過負荷やキャッシュヒットの指標ではありません。全Podがbusyでも接続先を保持し、実行前の容量不足は503を返します。ドレインを開始すると未Readyになります。新Podへの段階更新がアプリのウォーム状態を保証するものではありません。
+
+
+標準のRollingUpdate構成では、計画的なPod終了時に`preStop`で35秒待ち、古いheadless ServiceのDNS応答（30秒TTL）を使う接続にも応答します。その後SIGTERMで通常のdrainへ進みます。既定の終了猶予90秒にはこの待機時間も含まれます。DNSのTTLを長くする環境では両方の猶予を調整してください。新旧Podを並行起動する空き容量が前提です。最小VPS用のRecreate構成ではこの待機を外します。強制終了・OOM・ノード障害による通信断を隠す仕組みではありません。
 
 ## 検証の再現
 

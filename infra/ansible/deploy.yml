@@ -1,0 +1,178 @@
+---
+- name: Load the published Hibana images on both workers
+  hosts: workers
+  tags: [images]
+  become: true
+  any_errors_fatal: true
+  tasks:
+    - name: Check architecture and node placement
+      ansible.builtin.assert:
+        that:
+          - hibana.management_node == groups['management'][0]
+          - hibana.execution_node == groups['execution'][0]
+          - hibana.architecture == ('arm64' if ansible_facts.architecture == 'aarch64' else 'amd64')
+          - hibana.version is match('^[0-9]+\.[0-9]+\.[0-9]+(-[a-z0-9.-]+)?$')
+    - name: Create archive cache
+      ansible.builtin.file:
+        path: /opt/hibana/images
+        state: directory
+        mode: '0700'
+    - name: Download checksummed release images
+      ansible.builtin.get_url:
+        url: "https://github.com/yukiharada1228/hibana/releases/download/v{{ hibana.version }}/hibana-{{ item }}-{{ hibana.version }}-linux-{{ hibana.architecture }}.tar"
+        checksum: "sha256:https://github.com/yukiharada1228/hibana/releases/download/v{{ hibana.version }}/SHA256SUMS"
+        dest: "/opt/hibana/images/hibana-{{ item }}-{{ hibana.version }}-linux-{{ hibana.architecture }}.tar"
+        mode: '0600'
+      loop: [platform, console]
+    - name: List imported images
+      ansible.builtin.command: ctr --namespace k8s.io images list --quiet
+      register: imported_images
+      changed_when: false
+    - name: Import each image once
+      ansible.builtin.command:
+        argv: [ctr, --namespace, k8s.io, images, import, --platform, "linux/{{ hibana.architecture }}", "/opt/hibana/images/hibana-{{ item }}-{{ hibana.version }}-linux-{{ hibana.architecture }}.tar"]
+      loop: [platform, console]
+      when: "('docker.io/library/hibana-' + item + ':' + hibana.version + '-linux-' + hibana.architecture) not in imported_images.stdout_lines"
+
+- name: Render and deploy the small VPS installation
+  hosts: control_plane
+  become: true
+  any_errors_fatal: true
+  vars:
+    kube: [kubectl, --kubeconfig, /etc/kubernetes/admin.conf]
+    rendered: /opt/hibana/rendered
+  tasks:
+    - name: Check persistent deployment identity
+      tags: [prepare]
+      ansible.builtin.stat:
+        path: /opt/hibana/rendered/.identity
+      register: deployment_identity
+    - name: Discover preexisting application volumes
+      tags: [prepare]
+      ansible.builtin.command:
+        argv: "{{ kube + ['get', 'pvc', '-A', '-o', 'json'] }}"
+      register: application_volumes
+      changed_when: false
+    - name: Refuse to replace credentials of an unmanaged deployment
+      tags: [prepare]
+      ansible.builtin.assert:
+        that: deployment_identity.stat.exists or (application_volumes.stdout | from_json)['items'] | selectattr('metadata.namespace', 'in', ['hibana', 'hibana-identity', 'hibana-edge']) | list | length == 0
+        fail_msg: Existing application PVCs have no IaC identity marker. Use a planned data/credential migration; bootstrap will not adopt them.
+    - name: Create source directories
+      tags: [prepare]
+      ansible.builtin.file:
+        path: "/opt/hibana/source/{{ item }}"
+        state: directory
+        mode: '0700'
+      loop: [infra, deploy, sdk]
+    - name: Bundle reviewed manifests and installer without local caches
+      tags: [prepare]
+      ansible.builtin.command:
+        argv: ["{{ ansible_playbook_python }}", "{{ playbook_dir }}/../package-source.py", "{{ playbook_dir }}/../../.local/iac-source.tar.gz"]
+      delegate_to: localhost
+      vars:
+        ansible_become: false
+      register: source_bundle
+      changed_when: "'changed' in source_bundle.stdout"
+    - name: Extract the reviewed source bundle
+      tags: [prepare]
+      ansible.builtin.unarchive:
+        src: "{{ playbook_dir }}/../../.local/iac-source.tar.gz"
+        dest: /opt/hibana/source
+    - name: Render private overlays without regenerating identity or credentials
+      tags: [prepare]
+      ansible.builtin.command:
+        argv: [python3, /opt/hibana/source/infra/render.py, --output, "{{ rendered }}"]
+        stdin: "{{ {'config': hibana, 'secrets': vault_hibana} | to_json }}"
+      no_log: true
+      changed_when: false
+    - name: Create the two application namespaces
+      ansible.builtin.command:
+        argv: "{{ kube + ['apply', '-f', item] }}"
+      loop:
+        - "{{ rendered }}/upstream/base/namespace.yaml"
+        - "{{ rendered }}/identity/namespace.yaml"
+      register: namespaces
+      changed_when: "'unchanged' not in namespaces.stdout"
+    - name: Apply persistent storage and ingress infrastructure
+      ansible.builtin.command:
+        argv: "{{ kube + ['apply', '-k', rendered + '/infrastructure'] }}"
+      no_log: true
+      register: infrastructure
+      changed_when: "'configured' in infrastructure.stdout or 'created' in infrastructure.stdout"
+    - name: Configure in cluster identity DNS
+      ansible.builtin.command:
+        argv: "{{ kube + ['apply', '-f', rendered + '/infrastructure/dns.yaml'] }}"
+      register: dns
+      changed_when: "'unchanged' not in dns.stdout"
+    - name: Apply dependencies and Keycloak
+      ansible.builtin.command:
+        argv: "{{ kube + ['apply', '-k', rendered + '/' + item] }}"
+      loop: [dependencies, identity]
+      no_log: true
+      register: dependencies
+      changed_when: "'configured' in dependencies.stdout or 'created' in dependencies.stdout"
+    - name: Wait for persistent dependencies and ingress
+      ansible.builtin.command:
+        argv: "{{ kube + ['-n', item.ns, 'rollout', 'status', 'deployment/' + item.name, '--timeout=600s'] }}"
+      loop:
+        - {ns: hibana, name: hibana-postgres}
+        - {ns: hibana, name: hibana-objects}
+        - {ns: hibana, name: hibana-redis}
+        - {ns: hibana-identity, name: keycloak-postgres}
+        - {ns: hibana-identity, name: keycloak}
+        - {ns: hibana-edge, name: traefik}
+      changed_when: false
+    - name: Install the Hibana runtime using its existing lifecycle
+      ansible.builtin.command:
+        argv:
+          - python3
+          - /opt/hibana/source/sdk/platform/remote.py
+          - install
+          - --kubeconfig
+          - /etc/kubernetes/admin.conf
+          - --context
+          - kubernetes-admin@hibana-vps
+          - --overlay
+          - "{{ rendered }}/site"
+          - --image
+          - "hibana-platform:{{ hibana.version }}-linux-{{ hibana.architecture }}"
+      environment:
+        SSL_CERT_FILE: "{{ rendered + '/site/ca.crt' if hibana.tls_mode == 'provided' else '/etc/ssl/certs/ca-certificates.crt' }}"
+      register: installation
+      no_log: true
+      failed_when: false
+      changed_when: "'Installing: database migration' in installation.stdout"
+    - name: Preserve private installation diagnostics
+      ansible.builtin.copy:
+        dest: /opt/hibana/install.log
+        content: "{{ installation.stdout }}\n{{ installation.stderr }}\n"
+        mode: '0600'
+      no_log: true
+    - name: Require a successful installation
+      ansible.builtin.assert:
+        that: installation.rc == 0
+        fail_msg: Installation stopped. Inspect /opt/hibana/install.log on the control plane; fix the cause and rerun. Data and failed migration Jobs were retained.
+    - name: Create the first tenant with its imported owner identity
+      ansible.builtin.uri:
+        url: "https://{{ hibana.domain }}/api/admin/tenants"
+        method: POST
+        headers:
+          Authorization: "Bearer {{ vault_hibana.bootstrap }}"
+        body_format: json
+        body:
+          slug: "{{ hibana.tenant_slugs[0] }}"
+          name: "{{ hibana.tenant_slugs[0] }}"
+          admin_email: "{{ hibana.admin_email }}"
+          admin_oidc_subject: "{{ vault_hibana.owner_subject }}"
+        ca_path: "{{ rendered + '/site/ca.crt' if hibana.tls_mode == 'provided' else '/etc/ssl/certs/ca-certificates.crt' }}"
+        status_code: [201, 409]
+      register: tenant
+      changed_when: tenant.status == 201
+      no_log: true
+    - name: Show the deployed URLs
+      ansible.builtin.debug:
+        msg:
+          - "Console: https://{{ hibana.domain }}"
+          - "CLI: hibana login --url https://{{ hibana.domain }}/api --tenant {{ hibana.tenant_slugs[0] }}"
+          - "Initial owner password is in your Vault file. Change it at first login."

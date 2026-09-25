@@ -5,6 +5,7 @@ mod authz;
 mod backup;
 mod build_metadata;
 mod client_ip;
+mod compiled_cache;
 mod completion;
 mod config;
 mod crypto;

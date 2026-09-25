@@ -35,27 +35,57 @@ export async function testIngressReadiness({api, sql, token, wasm, upload, url, 
 
   const readiness = () => fetch(metricsUrl+'/readyz', {signal:AbortSignal.timeout(1000)});
   const release = holdDownloads();
+  let cold;
   try {
     await stopWorker();
-    // An unavailable execution endpoint models the Ready-only Service while
-    // preparation discovery can already reach the cold Pod.
-    await restart({WORKER_HTTP_URL:'http://127.0.0.1:1', WORKER_PREPARATION_URL:`http://127.0.0.1:${workerPort}`});
+    await restart({});
     await startWorker(undefined,{WASM_CACHE_DIR:cacheDir});
     for (let n=0; n<3; n++) {
       assert.equal((await fetch(metricsUrl+'/healthz')).status,200);
-      assert.equal((await readiness()).status,503, 'cold Worker must not let Kubernetes retire prepared Pods');
-      await sleep(400);
+      assert.equal((await readiness()).status,200, 'empty cache must not prevent admission');
+      await sleep(200);
     }
+    const metrics = await (await fetch(metricsUrl+'/metrics')).text();
+    assert.match(metrics, /^wasmtime_component_cache_misses_total 0$/m, 'no background fleet-wide warming');
+    const count = await sql(`SELECT count(*) FROM executions WHERE component_id='${id}'`);
+    cold = invoke(); cold.catch(() => {});
+    for (let n=0;n<50;n++) {
+      if (await sql(`SELECT count(*) FROM executions WHERE component_id='${id}'`) !== count) break;
+      await sleep(50);
+    }
+    assert.equal((await sql(`SELECT status FROM executions WHERE component_id='${id}' ORDER BY created_at DESC LIMIT 1`)).trim(),'pending',
+      'a blocked cold load must not claim a guest');
+    assert.equal((await readiness()).status,200);
   } finally { release(); }
-  let ready = false;
-  for (let n=0; n<200; n++) {
-    if ((await readiness()).status === 200) { ready=true; break; }
-    await sleep(200);
-  }
-  assert.ok(ready, 'separate preparation discovery must warm the Worker before execution discovery can reach it');
-  await restart({});
+  assert.equal((await cold).status,200, 'same cold request executes after recovery without client retry');
+  // Cancellation while storage is stalled must be rechecked after restoration.
+  const releaseCanceled = holdDownloads();
+  let canceled;
+  try {
+    await stopWorker();
+    await startWorker(undefined,{WASM_CACHE_DIR:cacheDir+'-canceled'});
+    canceled = invoke(); canceled.catch(() => {});
+    let pending;
+    for (let n=0;n<100;n++) {
+      pending = (await sql(`SELECT id FROM executions WHERE component_id='${id}' AND status='pending'`)).trim();
+      if (pending) break;
+      await sleep(50);
+    }
+    assert.ok(pending);
+    let loading=false;
+    for (let n=0;n<100;n++) {
+      loading=/^wasmtime_component_cache_misses_total 1$/m.test(await (await fetch(metricsUrl+'/metrics')).text());
+      if (loading) break;
+      await sleep(50);
+    }
+    assert.ok(loading, 'download must have started before cancellation');
+    await sql(`UPDATE executions SET status='failed',finished_at=now() WHERE id='${pending}'`);
+  } finally { releaseCanceled(); }
+  assert.equal((await canceled).status,401);
+  assert.doesNotMatch(await (await fetch(metricsUrl+'/metrics')).text(), /^executions_total\{outcome="succeeded"\} [1-9]/m);
+  console.log('PASS cancellation during cold restoration never starts the guest');
   await operator('prepare','','127.0.0.1');
   assert.equal((await invoke()).status,200);
   assert.equal((await api('/components',{token})).status,200);
-  console.log('PASS cold Worker stays alive but unready until active Wasm is prepared; separate preparation discovery and ordinary install barrier recover without closing admission');
+  console.log('PASS empty Worker is ready without fleet-wide warming; cold request waits before claim, then serves HTTP');
 }

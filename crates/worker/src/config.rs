@@ -2,9 +2,11 @@
 use anyhow::Context as _;
 use std::path::PathBuf;
 pub(crate) struct Settings {
+    pub(crate) compiled_cache_auth: Option<hibana_shared::compiled_cache::Auth>,
     pub(crate) tcp_policy: crate::network::TcpPolicy,
     pub(crate) database_url: String,
     pub(crate) wasm_cache_dir: PathBuf,
+    pub(crate) cache_disk_bytes: u64,
     pub(crate) metrics_bind_addr: String,
     pub(crate) http_bind_addr: String,
     pub(crate) control_plane_internal_url: String,
@@ -33,11 +35,14 @@ impl Settings {
             .map(|v| v.trim().to_string())
             .unwrap_or_else(|_| DEFAULT_METRICS_BIND_ADDR.to_string());
         Ok(Self {
+            compiled_cache_auth: hibana_shared::compiled_cache::Auth::from_env()
+                .map_err(anyhow::Error::msg)?,
             tcp_policy: crate::network::TcpPolicy::parse_private_endpoints(
                 &std::env::var("WORKER_PRIVATE_TCP_ENDPOINTS").unwrap_or_default(),
             )?,
             database_url,
             wasm_cache_dir,
+            cache_disk_bytes: bounded("WORKER_CACHE_DISK_MIB", 2048, 1, 2048)? * 1024 * 1024,
             metrics_bind_addr,
             http_bind_addr: std::env::var("WORKER_HTTP_BIND_ADDR")
                 .unwrap_or_else(|_| "127.0.0.1:8082".into()),

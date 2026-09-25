@@ -6,7 +6,7 @@ Hibanaは、Hono・TypeScript・JavaScript・Rust・Goで書いたWeb APIを、�
 
 Cloudflare Workersのような短い開発・配備の流れを参考にしています。実行にはWasmtimeを使い、各言語のアプリを共通のWASI HTTP Componentとして扱います。
 
-現在の公開候補版は[`0.2.0-rc.10`](https://github.com/yukiharada1228/hibana/releases/tag/v0.2.0-rc.10)です。npmからCLIを導入でき、GitHub Releasesからランタイム・コンソール・基盤を取得できます。OIDC認証、KeycloakのKubernetes構成生成、アプリの外部通信設定、`tail`とコンソールでのログ閲覧に対応しています。[版ごとの変更と基盤の導入手順](docs/release-candidate.md)を確認し、各コンポーネントのバージョンを揃えてください。
+現在の公開候補版は[`0.2.0-rc.11`](https://github.com/yukiharada1228/hibana/releases/tag/v0.2.0-rc.11)です。npmからCLIを導入でき、GitHub Releasesからランタイム・コンソール・基盤を取得できます。OIDC認証、KeycloakのKubernetes構成生成、アプリの外部通信設定、`tail`とコンソールでのログ閲覧に対応しています。[版ごとの変更と基盤の導入手順](docs/release-candidate.md)を確認し、各コンポーネントのバージョンを揃えてください。
 
 v0.1.0時点の2時間のHTTP負荷と、配備・復元・停止・削除の[自動受入結果](docs/pilot-validation.md)を公開しています。実オンプレでの本番利用の条件は[運用ガイド](docs/on-prem-production.md)にまとめています。
 
@@ -28,14 +28,14 @@ HTTPのバイナリ入出力と、SSEなどのレスポンスストリーミン�
 Node.js 24以上とnpmが必要です。グローバルインストールは不要です。管理者から管理APIのURL・テナント名・組織のアカウントを受け取り、ブラウザでログインします。次のURLとテナント名は自分の環境の値に置き換えてください。コンソールがある基盤では通常、同じホストの`/api`が管理APIです。
 
 ```bash
-npx --yes @yukiharada1228/hibana@0.2.0-rc.10 login \
+npx --yes @yukiharada1228/hibana@0.2.0-rc.11 login \
   --url https://hibana.example.com/api --tenant team
 ```
 
 ローカルで試すだけならログインは不要です。空のディレクトリにHonoアプリを作り、起動します。
 
 ```bash
-npx --yes @yukiharada1228/hibana@0.2.0-rc.10 init my-api
+npx --yes @yukiharada1228/hibana@0.2.0-rc.11 init my-api
 cd my-api
 npm run dev
 ```
@@ -96,8 +96,8 @@ npm exec -- hibana rollback
 Hono・JavaScriptのプロジェクトでは`npm run dev`や`npm run deploy`を使えます。Rust・Goのプロジェクトにはnpm依存を追加せず、`npx`から設定ファイルを指定して操作します。
 
 ```bash
-npx --yes @yukiharada1228/hibana@0.2.0-rc.10 init my-rust --template rust
-npx --yes @yukiharada1228/hibana@0.2.0-rc.10 dev -c my-rust/hibana.json
+npx --yes @yukiharada1228/hibana@0.2.0-rc.11 init my-rust --template rust
+npx --yes @yukiharada1228/hibana@0.2.0-rc.11 dev -c my-rust/hibana.json
 ```
 
 ビルド済みのWASI HTTP Componentも配備できます。言語別のツール要件とビルド設定は[CLIガイド](sdk/README.md)を参照してください。

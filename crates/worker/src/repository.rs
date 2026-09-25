@@ -28,14 +28,6 @@ impl ExecutionRepository {
         Self { pool }
     }
 
-    pub(crate) async fn active_artifact_hashes(&self) -> Result<BTreeSet<String>, DbErr> {
-        Ok(hibana_database::queries::active_artifacts(&self.pool)
-            .await?
-            .into_iter()
-            .map(|artifact| artifact.sha256)
-            .collect())
-    }
-
     pub(crate) async fn mark_running(&self, tenant: &str, id: &str) -> anyhow::Result<bool> {
         let started = std::time::Instant::now();
         let tx = self.pool.begin().await?;

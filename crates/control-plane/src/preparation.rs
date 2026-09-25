@@ -1,4 +1,4 @@
-//! Compile before publication and reconcile active artifacts onto newly discovered Workers.
+//! Verify code before publication and authorize on-demand immutable artifact recovery.
 //! No guest handler runs during preparation. No database locks span Worker calls.
 use crate::{db, dispatch, error::AppError, state::AppState};
 use axum::{extract::State, http::HeaderMap, Json};
@@ -10,8 +10,8 @@ use hibana_shared::{
 use std::time::Duration;
 
 pub(crate) fn http_client() -> reqwest::Client {
-    // Compilation sends no headers until it finishes. Do not inherit the
-    // invocation client's shorter idle-read timeout; bound the whole request.
+    // Compilation sends no headers until it finishes. Bound the entire
+    // preparation separately from the invocation client's idle-read timeout.
     reqwest::Client::builder()
         .no_proxy()
         .redirect(reqwest::redirect::Policy::none())
@@ -34,11 +34,48 @@ pub(crate) async fn redeem(
     State(state): State<AppState>,
     headers: HeaderMap,
 ) -> Result<Json<Artifact>, AppError> {
+    let claims = authorize(&state, &headers).await?;
+    Ok(Json(artifact(&state, &headers, &claims).await?))
+}
+
+async fn artifact(
+    state: &AppState,
+    headers: &HeaderMap,
+    claims: &Claims,
+) -> Result<Artifact, AppError> {
+    let compiled_url = match (
+        state.storage().compiled_auth.as_ref(),
+        crate::compiled_cache::runtime(headers),
+    ) {
+        (Some(_), Some(runtime)) => {
+            let key = hibana_shared::compiled_cache::object_key(runtime, &claims.sha256)
+                .map_err(|_| FaasError::Unauthorized)?;
+            // Cache availability must not prevent source-Wasm preparation.
+            state
+                .storage()
+                .presign_get(&key, state.presign_ttl())
+                .await
+                .ok()
+        }
+        _ => None,
+    };
+    let url = state
+        .storage()
+        .presign_get(&claims.storage_uri, state.presign_ttl())
+        .await?;
+    Ok(Artifact {
+        sha256: claims.sha256.clone(),
+        url,
+        compiled_url,
+    })
+}
+
+pub(crate) async fn authorize(state: &AppState, headers: &HeaderMap) -> Result<Claims, AppError> {
     let token = headers
         .get(TOKEN_HEADER)
         .and_then(|v| v.to_str().ok())
         .ok_or(FaasError::Unauthorized)?;
-    let claims = state
+    let mut claims = state
         .signer()
         .verify_preparation(token)
         .map_err(|_| FaasError::Unauthorized)?;
@@ -48,14 +85,8 @@ pub(crate) async fn redeem(
     if !db::tenant_is_active(state.pool(), &claims.tenant_id).await? {
         return Err(FaasError::Forbidden.into());
     }
-    let url = state
-        .storage()
-        .presign_get(&claims.storage_uri, state.presign_ttl())
-        .await?;
-    Ok(Json(Artifact {
-        sha256: claims.sha256,
-        url,
-    }))
+    claims.sha256.make_ascii_lowercase();
+    Ok(claims)
 }
 
 pub(crate) async fn prepare(
@@ -151,7 +182,7 @@ async fn prepare_target(
 
 /// Maintenance barrier for a known ready fleet. The operator supplies Pod IPs
 /// from Kubernetes so a stale/partial DNS answer cannot report success. No guest
-/// code runs, and a final cache-only pass detects eviction during preparation.
+/// code runs. Each app must be loadable; simultaneous cache residency is unnecessary.
 pub(crate) async fn prepare_active(
     state: &AppState,
     expected: &std::collections::BTreeSet<std::net::IpAddr>,
@@ -168,18 +199,16 @@ pub(crate) async fn prepare_active(
         return Err(FaasError::Unavailable.into());
     }
     let artifacts = hibana_database::queries::active_artifacts(state.pool()).await?;
-    for check_only in [false, true] {
-        for artifact in &artifacts {
-            prepare_targets(
-                state,
-                &artifact.tenant_id,
-                &artifact.storage_uri,
-                &artifact.sha256,
-                &targets,
-                check_only,
-            )
-            .await?;
-        }
+    for artifact in &artifacts {
+        prepare_targets(
+            state,
+            &artifact.tenant_id,
+            &artifact.storage_uri,
+            &artifact.sha256,
+            &targets,
+            false,
+        )
+        .await?;
     }
     if dispatch::discover(&endpoint, "prepare")
         .await
@@ -219,35 +248,55 @@ pub(crate) async fn prepare_version(
     Ok(reservation)
 }
 
-async fn reconcile(state: &AppState) -> Result<(), AppError> {
-    for artifact in hibana_database::queries::active_artifacts(state.pool()).await? {
-        if prepare(
-            state,
-            &artifact.tenant_id,
-            &artifact.storage_uri,
-            &artifact.sha256,
-        )
-        .await
-        .is_err()
-        {
-            tracing::warn!("Active artifact preparation incomplete; will retry");
-        }
+/// A job grants access only to its still-pending, tenant-scoped immutable version.
+/// No client-supplied storage path or digest participates in this lookup.
+pub(crate) async fn redeem_execution(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<hibana_shared::preparation::AuthorizedArtifact>, AppError> {
+    use hibana_database::prelude::*;
+    let job = crate::job_auth::claims_from_token(&state, &headers).await?;
+    let tx = state.pool().begin().await?;
+    db::set_tenant_guc(&tx, &job.tenant_id).await?;
+    let (storage_uri, sha256) =
+        hibana_database::queries::pinned_execution(&job.tenant_id, &job.execution_id)
+            .filter(executions::Column::VersionId.eq(&job.version_id))
+            .select_only()
+            .column_as(
+                Expr::col((
+                    component_versions::Entity,
+                    component_versions::Column::StorageUri,
+                )),
+                "storage_uri",
+            )
+            .column_as(
+                Expr::col((
+                    component_versions::Entity,
+                    component_versions::Column::WasmSha256,
+                )),
+                "sha256",
+            )
+            .into_tuple::<(String, String)>()
+            .one(&tx)
+            .await?
+            .ok_or(FaasError::Unauthorized)?;
+    tx.commit().await?;
+    let now = chrono::Utc::now().timestamp();
+    let claims = Claims {
+        tenant_id: job.tenant_id,
+        storage_uri,
+        sha256: sha256.to_ascii_lowercase(),
+        kid: state.signer().kid().into(),
+        iat: now,
+        exp: now + 120,
+    };
+    if !claims.valid_at(now) {
+        return Err(FaasError::Unauthorized.into());
     }
-    Ok(())
-}
-
-pub(crate) fn spawn(state: AppState) {
-    if endpoint().is_err() {
-        return;
-    }
-    tokio::spawn(async move {
-        loop {
-            if reconcile(&state).await.is_err() {
-                tracing::warn!("Artifact preparation reconciliation unavailable");
-            }
-            tokio::time::sleep(Duration::from_secs(5)).await;
-        }
-    });
+    Ok(Json(hibana_shared::preparation::AuthorizedArtifact {
+        artifact: artifact(&state, &headers, &claims).await?,
+        token: state.signer().sign_preparation(&claims),
+    }))
 }
 
 #[cfg(test)]
@@ -258,7 +307,7 @@ mod tests {
     use tokio::sync::Notify;
 
     #[tokio::test]
-    async fn preparation_waits_past_invocation_idle_limit_but_has_a_total_deadline() {
+    async fn preparation_waits_for_compilation_but_has_a_total_deadline() {
         for (check_only, elapsed, succeeds) in
             [(false, 61, true), (true, 61, true), (false, 86, false)]
         {

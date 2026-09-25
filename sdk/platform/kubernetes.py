@@ -2,6 +2,8 @@
 """Manage the checkout-owned kind environment. Kubernetes resources live in Kustomize."""
 import argparse
 from datetime import datetime, timezone
+import hashlib
+import hmac
 import ipaddress
 import json
 import os
@@ -13,6 +15,7 @@ import shutil
 import signal
 import subprocess
 import sys
+import tempfile
 import time
 import urllib.error
 import urllib.request
@@ -236,6 +239,20 @@ class LocalCluster(KubernetesTarget):
         if stored is not None:
             target.chmod(0o600)
             sdk.chmod(0o600)
+            runtime = next(item["stringData"] for item in stored["items"]
+                           if item["metadata"]["name"] == "hibana-runtime")
+            if "COMPILED_CACHE_KEY" not in runtime:
+                runtime["COMPILED_CACHE_KEY"] = compiled_cache_key(oidc["JOB_SIGNING_KEY"])
+                descriptor, name = tempfile.mkstemp(dir=self.state)
+                pending_path = Path(name)
+                try:
+                    with os.fdopen(descriptor, "w") as pending:
+                        pending.write(json.dumps(stored))
+                        pending.flush()
+                        os.fsync(pending.fileno())
+                    pending_path.replace(target)
+                finally:
+                    pending_path.unlink(missing_ok=True)
             return stored
         admin, app, redis, s3, bootstrap = [secrets.token_hex(24) for _ in range(5)]
         data = {
@@ -252,6 +269,7 @@ class LocalCluster(KubernetesTarget):
                 "MINIO_ROOT_USER": "hibana-local", "MINIO_ROOT_PASSWORD": s3,
             },
         }
+        data["hibana-runtime"]["COMPILED_CACHE_KEY"] = compiled_cache_key(data["hibana-control-plane"]["JOB_SIGNING_KEY"])
         result = {"apiVersion": "v1", "kind": "List", "items": [
             {"apiVersion": "v1", "kind": "Secret", "metadata": {"name": name, "namespace": "hibana"},
              "type": "Opaque", "stringData": values} for name, values in data.items()
@@ -561,6 +579,11 @@ def main():
     except KeyboardInterrupt:
         return 130
     return 0
+
+
+def compiled_cache_key(signing_seed):
+    """Independent key; Workers never receive the control-plane signing seed."""
+    return hmac.new(bytes.fromhex(signing_seed), b"hibana-compiled-cache-key-v1", hashlib.sha256).hexdigest()
 
 
 if __name__ == "__main__":

@@ -1,0 +1,490 @@
+{
+  "date": "2026-09-24",
+  "source_commit": "e0c742002370732e97cd9c3cc18900eeb5ea4bfd",
+  "platform_release": "0.2.0-rc.10",
+  "cluster": "hibana-capacity-2g",
+  "architecture": "linux/arm64",
+  "node_count": 3,
+  "node_limits": [
+    {
+      "node": "/hibana-capacity-2g-control-plane",
+      "memory_bytes": 2147483648,
+      "memory_plus_swap_bytes": 2147483648,
+      "nano_cpus": 2000000000
+    },
+    {
+      "node": "/hibana-capacity-2g-worker",
+      "memory_bytes": 2147483648,
+      "memory_plus_swap_bytes": 2147483648,
+      "nano_cpus": 2000000000
+    },
+    {
+      "node": "/hibana-capacity-2g-worker2",
+      "memory_bytes": 2147483648,
+      "memory_plus_swap_bytes": 2147483648,
+      "nano_cpus": 2000000000
+    }
+  ],
+  "node_allocatable": {
+    "cpu_millicores": 1800,
+    "memory_mib": 1792
+  },
+  "node_capacity_reporting_note": "kind reports shared VM capacity; systemReserved was adjusted to bound scheduler allocatable. Docker cgroups enforce each node 2GiB/2 CPU from creation; swap is zero.",
+  "worker_settings": {
+    "replicas": 1,
+    "concurrency": 1,
+    "guest_memory_budget_mib": 512,
+    "compiler_memory_mib": 1024,
+    "memory_request_mib": 768,
+    "memory_limit_mib": 1280
+  },
+  "measurement": {
+    "interval_seconds": 2,
+    "first_sample_utc": "2026-09-24T12:39:42.885714+00:00",
+    "last_sample_utc": "2026-09-24T12:53:23.506878+00:00",
+    "working_set_definition": "memory.current - memory.stat inactive_file"
+  },
+  "memory_by_phase": {
+    "setup": {
+      "hibana-capacity-2g-control-plane": {
+        "samples": 82,
+        "max_working_set_mib": 1053.8,
+        "max_current_mib": 1306.1,
+        "max_oom_kill_counter": 0,
+        "average_cpu_cores": 0.191
+      },
+      "hibana-capacity-2g-worker": {
+        "samples": 82,
+        "max_working_set_mib": 1032.9,
+        "max_current_mib": 1989.4,
+        "max_oom_kill_counter": 0,
+        "average_cpu_cores": 0.446
+      },
+      "hibana-capacity-2g-worker2": {
+        "samples": 82,
+        "max_working_set_mib": 473.8,
+        "max_current_mib": 1482.7,
+        "max_oom_kill_counter": 0,
+        "average_cpu_cores": 0.142
+      }
+    },
+    "oidc-login": {
+      "hibana-capacity-2g-control-plane": {
+        "samples": 22,
+        "max_working_set_mib": 961.8,
+        "max_current_mib": 1285.0,
+        "max_oom_kill_counter": 0,
+        "average_cpu_cores": 0.137
+      },
+      "hibana-capacity-2g-worker": {
+        "samples": 22,
+        "max_working_set_mib": 1072.3,
+        "max_current_mib": 1661.8,
+        "max_oom_kill_counter": 0,
+        "average_cpu_cores": 0.15
+      },
+      "hibana-capacity-2g-worker2": {
+        "samples": 22,
+        "max_working_set_mib": 462.3,
+        "max_current_mib": 708.0,
+        "max_oom_kill_counter": 0,
+        "average_cpu_cores": 0.064
+      }
+    },
+    "deploy-and-functional-smoke": {
+      "hibana-capacity-2g-control-plane": {
+        "samples": 26,
+        "max_working_set_mib": 963.8,
+        "max_current_mib": 1287.4,
+        "max_oom_kill_counter": 0,
+        "average_cpu_cores": 0.333
+      },
+      "hibana-capacity-2g-worker": {
+        "samples": 26,
+        "max_working_set_mib": 1058.2,
+        "max_current_mib": 1646.0,
+        "max_oom_kill_counter": 0,
+        "average_cpu_cores": 0.16
+      },
+      "hibana-capacity-2g-worker2": {
+        "samples": 26,
+        "max_working_set_mib": 766.8,
+        "max_current_mib": 1027.7,
+        "max_oom_kill_counter": 0,
+        "average_cpu_cores": 0.652
+      }
+    },
+    "tail": {
+      "hibana-capacity-2g-control-plane": {
+        "samples": 13,
+        "max_working_set_mib": 693.6,
+        "max_current_mib": 1234.6,
+        "max_oom_kill_counter": 0,
+        "average_cpu_cores": 0.13
+      },
+      "hibana-capacity-2g-worker": {
+        "samples": 13,
+        "max_working_set_mib": 919.4,
+        "max_current_mib": 1306.2,
+        "max_oom_kill_counter": 0,
+        "average_cpu_cores": 0.06
+      },
+      "hibana-capacity-2g-worker2": {
+        "samples": 13,
+        "max_working_set_mib": 627.4,
+        "max_current_mib": 902.9,
+        "max_oom_kill_counter": 0,
+        "average_cpu_cores": 0.05
+      }
+    },
+    "steady-2rps": {
+      "hibana-capacity-2g-control-plane": {
+        "samples": 86,
+        "max_working_set_mib": 704.4,
+        "max_current_mib": 1247.2,
+        "max_oom_kill_counter": 0,
+        "average_cpu_cores": 0.142
+      },
+      "hibana-capacity-2g-worker": {
+        "samples": 86,
+        "max_working_set_mib": 936.2,
+        "max_current_mib": 1343.2,
+        "max_oom_kill_counter": 0,
+        "average_cpu_cores": 0.075
+      },
+      "hibana-capacity-2g-worker2": {
+        "samples": 86,
+        "max_working_set_mib": 639.8,
+        "max_current_mib": 920.3,
+        "max_oom_kill_counter": 0,
+        "average_cpu_cores": 0.084
+      }
+    },
+    "concurrency-2": {
+      "hibana-capacity-2g-control-plane": {
+        "samples": 30,
+        "max_working_set_mib": 709.1,
+        "max_current_mib": 1254.0,
+        "max_oom_kill_counter": 0,
+        "average_cpu_cores": 0.096
+      },
+      "hibana-capacity-2g-worker": {
+        "samples": 30,
+        "max_working_set_mib": 938.7,
+        "max_current_mib": 1346.8,
+        "max_oom_kill_counter": 0,
+        "average_cpu_cores": 0.785
+      },
+      "hibana-capacity-2g-worker2": {
+        "samples": 30,
+        "max_working_set_mib": 657.2,
+        "max_current_mib": 980.8,
+        "max_oom_kill_counter": 0,
+        "average_cpu_cores": 0.809
+      }
+    },
+    "concurrency-4": {
+      "hibana-capacity-2g-control-plane": {
+        "samples": 36,
+        "max_working_set_mib": 717.8,
+        "max_current_mib": 1262.7,
+        "max_oom_kill_counter": 0,
+        "average_cpu_cores": 0.109
+      },
+      "hibana-capacity-2g-worker": {
+        "samples": 36,
+        "max_working_set_mib": 939.6,
+        "max_current_mib": 1347.7,
+        "max_oom_kill_counter": 0,
+        "average_cpu_cores": 0.994
+      },
+      "hibana-capacity-2g-worker2": {
+        "samples": 36,
+        "max_working_set_mib": 675.6,
+        "max_current_mib": 1021.4,
+        "max_oom_kill_counter": 0,
+        "average_cpu_cores": 1.14
+      }
+    },
+    "cold-worker-replacement": {
+      "hibana-capacity-2g-control-plane": {
+        "samples": 14,
+        "max_working_set_mib": 730.8,
+        "max_current_mib": 1276.0,
+        "max_oom_kill_counter": 0,
+        "average_cpu_cores": 0.229
+      },
+      "hibana-capacity-2g-worker": {
+        "samples": 14,
+        "max_working_set_mib": 939.0,
+        "max_current_mib": 1347.1,
+        "max_oom_kill_counter": 0,
+        "average_cpu_cores": 0.098
+      },
+      "hibana-capacity-2g-worker2": {
+        "samples": 14,
+        "max_working_set_mib": 815.5,
+        "max_current_mib": 1069.3,
+        "max_oom_kill_counter": 0,
+        "average_cpu_cores": 0.478
+      }
+    },
+    "cluster-restart": {
+      "hibana-capacity-2g-control-plane": {
+        "samples": 66,
+        "max_working_set_mib": 731.6,
+        "max_current_mib": 1276.7,
+        "max_oom_kill_counter": 0,
+        "average_cpu_cores": 0.296
+      },
+      "hibana-capacity-2g-worker": {
+        "samples": 38,
+        "max_working_set_mib": 941.0,
+        "max_current_mib": 1349.4,
+        "max_oom_kill_counter": 0,
+        "average_cpu_cores": 1.116
+      },
+      "hibana-capacity-2g-worker2": {
+        "samples": 38,
+        "max_working_set_mib": 597.5,
+        "max_current_mib": 900.4,
+        "max_oom_kill_counter": 0,
+        "average_cpu_cores": 0.149
+      }
+    },
+    "after-restart": {
+      "hibana-capacity-2g-control-plane": {
+        "samples": 12,
+        "max_working_set_mib": 721.6,
+        "max_current_mib": 729.4,
+        "max_oom_kill_counter": 0,
+        "average_cpu_cores": 0.138
+      },
+      "hibana-capacity-2g-worker": {
+        "samples": 12,
+        "max_working_set_mib": 734.4,
+        "max_current_mib": 1234.2,
+        "max_oom_kill_counter": 0,
+        "average_cpu_cores": 0.283
+      },
+      "hibana-capacity-2g-worker2": {
+        "samples": 12,
+        "max_working_set_mib": 364.7,
+        "max_current_mib": 416.9,
+        "max_oom_kill_counter": 0,
+        "average_cpu_cores": 0.055
+      }
+    },
+    "concurrency-boundary": {
+      "hibana-capacity-2g-control-plane": {
+        "samples": 6,
+        "max_working_set_mib": 722.5,
+        "max_current_mib": 730.3,
+        "max_oom_kill_counter": 0,
+        "average_cpu_cores": 0.108
+      },
+      "hibana-capacity-2g-worker": {
+        "samples": 6,
+        "max_working_set_mib": 732.1,
+        "max_current_mib": 1231.9,
+        "max_oom_kill_counter": 0,
+        "average_cpu_cores": 0.052
+      },
+      "hibana-capacity-2g-worker2": {
+        "samples": 6,
+        "max_working_set_mib": 363.8,
+        "max_current_mib": 416.0,
+        "max_oom_kill_counter": 0,
+        "average_cpu_cores": 0.048
+      }
+    }
+  },
+  "load": [
+    {
+      "phase": "steady-2rps",
+      "requests": 360,
+      "seconds": 180.2,
+      "statuses": {
+        "200": 360
+      },
+      "invalid_200": 0,
+      "rps": 2,
+      "p50_ms": 17.7,
+      "p95_ms": 37.6,
+      "p99_ms": 99.6,
+      "max_ms": 430.7
+    },
+    {
+      "phase": "concurrency-2",
+      "requests": 108538,
+      "seconds": 60,
+      "statuses": {
+        "200": 3116,
+        "429": 105039,
+        "503": 383
+      },
+      "invalid_200": 0,
+      "rps": 1808.96,
+      "p50_ms": 7.9,
+      "p95_ms": 12,
+      "p99_ms": 21.8,
+      "max_ms": 73.1
+    },
+    {
+      "phase": "concurrency-4",
+      "requests": 165613,
+      "seconds": 60,
+      "statuses": {
+        "200": 2989,
+        "429": 162612,
+        "503": 12
+      },
+      "invalid_200": 0,
+      "rps": 2760.17,
+      "p50_ms": 9.8,
+      "p95_ms": 14.6,
+      "p99_ms": 23.4,
+      "max_ms": 46.3
+    }
+  ],
+  "restart": {
+    "cold_worker_replace_to_http_seconds": 31.25280566699803,
+    "stop_seconds": 61.08133087505121,
+    "start_to_maintenance_open_seconds": 79.75917829200625,
+    "stop_start_total_seconds": 140.84050916705746
+  },
+  "concurrency_boundary": [
+    {
+      "status": 503,
+      "ms": 20.784457999999994,
+      "valid": false,
+      "error_code": "non_json"
+    },
+    {
+      "status": 200,
+      "ms": 232.678875,
+      "valid": true
+    }
+  ],
+  "load_running_pod_replacements": 0,
+  "load_running_container_restarts": 0,
+  "functional_passes": [
+    "Keycloak browser authorization code with PKCE and CLI callback, before and after node restart",
+    "Scoped API token issuance",
+    "Hono CLI deploy and redeploy",
+    "Binary POST",
+    "Secrets binding",
+    "SSE",
+    "Rollback and explicit version rollback",
+    "hibana tail live event",
+    "Cold Worker Pod replacement",
+    "Cluster restart with application and Secret retained"
+  ],
+  "images": [
+    {
+      "namespace": "hibana-identity",
+      "container": "keycloak",
+      "image": "quay.io/keycloak/keycloak:26.7.4",
+      "image_id": "quay.io/keycloak/keycloak@sha256:82a77884f3af238beab1e7afd63b5f530e1b5c0590bd7aa60b40a40463e29b2c"
+    },
+    {
+      "namespace": "hibana-identity",
+      "container": "postgres",
+      "image": "docker.io/library/postgres:16",
+      "image_id": "docker.io/library/postgres@sha256:a3b7f434b2dc57ce85a67e171163eb8ab1a1ebcb39d27484661f26b1dfbe30d6"
+    },
+    {
+      "namespace": "hibana",
+      "container": "console",
+      "image": "docker.io/library/hibana-console:0.2.0-rc.10-linux-arm64",
+      "image_id": "sha256:a6a53a1493f82525bafc1588f7439635e01c2f816f92bb68791c93113f2b12ee"
+    },
+    {
+      "namespace": "hibana",
+      "container": "control-plane",
+      "image": "docker.io/library/hibana-platform:0.2.0-rc.10-linux-arm64",
+      "image_id": "sha256:ce370aac53a5d703920a282312d79d8e772feb1bea621b826b3a25b321f2a5ba"
+    },
+    {
+      "namespace": "hibana",
+      "container": "oidc-local-bridge",
+      "image": "docker.io/nginxinc/nginx-unprivileged:1.28-alpine",
+      "image_id": "sha256:b486e3d150c0420da4819a722088ac5e0d4ff3e46148761b7fdf310dbf45ba38"
+    },
+    {
+      "namespace": "hibana",
+      "container": "minio",
+      "image": "sha256:8f08aee614800a237906bd48114d733e5ac5bfac4ccdf731f141b0e880d7a253",
+      "image_id": "quay.io/minio/minio@sha256:14cea493d9a34af32f524e538b8346cf79f3321eff8e708c1e2960462bd8936e"
+    },
+    {
+      "namespace": "hibana",
+      "container": "postgres",
+      "image": "docker.io/library/postgres:16",
+      "image_id": "docker.io/library/postgres@sha256:a3b7f434b2dc57ce85a67e171163eb8ab1a1ebcb39d27484661f26b1dfbe30d6"
+    },
+    {
+      "namespace": "hibana",
+      "container": "redis",
+      "image": "docker.io/library/redis:7-alpine",
+      "image_id": "docker.io/library/redis@sha256:858f009f9709ce576febc734aa78b8f6d624b82571f9ddb6bda4377c833b3499"
+    },
+    {
+      "namespace": "hibana",
+      "container": "worker",
+      "image": "docker.io/library/hibana-platform:0.2.0-rc.10-linux-arm64",
+      "image_id": "sha256:ce370aac53a5d703920a282312d79d8e772feb1bea621b826b3a25b321f2a5ba"
+    }
+  ],
+  "cgroup_memory_peaks_including_cache_mib": {
+    "hibana-capacity-2g-control-plane": 1910.9,
+    "hibana-capacity-2g-worker": 2009.8,
+    "hibana-capacity-2g-worker2": 1516.5
+  },
+  "limitations": [
+    "Not VPS CPU, disk or network emulation",
+    "Shared host kernel; no separate VM OS overhead",
+    "kind memory-pressure eviction disabled; OOM counters and pod restarts monitored",
+    "Single Kubernetes control plane; single replicas and local PVCs; no HA",
+    "Public TLS ingress, ACME, external backups and monitoring stack not deployed",
+    "One Hono app, 5 minutes of load; not a long-duration soak",
+    "503 bodies not retained during flood; cannot attribute all flood failures to a single cause"
+  ],
+  "startup_notes": [
+    "Bucket initialization failed once before succeeding on retry",
+    "Full-cluster restart caused DNS/DB connection startup failures and automatic retries before recovery"
+  ],
+  "restoration": {
+    "clusters": [
+      {
+        "cluster": "hibana-dev",
+        "original_node_ids_and_limits_preserved": true,
+        "deployment_specs_unchanged": true,
+        "all_deployments_available": true
+      },
+      {
+        "cluster": "hibana-console",
+        "original_node_ids_and_limits_preserved": true,
+        "deployment_specs_unchanged": true,
+        "all_deployments_available": true
+      }
+    ],
+    "http_checks": [
+      {
+        "url": "http://127.0.0.1:28080/readyz",
+        "status": 200
+      },
+      {
+        "url": "http://127.0.0.1:28081/healthz",
+        "status": 200
+      },
+      {
+        "url": "http://127.0.0.1:38180/realms/hibana-demo/.well-known/openid-configuration",
+        "status": 200
+      }
+    ],
+    "experiment_nodes_stopped": true,
+    "keycloak_bridge_reloaded": true,
+    "note": "hibana-dev originally had no host HTTP port; verified Kubernetes workload readiness and unchanged configuration."
+  }
+}

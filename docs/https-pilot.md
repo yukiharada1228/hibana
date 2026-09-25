@@ -1,6 +1,6 @@
 # HTTPS環境を別PCから試す
 
-公開npm版`0.2.0-rc.10`で、Hibanaのリポジトリ・Docker・kubectlを持たない開発者のPCから、ログイン・作成・deploy・tail・rollbackを確認します。ここにあるURLは設定例です。実環境の接続先とテナント名へ置き換えてください。
+公開npm版`0.2.0-rc.11`で、Hibanaのリポジトリ・Docker・kubectlを持たない開発者のPCから、ログイン・作成・deploy・tail・rollbackを確認します。ここにあるURLは設定例です。実環境の接続先とテナント名へ置き換えてください。
 
 ## 管理者が用意する接続先
 
@@ -33,9 +33,9 @@ KeycloakのissuerはPCとControl Planeの両方から、同じHTTPS名で到達�
 Node.js 24以上を用意し、CLIとブラウザを同じPCで使います。既存アプリとの衝突を避け、テナント内で未使用のアプリ名を選んでください。以下は`remote-pilot`が未使用の場合の例です。
 
 ```sh
-npx --yes @yukiharada1228/hibana@0.2.0-rc.10 login \
+npx --yes @yukiharada1228/hibana@0.2.0-rc.11 login \
   --profile pilot --url https://hibana.example.internal/api --tenant team
-npx --yes @yukiharada1228/hibana@0.2.0-rc.10 init remote-pilot
+npx --yes @yukiharada1228/hibana@0.2.0-rc.11 init remote-pilot
 cd remote-pilot
 ```
 

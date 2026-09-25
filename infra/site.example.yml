@@ -1,0 +1,17 @@
+hibana:
+  domain: hibana.cloud
+  # Each tenant gets *.TENANT.apps.hibana.cloud DNS and certificate coverage.
+  tenant_slugs: [local]
+  admin_email: owner@hibana.cloud
+  management_node: hibana-management
+  execution_node: hibana-execution
+  version: 0.2.0-rc.11
+  architecture: amd64
+  pod_cidr: 10.244.0.0/16
+  ingress_pod_ip: 10.244.255.10
+  console_pod_ip: 10.244.255.11
+  ingress_service_ip: 10.96.0.50
+  # acme uses the scoped Cloudflare DNS token in the Vault file.
+  tls_mode: acme
+  acme_email: owner@hibana.cloud
+  acme_server: https://acme-v02.api.letsencrypt.org/directory

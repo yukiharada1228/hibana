@@ -13,6 +13,8 @@ use sea_orm::{
 };
 use serde_json::json;
 use std::sync::Arc;
+#[path = "http_tests/artifacts.rs"]
+mod artifacts;
 #[path = "http_tests/retention.rs"]
 mod retention;
 #[path = "http_tests/tail.rs"]
@@ -25,7 +27,8 @@ fn state(pool: DatabaseConnection, store: Arc<dyn crate::store::Store>) -> AppSt
         &cfg.s3_bucket,
         &cfg.s3_access_key,
         cfg.s3_secret_key_plain(),
-    );
+    )
+    .with_compiled_cache(cfg.compiled_cache_auth.clone());
     AppState::new(
         pool,
         storage,
@@ -256,6 +259,7 @@ async fn http_mvp_regression() {
     let id: String = fixture_scalar(&owner, "SELECT id FROM executions", vec![])
         .await
         .unwrap();
+    artifacts::recovery(&state, &owner, &id).await;
     let valid = token(&state, &id, "http", "source-v1");
     let job = direct_http::redeem(State(state.clone()), headers(&valid))
         .await

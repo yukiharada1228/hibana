@@ -98,7 +98,7 @@ fi
 #  - crates/worker/src/env.rs : worker 側の env 組み立て（M7b/M7c）
 # worker/main.rs のような巨大ファイルを allowlist に入れるとガードが実質無効になるため、
 # env 組み立ては専用モジュールへ切り出すこと（設計 §5.6）。
-expose_allow='crates/shared/src/redacted.rs|crates/control-plane/src/config.rs|crates/control-plane/src/oidc/config.rs|crates/control-plane/src/secrets.rs|crates/control-plane/src/handlers_secrets.rs|crates/worker/src/env.rs'
+expose_allow='crates/shared/src/redacted.rs|crates/shared/src/compiled_cache.rs|crates/control-plane/src/config.rs|crates/control-plane/src/oidc/config.rs|crates/control-plane/src/secrets.rs|crates/control-plane/src/handlers_secrets.rs|crates/worker/src/env.rs'
 set4=$(
   grep -rnE "\.expose\(\)" --include=*.rs crates/ 2>/dev/null \
     | sed -E 's#(//).*$##' \
