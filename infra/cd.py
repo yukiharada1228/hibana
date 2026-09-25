@@ -3,12 +3,14 @@
 
 import argparse
 import datetime
+import errno
 import fcntl
 import hashlib
 import json
 import os
 from pathlib import Path
 import re
+import resource
 import shutil
 import subprocess
 import tarfile
@@ -18,6 +20,7 @@ import urllib.request
 REPO = "yukiharada1228/hibana"
 ROOT = Path("/opt/hibana/cd")
 KUBE = ["kubectl", "--kubeconfig", "/etc/kubernetes/admin.conf"]
+DISK_RESERVE = 2 * 1024**3
 
 
 def run(args, **kwargs):
@@ -79,6 +82,9 @@ def backup(version):
                                       "--", "pg_restore", "--list"], stdin=source,
                                stdout=subprocess.DEVNULL, check=True, timeout=1800)
         archive = work / "backup.tar.gz"
+        # gzip may expand incompressible input slightly. Reserve a conservative
+        # bound before Python writes the archive; subprocess outputs are capped.
+        require_backup_space(2 * sum(path.stat().st_size for path in files.iterdir()) + 16 * 1024**2)
         with tarfile.open(archive, mode="w:gz") as bundle:
             for path in sorted(files.iterdir()):
                 bundle.add(path, arcname=path.name)
@@ -90,9 +96,9 @@ def backup(version):
                "--pinentry-mode", "loopback", "--no-symkey-cache", "--passphrase-file", str(ROOT / "vault.key")]
         encrypted, decrypted = work / "backup.gpg", work / "verified.tar.gz"
         try:
-            subprocess.run(gpg + ["--rfc4880", "--cipher-algo", "AES256", "--compress-algo", "none",
-                                  "--output", str(encrypted), "--symmetric", str(archive)], check=True, timeout=1800)
-            subprocess.run(gpg + ["--output", str(decrypted), "--decrypt", str(encrypted)], check=True, timeout=1800)
+            disk_limited_run(gpg + ["--rfc4880", "--cipher-algo", "AES256", "--compress-algo", "none",
+                                   "--output", str(encrypted), "--symmetric", str(archive)])
+            disk_limited_run(gpg + ["--output", str(decrypted), "--decrypt", str(encrypted)])
             if file_hash(archive) != file_hash(decrypted):
                 raise RuntimeError("Backup encryption verification failed")
         finally:
@@ -106,7 +112,25 @@ def backup(version):
 
 def capture_file(command, destination):
     with destination.open("wb") as output:
-        subprocess.run(command, stdout=output, check=True, timeout=1800)
+        disk_limited_run(command, stdout=output)
+
+
+def require_backup_space(needed=1):
+    available = shutil.disk_usage(ROOT).free - DISK_RESERVE
+    if available < needed:
+        raise OSError(errno.ENOSPC, "Backup requires 2 GiB of free disk headroom")
+    return available
+
+
+def disk_limited_run(command, **kwargs):
+    maximum = require_backup_space()
+
+    def limit_output():
+        resource.setrlimit(resource.RLIMIT_FSIZE, (maximum, maximum))
+
+    # All generated files are on ROOT's filesystem. Enforce the cap in the
+    # child so pg_dump/tar/GnuPG cannot fill the control-plane root disk.
+    return subprocess.run(command, check=True, timeout=1800, preexec_fn=limit_output, **kwargs)
 
 
 def file_hash(path):

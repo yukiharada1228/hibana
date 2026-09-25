@@ -2,6 +2,7 @@
 
 import importlib.util
 import os
+from types import SimpleNamespace
 from pathlib import Path
 import subprocess
 import sys
@@ -109,6 +110,20 @@ else:
                 with self.assertRaises(subprocess.CalledProcessError):
                     self.backup()
             self.assertEqual(list((self.root / "backups").iterdir()), [])
+
+    def test_disk_headroom_refuses_backup_and_caps_subprocess_output(self):
+        # Refuse both before dumping and before archive creation (after dumps).
+        for free in [cd.DISK_RESERVE, cd.DISK_RESERVE + 100 * 1024**2]:
+            with patch.object(cd.shutil, "disk_usage", return_value=SimpleNamespace(free=free)):
+                with self.assertRaises(OSError):
+                    self.backup()
+            self.assertEqual(list((self.root / "backups").iterdir()), [])
+        output = self.root / "limited.dump"
+        with patch.object(cd, "ROOT", self.root), \
+                patch.object(cd.shutil, "disk_usage", return_value=SimpleNamespace(free=cd.DISK_RESERVE + 1024)):
+            with self.assertRaises(subprocess.CalledProcessError):
+                cd.capture_file([sys.executable, str(self.kube), "pg_dump"], output)
+        self.assertLessEqual(output.stat().st_size, 1024)
 
     def test_failed_encryption_or_verification_keeps_existing_backups(self):
         backups = self.root / "backups"
